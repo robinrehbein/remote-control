@@ -13,7 +13,7 @@ COPY tsconfig.base.json /tsconfig.base.json
 # file:../../packages/protocol resolves to /packages/protocol from /app
 COPY packages/protocol /packages/protocol
 
-COPY shims/kilo/package.json shims/kilo/package-lock.json /app/
+COPY shims/kilo/package.json shims/kilo/package-lock.json ./
 RUN npm ci --no-audit --no-fund
 
 COPY shims/kilo/tsconfig.json /app/tsconfig.json

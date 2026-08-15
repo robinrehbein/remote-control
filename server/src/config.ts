@@ -20,7 +20,32 @@ function loadDockerEnabled(): boolean {
   const raw = process.env.DOCKER_ENABLED;
   if (raw === '1' || raw === 'true') return true;
   if (raw === '0' || raw === 'false') return false;
-  return existsSync('/var/run/docker.sock');
+  return existsSync('/var/run/docker.sock') || dockerHost() !== null;
+}
+
+/** Remote docker daemon, e.g. tcp://docker.example.com:2376 (Fly deployment mode). */
+function dockerHost(): string | null {
+  const raw = process.env.DOCKER_HOST?.trim();
+  return raw && raw.length > 0 ? raw : null;
+}
+
+function dockerAddr(fallbackHost: string | null): string | null {
+  const raw = process.env.DOCKER_ADDR?.trim();
+  if (raw && raw.length > 0) return raw;
+  if (!fallbackHost) return null;
+  try {
+    const url = new URL(fallbackHost);
+    return url.hostname;
+  } catch {
+    return fallbackHost;
+  }
+}
+
+function b64Env(name: string): string | undefined {
+  const raw = process.env[name]?.trim();
+  if (!raw) return undefined;
+  const buf = Buffer.from(raw, 'base64');
+  return buf.length > 0 ? buf.toString() : undefined;
 }
 
 export const config = {
@@ -28,6 +53,15 @@ export const config = {
   dataDir: resolve(process.env.DATA_DIR ?? './data'),
   masterKey: loadMasterKey(),
   dockerEnabled: loadDockerEnabled(),
+  /** null => local /var/run/docker.sock; tcp://host:port => remote daemon (session containers run elsewhere, e.g. orchestrator on Fly.io + Docker host at home) */
+  dockerHost: dockerHost(),
+  /** Hostname/IP the orchestrator uses to reach published shim ports on the docker host (defaults to DOCKER_HOST's hostname) */
+  dockerAddr: dockerAddr(dockerHost()),
+  dockerTls: {
+    ca: b64Env('DOCKER_CLIENT_CA_B64'),
+    cert: b64Env('DOCKER_CLIENT_CERT_B64'),
+    key: b64Env('DOCKER_CLIENT_KEY_B64'),
+  },
   networkName: process.env.NETWORK_NAME ?? 'pocketagent',
   sessionMemLimit: process.env.SESSION_MEM_LIMIT ?? '2g',
   idleStopSec: Number(process.env.IDLE_STOP_SEC ?? 900),

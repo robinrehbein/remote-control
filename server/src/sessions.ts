@@ -54,6 +54,7 @@ export class SessionManager {
       volume_name: null,
       shim_token: null,
       pr_url: null,
+      shim_endpoint: null,
       created_at: now,
       last_active_at: now,
     };
@@ -72,9 +73,12 @@ export class SessionManager {
       const cid = await docker.createSessionContainer(staged, env);
       if (!cid) throw new Error('failed to create session container');
       if (!(await docker.startContainer(cid))) throw new Error('failed to start session container');
+      const endpoint = await docker.shimEndpoint(cid);
       this.store.setProvisioned(row.id, cid, staged.volume_name as string, shimToken);
-      await this.waitForShim(row.id, shimToken, 60_000);
-      this.connectEvents(row.id, shimToken);
+      this.store.setShimEndpoint(row.id, endpoint);
+      const base = this.shimBase(row.id, endpoint);
+      await this.waitForShim(base, shimToken, 60_000);
+      this.connectEvents(row.id, base, shimToken);
       this.setStatus(row.id, 'idle');
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -82,6 +86,10 @@ export class SessionManager {
       this.emitEvent(row.id, { type: 'error', message, fatal: true });
       this.broadcastStatus(row.id, 'error');
     }
+  }
+
+  private shimBase(id: string, endpoint?: string | null): string {
+    return endpoint ?? this.store.getSession(id)?.shim_endpoint ?? `http://${id}:8080`;
   }
 
   private buildEnv(
@@ -117,8 +125,8 @@ export class SessionManager {
     return env;
   }
 
-  private async waitForShim(id: string, token: string, timeoutMs: number): Promise<void> {
-    const client = new ShimClient(id, token);
+  private async waitForShim(base: string, token: string, timeoutMs: number): Promise<void> {
+    const client = new ShimClient(base, token);
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       if (await client.status()) return;
@@ -127,9 +135,9 @@ export class SessionManager {
     throw new Error('shim did not become ready in time');
   }
 
-  private connectEvents(id: string, token: string): void {
+  private connectEvents(id: string, base: string, token: string): void {
     this.clients.get(id)?.stop();
-    const client = new ShimClient(id, token);
+    const client = new ShimClient(base, token);
     this.clients.set(id, client);
     client.startEvents((ev) => this.onEvent(id, ev));
   }
@@ -181,7 +189,7 @@ export class SessionManager {
   private client(id: string): ShimClient {
     const row = this.requireSession(id);
     if (!row.shim_token) throw new Error('session not provisioned');
-    return this.clients.get(id) ?? new ShimClient(id, row.shim_token);
+    return this.clients.get(id) ?? new ShimClient(this.shimBase(id), row.shim_token);
   }
 
   async prompt(id: string, text: string, mode?: AgentMode): Promise<void> {
@@ -238,12 +246,16 @@ export class SessionManager {
       if (!started) throw new Error('failed to start session container');
     }
     if (cid && cid !== row.container_id) this.store.setContainer(id, cid);
-    await this.waitForShim(id, row.shim_token, 60_000);
+    // remote mode assigns a new published port per (re)created container
+    const endpoint = cid ? await docker.shimEndpoint(cid) : row.shim_endpoint;
+    this.store.setShimEndpoint(id, endpoint);
+    const base = this.shimBase(id, endpoint);
+    await this.waitForShim(base, row.shim_token, 60_000);
     if (row.session_ref) {
-      const res = await new ShimClient(id, row.shim_token).resume(row.session_ref);
+      const res = await new ShimClient(base, row.shim_token).resume(row.session_ref);
       if (!res?.ok) throw new Error(res && !res.ok ? res.error : 'resume failed');
     }
-    this.connectEvents(id, row.shim_token);
+    this.connectEvents(id, base, row.shim_token);
     this.setStatus(id, 'idle');
   }
 

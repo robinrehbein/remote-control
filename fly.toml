@@ -1,0 +1,41 @@
+# fly.io deployment for the PocketAgent orchestrator.
+# The orchestrator runs on Fly; session containers run on a REMOTE docker
+# daemon (your Docker/Coolify host) configured via DOCKER_HOST secrets.
+# See FLY.md for the full guide.
+app = "pocketagent"
+primary_region = "fra"
+
+[build]
+  dockerfile = "server/Dockerfile"
+
+[env]
+  PORT = "3000"
+  DATA_DIR = "/data"
+  NETWORK_NAME = "pocketagent"
+
+# WebSocket-heavy service: keep one instance always up, no auto-stop
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 200
+
+[[http_service.checks]]
+  interval = "30s"
+  timeout = "5s"
+  grace_period = "10s"
+  method = "GET"
+  path = "/api/health"
+
+[mounts]
+  source = "pocketagent_data"
+  destination = "/data"

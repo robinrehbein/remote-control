@@ -16,8 +16,8 @@ export class ShimClient {
   private ac: AbortController | null = null;
   private stopped = false;
 
-  constructor(sessionId: string, token: string) {
-    this.base = `http://${sessionId}:8080`;
+  constructor(base: string, token: string) {
+    this.base = base.replace(/\/+$/, '');
     this.token = token;
   }
 

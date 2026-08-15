@@ -7,8 +7,27 @@ let client: Docker | null = null;
 
 function docker(): Docker | null {
   if (!config.dockerEnabled) return null;
-  client ??= new Docker({ socketPath: '/var/run/docker.sock' });
+  if (client === null) {
+    if (config.dockerHost) {
+      const url = new URL(config.dockerHost);
+      client = new Docker({
+        protocol: url.protocol === 'https:' ? 'https' : 'http',
+        host: url.hostname,
+        port: url.port ? Number(url.port) : 2375,
+        ...(config.dockerTls.ca && config.dockerTls.cert && config.dockerTls.key
+          ? { ca: config.dockerTls.ca, cert: config.dockerTls.cert, key: config.dockerTls.key }
+          : {}),
+      });
+    } else {
+      client = new Docker({ socketPath: '/var/run/docker.sock' });
+    }
+  }
   return client;
+}
+
+/** true when session containers run on a remote daemon; shim ports are then published on the docker host. */
+export function isRemote(): boolean {
+  return config.dockerHost !== null;
 }
 
 export function parseMem(spec: string): number {
@@ -58,13 +77,16 @@ export async function createSessionContainer(
   if (!d || !session.volume_name) return null;
   try {
     await ensureVolume(session.volume_name);
+    const remote = isRemote();
     const c = await d.createContainer({
       Image: adapterImage(session.adapter),
       Env: envArr(env),
       Labels: { 'pocketagent.session': session.id },
+      ...(remote ? { ExposedPorts: { '8080/tcp': {} } } : {}),
       HostConfig: {
         Memory: parseMem(config.sessionMemLimit),
         Binds: [`${session.volume_name}:/work`],
+        ...(remote ? { PortBindings: { '8080/tcp': [{ HostPort: '' }] } } : {}),
       },
       NetworkingConfig: {
         EndpointsConfig: { [config.networkName]: { Aliases: [session.id] } },
@@ -85,6 +107,27 @@ export async function startContainer(id: string): Promise<boolean> {
     return true;
   } catch (e) {
     return String(e).includes('already started');
+  }
+}
+
+/**
+ * Base URL the orchestrator uses to reach a running session shim.
+ * Local mode: docker-network alias (null => caller uses http://<sessionId>:8080).
+ * Remote mode: published random host port on the docker host (DOCKER_ADDR).
+ */
+export async function shimEndpoint(containerId: string): Promise<string | null> {
+  if (!isRemote() || !config.dockerAddr) return null;
+  const d = docker();
+  if (!d) return null;
+  try {
+    const info = await d.getContainer(containerId).inspect();
+    const bindings = info.NetworkSettings.Ports?.['8080/tcp'];
+    const hostPort = bindings?.[0]?.HostPort;
+    if (!hostPort) return null;
+    return `http://${config.dockerAddr}:${hostPort}`;
+  } catch (e) {
+    console.error(`[docker] endpoint inspect failed: ${String(e)}`);
+    return null;
   }
 }
 

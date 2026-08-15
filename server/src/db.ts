@@ -23,6 +23,7 @@ export interface SessionRow {
   adapter: string; provider: string; model: string; mode: string;
   status: string; branch: string; session_ref: string | null; container_id: string | null;
   volume_name: string | null; shim_token: string | null; pr_url: string | null;
+  shim_endpoint: string | null;
   created_at: string; last_active_at: string;
 }
 export interface PairingCodeRow { code: string; tenant_id: string; expires_at: string; used: number }
@@ -48,7 +49,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, repo_id TEXT NOT NULL, repo_full_name TEXT NOT NULL,
   adapter TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, mode TEXT NOT NULL,
   status TEXT NOT NULL, branch TEXT NOT NULL, session_ref TEXT, container_id TEXT,
-  volume_name TEXT, shim_token TEXT, pr_url TEXT,
+  volume_name TEXT, shim_token TEXT, pr_url TEXT, shim_endpoint TEXT,
   created_at TEXT NOT NULL, last_active_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS session_events (
@@ -65,6 +66,14 @@ export class Store {
     this.db = new Database(join(dir, 'orchestrator.db'));
     this.db.pragma('journal_mode = WAL');
     this.db.exec(SCHEMA);
+    this.migrate();
+  }
+
+  private migrate(): void {
+    const cols = this.db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>;
+    if (!cols.some((c) => c.name === 'shim_endpoint')) {
+      this.db.exec('ALTER TABLE sessions ADD COLUMN shim_endpoint TEXT');
+    }
   }
 
   close(): void {
@@ -150,13 +159,13 @@ export class Store {
     this.db
       .prepare(
         `INSERT INTO sessions (id, tenant_id, repo_id, repo_full_name, adapter, provider, model, mode,
-         status, branch, session_ref, container_id, volume_name, shim_token, pr_url, created_at, last_active_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         status, branch, session_ref, container_id, volume_name, shim_token, pr_url, shim_endpoint, created_at, last_active_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         row.id, row.tenant_id, row.repo_id, row.repo_full_name, row.adapter, row.provider,
         row.model, row.mode, row.status, row.branch, row.session_ref, row.container_id,
-        row.volume_name, row.shim_token, row.pr_url, row.created_at, row.last_active_at,
+        row.volume_name, row.shim_token, row.pr_url, row.shim_endpoint, row.created_at, row.last_active_at,
       );
   }
 
@@ -182,6 +191,10 @@ export class Store {
 
   setContainer(id: string, containerId: string): void {
     this.db.prepare('UPDATE sessions SET container_id = ? WHERE id = ?').run(containerId, id);
+  }
+
+  setShimEndpoint(id: string, endpoint: string | null): void {
+    this.db.prepare('UPDATE sessions SET shim_endpoint = ? WHERE id = ?').run(endpoint, id);
   }
 
   setSessionRef(id: string, ref: string): void {

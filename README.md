@@ -77,6 +77,21 @@ docker exec -it pocketagent-orchestrator npx tsx src/pair.ts
 
 App installieren (APK aus GitHub Actions Artifact), Server-URL + Code + Gerätename eingeben → Device-Token wird im Keystore verschlüsselt gespeichert. Provider-Keys landen danach NIE auf dem Handy, nur im Server-Vault (Einstellungen → Secrets: `github` PAT mit repo-Scope, `openai`, `zai`, `moonshot`, `anthropic`, `claude_oauth` (setup-token), `junie`).
 
+### Keys vom Laptop hinterlegen
+
+Statt Provider-Keys aufs Handy zu tippen, gehen sie direkt vom Laptop in den Server-Vault: `POST /api/secrets` (Auth: `Authorization: Bearer <PAIRING_ADMIN_TOKEN>`, gleicher Token wie bei `/api/pairing/create` — in `.env` setzen) landet auf demselben Vault-Codepfad wie das `secret.set` der App. Das CLI-Paket `cli/` (`pocketagent-secret`, Node-Builtins only, kein `npm install -g` nötig) macht daraus einen einzeiler:
+
+```bash
+export POCKETAGENT_URL=https://orch.example.com
+export POCKETAGENT_ADMIN_TOKEN=...   # = PAIRING_ADMIN_TOKEN aus .env
+
+node cli/src/index.ts claude                    # führt `claude setup-token` aus, speichert als claude_oauth
+echo sk-... | node cli/src/index.ts openai       # Wert per stdin (pipe)
+cat kilo-auth.json | node cli/src/index.ts kilo  # Datei-Inhalt per stdin (Gateway auth.json)
+```
+
+Ohne Wert-Argument und ohne Pipe fragt die CLI interaktiv (Eingabe versteckt). `http://` wird nur zu `localhost` akzeptiert, sonst `https://` oder explizit `--insecure-http`.
+
 ### 4. Auth-Quellen je Adapter
 
 | Adapter | Secret | Hinweis |

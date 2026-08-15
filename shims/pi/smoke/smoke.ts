@@ -1,12 +1,13 @@
 import { execFile } from 'node:child_process';
 import type { AddressInfo } from 'node:net';
 import http, { type IncomingMessage } from 'node:http';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import type { AgentEvent } from '@pocketagent/protocol';
 import { EventBroadcaster } from '../src/events';
+import { askpassEnv, commitTurn, ensureRepo, pushBranch, readGithubPat, type GitContext } from '../src/gitops';
 import { buildApp, loadConfig } from '../src/index';
 import { FakeRunner } from './fake';
 
@@ -278,8 +279,104 @@ async function main(): Promise<void> {
   sse.close();
   await app.close();
   bus.stop();
+
+  // --- credentials: readGithubPat (creds file -> GITHUB_PAT env fallback) ---
+  const testPat = 'smoke-pat-never-leak-0123456789abcdef';
+  const credsDir = await mkdtemp(join(tmpdir(), 'pi-shim-smoke-creds-'));
+  const credsFile = join(credsDir, 'creds.json');
+  const savedCredsFile = process.env.PA_CREDS_FILE;
+  const savedEnvPat = process.env.GITHUB_PAT;
+  try {
+    await writeFile(credsFile, JSON.stringify({ githubPat: testPat }), 'utf8');
+    process.env.PA_CREDS_FILE = credsFile;
+    delete process.env.GITHUB_PAT;
+    expect(readGithubPat() === testPat, 'readGithubPat reads githubPat from creds file');
+
+    process.env.GITHUB_PAT = 'env-fallback-pat';
+    expect(readGithubPat() === testPat, 'creds file wins over GITHUB_PAT env');
+
+    await writeFile(credsFile, '{not valid json', 'utf8');
+    expect(readGithubPat() === 'env-fallback-pat', 'malformed creds file falls back to env');
+
+    process.env.PA_CREDS_FILE = join(credsDir, 'missing.json');
+    delete process.env.GITHUB_PAT;
+    expect(readGithubPat() === undefined, 'missing creds file + no env -> undefined');
+
+    process.env.PA_CREDS_FILE = credsFile;
+    await writeFile(credsFile, JSON.stringify({ other: 'nope' }), 'utf8');
+    expect(readGithubPat() === undefined, 'creds file without githubPat -> undefined');
+  } finally {
+    if (savedCredsFile === undefined) delete process.env.PA_CREDS_FILE;
+    else process.env.PA_CREDS_FILE = savedCredsFile;
+    if (savedEnvPat === undefined) delete process.env.GITHUB_PAT;
+    else process.env.GITHUB_PAT = savedEnvPat;
+  }
+
+  // --- askpass helper: PAT never in the script, env wired correctly ---
+  expect(askpassEnv(undefined) === undefined, 'askpassEnv is undefined without a PAT');
+  const askpass = askpassEnv(testPat);
+  const helperPath = askpass?.GIT_ASKPASS;
+  expect(typeof helperPath === 'string', 'askpassEnv sets GIT_ASKPASS');
+  const helperBody = await readFile(helperPath as string, 'utf8');
+  expect(!helperBody.includes(testPat), 'askpass script must not contain the PAT literal');
+  expect(helperBody.includes('x-access-token'), 'askpass script answers the username prompt');
+  expect(helperBody.includes('PA_GIT_PAT'), 'askpass script reads PA_GIT_PAT');
+  const helperStat = await stat(helperPath as string);
+  expect((helperStat.mode & 0o777) === 0o700, `askpass script mode is 0700 (got ${helperStat.mode.toString(8)})`);
+  expect(askpass?.PA_GIT_PAT === testPat, 'askpassEnv carries the PAT via PA_GIT_PAT');
+  expect(askpass?.GIT_TERMINAL_PROMPT === '0', 'askpassEnv disables terminal prompts');
+  expect(askpass?.HOME === process.env.HOME, 'askpassEnv preserves HOME for child processes');
+  expect(askpass?.XDG_CONFIG_HOME === process.env.XDG_CONFIG_HOME, 'askpassEnv preserves XDG_CONFIG_HOME');
+  await rm(helperPath as string, { force: true });
+
+  // --- local git end-to-end: clone + push over file:// with askpass flow ---
+  let gitAvailable = true;
+  try {
+    await exec('git', ['--version']);
+  } catch {
+    gitAvailable = false;
+    console.log('SKIP: git binary not available; skipping credential e2e checks');
+  }
+  if (gitAvailable) {
+    const e2eRoot = await mkdtemp(join(tmpdir(), 'pi-shim-smoke-e2e-'));
+    try {
+      const upstream = join(e2eRoot, 'upstream');
+      const origin = join(e2eRoot, 'origin.git');
+      await exec('git', ['init', '-b', 'main', upstream]);
+      await exec('git', ['config', 'user.name', 'Smoke Test'], { cwd: upstream });
+      await exec('git', ['config', 'user.email', 'smoke@test.local'], { cwd: upstream });
+      await writeFile(join(upstream, 'README.md'), '# e2e origin\n', 'utf8');
+      await exec('git', ['add', '-A'], { cwd: upstream });
+      await exec('git', ['commit', '-m', 'init', '--no-verify'], { cwd: upstream });
+      await exec('git', ['clone', '--bare', upstream, origin]);
+
+      const workDir2 = join(e2eRoot, 'clone');
+      const ctx: GitContext = {
+        workDir: workDir2,
+        sessionId: 'smoke-e2e',
+        repoUrl: `file://${origin}`,
+        githubPat: testPat,
+      };
+      const e2eBranch = await ensureRepo(ctx);
+      expect(e2eBranch === 'agent/smoke-e2e', 'ensureRepo clones and creates the agent branch');
+      await writeFile(join(workDir2, 'note.txt'), 'e2e\n', 'utf8');
+      const sha = await commitTurn(ctx, new Date().toISOString());
+      expect(sha.length > 0, 'commitTurn commits on the clone');
+      await pushBranch(ctx, e2eBranch);
+
+      const gitConfig = await readFile(join(workDir2, '.git', 'config'), 'utf8');
+      expect(!gitConfig.includes(testPat), '.git/config must not contain the PAT');
+      expect(gitConfig.includes('file://'), 'remote recorded as a plain URL');
+      const remoteBranches = await exec('git', ['branch', '--list', 'agent/smoke-e2e'], { cwd: origin });
+      expect(remoteBranches.stdout.trim().length > 0, 'branch pushed to the file:// remote');
+    } finally {
+      await rm(e2eRoot, { recursive: true, force: true });
+    }
+  }
+
   await rm(workDir, { recursive: true, force: true });
   await rm(agentDir, { recursive: true, force: true });
+  await rm(credsDir, { recursive: true, force: true });
 
   console.log('SMOKE OK');
 }

@@ -106,5 +106,5 @@ export function getAdapter(id: string): AdapterDescriptor | undefined {
 
 export function adapterImage(id: string): string {
   const desc = getAdapter(id);
-  return desc?.image ?? `${config.adapterImagePrefix}/${id}-shim:latest`;
+  return desc?.image ?? `${config.adapterImagePrefix}/${id}-shim:${config.adapterImageTag}`;
 }

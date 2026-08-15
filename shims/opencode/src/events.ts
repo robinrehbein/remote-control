@@ -1,6 +1,6 @@
 import type { ServerResponse } from 'node:http';
 import type { AgentEvent, AgentMode, PermissionKind } from '@pocketagent/protocol';
-import type { OpenCodeClient } from './opencode-client';
+import type { OpenCodeClient } from './opencode-client.ts';
 
 export class Broadcaster {
   private readonly clients = new Set<ServerResponse>();

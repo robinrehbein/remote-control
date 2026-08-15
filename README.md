@@ -57,6 +57,15 @@ docker build -f shims/junie/Dockerfile    -t pocketagent/junie-shim:latest .
 
 Wichtig: Build-Kontext ist immer der Repo-Root (`.`), weil die Shims und der Server per `file:`-Dependency `packages/protocol` einbinden.
 
+**Image-Pinning (Supply Chain):** Standardmäßig nutzt der Orchestrator
+`<ADAPTER_IMAGE_PREFIX>/<id>-shim:<ADAPTER_IMAGE_TAG>` (Default-Tag `latest`,
+siehe `.env.example`). Für reproduzierbare Deploys zwei Möglichkeiten:
+
+- global per Env: `ADAPTER_IMAGE_TAG=2026-08-15` (oder ein CI-Build-Tag) pinnen
+- pro Adapter per Manifest: `"image": "ghcr.io/owner/opencode-shim@sha256:<digest>"`
+  in `shims/<id>/adapter.json` — ein Digest überschreibt Prefix/Tag komplett
+  (Registry-Modus, Images werden dann automatisch gepullt).
+
 ### 2. Orchestrator starten
 
 ```bash
@@ -71,7 +80,7 @@ Der Orchestrator mountet `docker.sock` (startet/stoppt Session-Container), legt 
 ### 3. Pairing
 
 ```bash
-docker exec -it pocketagent-orchestrator npx tsx src/pair.ts
+docker exec -it pocketagent-orchestrator node dist/pair.js
 # → Code 8 Zeichen, 10 min gültig
 ```
 
@@ -125,8 +134,35 @@ Android: siehe `android/README.md` (lokal + CI; CI-Workflow liegt in `.github/wo
 
 - Device-Token: nur SHA-256-Hash in der DB; Token im Android Keystore (AES-GCM)
 - Provider-Secrets: AES-256-GCM im Vault, MASTER_KEY aus Env; pro Session-Container wird nur das Credential des gewählten Adapters/Providers injiziert
+<<<<<<< HEAD
 - Session-Container: eigenes Volume, Memory-Limit, per-Session Random-Token für die Shim-API; Yolo-Deny-Liste blockt `git push`/`rm -rf` im Agenten-Kontext (Push läuft nur über den Shim)
 - Bekannte Grenze (Single-User akzeptiert): `docker.sock` im Orchestrator = Root-äquivalent; für Multi-Tenant später rootless Runner (siehe Plan). Auf Shared-Hosts (z. B. Coolify mit weiteren Apps) Blast-Radius beachten → RUNBOOK-Sektion Coolify sowie geplante Alternativen (Socket-Proxy, Remote-Runner)
+=======
+- **Egress-Proxy** (networkPolicy `allowlist`): verlangt jetzt Proxy-Auth — nur Requests mit dem Per-Session-Shim-Token (`Proxy-Authorization: Bearer/Basic`) passieren; alles andere → 403
+- Session-Container: eigenes Volume, Memory-/CPU-Limit, readonly Rootfs, per-Session Random-Token für die Shim-API
+- **Ehrlich über die Grenzen** (Details: `SECURITY.md`):
+  - Die Yolo-Deny-Liste (`git push`/`rm -rf` im Agenten-Kontext) ist **advisory und umgehbar** — kein Sicherheitskontrolle. Echter Netzwerk-Enforcement gibt es nur über networkPolicy `allowlist`/`isolated` (interner Docker-Netzwerk + Egress-Proxy).
+  - Provider-API-Keys sind **by design im Agenten-Prozess sichtbar** (gleiche uid im Session-Container) — benanntes Restrisiko: ein kompromittierter Agent-Prozess kann den eigenen Provider-Key lesen.
+  - Der GitHub-PAT wird **nicht mehr** als Container-Env oder in `.git/config` gesetzt, sondern vor dem Start als nur-lesbare Creds-Datei injiziert (`PA_CREDS_FILE=/run/secrets/pa/creds.json`, uid 1000, mode 0400) — bleibt aber weiterhin für Prozesse mit derselben uid lesbar (benanntes Restrisiko).
+  - `docker.sock` im Orchestrator = Root-äquivalent (Single-User akzeptiert); für Multi-Tenant später rootless Runner.
+  - Remote-/Fly-Modus: Shim-Traffic läuft **plaintext** über `DOCKER_ADDR` (published Ports), außer du tunnelst (SSH/WireGuard — siehe `FLY.md`); Remote-Sessions mit `networkPolicy 'open'` erfordern explizit `REMOTE_NETWORK_OPEN=1`, `allowlist`/`isolated` gehen nur mit lokalem Socket.
+
+## Migration: bestehende Session-Volumes
+
+Ältere Session-Volumes wurden **root-owned** erstellt; neue Shim-Images laufen als `node` (uid 1000). Alte Sessions lassen sich daher nicht resumen. Entweder die Volumes löschen (das Work wird beim nächsten Session-Start neu geklont):
+
+```bash
+docker volume rm pocketagent-sess-*
+```
+
+oder einmalig an uid 1000 übergeben:
+
+```bash
+for v in $(docker volume ls -q --filter name=pocketagent-sess-); do
+  docker run --rm -v "$v:/w" alpine chown -R 1000:1000 /w
+done
+```
+>>>>>>> 55a7f2f
 
 ## Status / Verifikation
 

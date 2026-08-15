@@ -277,4 +277,12 @@ class ProtocolDecodeTest {
         assertNull(parseServerMessage("""{"type":"completely.unknown"}"""))
         assertNull(parseServerMessage("""{"noType":true}"""))
     }
+
+    @Test
+    fun `returns null for unknown future server message types`() {
+        assertNull(parseServerMessage("""{"type":"device.list","requestId":"r1","devices":[]}"""))
+        assertNull(parseServerMessage("""{"type":"device.revoke","requestId":"r2","deviceId":"d1"}"""))
+        assertNull(parseServerMessage("""{"type":"link.list","requestId":"r3","links":[]}"""))
+        assertNull(parseServerMessage("""{"type":"link.revoke","requestId":"r4","linkId":"l1"}"""))
+    }
 }

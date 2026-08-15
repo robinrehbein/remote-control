@@ -105,6 +105,14 @@ function gatewayToken(): string | null {
   return raw && raw.length > 0 ? raw : null;
 }
 
+/** Optional per-session CPU limit in docker NanoCPUs (e.g. 1000000000 = 1 CPU); undefined when unset/invalid. */
+function loadSessionCpuQuota(): number | undefined {
+  const raw = process.env.SESSION_CPU_QUOTA?.trim();
+  if (!raw) return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.round(n) : undefined;
+}
+
 export const config = {
   port: Number(process.env.PORT ?? 3000),
   dataDir: resolve(process.env.DATA_DIR ?? './data'),
@@ -131,6 +139,8 @@ export const config = {
   idleStopSec: Number(process.env.IDLE_STOP_SEC ?? 900),
   gcDays: Number(process.env.GC_DAYS ?? 14),
   adapterImagePrefix: process.env.ADAPTER_IMAGE_PREFIX ?? 'pocketagent',
+  /** Tag used for adapter shim images (pin a specific build instead of 'latest'). */
+  adapterImageTag: process.env.ADAPTER_IMAGE_TAG?.trim() || 'latest',
   networkPolicyDefault: loadNetworkPolicyDefault(),
   networkAllowlist: loadNetworkAllowlist(),
   egressProxyPort: Number(process.env.EGRESS_PROXY_PORT ?? 3128),
@@ -142,14 +152,29 @@ export const config = {
    * (`/s/<sessionId>/...`) and enforces the egress allowlist out, so session
    * containers can stay on internal per-session networks.
    *
-   * Without GATEWAY_TOKEN the server keeps the previous remote behaviour
-   * (policy forced to 'open', shim ports published on the docker host).
+   * Without GATEWAY_TOKEN remote mode falls back to published shim ports:
+   * networkPolicy 'open' then requires explicit REMOTE_NETWORK_OPEN=1 consent
+   * (plaintext HTTP on the docker host unless tunneled), and allowlist/isolated
+   * are rejected.
    */
   gatewayToken: gatewayToken(),
   /** Host port the gateway's ingress listener is published on (fixed, not random). */
   gatewayPort: Number(process.env.GATEWAY_PORT ?? 8443),
   /** Image the gateway container runs; must exist on the *runner*. */
   gatewayImage: process.env.GATEWAY_IMAGE ?? `${process.env.ADAPTER_IMAGE_PREFIX ?? 'pocketagent'}/orchestrator:latest`,
+  /**
+   * Explicit consent for networkPolicy 'open' in remote-daemon mode (DOCKER_HOST=tcp://...)
+   * without a configured gateway. Remote mode publishes shim ports as plaintext HTTP on
+   * the docker host unless tunneled; creating such sessions requires this flag.
+   */
+  remoteNetworkOpen: process.env.REMOTE_NETWORK_OPEN === '1',
+  /**
+   * Host IP shim ports are published on in remote-daemon mode. Default 127.0.0.1 keeps
+   * them off the LAN; reach them via SSH tunnel or set to a WireGuard interface IP.
+   */
+  dockerPublishIp: process.env.DOCKER_PUBLISH_IP?.trim() || '127.0.0.1',
+  /** Optional per-session CPU limit in docker NanoCPUs (undefined = unlimited). */
+  sessionCpuQuota: loadSessionCpuQuota(),
 } as const;
 
 /** Port the gateway listens on inside its container (ingress). */

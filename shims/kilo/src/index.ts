@@ -7,11 +7,11 @@ import { dirname, join, resolve } from 'node:path';
 import Fastify, { type FastifyReply } from 'fastify';
 import { selectModel } from '@pocketagent/protocol';
 import type { AgentMode, PermissionDecision, PromptRequest, ResumeRequest, ShimStatus } from '@pocketagent/protocol';
-import { readEnv, type ShimEnvConfig } from './env';
-import { parsePermissionJson, permissionForMode, writeOpencodeConfig, type PermissionMap } from './modes';
-import * as gitops from './gitops';
-import { OpenCodeClient, type PromptMessageBody } from './opencode-client';
-import { Broadcaster, EventNormalizer } from './events';
+import { readEnv, type ShimEnvConfig } from './env.js';
+import { parsePermissionJson, permissionForMode, writeOpencodeConfig, type PermissionMap } from './modes.js';
+import * as gitops from './gitops.js';
+import { OpenCodeClient, type PromptMessageBody } from './opencode-client.js';
+import { Broadcaster, EventNormalizer } from './events.js';
 
 const MODES: readonly AgentMode[] = ['yolo', 'auto', 'acceptEdits', 'ask'];
 const DECISIONS: readonly PermissionDecision[] = ['once', 'always', 'reject'];
@@ -33,7 +33,9 @@ function spawnOpenCode(env: ShimEnvConfig, onDead: (reason: string) => void): Ch
   // headless server ("kilo server listening on ..."); no login required unless
   // KILO_SERVER_PASSWORD is set (then HTTP Basic user "kilo" is enforced).
   const args = ['serve', '--port', String(env.opencodePort), '--hostname', '127.0.0.1'];
-  // inherit full env so provider credentials (OPENAI_API_KEY, ...) reach opencode.
+  // inherit full env so provider credentials (OPENAI_API_KEY, ...) reach opencode
+  // and so the child resolves the same XDG_CONFIG_HOME (-> auth.json written by
+  // writeKiloAuth) as this process.
   // @kilocode/cli's bin is "./bin/kilo", a Node wrapper script without a .js
   // extension — detect the shebang so we spawn it through process.execPath.
   let head = '';
@@ -79,6 +81,8 @@ function tokenOk(header: string | undefined, expected: string): boolean {
 function writeKiloAuth(): void {
   // KILO_AUTH_CONTENT carries the kilo gateway auth.json so `kilo serve` can
   // use gateway models; kilo reads it from $XDG_CONFIG_HOME/kilo/auth.json.
+  // The container sets HOME=/tmp and XDG_CONFIG_HOME=/tmp/xdg (writable tmpfs)
+  // so this resolves under /tmp/xdg even with a read-only root filesystem.
   const content = process.env.KILO_AUTH_CONTENT;
   if (content === undefined || content.length === 0) return;
   try {
@@ -91,7 +95,8 @@ function writeKiloAuth(): void {
   const kiloDir = join(configDir, 'kilo');
   try {
     mkdirSync(kiloDir, { recursive: true });
-    writeFileSync(join(kiloDir, 'auth.json'), content);
+    // auth.json holds gateway credentials: create it readable by this uid only
+    writeFileSync(join(kiloDir, 'auth.json'), content, { mode: 0o600 });
   } catch (err) {
     console.error(`[opencode] could not write kilo auth.json: ${err instanceof Error ? err.message : String(err)}`);
   }

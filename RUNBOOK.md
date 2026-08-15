@@ -79,6 +79,21 @@ Pull requests R/W je Repo), danach pro Adapter siehe README-Tabelle
 5. Container-Kill-Test: `docker kill <session-container>` → in App „Resume" →
    Volume + Session-Resume muss den Zustand wiederherstellen
 
+## Coolify-Deployment (empfohlen)
+
+- App über Coolify mit Domain + TLS deployen (Traefik terminiert TLS; App-Port
+  3000 nur intern, kein Host-Port-Publish). Der WebSocket der App läuft dann
+  als `wss://` — Pairing/Device-Token nie über Klartext.
+- Coolify Auto-Cleanup/„Docker Cleanup" prüfen: Session-Container heißen nach
+  Label `pocketagent.session`, gestoppte Idle-Sessions und `pocketagent-*`-
+  Volumes/Netze dürfen NICHT weggeräumt werden → Cleanup deaktivieren oder
+  Ausnahmen konfigurieren; mindestens keinen `docker system prune --volumes`
+  auf dem Host laufen lassen.
+- Host-Hygiene: solange `docker.sock` gemountet ist, keine weiteren
+  sensiblen Apps auf demselben Server; `MASTER_KEY` nur als Coolify-Secret.
+- Verweis: Socket-Härtung via Socket-Proxy und Remote-Runner-Modus (eigene
+  Sektionen/README) für mehr Isolation.
+
 ## Bekannte Grenzen (bewusst)
 
 - Junie: keine Remote-Approvals (ein-shot-CLI) → App zeigt Warnbanner; ask/acceptEdits

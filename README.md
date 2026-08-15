@@ -107,7 +107,7 @@ Android: siehe `android/README.md` (lokal + CI; CI-Workflow liegt in `.github/wo
 - Device-Token: nur SHA-256-Hash in der DB; Token im Android Keystore (AES-GCM)
 - Provider-Secrets: AES-256-GCM im Vault, MASTER_KEY aus Env; pro Session-Container wird nur das Credential des gewählten Adapters/Providers injiziert
 - Session-Container: eigenes Volume, Memory-Limit, per-Session Random-Token für die Shim-API; Yolo-Deny-Liste blockt `git push`/`rm -rf` im Agenten-Kontext (Push läuft nur über den Shim)
-- Bekannte Grenze (Single-User akzeptiert): `docker.sock` im Orchestrator = Root-äquivalent; für Multi-Tenant später rootless Runner (siehe Plan)
+- Bekannte Grenze (Single-User akzeptiert): `docker.sock` im Orchestrator = Root-äquivalent; für Multi-Tenant später rootless Runner (siehe Plan). Auf Shared-Hosts (z. B. Coolify mit weiteren Apps) Blast-Radius beachten → RUNBOOK-Sektion Coolify sowie geplante Alternativen (Socket-Proxy, Remote-Runner)
 
 ## Status / Verifikation
 

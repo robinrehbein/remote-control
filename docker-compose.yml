@@ -6,8 +6,11 @@ services:
     image: pocketagent/orchestrator:latest
     container_name: pocketagent-orchestrator
     restart: unless-stopped
+    # Hinter Reverse-Proxy betreiben (Coolify/Traefik mit TLS); nur zum lokalen
+    # Testen direkt erreichbar. Wer Coolify die Domain routen lässt, kann das
+    # ports-Mapping ganz entfernen.
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
       # Generate once: openssl rand -hex 32
       MASTER_KEY: ${MASTER_KEY:?set MASTER_KEY in .env}

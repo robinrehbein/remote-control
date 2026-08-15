@@ -2,9 +2,17 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import type { AgentEvent, AgentMode, ModelsResponse, PromptRequest, ShimStatus } from '@pocketagent/protocol';
-import { EventBroadcaster } from './events';
-import { commitTurn, createDraftPr, ensureRepo, getDiff, pushBranch, type GitContext } from './gitops';
-import { RealJunieRunner, type JunieRunner } from './junie';
+import { EventBroadcaster } from './events.js';
+import {
+  commitTurn,
+  createDraftPr,
+  ensureRepo,
+  getDiff,
+  pushBranch,
+  readGithubPat,
+  type GitContext,
+} from './gitops.js';
+import { RealJunieRunner, type JunieRunner } from './junie.js';
 
 const AGENT_MODES: readonly AgentMode[] = ['yolo', 'auto', 'acceptEdits', 'ask'];
 
@@ -65,7 +73,8 @@ export function loadConfig(env: NodeJS.ProcessEnv): ShimConfig {
     mode: mode ?? 'ask',
     repoUrl: env.REPO_URL,
     repoBranch: env.REPO_BRANCH,
-    githubPat: env.GITHUB_PAT,
+    // PA_CREDS_FILE creds.json first (container mode), GITHUB_PAT fallback (link mode).
+    githubPat: readGithubPat(env),
     repoFullName: env.REPO_FULL_NAME,
     autoPush: env.AUTO_PUSH === '1',
     heartbeatMs: intEnv(env.JUNIE_HEARTBEAT_MS, 15_000),

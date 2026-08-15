@@ -9,7 +9,6 @@ export interface ShimEnvConfig {
   sessionId: string;
   repoUrl: string;
   repoBranch: string | undefined;
-  githubPat: string | undefined;
   repoFullName: string;
   autoPush: boolean;
   opencodePort: number;
@@ -34,7 +33,6 @@ export function readEnv(env: Record<string, string | undefined> = process.env): 
     sessionId: env.SESSION_ID ?? 'unknown-session',
     repoUrl: env.REPO_URL ?? '',
     repoBranch: env.REPO_BRANCH,
-    githubPat: env.GITHUB_PAT,
     repoFullName: env.REPO_FULL_NAME ?? '',
     autoPush: env.AUTO_PUSH === '1',
     opencodePort: port,

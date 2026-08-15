@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import type { AddressInfo } from 'node:net';
 import http, { type IncomingMessage } from 'node:http';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -9,6 +9,7 @@ import type { AgentEvent } from '@pocketagent/protocol';
 import { EventBroadcaster } from '../src/events';
 import { buildApp, loadConfig } from '../src/index';
 import { FakeJunieRunner } from '../src/junie';
+import { askpassEnv, commitTurn, ensureRepo, pushBranch, readGithubPat, type GitContext } from '../src/gitops';
 
 const exec = promisify(execFile);
 
@@ -275,6 +276,106 @@ async function main(): Promise<void> {
 
   // --- heartbeat ---
   await waitFor(() => sse.events, event => event.type === 'ping', 5_000, 'SSE heartbeat ping');
+
+  // --- readGithubPat: PA_CREDS_FILE creds.json with GITHUB_PAT fallback ---
+  {
+    const prevCredsFile = process.env.PA_CREDS_FILE;
+    const prevPat = process.env.GITHUB_PAT;
+    const credsDir = await mkdtemp(join(tmpdir(), 'junie-shim-smoke-creds-'));
+    try {
+      const credsFile = join(credsDir, 'creds.json');
+      await writeFile(credsFile, JSON.stringify({ githubPat: 'pat-from-file-123' }), 'utf8');
+      process.env.PA_CREDS_FILE = credsFile;
+      process.env.GITHUB_PAT = 'pat-from-env-456';
+      expect(readGithubPat() === 'pat-from-file-123', 'readGithubPat prefers PA_CREDS_FILE over GITHUB_PAT');
+
+      process.env.PA_CREDS_FILE = join(credsDir, 'missing.json');
+      expect(readGithubPat() === 'pat-from-env-456', 'readGithubPat falls back to GITHUB_PAT when file missing');
+
+      await writeFile(credsFile, '{not json', 'utf8');
+      process.env.PA_CREDS_FILE = credsFile;
+      expect(readGithubPat() === 'pat-from-env-456', 'readGithubPat tolerates a malformed creds file');
+
+      delete process.env.GITHUB_PAT;
+      expect(readGithubPat() === undefined, 'readGithubPat is undefined without any source');
+    } finally {
+      if (prevCredsFile === undefined) delete process.env.PA_CREDS_FILE;
+      else process.env.PA_CREDS_FILE = prevCredsFile;
+      if (prevPat === undefined) delete process.env.GITHUB_PAT;
+      else process.env.GITHUB_PAT = prevPat;
+      await rm(credsDir, { recursive: true, force: true });
+    }
+  }
+
+  // --- askpass helper: PAT lives in env, never inside the script ---
+  const askpassScriptPath = join(tmpdir(), `pocketagent-askpass-${process.pid}.sh`);
+  try {
+    expect(askpassEnv(undefined) === undefined, 'askpassEnv returns undefined without a PAT');
+    const askpass = askpassEnv('askpass-pat-xyz-987');
+    expect(askpass !== undefined, 'askpassEnv returns an env object for a PAT');
+    expect(typeof askpass?.GIT_ASKPASS === 'string', 'askpassEnv sets GIT_ASKPASS');
+    expect(askpass?.GIT_TERMINAL_PROMPT === '0', 'askpassEnv disables terminal prompts');
+    expect(askpass?.PA_GIT_PAT === 'askpass-pat-xyz-987', 'askpassEnv passes the PAT via env var');
+    const script = await readFile(askpassScriptPath, 'utf8');
+    expect(script.includes('x-access-token'), 'askpass script answers username prompts');
+    expect(script.includes('$PA_GIT_PAT'), 'askpass script reads the PAT from the environment');
+    expect(!script.includes('askpass-pat-xyz-987'), 'askpass script contains no PAT literal');
+    const mode = (await stat(askpassScriptPath)).mode & 0o777;
+    expect(mode === 0o700, `askpass script mode is 0700, got ${mode.toString(8)}`);
+  } finally {
+    await rm(askpassScriptPath, { force: true });
+  }
+
+  // --- local git end-to-end: clone + push via plain URL + askpass helper ---
+  let gitAvailable = true;
+  try {
+    await exec('git', ['--version']);
+  } catch {
+    gitAvailable = false;
+  }
+  if (!gitAvailable) {
+    console.log('SKIP: git binary not available for askpass push e2e test');
+  } else {
+    const e2eDir = await mkdtemp(join(tmpdir(), 'junie-shim-smoke-git-'));
+    try {
+      // seed repo -> bare remote with one commit on main
+      const seed = join(e2eDir, 'seed');
+      const bare = join(e2eDir, 'origin.git');
+      await exec('git', ['init', '-b', 'main', seed]);
+      await exec('git', ['config', 'user.name', 'Smoke Test'], { cwd: seed });
+      await exec('git', ['config', 'user.email', 'smoke@test.local'], { cwd: seed });
+      await writeFile(join(seed, 'README.md'), '# e2e\n', 'utf8');
+      await exec('git', ['add', '-A'], { cwd: seed });
+      await exec('git', ['commit', '-m', 'init', '--no-verify'], { cwd: seed });
+      await exec('git', ['init', '--bare', '-b', 'main', bare]);
+      await exec('git', ['push', `file://${bare}`, 'main:main'], { cwd: seed });
+
+      // new push path: plain file:// URL, PAT only via askpass env
+      const ctx: GitContext = {
+        workDir: join(e2eDir, 'clone'),
+        sessionId: 'smoke-git',
+        repoUrl: `file://${bare}`,
+        repoBranch: 'main',
+        githubPat: 'e2e-pat-321',
+      };
+      const pushedBranch = await ensureRepo(ctx);
+      expect(pushedBranch === 'agent/smoke-git', 'ensureRepo clones and creates the agent branch');
+      await writeFile(join(ctx.workDir, 'note.txt'), 'e2e\n', 'utf8');
+      const sha = await commitTurn(ctx, new Date().toISOString());
+      expect(typeof sha === 'string' && sha.length > 0, 'commitTurn produced a commit');
+      await pushBranch(ctx, pushedBranch);
+
+      const remoteSha = (await exec('git', ['rev-parse', `refs/heads/${pushedBranch}`], { cwd: bare })).stdout.trim();
+      expect(remoteSha === sha, 'push reached the bare remote via plain URL + askpass');
+
+      const cloneConfig = await readFile(join(ctx.workDir, '.git', 'config'), 'utf8');
+      expect(!cloneConfig.includes('e2e-pat-321'), '.git/config contains no PAT');
+      expect(!cloneConfig.includes('x-access-token:'), '.git/config contains no embedded credentials');
+    } finally {
+      await rm(e2eDir, { recursive: true, force: true });
+      await rm(join(tmpdir(), `pocketagent-askpass-${process.pid}.sh`), { force: true });
+    }
+  }
 
   sse.close();
   await app.close();

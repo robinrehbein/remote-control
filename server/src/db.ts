@@ -3,6 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { config } from './config.js';
+import { decrypt, decryptStrict, encrypt } from './vault.js';
 
 export function sha256(s: string): string {
   return createHash('sha256').update(s).digest('hex');
@@ -27,7 +28,11 @@ export interface SessionRow {
   reasoning_effort: string | null;
   created_at: string; last_active_at: string;
 }
-export interface PairingCodeRow { code: string; tenant_id: string; expires_at: string; used: number }
+export interface PairingCodeRow {
+  code: string; tenant_id: string; expires_at: string; used: number;
+  /** Failed confirm attempts against this code; >= 5 locks the code. */
+  attempts: number;
+}
 export interface LinkRow { id: string; tenant_id: string; name: string; token_hash: string; created_at: string }
 
 const SCHEMA = `
@@ -76,18 +81,22 @@ export class Store {
   }
 
   private migrate(): void {
-    const cols = this.db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>;
-    if (!cols.some((c) => c.name === 'shim_endpoint')) {
+    const sessionCols = this.db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>;
+    if (!sessionCols.some((c) => c.name === 'shim_endpoint')) {
       this.db.exec('ALTER TABLE sessions ADD COLUMN shim_endpoint TEXT');
     }
-    if (!cols.some((c) => c.name === 'link_id')) {
+    if (!sessionCols.some((c) => c.name === 'link_id')) {
       this.db.exec('ALTER TABLE sessions ADD COLUMN link_id TEXT');
     }
-    if (!cols.some((c) => c.name === 'network_policy')) {
+    if (!sessionCols.some((c) => c.name === 'network_policy')) {
       this.db.exec('ALTER TABLE sessions ADD COLUMN network_policy TEXT');
     }
-    if (!cols.some((c) => c.name === 'reasoning_effort')) {
+    if (!sessionCols.some((c) => c.name === 'reasoning_effort')) {
       this.db.exec('ALTER TABLE sessions ADD COLUMN reasoning_effort TEXT');
+    }
+    const pairingCols = this.db.prepare('PRAGMA table_info(pairing_codes)').all() as Array<{ name: string }>;
+    if (!pairingCols.some((c) => c.name === 'attempts')) {
+      this.db.exec('ALTER TABLE pairing_codes ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0');
     }
   }
 
@@ -116,19 +125,49 @@ export class Store {
     return rows.map((r) => r.fcm_token);
   }
 
+  listDevices(tenant: string): DeviceRow[] {
+    return this.db.prepare('SELECT * FROM devices WHERE tenant_id = ?').all(tenant) as DeviceRow[];
+  }
+
+  /** Revocation: deletes the device row (token dies with it). Returns true when a row was removed. */
+  deleteDevice(id: string): boolean {
+    return this.db.prepare('DELETE FROM devices WHERE id = ?').run(id).changes === 1;
+  }
+
+  listLinks(tenant: string): LinkRow[] {
+    return this.db.prepare('SELECT * FROM links WHERE tenant_id = ?').all(tenant) as LinkRow[];
+  }
+
+  /** Revocation: deletes the link row. Returns true when a row was removed. */
+  deleteLink(id: string): boolean {
+    return this.db.prepare('DELETE FROM links WHERE id = ?').run(id).changes === 1;
+  }
+
   createPairingCode(code: string, tenant: string, expiresAt: string): void {
     this.db
       .prepare('INSERT INTO pairing_codes (code, tenant_id, expires_at, used) VALUES (?, ?, ?, 0)')
       .run(code, tenant, expiresAt);
   }
 
-  consumePairingCode(code: string): boolean {
-    const row = this.db.prepare('SELECT * FROM pairing_codes WHERE code = ?').get(code) as
-      | PairingCodeRow
-      | undefined;
-    if (!row || row.used !== 0 || Date.parse(row.expires_at) < Date.now()) return false;
-    this.db.prepare('UPDATE pairing_codes SET used = 1 WHERE code = ?').run(code);
-    return true;
+  /**
+   * Consume a pairing code atomically: exactly one caller can flip used 0->1, and
+   * only while the code is unused, has < 5 failed attempts and is unexpired.
+   * better-sqlite3 is synchronous, so this read-modify-write is race-free within
+   * one process (the single-process trust model of this server).
+   */
+  consumePairingCode(code: string, nowIso: string = new Date().toISOString()): boolean {
+    const consumed = this.db
+      .prepare(
+        'UPDATE pairing_codes SET used = 1 WHERE code = ? AND used = 0 AND attempts < 5 AND expires_at > ?',
+      )
+      .run(code, nowIso);
+    if (consumed.changes === 1) return true;
+    // Failed attempt: burn an attempt only when the row exists and was not
+    // already consumed, so expired/unknown submissions don't burn unrelated rows.
+    this.db
+      .prepare('UPDATE pairing_codes SET attempts = attempts + 1 WHERE code = ? AND used = 0')
+      .run(code);
+    return false;
   }
 
   createLink(id: string, tenant: string, name: string, tokenHash: string): void {
@@ -163,6 +202,34 @@ export class Store {
     return this.db
       .prepare('SELECT * FROM secrets WHERE tenant_id = ? AND kind = ? ORDER BY created_at DESC LIMIT 1')
       .get(tenant, kind) as SecretRow | undefined;
+  }
+
+  /** In-place re-encryption of a secret row (used for legacy AAD-less migration). */
+  updateSecret(id: string, ciphertext: string, nonce: string): void {
+    this.db.prepare('UPDATE secrets SET ciphertext = ?, nonce = ? WHERE id = ?').run(ciphertext, nonce, id);
+  }
+
+  /**
+   * Newest plaintext secret value for tenant+kind (same ordering as getSecretByKind),
+   * decrypted with AAD `secret:<tenant>:<kind>`. Legacy rows written before AAD
+   * binding decrypt via the no-AAD fallback and are transparently re-encrypted
+   * with AAD and persisted. Returns null when no row exists.
+   */
+  getSecretValue(kind: string, tenant: string): string | null {
+    const row = this.getSecretByKind(kind, tenant);
+    if (!row) return null;
+    const aad = `secret:${tenant}:${kind}`;
+    const enc = { ciphertext: row.ciphertext, nonce: row.nonce };
+    try {
+      return decryptStrict(enc, aad);
+    } catch {
+      // AAD-strict decrypt failed => legacy row; decrypt via the no-AAD fallback
+      // path (returns normally for legacy rows) and re-encrypt with AAD.
+      const value = decrypt(enc);
+      const re = encrypt(value, aad);
+      this.updateSecret(row.id, re.ciphertext, re.nonce);
+      return value;
+    }
   }
 
   listSecrets(tenant: string): SecretRow[] {
@@ -280,6 +347,12 @@ export class Store {
     this.db
       .prepare('INSERT INTO session_events (session_id, type, payload, ts) VALUES (?, ?, ?, ?)')
       .run(sessionId, type, payload, new Date().toISOString());
+    // Keep only the 5000 most recent events per session (unbounded growth = DoS).
+    this.db
+      .prepare(
+        'DELETE FROM session_events WHERE session_id = ? AND id NOT IN (SELECT id FROM session_events WHERE session_id = ? ORDER BY id DESC LIMIT 5000)',
+      )
+      .run(sessionId, sessionId);
   }
 
   deleteSession(id: string): void {

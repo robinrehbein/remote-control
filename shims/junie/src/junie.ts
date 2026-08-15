@@ -241,6 +241,12 @@ export class RealJunieRunner implements JunieRunner {
     if (options.model !== undefined) this.state.model = options.model;
     const outDir = await mkdtemp(join(tmpdir(), 'junie-shim-'));
     const outFile = join(outDir, 'result.json');
+    // NOTE (accepted residual risk): the junie CLI documents auth only via CLI
+    // flags (`--auth <key>`, `--<provider>-api-key <key>`); no env-var auth
+    // mode is referenced anywhere in this shim. Keys passed as argv are
+    // readable by any same-uid process through /proc/<pid>/cmdline. Mitigation
+    // is container isolation (per-session container running as `node`), and
+    // every key below is redacted from emitted events and error strings.
     try {
       return await this.runOnce(text, outFile);
     } finally {
@@ -267,9 +273,11 @@ export class RealJunieRunner implements JunieRunner {
     if (provider !== undefined) args.push('--provider', provider);
     args.push(text);
 
-    const secrets = [this.opts.env.JUNIE_API_KEY, byokKey].filter(
-      (secret): secret is string => typeof secret === 'string' && secret.length > 0,
-    );
+    const secrets = [
+      this.opts.env.JUNIE_API_KEY,
+      byokKey,
+      ...Object.values(BYOK_PROVIDERS).map(provider => this.opts.env[provider.env]),
+    ].filter((secret): secret is string => typeof secret === 'string' && secret.length > 0);
 
     return await new Promise<JuniePromptResult>(resolve => {
       const child = spawn('junie', args, {

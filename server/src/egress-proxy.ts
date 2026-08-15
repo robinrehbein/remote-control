@@ -34,9 +34,13 @@ export function hostAllowed(host: string, allowlist: string[]): boolean {
   return false;
 }
 
+export type TokenValidator = (token: string) => boolean;
+
 export interface EgressProxyOptions {
   port?: number;
   allowlist?: string[];
+  /** Per-session token gate (Proxy-Authorization); unset = accept unauthenticated. */
+  tokenValidator?: TokenValidator;
 }
 
 function forbidden(socket: net.Socket): void {
@@ -44,12 +48,46 @@ function forbidden(socket: net.Socket): void {
 }
 
 /**
- * Build the proxy server without binding it. Used in-process by the
- * orchestrator (local mode) and standalone by the remote gateway container
- * (server/src/gateway.ts) — identical filtering logic in both.
+ * Extract the proxy-auth token from a Proxy-Authorization header value:
+ * 'Bearer <t>' or 'Basic <base64 of "pa:<t>">'. Malformed values -> null.
  */
-export function createEgressProxyServer(allowlist: string[]): http.Server {
+export function parseProxyAuth(header: string | undefined): string | null {
+  if (!header) return null;
+  const m = /^(\w+)\s+(\S+)\s*$/.exec(header.trim());
+  if (!m) return null;
+  const [, scheme, value] = m as unknown as [string, string, string];
+  if (scheme.toLowerCase() === 'bearer') return value;
+  if (scheme.toLowerCase() === 'basic') {
+    const decoded = Buffer.from(value, 'base64').toString('utf8');
+    const i = decoded.indexOf(':');
+    if (i === -1) return null;
+    return decoded.slice(i + 1);
+  }
+  return null;
+}
+
+function proxyAuthorized(req: http.IncomingMessage, tokenValidator: TokenValidator | undefined): boolean {
+  if (!tokenValidator) return true;
+  const header = req.headers['proxy-authorization'];
+  const token = parseProxyAuth(Array.isArray(header) ? header[0] : header);
+  return token !== null && tokenValidator(token);
+}
+
+/**
+ * Build the proxy server without binding it. Used in-process by the
+ * orchestrator (local mode, with a per-session token validator) and standalone
+ * by the remote gateway container (server/src/gateway.ts, ingress auth via
+ * GATEWAY_TOKEN instead) — identical filtering logic in both.
+ */
+export function createEgressProxyServer(
+  allowlist: string[],
+  tokenValidator?: TokenValidator,
+): http.Server {
   const server = http.createServer((req, res) => {
+    if (!proxyAuthorized(req, tokenValidator)) {
+      res.writeHead(403).end('forbidden');
+      return;
+    }
     let target: URL;
     try {
       target = new URL(req.url ?? '/');
@@ -83,7 +121,11 @@ export function createEgressProxyServer(allowlist: string[]): http.Server {
     const idx = url.lastIndexOf(':');
     const host = idx === -1 ? url : url.slice(0, idx);
     const portNum = idx === -1 ? 443 : Number(url.slice(idx + 1));
-    if ((portNum !== 443 && portNum !== 80) || !hostAllowed(host, allowlist)) {
+    if (
+      !proxyAuthorized(req, tokenValidator) ||
+      (portNum !== 443 && portNum !== 80) ||
+      !hostAllowed(host, allowlist)
+    ) {
       forbidden(socket);
       return;
     }
@@ -105,7 +147,7 @@ export function createEgressProxyServer(allowlist: string[]): http.Server {
 export function startEgressProxy(opts: EgressProxyOptions = {}): http.Server {
   const port = opts.port ?? config.egressProxyPort;
   const allowlist = opts.allowlist ?? config.networkAllowlist;
-  const server = createEgressProxyServer(allowlist);
+  const server = createEgressProxyServer(allowlist, opts.tokenValidator);
   server.listen(port, '0.0.0.0');
   return server;
 }

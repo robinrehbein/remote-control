@@ -7,6 +7,11 @@ export type PermissionMap = Record<string, PermissionValue>;
 
 const readAllow: PermissionMap = { read: 'allow', glob: 'allow', grep: 'allow', list: 'allow' };
 
+// ADVISORY ONLY: the yolo/auto deny-list below ('git push*', 'rm -rf *') is a
+// guardrail, not a security boundary. It is trivially bypassable — the agent
+// can run `command git push`, edit this config file, or call the REST API
+// directly. Real isolation comes from the container sandbox; see the README
+// security section.
 export function permissionForMode(mode: AgentMode): PermissionMap {
   switch (mode) {
     case 'yolo':

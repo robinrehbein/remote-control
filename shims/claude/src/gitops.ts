@@ -1,14 +1,21 @@
 /**
  * Git operations for the claude shim: repo bootstrap (clone/branch),
  * per-turn auto-commit, push + draft PR, and uncommitted-change diff.
+ *
+ * The GitHub PAT never appears in remote URLs, .git/config, argv or logs:
+ * it is read from the creds file (PA_CREDS_FILE) or GITHUB_PAT env and
+ * injected into git child processes via a GIT_ASKPASS helper.
  */
 import type { DiffEntry } from '@pocketagent/protocol';
 import { execFile } from 'node:child_process';
-import { promises as fs } from 'node:fs';
+import { chmodSync, promises as fs, readFileSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 
 const exec = promisify(execFile);
+
+export const DEFAULT_CREDS_FILE = '/run/secrets/pa/creds.json';
 
 export interface RepoConfig {
   workDir: string;
@@ -30,26 +37,75 @@ function sanitize(out: unknown): string {
   return String(out ?? '').replace(/https:\/\/[^\s'"]+@/g, 'https://***@').slice(0, 500);
 }
 
-async function git(cwd: string, args: string[]): Promise<string> {
+/**
+ * GitHub PAT from the orchestrator creds file (PA_CREDS_FILE, default
+ * /run/secrets/pa/creds.json, JSON {"githubPat":"..."}), falling back to
+ * GITHUB_PAT env (link-agent mode). Tolerates a missing/malformed file.
+ */
+export function readGithubPat(): string | undefined {
+  const credsFile = process.env.PA_CREDS_FILE || DEFAULT_CREDS_FILE;
   try {
-    const { stdout } = await exec('git', args, { cwd, maxBuffer: 64 * 1024 * 1024 });
+    const parsed = JSON.parse(readFileSync(credsFile, 'utf8')) as { githubPat?: unknown };
+    if (typeof parsed.githubPat === 'string' && parsed.githubPat.length > 0) {
+      return parsed.githubPat;
+    }
+  } catch {
+    /* missing or malformed creds file -> fall through to env */
+  }
+  return process.env.GITHUB_PAT || undefined;
+}
+
+/**
+ * Env for git child processes that supplies the PAT via GIT_ASKPASS: a
+ * tiny sh script echoing the username or printing $PA_GIT_PAT. The PAT
+ * lives only in the child env, never inside the script file itself.
+ * Returns undefined when no PAT is available.
+ */
+export function askpassEnv(pat: string | undefined): NodeJS.ProcessEnv | undefined {
+  if (!pat) return undefined;
+  const scriptPath = path.join(os.tmpdir(), `pocketagent-askpass-${process.pid}.sh`);
+  const script =
+    '#!/bin/sh\n' +
+    'case "$1" in\n' +
+    '  Username*) echo "x-access-token" ;;\n' +
+    '  *) printf \'%s\' "$PA_GIT_PAT" ;;\n' +
+    'esac\n';
+  try {
+    writeFileSync(scriptPath, script, { mode: 0o700 });
+    chmodSync(scriptPath, 0o700);
+  } catch {
+    return undefined;
+  }
+  return {
+    ...process.env,
+    GIT_ASKPASS: scriptPath,
+    GIT_TERMINAL_PROMPT: '0',
+    PA_GIT_PAT: pat,
+  };
+}
+
+/** Strip embedded credentials (user:pass@) from a remote URL. */
+function stripUrlCredentials(url: string): string {
+  try {
+    const u = new URL(url);
+    if (u.username || u.password) {
+      u.username = '';
+      u.password = '';
+      return u.toString();
+    }
+  } catch {
+    /* not a parseable URL (e.g. ssh remote) */
+  }
+  return url;
+}
+
+async function git(cwd: string, args: string[], env?: NodeJS.ProcessEnv): Promise<string> {
+  try {
+    const { stdout } = await exec('git', args, { cwd, env, maxBuffer: 64 * 1024 * 1024 });
     return stdout;
   } catch (err) {
     const e = err as { stderr?: string; message: string };
     throw new Error(`git ${args[0] ?? ''} failed: ${sanitize(e.stderr || e.message)}`);
-  }
-}
-
-/** Inject the PAT into an https clone URL without ever logging it. */
-function authUrl(repoUrl: string, pat?: string): string {
-  if (!pat) return repoUrl;
-  try {
-    const url = new URL(repoUrl);
-    url.username = 'x-access-token';
-    url.password = pat;
-    return url.toString();
-  } catch {
-    return repoUrl;
   }
 }
 
@@ -62,6 +118,7 @@ export function branchName(sessionId: string): string {
  * and a session-local git identity.
  */
 export async function ensureRepo(cfg: RepoConfig): Promise<'cloned' | 'existing' | 'skipped'> {
+  const pat = cfg.pat ?? readGithubPat();
   await fs.mkdir(cfg.workDir, { recursive: true });
   const hasGit = await fs
     .stat(path.join(cfg.workDir, '.git'))
@@ -71,10 +128,11 @@ export async function ensureRepo(cfg: RepoConfig): Promise<'cloned' | 'existing'
     const entries = await fs.readdir(cfg.workDir);
     if (entries.length > 0) return 'skipped';
     if (!cfg.repoUrl) return 'skipped';
+    // Plain URL (no embedded credentials); the PAT reaches git via GIT_ASKPASS.
     const args = ['clone'];
     if (cfg.repoBranch) args.push('--branch', cfg.repoBranch, '--single-branch');
-    args.push(authUrl(cfg.repoUrl, cfg.pat), cfg.workDir);
-    await git(cfg.workDir, args);
+    args.push(cfg.repoUrl, cfg.workDir);
+    await git(cfg.workDir, args, askpassEnv(pat));
   }
   await git(cfg.workDir, ['config', 'user.name', 'PocketAgent']);
   await git(cfg.workDir, ['config', 'user.email', 'agent@pocketagent.local']);
@@ -101,12 +159,15 @@ export async function commitTurn(workDir: string): Promise<string> {
 
 /** Push session branch and open (or find) a draft PR. */
 export async function pushAndCreatePr(cfg: PushConfig): Promise<{ branch: string; prUrl?: string }> {
+  const pat = cfg.pat ?? readGithubPat();
   const branch = branchName(cfg.sessionId);
   const origin = (await git(cfg.workDir, ['remote', 'get-url', 'origin'])).trim();
-  if (cfg.pat) {
-    await git(cfg.workDir, ['remote', 'set-url', 'origin', authUrl(origin, cfg.pat)]);
+  const clean = stripUrlCredentials(origin);
+  if (clean !== origin) {
+    // Drop credentials possibly embedded by an older shim version.
+    await git(cfg.workDir, ['remote', 'set-url', 'origin', clean]);
   }
-  await git(cfg.workDir, ['push', '-u', 'origin', branch]);
+  await git(cfg.workDir, ['push', '-u', 'origin', branch], askpassEnv(pat));
 
   if (!cfg.pat || !cfg.repoFullName) return { branch };
   const prUrl = await createDraftPr(cfg.pat, cfg.repoFullName, branch, cfg.base ?? 'main');

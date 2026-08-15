@@ -1,4 +1,5 @@
 import type { AgentMode } from '@pocketagent/protocol';
+import { readGithubPat } from './gitops.js';
 
 const MODES: readonly AgentMode[] = ['yolo', 'auto', 'acceptEdits', 'ask'];
 
@@ -34,7 +35,7 @@ export function readEnv(env: Record<string, string | undefined> = process.env): 
     sessionId: env.SESSION_ID ?? 'unknown-session',
     repoUrl: env.REPO_URL ?? '',
     repoBranch: env.REPO_BRANCH,
-    githubPat: env.GITHUB_PAT,
+    githubPat: readGithubPat(env),
     repoFullName: env.REPO_FULL_NAME ?? '',
     autoPush: env.AUTO_PUSH === '1',
     opencodePort: port,

@@ -18,6 +18,7 @@ import { SERVER_VERSION, config, isNetworkPolicy } from './config.js';
 import type { LinkRow, RepoRow, SessionRow, Store } from './db.js';
 import { decrypt } from './vault.js';
 import * as docker from './docker.js';
+
 import { getAdapter } from './adapters.js';
 import { ShimClient, normalizeModels } from './shim-client.js';
 import { sendPush } from './fcm.js';
@@ -78,6 +79,14 @@ export class SessionManager {
     private readonly store: Store,
     private readonly broadcast: (m: ServerMessage) => void,
   ) {}
+
+  /**
+   * Egress proxy auth (wired by the caller into startEgressProxy): only
+   * tokens matching a live session's shim_token pass (read-only lookup).
+   */
+  egressTokenAllowed(token: string): boolean {
+    return this.store.listSessions(TENANT).some((r) => r.shim_token === token);
+  }
 
   setLinkTransport(t: LinkTransport): void {
     this.linkTransport = t;
@@ -143,6 +152,20 @@ export class SessionManager {
       throw new Error(`invalid networkPolicy "${String(msg.networkPolicy)}"`);
     }
     const networkPolicy: NetworkPolicy = msg.networkPolicy ?? config.networkPolicyDefault;
+    // Remote-mode gating (skip when the gateway container provides per-session
+    // networks + egress): without GATEWAY_TOKEN, allowlist/isolated cannot be
+    // served and 'open' publishes plaintext shim ports - explicit consent only.
+    if (docker.isRemote() && !docker.gatewayEnabled()) {
+      if (networkPolicy === 'allowlist' || networkPolicy === 'isolated') {
+        throw new Error('network policies require local docker socket mode or a configured gateway (GATEWAY_TOKEN)');
+      }
+      if (!config.remoteNetworkOpen) {
+        throw new Error(
+          'remote docker mode ships shim traffic plaintext over DOCKER_ADDR (published ports) unless tunneled; ' +
+            'set REMOTE_NETWORK_OPEN=1 to explicitly consent to networkPolicy "open" for remote sessions',
+        );
+      }
+    }
     const id = randomUUID();
     const now = new Date().toISOString();
     const row: SessionRow = {
@@ -178,10 +201,12 @@ export class SessionManager {
       if (!config.dockerEnabled) throw new Error('docker is disabled on this server');
       await docker.ensureNetwork();
       const shimToken = randomBytes(24).toString('hex');
-      const staged: SessionRow = { ...row, volume_name: `pocketagent-sess-${row.id}` };
+      const staged: SessionRow = { ...row, volume_name: `pocketagent-sess-${row.id}`, shim_token: shimToken };
       const env = this.buildEnv(staged, repo, shimToken, baseBranch);
       const cid = await docker.createSessionContainer(staged, env);
       if (!cid) throw new Error('failed to create session container');
+      const pat = this.githubPatFor(row);
+      if (pat) await docker.injectCredsFile(cid, { githubPat: pat });
       if (!(await docker.startContainer(cid))) throw new Error('failed to start session container');
       const endpoint = await docker.shimEndpoint(cid, row.id);
       this.store.setProvisioned(row.id, cid, staged.volume_name as string, shimToken);
@@ -211,6 +236,14 @@ export class SessionManager {
     return new ShimClient(base, token, docker.gatewayHeaders());
   }
 
+  /**
+   * GitHub PAT (K1 store lookup, plaintext). Never passed as container env;
+   * injected as /run/secrets/pa/creds.json before container start (K2).
+   */
+  private githubPatFor(row: SessionRow): string | null {
+    return this.store.getSecretValue('github', row.tenant_id);
+  }
+
   private buildEnv(
     row: SessionRow,
     repo: RepoRow,
@@ -229,9 +262,9 @@ export class SessionManager {
       REPO_BRANCH: baseBranch,
       REPO_FULL_NAME: repo.full_name,
       AUTO_PUSH: row.mode === 'yolo' ? '1' : '0',
+      // creds file injected via putArchive before container start (see githubPatFor)
+      PA_CREDS_FILE: '/run/secrets/pa/creds.json',
     };
-    const gh = this.store.getSecretByKind('github', row.tenant_id);
-    if (gh) env.GITHUB_PAT = decrypt({ ciphertext: gh.ciphertext, nonce: gh.nonce });
     const setKey = (kind: string, key: string): void => {
       const s = this.store.getSecretByKind(kind, row.tenant_id);
       if (s) env[key] = decrypt({ ciphertext: s.ciphertext, nonce: s.nonce });
@@ -462,6 +495,8 @@ export class SessionManager {
         this.buildEnv(row, repo, row.shim_token, repo.default_branch),
       );
       if (!cid) throw new Error('failed to recreate session container');
+      const pat = this.githubPatFor(row);
+      if (pat) await docker.injectCredsFile(cid, { githubPat: pat });
       started = await docker.startContainer(cid);
       if (!started) throw new Error('failed to start session container');
     }
@@ -488,7 +523,10 @@ export class SessionManager {
     const repo = this.store.getRepo(row.repo_id);
     if (!repo) throw new Error('repo missing');
     const env = this.buildEnv(row, repo, row.shim_token ?? '', repo.default_branch);
-    if (!(await docker.oneShotPush(row, env))) throw new Error('push failed');
+    const pat = this.githubPatFor(row);
+    if (!(await docker.oneShotPush(row, env, pat ? { githubPat: pat } : undefined))) {
+      throw new Error('push failed');
+    }
     this.emitEvent(id, { type: 'pushed', branch: row.branch, auto: false });
   }
 

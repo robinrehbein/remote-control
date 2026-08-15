@@ -24,8 +24,10 @@ class PairingApi(private val client: OkHttpClient) {
 
     suspend fun confirm(serverUrl: String, code: String, deviceName: String): Result<PairingConfirmResponse> =
         withContext(Dispatchers.IO) {
+            val base = normalizeUrl(serverUrl)
+            val cleartext = base.startsWith("http://")
             runCatching {
-                val url = normalizeUrl(serverUrl).trimEnd('/') + PAIRING_PATH
+                val url = base.trimEnd('/') + PAIRING_PATH
                 val body = ProtocolJson.encodeToString(PairingConfirmBody.serializer(), PairingConfirmBody(code, deviceName))
                     .toRequestBody("application/json; charset=utf-8".toMediaType())
                 val request = Request.Builder()
@@ -39,6 +41,13 @@ class PairingApi(private val client: OkHttpClient) {
                     }
                     parseResponse(text) ?: throw IllegalStateException("Ungültige Server-Antwort")
                 }
+            }.recoverCatching { error ->
+                if (!cleartext) throw error
+                throw IllegalStateException(
+                    "Klartext-HTTP (http://) ist auf Android 9+ standardmäßig blockiert. " +
+                        "Bitte eine https://-Server-URL verwenden. (Ursache: ${error.message})",
+                    error
+                )
             }
         }
 

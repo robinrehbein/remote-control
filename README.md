@@ -65,6 +65,8 @@ docker compose up -d
 
 Der Orchestrator mountet `docker.sock` (startet/stoppt Session-Container), legt SQLite + Vault in `orchestrator-data` ab und lauscht auf `:3000`. In Coolify: als App via Dockerfile/Compose deployen, Domain + TLS davor schalten.
 
+**Alternative Fly.io** (Orchestrator auf Fly, Container auf deinem Docker-Host via `DOCKER_HOST`): Anleitung in `FLY.md` — der Server unterstützt beide Modi ohne Codeänderung.
+
 ### 3. Pairing
 
 ```bash

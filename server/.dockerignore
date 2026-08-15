@@ -1,15 +1,20 @@
-node_modules
+# server/Dockerfile is built with the repo root as context, so the root
+# /.dockerignore is the file docker actually reads. This copy is kept in sync
+# for builders that resolve the ignore file next to the Dockerfile instead.
+# It must NOT exclude shims/*/src|scripts|Dockerfile: those are bundled into
+# the orchestrator image as build contexts for the shim self build.
+**/node_modules
+**/dist
+**/*.tsbuildinfo
+**/.smoke-work
+
+.git
+.github
+.kilo
+android
 data
 *.db
 *.db-wal
 *.db-shm
-dist
-.git
-.kilo
-android
-shims/*/node_modules
-shims/*/smoke
-shims/*/src
-shims/*/scripts
-shims/*/Dockerfile
-shims/*/tsconfig.json
+.env
+.env.*

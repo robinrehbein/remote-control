@@ -134,12 +134,12 @@ Optional. Standard bleibt der direkte `docker.sock`-Mount — nichts ändert sic
 solange das Profil nicht gestartet wird.
 
 **Was es bringt:** Der Orchestrator sieht nicht mehr die komplette Docker-API,
-sondern nur die per Env freigeschalteten Endpunkte (Container, Images, Netze,
-Volumes + Schreiboperationen; `EXEC`, `BUILD`, `SWARM`, `SYSTEM` sind aus).
-Der rohe Socket steckt nur noch im Proxy-Container (read-only gemountet), nicht
-mehr im Node-Prozess, der WebSocket-Traffic aus dem Internet verarbeitet. Ein
-RCE im Orchestrator kann damit z. B. kein `docker exec` in fremde Container und
-kein Image-Build mit beliebigem Kontext mehr auslösen.
+sondern nur die per Env freigeschalteten Endpunkte (Container, Images inkl.
+`BUILD` — der Shim-Selfbuild braucht `POST /build` —, Netze, Volumes +
+Schreiboperationen; `EXEC`, `SWARM`, `SYSTEM` sind aus). Der rohe Socket steckt
+nur noch im Proxy-Container (read-only gemountet), nicht mehr im Node-Prozess,
+der WebSocket-Traffic aus dem Internet verarbeitet. Ein RCE im Orchestrator
+kann damit z. B. kein `docker exec` in fremde Container mehr auslösen.
 
 **Was es NICHT ist:** keine Sicherheitsgrenze. Wer Container erstellen und
 starten darf (das braucht PocketAgent per Definition), kann sich mit

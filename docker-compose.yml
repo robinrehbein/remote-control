@@ -10,11 +10,8 @@ services:
     # Testen direkt erreichbar. Wer Coolify die Domain routen lässt, kann das
     # ports-Mapping ganz entfernen.
     ports:
-<<<<<<< HEAD
-=======
       # Loopback-only by default; remove the 127.0.0.1 prefix only for
       # direct LAN exposure or when a reverse proxy terminates TLS for you.
->>>>>>> 55a7f2f
       - "127.0.0.1:3000:3000"
     environment:
       # Generate once: openssl rand -hex 32
@@ -25,9 +22,12 @@ services:
       IDLE_STOP_SEC: ${IDLE_STOP_SEC:-900}
       GC_DAYS: ${GC_DAYS:-14}
       ADAPTER_IMAGE_PREFIX: pocketagent
-      # Shim image tag (default latest; pin a build tag or use digest pinning
-      # via shims/<id>/adapter.json "image" for reproducible deploys)
-      ADAPTER_IMAGE_TAG: ${ADAPTER_IMAGE_TAG:-latest}
+      # Shim image tag. UNGESETZT lassen (empfohlen): der Orchestrator taggt
+      # dann mit einem Content-Hash der mitgelieferten Shim-Quellen und baut
+      # fehlende Images selbst über die Docker-API (kein Registry-Push nötig).
+      # Gesetzt = gepinnt: der Tag wird unverändert benutzt, Images müssen
+      # dann lokal vorliegen oder pullbar sein.
+      # ADAPTER_IMAGE_TAG: ${ADAPTER_IMAGE_TAG:-latest}
       # Optional per-session CPU limit in docker NanoCPUs (e.g. 1000000000 = 1 CPU)
       SESSION_CPU_QUOTA: ${SESSION_CPU_QUOTA:-}
       # Remote-docker mode only (DOCKER_HOST=tcp://...): explicit consent that
@@ -79,7 +79,9 @@ services:
   # Socket liegt dann nur noch im Proxy (read-only gemountet). Freigeschaltet
   # ist genau das, was server/src/docker.ts braucht: Container create/start/
   # stop/remove/inspect/wait, Netzwerke inkl. connect/disconnect, Volumes,
-  # Image-Pull. Kein EXEC, kein BUILD, kein SWARM, kein SYSTEM.
+  # Image-Pull/-Inspect sowie BUILD=1 für POST /build, das der Selfbuild
+  # fehlender Shim-Images braucht (server/src/image-build.ts).
+  # Kein EXEC, kein SWARM, kein SYSTEM.
   socket-proxy:
     profiles: ["socketproxy"]
     image: tecnativa/docker-socket-proxy:latest
@@ -92,7 +94,8 @@ services:
       VOLUMES: "1"
       POST: "1"
       EXEC: "0"
-      BUILD: "0"
+      # Selfbuild fehlender Shim-Images (POST /build)
+      BUILD: "1"
       SWARM: "0"
       SYSTEM: "0"
     volumes:
@@ -102,10 +105,11 @@ services:
       - socketproxy
 
   # ---- adapter shim images (build-only, never run) --------------------
+  # Optional: der Orchestrator baut fehlende Shim-Images inzwischen selbst.
+  # Wer sie hier vorbaut, muss ADAPTER_IMAGE_TAG=latest setzen, damit die
+  # Sessions genau diese Tags benutzen (sonst gilt der Content-Hash-Tag).
   # Build all:  docker compose --profile shims build
   # Rebuild one: docker compose --profile shims build --no-cache opencode-shim
-  # The orchestrator starts these images on demand as session containers
-  # (tags MUST stay pocketagent/<id>-shim:latest = ADAPTER_IMAGE_PREFIX default).
   opencode-shim:
     profiles: ["shims"]
     build: { context: ., dockerfile: shims/opencode/Dockerfile }

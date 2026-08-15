@@ -1,4 +1,4 @@
-import { mkdtempSync } from 'node:fs';
+import { cpSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -18,6 +18,7 @@ type FetchLike = import('./secret-validate.js').FetchLike;
 const vault = await import('./vault.js');
 const admin = await import('./admin.js');
 const { sha256 } = await import('./db.js');
+const { config } = await import('./config.js');
 
 function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) {
@@ -213,7 +214,7 @@ async function gatewaySmoke(): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  const { app, store } = await buildApp();
+  const { app, store, manager } = await buildApp();
   await app.listen({ port: 0, host: '127.0.0.1' });
   const addr = app.server.address() as AddressInfo;
   const base = `http://127.0.0.1:${addr.port}`;
@@ -425,6 +426,156 @@ async function main(): Promise<void> {
   const resetBody = buildPromptBody(rowReset, 'hi');
   assert('model' in resetBody && resetBody.model === '', "prompt body sends model:'' instead of dropping the reset");
   assert(resetBody.mode === 'ask', 'prompt body carries the switched mode');
+
+  /* ---- shim self build: context, content-hash tag, daemon-less failure ---- */
+
+  const imageBuild = await import('./image-build.js');
+  const adapters2 = await import('./adapters.js');
+  const cfg = config as unknown as { dockerEnabled: boolean; adapterImageTagPinned: boolean };
+
+  const ctxRoot = imageBuild.shimContextRoot();
+  assert(typeof ctxRoot === 'string', 'shim build context bundled with the server');
+  const ctxFiles = imageBuild.shimContextFiles('kilo');
+  assert(Array.isArray(ctxFiles) && ctxFiles.includes('shims/kilo/Dockerfile'), 'kilo context carries its Dockerfile');
+  assert(
+    ctxFiles!.includes('tsconfig.base.json') && ctxFiles!.some((f) => f.startsWith('packages/protocol/')),
+    'context has the repo-root layout the shim Dockerfiles COPY from',
+  );
+  assert(!ctxFiles!.some((f) => f.includes('node_modules')), 'context never carries node_modules');
+  assert(imageBuild.shimContextFiles('does-not-exist') === null, 'unknown adapter has no build context');
+
+  // deterministic + content sensitive (on a throwaway copy, never the repo)
+  const ctxCopy = mkdtempSync(join(tmpdir(), 'pa-smoke-ctx-'));
+  for (const rel of ctxFiles!) cpSync(join(ctxRoot as string, rel), join(ctxCopy, rel));
+  const h1 = imageBuild.hashContext(ctxCopy, ctxFiles!);
+  assert(h1 === imageBuild.hashContext(ctxCopy, ctxFiles!), 'context hash is deterministic');
+  assert(/^[0-9a-f]{12}$/.test(h1), 'context hash is 12 hex chars');
+  writeFileSync(join(ctxCopy, 'shims/kilo/src/index.ts'), '// changed\n', { flag: 'a' });
+  assert(imageBuild.hashContext(ctxCopy, ctxFiles!) !== h1, 'context hash changes when a source file changes');
+  rmSync(ctxCopy, { recursive: true, force: true });
+
+  assert(
+    adapters2.adapterImage('kilo') === `pocketagent/kilo-shim:c${imageBuild.shimContextHash('kilo') as string}`,
+    'unpinned deployments tag shim images with the context hash',
+  );
+  cfg.adapterImageTagPinned = true;
+  assert(adapters2.adapterImage('kilo') === 'pocketagent/kilo-shim:latest', 'an explicit ADAPTER_IMAGE_TAG wins');
+  cfg.adapterImageTagPinned = false;
+
+  /**
+   * Build failures arrive as an `error` frame on a stream that ends normally
+   * (followProgress' callback error only covers transport faults), and parallel
+   * callers of one tag must share a single build.
+   */
+  let buildCalls = 0;
+  const fakeDocker = {
+    buildImage: () => {
+      buildCalls++;
+      return Promise.resolve({} as NodeJS.ReadableStream);
+    },
+    modem: {
+      followProgress: (
+        _s: unknown,
+        onFinished: (e: Error | null, o: unknown[]) => void,
+        onProgress: (ev: Record<string, unknown>) => void,
+      ) => {
+        setTimeout(() => {
+          onProgress({ stream: 'Step 1/12 : FROM node:22-bookworm-slim' });
+          onProgress({ stream: 'npm ci: ENOSPC no space left on device' });
+          onProgress({ error: 'The command /bin/sh -c npm ci returned a non-zero code: 1' });
+          onFinished(null, []);
+        }, 10);
+      },
+    },
+  };
+  let buildErr = '';
+  await Promise.all([
+    imageBuild.buildShimImage(fakeDocker as never, 'kilo', 'pa-smoke/kilo-shim:test').catch((e: unknown) => {
+      buildErr = e instanceof Error ? e.message : String(e);
+    }),
+    imageBuild.buildShimImage(fakeDocker as never, 'kilo', 'pa-smoke/kilo-shim:test').catch(() => {}),
+  ]);
+  assert(buildCalls === 1, 'parallel builds of one tag are deduped into a single build');
+  assert(buildErr.includes('non-zero code: 1'), 'build error frame becomes the exception cause');
+  assert(buildErr.includes('ENOSPC'), 'exception carries the last build log lines');
+
+  /* ---- harness switch: session.update { adapter } ---------------------- */
+
+  const noDocker = await request(c2, { type: 'session.update', requestId: 'sw0', sessionId, adapter: 'kilo' });
+  assert(
+    noDocker.type === 'error' && noDocker.message.includes('Docker'),
+    'adapter switch is refused (not half-applied) when docker is disabled',
+  );
+  assert(store.getSession(sessionId)?.adapter === 'opencode', 'refused switch left the row untouched');
+
+  // link sessions carry no container: the switch must be refused with a reason
+  const linkSessionId = randomUUID();
+  const opencodeRow = store.getSession(sessionId)!;
+  store.insertSession({ ...opencodeRow, id: linkSessionId, status: 'idle' });
+  store.setLinkId(linkSessionId, 'smoke-link');
+  let linkRefused = '';
+  try {
+    manager.updateSession({ type: 'session.update', requestId: 'sw-link', sessionId: linkSessionId, adapter: 'kilo' });
+  } catch (e) {
+    linkRefused = e instanceof Error ? e.message : String(e);
+  }
+  assert(linkRefused.includes('Link-Sessions'), 'adapter switch on a link session is refused');
+  await manager.deleteSession(linkSessionId);
+
+  // provisioned session + docker "available": the switch is applied and the
+  // container work runs asynchronously (no daemon here -> clean error event).
+  store.setProvisioned(sessionId, 'smoke-container', 'pocketagent-sess-smoke', 'smoke-shim-token');
+  store.setSessionRef(sessionId, 'runtime-session-ref');
+  store.updateSessionStatus(sessionId, 'idle');
+  cfg.dockerEnabled = true;
+  try {
+    const unknownAdapter = await request(c2, {
+      type: 'session.update',
+      requestId: 'sw1',
+      sessionId,
+      adapter: 'does-not-exist',
+    });
+    assert(unknownAdapter.type === 'error', 'session.update rejects an unknown adapter');
+
+    const switched = await request(c2, { type: 'session.update', requestId: 'sw2', sessionId, adapter: 'kilo' });
+    assert(switched.type === 'request.ok', 'adapter switch is acked immediately (build may take minutes)');
+    const swRow = store.getSession(sessionId);
+    assert(swRow?.adapter === 'kilo', 'adapter switched in the row');
+    assert(swRow?.session_ref === null, 'harness session ref dropped (not transferable)');
+    assert(swRow?.model === '', 'model reset to the adapter default');
+    assert(swRow?.reasoning_effort === null, 'reasoning effort reset');
+    assert(swRow?.provider === 'zai', 'provider reset to the new adapter default');
+    assert(swRow?.volume_name === 'pocketagent-sess-smoke', 'volume kept across the switch');
+    assert(swRow?.branch === opencodeRow.branch, 'session branch kept across the switch');
+
+    const notice = await c2.wait(
+      (m) => m.type === 'session.event' && m.sessionId === sessionId && m.event.type === 'notice',
+    );
+    assert(
+      notice.type === 'session.event' &&
+        notice.event.type === 'notice' &&
+        notice.event.message.includes('Agent gewechselt'),
+      'switch emits a notice event (unknown types are ignored by older apps)',
+    );
+
+    // no docker daemon in CI: the self build must fail with its real cause
+    const buildFailed = await c2.wait(
+      (m) =>
+        m.type === 'session.event' &&
+        m.sessionId === sessionId &&
+        m.event.type === 'error' &&
+        m.event.message.includes('kilo-shim'),
+      30_000,
+    );
+    assert(
+      buildFailed.type === 'session.event' &&
+        buildFailed.event.type === 'error' &&
+        buildFailed.event.message.includes('konnte nicht gebaut werden'),
+      'a failing self build surfaces the real cause instead of a generic message',
+    );
+  } finally {
+    cfg.dockerEnabled = false;
+  }
 
   const models = await request(c2, { type: 'session.models.get', requestId: 'mod1', sessionId });
   assert(

@@ -44,22 +44,25 @@ Jeder Shim implementiert dasselbe Protokoll: `POST /prompt`, `POST /abort`, `POS
 
 ## Deployment (Coolify / Docker-Host)
 
-### 1. Images bauen (auf dem Server, aus dem Repo-Root)
+### 1. Orchestrator-Image bauen (aus dem Repo-Root)
 
 ```bash
-docker build -f server/Dockerfile        -t pocketagent/orchestrator:latest .
-docker build -f shims/opencode/Dockerfile -t pocketagent/opencode-shim:latest .
-docker build -f shims/kilo/Dockerfile     -t pocketagent/kilo-shim:latest .
-docker build -f shims/claude/Dockerfile   -t pocketagent/claude-shim:latest .
-docker build -f shims/pi/Dockerfile       -t pocketagent/pi-shim:latest .
-docker build -f shims/junie/Dockerfile    -t pocketagent/junie-shim:latest .
+docker build -f server/Dockerfile -t pocketagent/orchestrator:latest .
 ```
+
+**Shim-Images müssen nicht mehr manuell gebaut werden:** Der Orchestrator
+bündelt die Shim-Quellen und baut fehlende Images beim ersten Session-Start
+eines Agenten selbst über die Docker-API (die App zeigt währenddessen einen
+Hinweis; Erst-Build dauert einige Minuten). Ohne `ADAPTER_IMAGE_TAG` werden
+Content-Hash-Tags verwendet — nach jedem Deploy mit geänderten Shim-Quellen
+wird automatisch neu gebaut. Wer trotzdem vorbauen will (z. B. um den
+Erst-Start zu beschleunigen): `docker compose --profile shims build`.
 
 Wichtig: Build-Kontext ist immer der Repo-Root (`.`), weil die Shims und der Server per `file:`-Dependency `packages/protocol` einbinden.
 
 **Image-Pinning (Supply Chain):** Standardmäßig nutzt der Orchestrator
-`<ADAPTER_IMAGE_PREFIX>/<id>-shim:<ADAPTER_IMAGE_TAG>` (Default-Tag `latest`,
-siehe `.env.example`). Für reproduzierbare Deploys zwei Möglichkeiten:
+`<ADAPTER_IMAGE_PREFIX>/<id>-shim:c<hash>` (Content-Hash der gebündelten
+Quellen, siehe `.env.example`). Für reproduzierbare Deploys zwei Möglichkeiten:
 
 - global per Env: `ADAPTER_IMAGE_TAG=2026-08-15` (oder ein CI-Build-Tag) pinnen
 - pro Adapter per Manifest: `"image": "ghcr.io/owner/opencode-shim@sha256:<digest>"`

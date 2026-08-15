@@ -1,8 +1,11 @@
+@file:OptIn(kotlinx.serialization.ExperimentalSerializationApi::class)
+
 package com.pocketagent.app.data
 
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNames
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
@@ -90,14 +93,18 @@ data class AdapterDescriptor(
 
 @Serializable
 enum class SessionStatus {
-    @SerialName("creating") CREATING,
+    /** `starting` schickt der Server beim Agent-Wechsel — dieselbe Bedeutung wie `creating`. */
+    @SerialName("creating") @JsonNames("starting") CREATING,
     @SerialName("running") RUNNING,
     @SerialName("idle") IDLE,
     @SerialName("stopped") STOPPED,
     @SerialName("error") ERROR;
 
     companion object {
-        fun fromRaw(raw: String): SessionStatus? = entries.firstOrNull { it.name.equals(raw, ignoreCase = true) }
+        fun fromRaw(raw: String): SessionStatus? = when {
+            raw.equals("starting", ignoreCase = true) -> CREATING
+            else -> entries.firstOrNull { it.name.equals(raw, ignoreCase = true) }
+        }
     }
 }
 
@@ -229,6 +236,10 @@ sealed interface AgentEvent {
     data class TurnFailed(val error: String) : AgentEvent
     data class Pushed(val branch: String, val prUrl: String? = null, val auto: Boolean) : AgentEvent
     data class ErrorEvent(val message: String, val fatal: Boolean? = null) : AgentEvent
+
+    /** Systemhinweis des Servers (Image-Build, Agent-Wechsel) — kein Agent-Output. */
+    data class Notice(val message: String) : AgentEvent
+
     data class Ping(val ts: Long) : AgentEvent
 }
 
@@ -437,6 +448,8 @@ fun parseAgentEvent(obj: JsonObject): AgentEvent? {
                 fatal = obj["fatal"]?.jsonPrimitive?.booleanOrNullCompat(),
             )
 
+            "notice" -> AgentEvent.Notice(message = obj.optString("message") ?: return null)
+
             "ping" -> AgentEvent.Ping(ts = obj["ts"]?.jsonPrimitive?.longOrNull ?: 0L)
 
             else -> null
@@ -629,8 +642,11 @@ fun encodeSessionPrompt(sessionId: String, text: String, mode: AgentMode?): Stri
 }.toString()
 
 /**
- * Mode/Modell/Reasoning einer laufenden Session ändern. Alle Felder optional;
- * leerer Modell-String setzt auf den Adapter-Default zurück.
+ * Mode/Modell/Reasoning/Agent einer laufenden Session ändern. Alle Felder
+ * optional; leerer Modell-String setzt auf den Adapter-Default zurück.
+ * [adapter] wechselt den Agenten auf dem aktuellen Code-Stand: der Server
+ * bestätigt mit request.ok und meldet den Fortschritt als session.status
+ * ('starting' → 'idle'); Modell und Reasoning setzt er dabei zurück.
  */
 fun encodeSessionUpdate(
     requestId: String,
@@ -638,6 +654,7 @@ fun encodeSessionUpdate(
     mode: AgentMode? = null,
     model: String? = null,
     reasoningEffort: ReasoningEffort? = null,
+    adapter: String? = null,
 ): String = buildJsonObject {
     put("type", "session.update")
     put("requestId", requestId)
@@ -645,6 +662,7 @@ fun encodeSessionUpdate(
     mode?.let { put("mode", it.wireName()) }
     model?.let { put("model", it) }
     reasoningEffort?.let { put("reasoningEffort", it.wireName()) }
+    adapter?.let { put("adapter", it) }
 }.toString()
 
 fun encodeSessionModelsGet(requestId: String, sessionId: String): String = buildJsonObject {

@@ -274,6 +274,12 @@ export type AgentEvent =
   | { type: 'turn.failed'; error: string }
   | { type: 'pushed'; branch: string; prUrl?: string; auto: boolean }
   | { type: 'error'; message: string; fatal?: boolean }
+  /**
+   * Informational, non-fatal progress line for the session log (e.g. "the
+   * agent image is being built"). Purely additive: clients that predate this
+   * variant ignore unknown event types.
+   */
+  | { type: 'notice'; message: string }
   | { type: 'ping'; ts: number };
 
 /** SSE wire format: `event: agent` + `data: <AgentEvent JSON>` */
@@ -358,9 +364,9 @@ export type ClientMessage =
     }
   | { type: 'session.prompt'; sessionId: string; text: string; mode?: AgentMode }
   /**
-   * Change mode / model / reasoning effort of a live session. Every field is
-   * optional; the server persists what is set and answers with `session.status`
-   * (carrying the updated session) to all devices.
+   * Change mode / model / reasoning effort / harness of a live session. Every
+   * field is optional; the server persists what is set and answers with
+   * `session.status` (carrying the updated session) to all devices.
    */
   | {
       type: 'session.update';
@@ -370,6 +376,14 @@ export type ClientMessage =
       /** Empty string resets the session to the adapter default. */
       model?: string;
       reasoningEffort?: ReasoningEffort;
+      /**
+       * Switch the session to another harness. The volume (repo checkout +
+       * branch) is kept, everything harness-bound is dropped: the runtime
+       * session reference, the model and the reasoning effort reset, provider
+       * falls back to the new adapter's default. The container is recreated
+       * asynchronously - `request.ok` only acknowledges the switch.
+       */
+      adapter?: AdapterId;
     }
   /** Ask the session's shim for its model catalog (proxied GET /models). */
   | { type: 'session.models.get'; requestId: string; sessionId: string }

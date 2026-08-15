@@ -141,6 +141,13 @@ export const config = {
   adapterImagePrefix: process.env.ADAPTER_IMAGE_PREFIX ?? 'pocketagent',
   /** Tag used for adapter shim images (pin a specific build instead of 'latest'). */
   adapterImageTag: process.env.ADAPTER_IMAGE_TAG?.trim() || 'latest',
+  /**
+   * True when the operator pinned ADAPTER_IMAGE_TAG explicitly. Only then is
+   * the tag used verbatim; otherwise adapterImage() derives a content-hash tag
+   * from the bundled shim sources so a deploy with changed shims rebuilds
+   * itself and an unchanged one reuses the image already on the host.
+   */
+  adapterImageTagPinned: (process.env.ADAPTER_IMAGE_TAG?.trim() ?? '').length > 0,
   networkPolicyDefault: loadNetworkPolicyDefault(),
   networkAllowlist: loadNetworkAllowlist(),
   egressProxyPort: Number(process.env.EGRESS_PROXY_PORT ?? 3128),

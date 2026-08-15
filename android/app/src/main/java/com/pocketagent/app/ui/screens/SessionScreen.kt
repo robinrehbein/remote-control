@@ -73,7 +73,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -102,6 +104,7 @@ import com.pocketagent.app.ui.theme.ContentInset
 import com.pocketagent.app.ui.theme.MinTouchTarget
 import com.pocketagent.app.ui.theme.MonoMedium
 import com.pocketagent.app.ui.theme.PillShape
+import com.pocketagent.app.ui.theme.PrimaryButtonHeight
 import com.pocketagent.app.ui.theme.RadioRowDividerInset
 import com.pocketagent.app.ui.theme.ScreenGutter
 import com.pocketagent.app.ui.theme.semantic
@@ -151,6 +154,9 @@ sealed interface TimelineItem {
     ) : TimelineItem
 
     data class Error(val message: String) : TimelineItem
+
+    /** Systemhinweis des Servers, z. B. Image-Build oder Agent-Wechsel. */
+    data class Notice(val text: String) : TimelineItem
 }
 
 /** Ladezustand des Modellkatalogs (session.models.get). */
@@ -181,6 +187,7 @@ class SessionViewModel : ViewModel() {
     val deleted: StateFlow<Boolean> = _deleted
 
     private val _adapters = MutableStateFlow<List<AdapterDescriptor>>(emptyList())
+    val adapters: StateFlow<List<AdapterDescriptor>> = _adapters
 
     private val _models = MutableStateFlow<ModelsState>(ModelsState.Idle)
     val models: StateFlow<ModelsState> = _models
@@ -255,6 +262,7 @@ class SessionViewModel : ViewModel() {
             is AgentEvent.Pushed -> append(TimelineItem.Pushed(event.branch, event.prUrl, event.auto))
             is AgentEvent.TurnFailed -> append(TimelineItem.Error("Turn fehlgeschlagen: ${event.error}"))
             is AgentEvent.ErrorEvent -> append(TimelineItem.Error(event.message))
+            is AgentEvent.Notice -> append(TimelineItem.Notice(event.message))
 
             is AgentEvent.Status -> _busy.value = event.busy
             is AgentEvent.MessageDelta, is AgentEvent.Ping -> Unit
@@ -287,16 +295,17 @@ class SessionViewModel : ViewModel() {
         }
     }
 
-    /* ---------------- Modus / Modell / Reasoning ---------------- */
+    /* ---------------- Agent / Modus / Modell / Reasoning ---------------- */
 
     private fun update(
         mode: AgentMode? = null,
         model: String? = null,
         reasoningEffort: ReasoningEffort? = null,
+        adapter: String? = null,
     ) {
         viewModelScope.launch {
             // Erfolgsfall aktualisiert die UI über das session.status-Handling
-            repository.updateSession(sessionId, mode, model, reasoningEffort)
+            repository.updateSession(sessionId, mode, model, reasoningEffort, adapter)
                 .onFailure { append(TimelineItem.Error("Änderung fehlgeschlagen: ${it.message}")) }
         }
     }
@@ -307,6 +316,18 @@ class SessionViewModel : ViewModel() {
     fun setModel(model: String) = update(model = model.trim())
 
     fun setReasoning(effort: ReasoningEffort) = update(reasoningEffort = effort)
+
+    /**
+     * Agent der laufenden Session wechseln. Der Server startet den neuen
+     * Agenten asynchron auf dem aktuellen Code-Stand und meldet den
+     * Fortschritt als session.status ('starting' → 'idle').
+     */
+    fun setAdapter(adapterId: String) = update(adapter = adapterId)
+
+    /** Für die Zugangs-Punkte im Agent-Sheet. */
+    fun loadSecrets() {
+        viewModelScope.launch { repository.loadSecrets() }
+    }
 
     fun loadModels() {
         if (_models.value is ModelsState.Loading) return
@@ -353,6 +374,9 @@ fun SessionScreen(
     val deleted by vm.deleted.collectAsState()
     val capabilities by vm.capabilities.collectAsState()
     val models by vm.models.collectAsState()
+    val adapters by vm.adapters.collectAsState()
+    val secrets by repository.secrets.collectAsState()
+    val secretKinds = remember(secrets) { secrets.map { it.kind }.toSet() }
 
     LaunchedEffect(deleted) { if (deleted) onBack() }
 
@@ -387,7 +411,7 @@ fun SessionScreen(
                             StatusLine(
                                 status = s.status,
                                 details = listOfNotNull(
-                                    s.adapter,
+                                    adapterLabel(adapters, s.adapter),
                                     s.mode.wireName(),
                                     s.networkPolicy?.takeIf { it != "allowlist" }?.let(::networkPolicyLabel),
                                 ),
@@ -466,9 +490,11 @@ fun SessionScreen(
                             )
                         }
                     }
-                    // Kompakte Chip-Reihe: aktiver Modus immer, Modell und
+                    // Kompakte Chip-Reihe: Agent und Modus immer, Modell und
                     // Reasoning nur, wenn der Adapter sie wirklich unterstützt.
+                    // Während der Agent hochfährt ist nichts davon einstellbar.
                     session?.let { s ->
+                        val chipsEnabled = s.status != SessionStatus.CREATING
                         Row(
                             horizontalArrangement = Arrangement.spacedBy(6.dp),
                             verticalAlignment = Alignment.CenterVertically,
@@ -478,14 +504,25 @@ fun SessionScreen(
                                 .padding(start = ScreenGutter, end = ScreenGutter, top = 2.dp, bottom = 4.dp),
                         ) {
                             SettingChip(
+                                label = "Agent",
+                                value = adapterLabel(adapters, s.adapter),
+                                enabled = chipsEnabled,
+                                onClick = {
+                                    sheet = SessionSheet.AGENT
+                                    vm.loadSecrets()
+                                },
+                            )
+                            SettingChip(
                                 label = "Modus",
                                 value = modeLabel(s.mode),
+                                enabled = chipsEnabled,
                                 onClick = { sheet = SessionSheet.MODE },
                             )
                             if (capabilities.modelSwitch) {
                                 SettingChip(
                                     label = "Modell",
                                     value = s.model.ifBlank { "Standard" },
+                                    enabled = chipsEnabled,
                                     onClick = {
                                         sheet = SessionSheet.MODEL
                                         vm.loadModels()
@@ -496,6 +533,7 @@ fun SessionScreen(
                                 SettingChip(
                                     label = "Reasoning",
                                     value = reasoningLabel(ReasoningEffort.fromRaw(s.reasoningEffort)),
+                                    enabled = chipsEnabled,
                                     onClick = { sheet = SessionSheet.REASONING },
                                 )
                             }
@@ -590,6 +628,14 @@ fun SessionScreen(
     }
 
     when (sheet) {
+        SessionSheet.AGENT -> AgentSheet(
+            adapters = adapters,
+            current = session?.adapter.orEmpty(),
+            secretKinds = secretKinds,
+            onDismiss = { sheet = null },
+            onSwitch = { adapterId -> sheet = null; vm.setAdapter(adapterId) },
+        )
+
         SessionSheet.MODE -> ModeSheet(
             current = session?.mode,
             onDismiss = { sheet = null },
@@ -629,10 +675,14 @@ fun SessionScreen(
 }
 
 /* ------------------------------------------------------------------ */
-/* Modus / Modell / Reasoning — Chips + Bottom Sheets                  */
+/* Agent / Modus / Modell / Reasoning — Chips + Bottom Sheets          */
 /* ------------------------------------------------------------------ */
 
-enum class SessionSheet { MODE, MODEL, REASONING }
+enum class SessionSheet { AGENT, MODE, MODEL, REASONING }
+
+/** Anzeigename des Adapters; ohne Manifest bleibt die rohe Id stehen. */
+fun adapterLabel(adapters: List<AdapterDescriptor>, id: String): String =
+    adapters.firstOrNull { it.id == id }?.name ?: id
 
 fun modeLabel(mode: AgentMode): String = when (mode) {
     AgentMode.ASK -> "Ask"
@@ -650,12 +700,20 @@ fun reasoningLabel(effort: ReasoningEffort?): String = when (effort) {
 
 /** Kompakter Pill-Chip: Label klein und grau, aktiver Wert darunter/daneben. */
 @Composable
-private fun SettingChip(label: String, value: String, onClick: () -> Unit) {
+private fun SettingChip(
+    label: String,
+    value: String,
+    onClick: () -> Unit,
+    enabled: Boolean = true,
+) {
     Surface(
         shape = PillShape,
         color = MaterialTheme.colorScheme.surfaceContainerHighest,
         onClick = onClick,
-        modifier = Modifier.heightIn(min = 34.dp),
+        enabled = enabled,
+        modifier = Modifier
+            .heightIn(min = 34.dp)
+            .alpha(if (enabled) 1f else 0.4f),
     ) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
@@ -685,9 +743,12 @@ private fun SettingChip(label: String, value: String, onClick: () -> Unit) {
     }
 }
 
-/** Gemeinsame Hülle der drei Sheets: Titel + One-UI-Gruppenkarte. */
+/**
+ * Gemeinsame Hülle aller Einstell-Sheets: Titel + One-UI-Gruppenkarte.
+ * Auch der New-Session-Screen baut sein Modell-Sheet hierauf.
+ */
 @Composable
-private fun SettingSheet(
+fun SettingSheet(
     title: String,
     onDismiss: () -> Unit,
     content: @Composable ColumnScope.() -> Unit,
@@ -711,6 +772,68 @@ private fun SettingSheet(
         }
     }
 }
+
+/**
+ * Agent der laufenden Session wechseln. Die Liste ist dieselbe wie beim
+ * Anlegen einer Session; der Hinweis darunter sagt, was der Wechsel kostet.
+ */
+@Composable
+private fun AgentSheet(
+    adapters: List<AdapterDescriptor>,
+    current: String,
+    secretKinds: Set<String>,
+    onDismiss: () -> Unit,
+    onSwitch: (String) -> Unit,
+) {
+    var picked by remember(current) { mutableStateOf(current) }
+    SettingSheet(title = "Agent", onDismiss = onDismiss) {
+        GroupCard {
+            Column(
+                modifier = Modifier
+                    .heightIn(max = 320.dp)
+                    .verticalScroll(rememberScrollState()),
+            ) {
+                adapters.forEachIndexed { index, descriptor ->
+                    if (index > 0) ListDivider(RadioRowDividerInset)
+                    SelectableTile(
+                        title = descriptor.name,
+                        subtitle = shortDescription(descriptor.description),
+                        selected = picked == descriptor.id,
+                        onClick = { picked = descriptor.id },
+                        trailing = if (!adapterKeyPresent(descriptor, secretKinds)) {
+                            { DotLabel(color = semantic().warning, label = "Kein Zugang") }
+                        } else {
+                            null
+                        },
+                    )
+                }
+            }
+        }
+        SectionNote(
+            "Der neue Agent startet frisch auf dem aktuellen Code-Stand dieser Session. " +
+                "Der bisherige Gesprächskontext des Agenten geht verloren; der Verlauf hier " +
+                "bleibt sichtbar.",
+        )
+        Button(
+            onClick = { onSwitch(picked) },
+            enabled = picked.isNotBlank() && picked != current,
+            shape = PillShape,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = ScreenGutter, vertical = 10.dp)
+                .height(PrimaryButtonHeight),
+        ) {
+            Text("Agent wechseln")
+        }
+    }
+}
+
+/** Erste Zeile der Adapter-Beschreibung, auf Sheet-Länge gekürzt. */
+private fun shortDescription(raw: String?): String? =
+    raw?.takeIf { it.isNotBlank() }
+        ?.lineSequence()
+        ?.first()
+        ?.let { if (it.length > 64) it.take(63).trimEnd() + "…" else it }
 
 @Composable
 private fun ModeSheet(
@@ -874,7 +997,12 @@ private fun TimelineItemView(item: TimelineItem, vm: SessionViewModel) {
         is TimelineItem.Chat -> ChatBubble(item)
         is TimelineItem.Tool -> ToolCard(item)
         is TimelineItem.Approval -> ApprovalCard(item, vm)
-        is TimelineItem.TurnEnd -> TurnEndSeparator(item)
+        is TimelineItem.TurnEnd -> SystemLine(
+            text = listOfNotNull("Fertig", item.commitSha?.take(7)).joinToString(" · "),
+            icon = Icons.Outlined.Check,
+        )
+
+        is TimelineItem.Notice -> SystemLine(text = item.text)
         is TimelineItem.Pushed -> PushCard(item)
         is TimelineItem.Error -> ErrorCard(item)
     }
@@ -1133,31 +1261,34 @@ private fun ResolvedLabel(label: String) {
     }
 }
 
+/**
+ * Die eine ruhige Systemzeile der Timeline: zentriert, grau, optional mit
+ * Icon. Turn-Ende und Server-Hinweise teilen sie sich.
+ */
 @Composable
-private fun TurnEndSeparator(item: TimelineItem.TurnEnd) {
-    Column(
-        horizontalAlignment = Alignment.CenterHorizontally,
+private fun SystemLine(text: String, icon: ImageVector? = null) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterHorizontally),
         modifier = Modifier
             .fillMaxWidth()
-            .padding(vertical = 6.dp),
+            .padding(horizontal = 24.dp, vertical = 6.dp),
     ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
+        icon?.let {
             Icon(
-                Icons.Outlined.Check,
+                it,
                 contentDescription = null,
                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.size(14.dp),
             )
-            Text(
-                text = listOfNotNull("Fertig", item.commitSha?.take(7)).joinToString(" · "),
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                fontWeight = FontWeight.Medium,
-            )
         }
+        Text(
+            text = text,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            fontWeight = FontWeight.Medium,
+            textAlign = TextAlign.Center,
+        )
     }
 }
 

@@ -289,10 +289,21 @@ export class Store {
     this.db.prepare('UPDATE sessions SET mode = ? WHERE id = ?').run(mode, id);
   }
 
-  /** Partial update of the switchable session settings (session.update). */
+  /**
+   * Partial update of the switchable session settings (session.update).
+   * `clearSessionRef` belongs to the harness switch: a runtime session
+   * reference is bound to the old adapter and must not survive it.
+   */
   updateSessionSettings(
     id: string,
-    patch: { mode?: string; model?: string; reasoningEffort?: string },
+    patch: {
+      mode?: string;
+      model?: string;
+      reasoningEffort?: string;
+      adapter?: string;
+      provider?: string;
+      clearSessionRef?: boolean;
+    },
   ): void {
     const sets: string[] = [];
     const values: (string | null)[] = [];
@@ -308,6 +319,17 @@ export class Store {
       sets.push('reasoning_effort = ?');
       // empty string clears the stored effort
       values.push(patch.reasoningEffort === '' ? null : patch.reasoningEffort);
+    }
+    if (patch.adapter !== undefined) {
+      sets.push('adapter = ?');
+      values.push(patch.adapter);
+    }
+    if (patch.provider !== undefined) {
+      sets.push('provider = ?');
+      values.push(patch.provider);
+    }
+    if (patch.clearSessionRef === true) {
+      sets.push('session_ref = NULL');
     }
     if (sets.length === 0) return;
     this.db.prepare(`UPDATE sessions SET ${sets.join(', ')} WHERE id = ?`).run(...values, id);

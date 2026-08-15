@@ -262,15 +262,18 @@ class AppRepository(
      * Modus/Modell/Reasoning einer laufenden Session setzen. Der Server
      * antwortet zusätzlich mit session.status an alle Geräte, die Liste
      * aktualisiert sich also über das bestehende Handling.
+     * [adapter] wechselt den Agenten; das passiert serverseitig asynchron,
+     * der Fortschritt kommt ebenfalls als session.status.
      */
     suspend fun updateSession(
         sessionId: String,
         mode: AgentMode? = null,
         model: String? = null,
         reasoningEffort: ReasoningEffort? = null,
+        adapter: String? = null,
     ): Result<Unit> {
         val response = request { id ->
-            encodeSessionUpdate(id, sessionId, mode, model, reasoningEffort)
+            encodeSessionUpdate(id, sessionId, mode, model, reasoningEffort, adapter)
         }
         return when (response) {
             is ServerMessage.ErrorMsg -> Result.failure(IllegalStateException(response.message))

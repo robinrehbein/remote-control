@@ -63,6 +63,17 @@ class SettingsViewModel : ViewModel() {
             repository.refreshStats()
             repository.loadSecrets()
             repository.refreshSessions()
+            repository.refreshRepos()
+        }
+    }
+
+    fun addRepo(fullName: String, defaultBranch: String, onDone: () -> Unit) {
+        viewModelScope.launch {
+            repository.addRepo(fullName, defaultBranch).fold(
+                onSuccess = { _error.value = null },
+                onFailure = { _error.value = it.message },
+            )
+            onDone()
         }
     }
 
@@ -97,9 +108,11 @@ fun SettingsScreen(onBack: () -> Unit) {
     val vm: SettingsViewModel = viewModel { SettingsViewModel().also { it.repository = repository } }
     val stats by repository.stats.collectAsState()
     val secrets by repository.secrets.collectAsState()
+    val repos by repository.repos.collectAsState()
     val error by vm.error.collectAsState()
 
     var showAddDialog by remember { mutableStateOf(false) }
+    var showAddRepoDialog by remember { mutableStateOf(false) }
     var confirmLogout by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) { vm.refresh() }
@@ -144,6 +157,41 @@ fun SettingsScreen(onBack: () -> Unit) {
                         }
                     }
                     TextButton(onClick = { vm.refresh() }) { Text("Aktualisieren") }
+                }
+            }
+
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    text = "Repositories",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.weight(1f),
+                )
+                IconButton(onClick = { showAddRepoDialog = true }) {
+                    Icon(Icons.Filled.Add, contentDescription = "Repository hinzufügen")
+                }
+            }
+            if (repos.isEmpty()) {
+                Text(
+                    "Noch keine Repos. Tippe auf + und gib den Namen im Format owner/repo ein.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            } else {
+                repos.forEach { repo ->
+                    Card(modifier = Modifier.fillMaxWidth()) {
+                        Column(Modifier.padding(start = 12.dp, end = 12.dp, top = 10.dp, bottom = 10.dp)) {
+                            Text(repo.fullName, style = MaterialTheme.typography.titleMedium)
+                            Text(
+                                text = "Basis-Branch: ${repo.defaultBranch}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
                 }
             }
 
@@ -206,6 +254,15 @@ fun SettingsScreen(onBack: () -> Unit) {
         )
     }
 
+    if (showAddRepoDialog) {
+        AddRepoDialog(
+            onDismiss = { showAddRepoDialog = false },
+            onSave = { fullName, branch ->
+                vm.addRepo(fullName, branch) { showAddRepoDialog = false }
+            },
+        )
+    }
+
     if (confirmLogout) {
         AlertDialog(
             onDismissRequest = { confirmLogout = false },
@@ -233,6 +290,60 @@ private fun StatRow(label: String, value: String) {
         Text(label, modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
         Text(value, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
     }
+}
+
+@Composable
+private fun AddRepoDialog(
+    onDismiss: () -> Unit,
+    onSave: (fullName: String, defaultBranch: String) -> Unit,
+) {
+    var fullName by remember { mutableStateOf("") }
+    var branch by remember { mutableStateOf("") }
+    val valid = Regex("^[\\w.-]+/[\\w.-]+$").matches(fullName.trim())
+    val effectiveBranch = branch.trim().ifEmpty { "main" }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Repository hinzufügen") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                OutlinedTextField(
+                    value = fullName,
+                    onValueChange = { fullName = it },
+                    label = { Text("owner/repo") },
+                    placeholder = { Text("robinrehbein/remote-control") },
+                    singleLine = true,
+                    isError = fullName.isNotBlank() && !valid,
+                    supportingText = if (fullName.isNotBlank() && !valid) {
+                        { Text("Format: owner/repo") }
+                    } else {
+                        null
+                    },
+                )
+                OutlinedTextField(
+                    value = branch,
+                    onValueChange = { branch = it },
+                    label = { Text("Basis-Branch (optional)") },
+                    placeholder = { Text("main") },
+                    singleLine = true,
+                )
+                Text(
+                    "Für private Repos zusätzlich ein github-Secret in den Secrets hinterlegen.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onSave(fullName.trim(), effectiveBranch) },
+                enabled = valid,
+            ) { Text("Hinzufügen") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Abbrechen") }
+        },
+    )
 }
 
 @Composable

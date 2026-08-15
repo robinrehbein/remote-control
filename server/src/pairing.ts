@@ -25,7 +25,8 @@ export function confirmPairing(
   tenant = 'default',
 ): PairingConfirmResponse | null {
   if (!body.code || !body.deviceName) return null;
-  if (!store.consumePairingCode(body.code)) return null;
+  // Codes are lowercase hex; normalize (e.g. Android keyboards may uppercase input).
+  if (!store.consumePairingCode(body.code.trim().toLowerCase())) return null;
   const deviceId = randomUUID();
   const deviceToken = randomBytes(48).toString('hex');
   store.createDevice(deviceId, tenant, body.deviceName, sha256(deviceToken));

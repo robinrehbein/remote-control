@@ -120,9 +120,9 @@ fun PairingScreen(onPaired: () -> Unit) {
         )
         OutlinedTextField(
             value = state.code,
-            onValueChange = { v -> vm.update { it.copy(code = v.uppercase()) } },
+            onValueChange = { v -> vm.update { it.copy(code = v.filter { c -> c.isLetterOrDigit() }.lowercase()) } },
             label = { Text(stringResource(R.string.pairing_code)) },
-            placeholder = { Text("XXXXXXXX") },
+            placeholder = { Text("xxxxxxxx") },
             singleLine = true,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii, imeAction = ImeAction.Next),
             modifier = Modifier

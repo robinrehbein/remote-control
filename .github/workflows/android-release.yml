@@ -3,13 +3,20 @@ name: Android Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create (e.g. v0.3.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
 
 jobs:
   release:
-    name: Build & Release APK
+    name: Build & Publish APK
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     defaults:
       run:
         working-directory: android
@@ -30,13 +37,19 @@ jobs:
           gradle-version: "8.11"
 
       - name: Unit tests
-        run: gradle :app:testDebugUnitTest --stacktrace --no-daemon
+        run: gradle :app:testReleaseUnitTest --stacktrace --no-daemon
 
-      - name: Build debug APK
-        run: gradle :app:assembleDebug --stacktrace --no-daemon
+      - name: Build release APK
+        run: gradle :app:assembleRelease --stacktrace --no-daemon
 
-      - name: Create GitHub Release with APK
+      - name: Rename APK
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: cp app/build/outputs/apk/release/app-release.apk "pocketagent-${RELEASE_TAG}.apk"
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: android/app/build/outputs/apk/debug/app-debug.apk
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: android/pocketagent-*.apk
           generate_release_notes: true

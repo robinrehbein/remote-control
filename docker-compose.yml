@@ -28,6 +28,20 @@ services:
       # Session-Netze + Egress-Proxy bleiben aktiv, keine Port-Publishes.
       # DOCKER_HOST: http://socket-proxy:2375
       # DOCKER_HOST_IS_LOCAL: "1"
+      # ---- Remote-Runner (echter fremder Daemon), siehe FLY.md/RUNBOOK ----
+      # Hier ist DOCKER_HOST_IS_LOCAL bewusst NICHT gesetzt. Ohne GATEWAY_TOKEN
+      # gilt dann Policy 'open' + veröffentlichte Shim-Ports. Mit Token startet
+      # der Orchestrator auf dem Runner den Container 'pocketagent-gateway'
+      # (Ingress :8443 published, Egress :3128 nur in den Session-Netzen) und
+      # Session-Netze/Allowlist funktionieren auch remote.
+      # DOCKER_HOST: tcp://runner.example.com:2376
+      # DOCKER_ADDR: runner.example.com
+      # DOCKER_CLIENT_CA_B64: ${DOCKER_CLIENT_CA_B64:-}
+      # DOCKER_CLIENT_CERT_B64: ${DOCKER_CLIENT_CERT_B64:-}
+      # DOCKER_CLIENT_KEY_B64: ${DOCKER_CLIENT_KEY_B64:-}
+      # GATEWAY_TOKEN: ${GATEWAY_TOKEN:-}        # openssl rand -hex 32, stabil halten
+      # GATEWAY_PORT: "8443"                     # Host-Port des Gateways am Runner
+      # GATEWAY_IMAGE: pocketagent/orchestrator:latest  # muss AUF DEM RUNNER liegen
     volumes:
       - orchestrator-data:/data
       # Härtung: diesen Mount entfernen und stattdessen DOCKER_HOST=http://socket-proxy:2375

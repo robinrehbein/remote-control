@@ -1,6 +1,14 @@
 import Docker from 'dockerode';
 import type { NetworkPolicy } from '@pocketagent/protocol';
-import { config, isNetworkPolicy } from './config.js';
+import {
+  GATEWAY_ALIAS,
+  GATEWAY_AUTH_HEADER,
+  GATEWAY_CONTAINER_NAME,
+  GATEWAY_EGRESS_PORT,
+  GATEWAY_INGRESS_PORT,
+  config,
+  isNetworkPolicy,
+} from './config.js';
 import { adapterImage, getAdapter } from './adapters.js';
 import type { SessionRow } from './db.js';
 
@@ -54,6 +62,104 @@ function envArr(env: Record<string, string | undefined>): string[] {
 
 /** Network alias the orchestrator container gets inside every session network. */
 const ORCHESTRATOR_ALIAS = 'orchestrator';
+
+/**
+ * true when session networking is routed through the gateway container on the
+ * runner (remote daemon + configured shared secret). Then remote mode keeps
+ * per-session internal networks and the egress allowlist instead of falling
+ * back to 'open' + published shim ports.
+ */
+export function gatewayEnabled(): boolean {
+  return isRemote() && config.gatewayToken !== null;
+}
+
+let warnedNoGateway = false;
+
+/** Auth headers the orchestrator must add when talking through the gateway. */
+export function gatewayHeaders(): Record<string, string> {
+  return gatewayEnabled() ? { [GATEWAY_AUTH_HEADER]: config.gatewayToken as string } : {};
+}
+
+let gatewayReady: Promise<string | null> | null = null;
+
+/**
+ * Create/start the managed gateway container on the runner (idempotent, the
+ * result is cached for the process lifetime). It runs the orchestrator image
+ * with `npx tsx src/gateway.ts`, publishes only its ingress port and stays on
+ * the default bridge network so it - and only it - has internet.
+ */
+export async function ensureGatewayContainer(): Promise<string | null> {
+  if (!gatewayEnabled()) return null;
+  if (!gatewayReady) {
+    gatewayReady = createGateway().catch((e) => {
+      console.error(`[docker] gateway container failed: ${String(e)}`);
+      gatewayReady = null;
+      return null;
+    });
+  }
+  return gatewayReady;
+}
+
+async function createGateway(): Promise<string | null> {
+  const d = docker();
+  if (!d) return null;
+  const existing = d.getContainer(GATEWAY_CONTAINER_NAME);
+  try {
+    const info = await existing.inspect();
+    if (!info.State?.Running) await existing.start().catch(() => {});
+    return info.Id;
+  } catch {
+    /* not created yet */
+  }
+  await pullImage(config.gatewayImage);
+  const c = await d.createContainer({
+    name: GATEWAY_CONTAINER_NAME,
+    Image: config.gatewayImage,
+    Cmd: ['npx', 'tsx', 'src/gateway.ts'],
+    Env: envArr({
+      GATEWAY_TOKEN: config.gatewayToken ?? undefined,
+      GATEWAY_ALLOWLIST: config.networkAllowlist.join(','),
+      GATEWAY_INGRESS_PORT: String(GATEWAY_INGRESS_PORT),
+      GATEWAY_EGRESS_PORT: String(GATEWAY_EGRESS_PORT),
+    }),
+    Labels: { 'pocketagent.role': 'gateway' },
+    ExposedPorts: { [`${GATEWAY_INGRESS_PORT}/tcp`]: {} },
+    HostConfig: {
+      RestartPolicy: { Name: 'unless-stopped' },
+      CapDrop: ['ALL'],
+      SecurityOpt: ['no-new-privileges'],
+      PortBindings: {
+        [`${GATEWAY_INGRESS_PORT}/tcp`]: [{ HostPort: String(config.gatewayPort) }],
+      },
+    },
+  });
+  await c.start();
+  console.log(`[docker] gateway container up (host port ${config.gatewayPort})`);
+  return c.id;
+}
+
+/** Attach the gateway to a session network so shims can reach it as 'gateway'. */
+async function attachGateway(networkName: string): Promise<void> {
+  const d = docker();
+  const id = await ensureGatewayContainer();
+  if (!d || !id) return;
+  try {
+    await d.getNetwork(networkName).connect({
+      Container: id,
+      EndpointConfig: { Aliases: [GATEWAY_ALIAS] },
+    });
+  } catch (e) {
+    const msg = String(e);
+    if (msg.includes('No such container') || msg.includes('404')) {
+      // gateway was removed behind our back - drop the cache so the next
+      // session recreates it
+      gatewayReady = null;
+    }
+    if (!msg.includes('already')) {
+      console.warn(`[docker] gateway attach to ${networkName} failed: ${msg}`);
+    }
+  }
+}
 
 export async function ensureNetwork(): Promise<void> {
   const d = docker();
@@ -127,8 +233,11 @@ export async function removeSessionNetwork(sessionId: string): Promise<void> {
   try {
     const info = await net.inspect();
     const selfId = process.env.HOSTNAME;
-    for (const cid of Object.keys(info.Containers ?? {})) {
-      if (selfId && cid.startsWith(selfId)) {
+    const members = (info.Containers ?? {}) as Record<string, { Name?: string } | undefined>;
+    for (const [cid, meta] of Object.entries(members)) {
+      const isSelf = selfId !== undefined && selfId.length > 0 && cid.startsWith(selfId);
+      const isGateway = (meta?.Name ?? '') === GATEWAY_CONTAINER_NAME;
+      if (isSelf || isGateway) {
         await net.disconnect({ Container: cid }).catch(() => {});
       } else {
         await d.getContainer(cid).remove({ force: true }).catch(() => {});
@@ -140,31 +249,55 @@ export async function removeSessionNetwork(sessionId: string): Promise<void> {
   }
 }
 
-/** Remote daemons publish shim ports; session networks only work in local mode (socket or socket proxy). */
+/**
+ * Session networks need something inside the session network that the
+ * orchestrator can talk to. Locally that is the orchestrator container itself
+ * (self-attach); on a remote daemon it is the gateway container. Without a
+ * configured GATEWAY_TOKEN a remote daemon has neither, so policies degrade to
+ * 'open' with published shim ports (previous behaviour).
+ */
 function policyFor(session: SessionRow): NetworkPolicy {
-  if (isRemote()) return 'open';
+  if (isRemote() && !gatewayEnabled()) {
+    if (!warnedNoGateway) {
+      warnedNoGateway = true;
+      console.warn(
+        '[docker] remote daemon without GATEWAY_TOKEN - network policies forced to "open" and shim ports published; set GATEWAY_TOKEN to enable per-session networks via the gateway container',
+      );
+    }
+    return 'open';
+  }
   const raw = session.network_policy;
   return isNetworkPolicy(raw) ? raw : config.networkPolicyDefault;
 }
 
 /**
  * Resolve the container network for a session. 'open' shares the main
- * network; 'allowlist'/'isolated' get a dedicated internal network and the
- * orchestrator attaches itself (alias 'orchestrator'). For 'allowlist' the
- * proxy env vars are injected into `env`.
+ * network; 'allowlist'/'isolated' get a dedicated internal network with a
+ * reachable relay attached: locally the orchestrator itself (alias
+ * 'orchestrator'), remotely the gateway container (alias 'gateway'). For
+ * 'allowlist' the proxy env vars are injected into `env`.
  */
 async function sessionNetworking(
   session: SessionRow,
   env: Record<string, string | undefined>,
 ): Promise<{ EndpointsConfig: Record<string, { Aliases: string[] }> }> {
-  if (policyFor(session) === 'open') {
+  const policy = policyFor(session);
+  if (policy === 'open') {
+    // With a gateway even 'open' sessions are reached through it (no published
+    // port), so it has to sit on the shared network too.
+    if (gatewayEnabled()) await attachGateway(config.networkName);
     return { EndpointsConfig: { [config.networkName]: { Aliases: [session.id] } } };
   }
   const netName = await ensureSessionNetwork(session.id);
-  await ensureSelfAttached(netName);
-  if (policyFor(session) === 'allowlist') {
-    env.HTTP_PROXY = `http://${ORCHESTRATOR_ALIAS}:${config.egressProxyPort}`;
-    env.HTTPS_PROXY = `http://${ORCHESTRATOR_ALIAS}:${config.egressProxyPort}`;
+  const viaGateway = gatewayEnabled();
+  if (viaGateway) await attachGateway(netName);
+  else await ensureSelfAttached(netName);
+  if (policy === 'allowlist') {
+    const proxy = viaGateway
+      ? `http://${GATEWAY_ALIAS}:${GATEWAY_EGRESS_PORT}`
+      : `http://${ORCHESTRATOR_ALIAS}:${config.egressProxyPort}`;
+    env.HTTP_PROXY = proxy;
+    env.HTTPS_PROXY = proxy;
     env.NO_PROXY = 'localhost,127.0.0.1';
   }
   return { EndpointsConfig: { [netName]: { Aliases: [session.id] } } };
@@ -208,7 +341,9 @@ export async function createSessionContainer(
   try {
     await ensureVolume(session.volume_name);
     await pullImage(adapterImage(session.adapter));
-    const remote = isRemote();
+    // With a gateway the shim is reached through it, so no host port is published
+    // (an internal per-session network could not serve one anyway).
+    const remote = isRemote() && !gatewayEnabled();
     const containerEnv = { ...env };
     const networking = await sessionNetworking(session, containerEnv);
     const c = await d.createContainer({
@@ -248,10 +383,15 @@ export async function startContainer(id: string): Promise<boolean> {
 /**
  * Base URL the orchestrator uses to reach a running session shim.
  * Local mode: docker-network alias (null => caller uses http://<sessionId>:8080).
- * Remote mode: published random host port on the docker host (DOCKER_ADDR).
+ * Remote mode with gateway: the gateway's single published port, path-routed
+ *   per session (`http://<DOCKER_ADDR>:<GATEWAY_PORT>/s/<sessionId>`).
+ * Remote mode without gateway: published random host port on the docker host.
  */
-export async function shimEndpoint(containerId: string): Promise<string | null> {
+export async function shimEndpoint(containerId: string, sessionId: string): Promise<string | null> {
   if (!isRemote() || !config.dockerAddr) return null;
+  if (gatewayEnabled()) {
+    return `http://${config.dockerAddr}:${config.gatewayPort}/s/${encodeURIComponent(sessionId)}`;
+  }
   const d = docker();
   if (!d) return null;
   try {

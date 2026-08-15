@@ -49,13 +49,14 @@ import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -65,6 +66,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -80,6 +82,7 @@ import com.pocketagent.app.data.SessionStatus
 import com.pocketagent.app.data.wireName
 import com.pocketagent.app.ui.components.MarkdownText
 import com.pocketagent.app.ui.theme.MonoMedium
+import com.pocketagent.app.ui.theme.PillShape
 import com.pocketagent.app.ui.theme.semantic
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -281,8 +284,13 @@ fun SessionScreen(
     var confirmDelete by remember { mutableStateOf(false) }
 
     Scaffold(
+        containerColor = MaterialTheme.colorScheme.background,
         topBar = {
             TopAppBar(
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.background,
+                    scrolledContainerColor = MaterialTheme.colorScheme.background,
+                ),
                 title = {
                     Column {
                         Text(
@@ -359,7 +367,7 @@ fun SessionScreen(
             )
         },
         bottomBar = {
-            Surface(tonalElevation = 3.dp) {
+            Surface(color = MaterialTheme.colorScheme.background, tonalElevation = 0.dp) {
                 Column(modifier = Modifier.navigationBarsPadding().imePadding()) {
                     AnimatedVisibility(visible = busy, enter = fadeIn(), exit = fadeOut()) {
                         Row(
@@ -391,7 +399,15 @@ fun SessionScreen(
                             placeholder = { Text("Nachricht an den Agenten …") },
                             modifier = Modifier.weight(1f),
                             maxLines = 5,
-                            shape = MaterialTheme.shapes.extraLarge,
+                            shape = PillShape,
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+                                unfocusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+                                disabledContainerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+                                focusedBorderColor = Color.Transparent,
+                                unfocusedBorderColor = Color.Transparent,
+                                disabledBorderColor = Color.Transparent,
+                            ),
                         )
                         IconButton(
                             onClick = { vm.sendPrompt() },
@@ -489,10 +505,10 @@ private fun ChatBubble(item: TimelineItem.Chat) {
         if (isUser) Spacer(modifier = Modifier.width(40.dp))
         Surface(
             shape = RoundedCornerShape(
-                topStart = 18.dp,
-                topEnd = 18.dp,
-                bottomStart = if (isUser) 18.dp else 4.dp,
-                bottomEnd = if (isUser) 4.dp else 18.dp,
+                topStart = 20.dp,
+                topEnd = 20.dp,
+                bottomStart = if (isUser) 20.dp else 6.dp,
+                bottomEnd = if (isUser) 6.dp else 20.dp,
             ),
             color = if (isUser) {
                 MaterialTheme.colorScheme.primaryContainer
@@ -624,14 +640,15 @@ private fun ToolCard(item: TimelineItem.Tool) {
 private fun ApprovalCard(item: TimelineItem.Approval, vm: SessionViewModel) {
     Surface(
         shape = MaterialTheme.shapes.large,
-        color = MaterialTheme.colorScheme.tertiaryContainer,
+        color = MaterialTheme.colorScheme.surfaceContainer,
         modifier = Modifier.fillMaxWidth(),
     ) {
-        Column(Modifier.padding(14.dp)) {
+        Column(Modifier.padding(16.dp)) {
             Text(
                 text = "Bestätigung erforderlich",
                 style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onTertiaryContainer,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.primary,
             )
             Text(
                 text = item.title,
@@ -650,7 +667,7 @@ private fun ApprovalCard(item: TimelineItem.Approval, vm: SessionViewModel) {
             }
             item.diff?.let { diff ->
                 Surface(
-                    color = MaterialTheme.colorScheme.surface,
+                    color = MaterialTheme.colorScheme.surfaceContainerHighest,
                     shape = MaterialTheme.shapes.medium,
                     modifier = Modifier
                         .fillMaxWidth()
@@ -669,14 +686,23 @@ private fun ApprovalCard(item: TimelineItem.Approval, vm: SessionViewModel) {
             when (item.resolved) {
                 null -> Column(modifier = Modifier.padding(top = 12.dp)) {
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(onClick = { vm.decide(item.permissionId, PermissionDecision.ONCE) }) {
+                        Button(
+                            shape = PillShape,
+                            onClick = { vm.decide(item.permissionId, PermissionDecision.ONCE) },
+                        ) {
                             Text("Erlauben")
                         }
-                        FilledTonalButton(onClick = { vm.decide(item.permissionId, PermissionDecision.ALWAYS) }) {
+                        FilledTonalButton(
+                            shape = PillShape,
+                            onClick = { vm.decide(item.permissionId, PermissionDecision.ALWAYS) },
+                        ) {
                             Text("Immer erlauben")
                         }
                     }
-                    TextButton(onClick = { vm.decide(item.permissionId, PermissionDecision.REJECT) }) {
+                    TextButton(
+                        shape = PillShape,
+                        onClick = { vm.decide(item.permissionId, PermissionDecision.REJECT) },
+                    ) {
                         Text("Ablehnen")
                     }
                 }

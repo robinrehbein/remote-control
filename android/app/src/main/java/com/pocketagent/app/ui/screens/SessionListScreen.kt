@@ -22,16 +22,15 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.SmartToy
+import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
-import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -43,17 +42,15 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.pocketagent.app.PocketAgentApp
-import com.pocketagent.app.R
 import com.pocketagent.app.data.SessionInfo
 import com.pocketagent.app.data.SessionStatus
 import com.pocketagent.app.data.WsClient
 import com.pocketagent.app.data.wireName
+import com.pocketagent.app.ui.theme.PillShape
 import com.pocketagent.app.ui.theme.semantic
 import kotlinx.coroutines.launch
 
@@ -73,21 +70,12 @@ fun SessionListScreen(
 
     LaunchedEffect(Unit) { repository.refreshSessions() }
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = {
-                    Column {
-                        Text(stringResource(R.string.session_list_title))
-                        ConnLabel(connState)
-                    }
-                },
-                actions = {
-                    IconButton(onClick = onOpenSettings) {
-                        Icon(Icons.Outlined.Settings, contentDescription = "Einstellungen")
-                    }
-                },
-            )
+    OneUiScaffold(
+        title = "PocketAgent",
+        actions = {
+            IconButton(onClick = onOpenSettings) {
+                Icon(Icons.Outlined.Settings, contentDescription = "Einstellungen")
+            }
         },
         floatingActionButton = {
             FloatingActionButton(onClick = onNewSession) {
@@ -95,30 +83,42 @@ fun SessionListScreen(
             }
         },
     ) { padding ->
-        PullToRefreshBox(
-            isRefreshing = refreshing,
-            onRefresh = {
-                refreshing = true
-                scope.launch {
-                    repository.refreshSessions()
-                    refreshing = false
-                }
-            },
+        Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding),
         ) {
-            LaunchedEffect(sessions) { refreshing = false }
-            if (sessions.isEmpty()) {
-                EmptySessions(onNewSession)
-            } else {
-                LazyColumn(
-                    modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 96.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp),
-                ) {
-                    items(sessions, key = { it.id }) { session ->
-                        SessionCard(session = session, onClick = { onOpenSession(session.id) })
+            Row(
+                horizontalArrangement = Arrangement.Center,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                ConnLabel(connState)
+            }
+            PullToRefreshBox(
+                isRefreshing = refreshing,
+                onRefresh = {
+                    refreshing = true
+                    scope.launch {
+                        repository.refreshSessions()
+                        refreshing = false
+                    }
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f),
+            ) {
+                LaunchedEffect(sessions) { refreshing = false }
+                if (sessions.isEmpty()) {
+                    EmptySessions(onNewSession)
+                } else {
+                    LazyColumn(
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 96.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        items(sessions, key = { it.id }) { session ->
+                            SessionCard(session = session, onClick = { onOpenSession(session.id) })
+                        }
                     }
                 }
             }
@@ -160,8 +160,9 @@ private fun EmptySessions(onNewSession: () -> Unit) {
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(top = 8.dp),
         )
-        androidx.compose.material3.Button(
+        Button(
             onClick = onNewSession,
+            shape = PillShape,
             modifier = Modifier.padding(top = 24.dp),
         ) {
             Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(18.dp))
@@ -205,7 +206,7 @@ private fun SessionCard(session: SessionInfo, onClick: () -> Unit) {
             .clip(MaterialTheme.shapes.large)
             .clickable(onClick = onClick),
     ) {
-        Column(Modifier.padding(16.dp)) {
+        Column(Modifier.padding(horizontal = 18.dp, vertical = 16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(

@@ -37,6 +37,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.pocketagent.app.PocketAgentApp
 import com.pocketagent.app.R
 import com.pocketagent.app.data.PairingApi
+import com.pocketagent.app.ui.theme.PillShape
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
@@ -119,14 +120,14 @@ fun PairingScreen(onPaired: () -> Unit) {
         }
         Text(
             text = "PocketAgent",
-            style = MaterialTheme.typography.headlineMedium,
-            modifier = Modifier.padding(top = 20.dp),
+            style = MaterialTheme.typography.headlineLarge,
+            modifier = Modifier.padding(top = 24.dp),
         )
         Text(
             text = "Steure Coding-Agenten von deinem Telefon aus",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(top = 6.dp, bottom = 32.dp),
+            modifier = Modifier.padding(top = 8.dp, bottom = 40.dp),
         )
 
         OutlinedTextField(
@@ -136,6 +137,7 @@ fun PairingScreen(onPaired: () -> Unit) {
             placeholder = { Text("https://pocketagent.example.com") },
             singleLine = true,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Next),
+            shape = MaterialTheme.shapes.small,
             modifier = Modifier.fillMaxWidth(),
         )
         OutlinedTextField(
@@ -145,6 +147,7 @@ fun PairingScreen(onPaired: () -> Unit) {
             placeholder = { Text("xxxxxxxx") },
             singleLine = true,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii, imeAction = ImeAction.Next),
+            shape = MaterialTheme.shapes.small,
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(top = 12.dp),
@@ -155,6 +158,7 @@ fun PairingScreen(onPaired: () -> Unit) {
             label = { Text(stringResource(R.string.pairing_device_name)) },
             singleLine = true,
             keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+            shape = MaterialTheme.shapes.small,
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(top = 12.dp),
@@ -172,6 +176,7 @@ fun PairingScreen(onPaired: () -> Unit) {
         Button(
             onClick = { vm.pair(onPaired) },
             enabled = !state.busy,
+            shape = PillShape,
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(top = 28.dp)

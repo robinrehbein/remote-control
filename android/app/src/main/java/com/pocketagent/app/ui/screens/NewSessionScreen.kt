@@ -1,21 +1,28 @@
-@file:OptIn(ExperimentalMaterial3Api::class)
+@file:OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 
 package com.pocketagent.app.ui.screens
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.outlined.UnfoldLess
@@ -26,19 +33,16 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
-import androidx.compose.material3.Scaffold
-import androidx.compose.material3.SegmentedButton
-import androidx.compose.material3.SegmentedButtonDefaults
-import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -49,7 +53,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -58,6 +62,8 @@ import com.pocketagent.app.PocketAgentApp
 import com.pocketagent.app.data.AdapterDescriptor
 import com.pocketagent.app.data.AgentMode
 import com.pocketagent.app.data.AppRepository
+import com.pocketagent.app.ui.theme.PillShape
+import com.pocketagent.app.ui.theme.semantic
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
@@ -69,6 +75,7 @@ class NewSessionViewModel : ViewModel() {
         val repoId: String? = null,
         val adapter: String = "",
         val provider: String = "",
+        val providerCustom: Boolean = false,
         val model: String = "",
         val mode: AgentMode = AgentMode.AUTO,
         val branch: String = "",
@@ -89,16 +96,20 @@ class NewSessionViewModel : ViewModel() {
         val s = _state.value
         if (s.adapter.isBlank() && adapters.isNotEmpty()) {
             val first = adapters.first()
-            _state.value = s.copy(adapter = first.id, provider = first.defaults.provider)
+            _state.value = s.copy(adapter = first.id, provider = defaultProviderFor(first))
         }
     }
 
     fun onAdapterSelected(adapter: AdapterDescriptor) {
         _state.value = _state.value.copy(
             adapter = adapter.id,
-            provider = adapter.defaults.provider.ifBlank { "openai" },
+            provider = defaultProviderFor(adapter),
+            providerCustom = false,
         )
     }
+
+    private fun defaultProviderFor(adapter: AdapterDescriptor): String =
+        adapter.defaults.provider.ifBlank { adapter.providerEnv.keys.firstOrNull().orEmpty() }
 
     fun addRepo(fullName: String, defaultBranch: String) {
         viewModelScope.launch {
@@ -144,10 +155,46 @@ class NewSessionViewModel : ViewModel() {
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Provider display names                                              */
+/* ------------------------------------------------------------------ */
+
+private fun providerDisplayName(key: String): String = when (key) {
+    "openai" -> "OpenAI"
+    "anthropic" -> "Anthropic"
+    "zai" -> "Z.AI"
+    "moonshot" -> "Moonshot/Kimi"
+    "kimi" -> "Kimi"
+    "google" -> "Google Gemini"
+    "groq" -> "Groq"
+    "openrouter" -> "OpenRouter"
+    "xai" -> "xAI"
+    else -> key
+}
+
+/** Provider keys in display order: default provider first, then the rest. */
+private fun orderedProviderKeys(descriptor: AdapterDescriptor): List<String> {
+    val keys = descriptor.providerEnv.keys.toList()
+    val def = descriptor.defaults.provider
+    return if (def.isNotBlank() && def in keys) {
+        listOf(def) + keys.filterNot { it == def }
+    } else {
+        keys
+    }
+}
+
+/** True when a usable secret for this adapter exists (card-level status). */
+private fun adapterKeyPresent(descriptor: AdapterDescriptor, secretKinds: Set<String>): Boolean = when {
+    descriptor.credentials.isNotEmpty() -> descriptor.credentials.keys.any { it in secretKinds }
+    descriptor.providerEnv.isNotEmpty() -> descriptor.providerEnv.keys.any { it in secretKinds }
+    else -> true
+}
+
 @Composable
 fun NewSessionScreen(
     onCreated: (String) -> Unit,
     onBack: () -> Unit,
+    onOpenSettings: () -> Unit,
 ) {
     val app = LocalContext.current.applicationContext as PocketAgentApp
     val repository = app.container.repository
@@ -155,11 +202,17 @@ fun NewSessionScreen(
     val state by vm.state.collectAsState()
     val repos by repository.repos.collectAsState()
     val adapters by repository.adapters.collectAsState()
+    val secrets by repository.secrets.collectAsState()
 
     var showAddRepo by remember { mutableStateOf(false) }
     var advanced by remember { mutableStateOf(false) }
 
-    LaunchedEffect(Unit) { repository.refreshRepos(); repository.refreshSessions(); repository.refreshAdapters() }
+    LaunchedEffect(Unit) {
+        repository.refreshRepos()
+        repository.refreshSessions()
+        repository.refreshAdapters()
+        repository.loadSecrets()
+    }
     LaunchedEffect(adapters) { vm.syncAdapterDefaults(adapters) }
     LaunchedEffect(state.createdSessionId) { state.createdSessionId?.let { onCreated(it) } }
     LaunchedEffect(repos) {
@@ -168,28 +221,19 @@ fun NewSessionScreen(
         }
     }
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("Neue Session") },
-                navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Zurück")
-                    }
-                },
-            )
-        },
-    ) { padding ->
+    val secretKinds = remember(secrets) { secrets.map { it.kind }.toSet() }
+    val selectedDescriptor = adapters.firstOrNull { it.id == state.adapter }
+
+    OneUiScaffold(title = "Neue Session", onBack = onBack) { padding ->
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
-                .verticalScroll(rememberScrollState())
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp),
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             /* -------- Repository -------- */
-            SectionHeader("Repository", modifier = Modifier.padding(0.dp))
+            SectionHeader("Repository")
             RepoSelector(
                 repos = repos.map { it.id to it.fullName },
                 selectedId = state.repoId,
@@ -197,22 +241,17 @@ fun NewSessionScreen(
                 onAddRepo = { showAddRepo = true },
             )
 
-            /* -------- Adapter -------- */
-            SectionHeader("Agent", modifier = Modifier.padding(0.dp))
-            val adapterList = adapters
-            if (adapterList.isEmpty()) {
-                Surface(
-                    shape = MaterialTheme.shapes.large,
-                    color = MaterialTheme.colorScheme.surfaceContainer,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
+            /* -------- Agent -------- */
+            SectionHeader("Agent")
+            if (adapters.isEmpty()) {
+                GroupCard {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         modifier = Modifier.padding(16.dp),
                     ) {
                         CircularProgressIndicator(
                             strokeWidth = 2.dp,
-                            modifier = Modifier.width(18.dp),
+                            modifier = Modifier.size(18.dp),
                         )
                         Text(
                             text = "Lade verfügbare Agenten …",
@@ -223,159 +262,245 @@ fun NewSessionScreen(
                     }
                 }
             } else {
-                SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
-                    adapterList.forEachIndexed { index, descriptor ->
-                        SegmentedButton(
-                            selected = state.adapter == descriptor.id,
-                            onClick = { vm.onAdapterSelected(descriptor) },
-                            shape = SegmentedButtonDefaults.itemShape(index = index, count = adapterList.size),
-                        ) {
-                            Text(descriptor.id)
-                        }
-                    }
+                adapters.forEach { descriptor ->
+                    AdapterCard(
+                        descriptor = descriptor,
+                        selected = state.adapter == descriptor.id,
+                        keyPresent = adapterKeyPresent(descriptor, secretKinds),
+                        onClick = { vm.onAdapterSelected(descriptor) },
+                    )
                 }
-                adapterList.firstOrNull { it.id == state.adapter }?.let { selected ->
-                    selected.description?.takeIf { it.isNotBlank() }?.let {
-                        Text(
-                            text = it,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
+                selectedDescriptor?.let { selected ->
                     if (!selected.capabilities.approvals && state.mode != AgentMode.YOLO) {
                         Text(
                             text = "${selected.name} unterstützt keine Remote-Approvals – Ask/AcceptEdits laufen ohne Nachfragen durch.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.tertiary,
+                            modifier = Modifier.padding(horizontal = 28.dp),
                         )
                     }
                 }
             }
 
-            /* -------- Modus -------- */
-            SectionHeader("Autonomie", modifier = Modifier.padding(0.dp))
-            ModeTile(
-                title = "Ask",
-                subtitle = "Jede Aktion wird vor der Ausführung bestätigt",
-                selected = state.mode == AgentMode.ASK,
-                onClick = { vm.update { it.copy(mode = AgentMode.ASK) } },
-            )
-            ModeTile(
-                title = "Accept Edits",
-                subtitle = "Datei-Änderungen laufen automatisch, alles andere wird gefragt",
-                selected = state.mode == AgentMode.ACCEPT_EDITS,
-                onClick = { vm.update { it.copy(mode = AgentMode.ACCEPT_EDITS) } },
-            )
-            ModeTile(
-                title = "Auto",
-                subtitle = "Agent entscheidet selbst, Push nur manuell",
-                selected = state.mode == AgentMode.AUTO,
-                onClick = { vm.update { it.copy(mode = AgentMode.AUTO) } },
-            )
-            ModeTile(
-                title = "Yolo",
-                subtitle = "Vollautomatisch inkl. Push und Draft-PR – ohne Nachfrage",
-                warning = true,
-                selected = state.mode == AgentMode.YOLO,
-                onClick = { vm.update { it.copy(mode = AgentMode.YOLO) } },
-            )
+            /* -------- Provider -------- */
+            if (selectedDescriptor != null && selectedDescriptor.providerEnv.isNotEmpty()) {
+                SectionHeader("Provider")
+                GroupCard {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            orderedProviderKeys(selectedDescriptor).forEach { key ->
+                                ProviderChip(
+                                    label = providerDisplayName(key),
+                                    selected = !state.providerCustom && state.provider == key,
+                                    keyPresent = key in secretKinds,
+                                    onClick = { vm.update { it.copy(provider = key, providerCustom = false) } },
+                                )
+                            }
+                            FilterChip(
+                                selected = state.providerCustom,
+                                onClick = { vm.update { it.copy(providerCustom = true) } },
+                                shape = PillShape,
+                                label = { Text("Anderer Provider …") },
+                            )
+                        }
+                        AnimatedVisibility(visible = state.providerCustom) {
+                            OutlinedTextField(
+                                value = state.provider,
+                                onValueChange = { v -> vm.update { it.copy(provider = v) } },
+                                label = { Text("Provider") },
+                                placeholder = { Text("z. B. deepseek") },
+                                singleLine = true,
+                                shape = MaterialTheme.shapes.small,
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
+                    }
+                }
+            }
+
+            /* -------- Key-Warnung -------- */
+            selectedDescriptor?.let { descriptor ->
+                val missingFor: String? = if (descriptor.credentials.isNotEmpty()) {
+                    if (descriptor.credentials.keys.none { it in secretKinds }) descriptor.name else null
+                } else {
+                    val p = state.provider.trim()
+                    if (p.isNotEmpty() && p !in secretKinds) providerDisplayName(p) else null
+                }
+                if (missingFor != null) {
+                    Surface(
+                        shape = MaterialTheme.shapes.large,
+                        color = MaterialTheme.colorScheme.tertiaryContainer,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp),
+                    ) {
+                        Column(modifier = Modifier.padding(start = 20.dp, end = 12.dp, top = 14.dp, bottom = 4.dp)) {
+                            Text(
+                                text = "Für $missingFor ist noch kein Key hinterlegt.",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onTertiaryContainer,
+                            )
+                            TextButton(onClick = onOpenSettings) {
+                                Text("Zu den Einstellungen")
+                            }
+                        }
+                    }
+                }
+            }
+
+            /* -------- Autonomie -------- */
+            SectionHeader("Autonomie")
+            GroupCard {
+                Column {
+                    ModeTile(
+                        title = "Ask",
+                        subtitle = "Jede Aktion wird vor der Ausführung bestätigt",
+                        selected = state.mode == AgentMode.ASK,
+                        onClick = { vm.update { it.copy(mode = AgentMode.ASK) } },
+                    )
+                    TileDivider()
+                    ModeTile(
+                        title = "Accept Edits",
+                        subtitle = "Datei-Änderungen laufen automatisch, alles andere wird gefragt",
+                        selected = state.mode == AgentMode.ACCEPT_EDITS,
+                        onClick = { vm.update { it.copy(mode = AgentMode.ACCEPT_EDITS) } },
+                    )
+                    TileDivider()
+                    ModeTile(
+                        title = "Auto",
+                        subtitle = "Agent entscheidet selbst, Push nur manuell",
+                        selected = state.mode == AgentMode.AUTO,
+                        onClick = { vm.update { it.copy(mode = AgentMode.AUTO) } },
+                    )
+                    TileDivider()
+                    ModeTile(
+                        title = "Yolo",
+                        subtitle = "Vollautomatisch inkl. Push und Draft-PR – ohne Nachfrage",
+                        warning = true,
+                        selected = state.mode == AgentMode.YOLO,
+                        onClick = { vm.update { it.copy(mode = AgentMode.YOLO) } },
+                    )
+                }
+            }
 
             /* -------- Netzwerk -------- */
-            SectionHeader("Netzwerk", modifier = Modifier.padding(0.dp))
-            ModeTile(
-                title = "Allowlist",
-                subtitle = "Nur GitHub, KI-Anbieter & Paket-Registries (empfohlen)",
-                selected = state.networkPolicy == "allowlist",
-                onClick = { vm.update { it.copy(networkPolicy = "allowlist") } },
-            )
-            ModeTile(
-                title = "Isoliert",
-                subtitle = "Kein Internetzugriff – nur für lokale Aufgaben",
-                selected = state.networkPolicy == "isolated",
-                onClick = { vm.update { it.copy(networkPolicy = "isolated") } },
-            )
-            ModeTile(
-                title = "Offen",
-                subtitle = "Vollständiger Netzwerkzugriff (wie lokal)",
-                selected = state.networkPolicy == "open",
-                onClick = { vm.update { it.copy(networkPolicy = "open") } },
-            )
+            SectionHeader("Netzwerk")
+            GroupCard {
+                Column {
+                    ModeTile(
+                        title = "Allowlist",
+                        subtitle = "Nur GitHub, KI-Anbieter & Paket-Registries (empfohlen)",
+                        selected = state.networkPolicy == "allowlist",
+                        onClick = { vm.update { it.copy(networkPolicy = "allowlist") } },
+                    )
+                    TileDivider()
+                    ModeTile(
+                        title = "Isoliert",
+                        subtitle = "Kein Internetzugriff – nur für lokale Aufgaben",
+                        selected = state.networkPolicy == "isolated",
+                        onClick = { vm.update { it.copy(networkPolicy = "isolated") } },
+                    )
+                    TileDivider()
+                    ModeTile(
+                        title = "Offen",
+                        subtitle = "Vollständiger Netzwerkzugriff (wie lokal)",
+                        selected = state.networkPolicy == "open",
+                        onClick = { vm.update { it.copy(networkPolicy = "open") } },
+                    )
+                }
+            }
             Text(
                 text = "Standard ist Allowlist – der Agent kommt nur an whitelistede Domains.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 28.dp),
             )
 
             /* -------- Erweitert -------- */
-            Surface(
-                shape = MaterialTheme.shapes.large,
-                color = MaterialTheme.colorScheme.surfaceContainer,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clickable { advanced = !advanced },
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.padding(start = 16.dp, end = 8.dp, top = 6.dp, bottom = 6.dp),
-                ) {
-                    Text(
-                        text = "Erweitert",
-                        style = MaterialTheme.typography.titleSmall,
-                        modifier = Modifier.weight(1f),
-                    )
-                    IconButton(onClick = { advanced = !advanced }) {
-                        Icon(
-                            if (advanced) Icons.Outlined.UnfoldLess else Icons.Outlined.UnfoldMore,
-                            contentDescription = null,
-                        )
-                    }
-                }
-            }
-            AnimatedVisibility(visible = advanced) {
-                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
-                        OutlinedTextField(
-                            value = state.provider,
-                            onValueChange = { v -> vm.update { it.copy(provider = v) } },
-                            label = { Text("Provider") },
-                            singleLine = true,
+            Spacer(modifier = Modifier.height(8.dp))
+            GroupCard {
+                Column {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { advanced = !advanced }
+                            .padding(start = 20.dp, end = 8.dp, top = 6.dp, bottom = 6.dp),
+                    ) {
+                        Text(
+                            text = "Erweitert",
+                            style = MaterialTheme.typography.titleSmall,
                             modifier = Modifier.weight(1f),
                         )
-                        OutlinedTextField(
-                            value = state.model,
-                            onValueChange = { v -> vm.update { it.copy(model = v) } },
-                            label = { Text("Modell") },
-                            placeholder = { Text("Default") },
-                            singleLine = true,
-                            modifier = Modifier.weight(1f),
-                        )
+                        IconButton(onClick = { advanced = !advanced }) {
+                            Icon(
+                                if (advanced) Icons.Outlined.UnfoldLess else Icons.Outlined.UnfoldMore,
+                                contentDescription = null,
+                            )
+                        }
                     }
-                    OutlinedTextField(
-                        value = state.branch,
-                        onValueChange = { v -> vm.update { it.copy(branch = v) } },
-                        label = { Text("Basis-Branch (optional)") },
-                        placeholder = { Text("Default-Branch des Repos") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth(),
-                    )
+                    AnimatedVisibility(visible = advanced) {
+                        Column(
+                            verticalArrangement = Arrangement.spacedBy(12.dp),
+                            modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 16.dp),
+                        ) {
+                            OutlinedTextField(
+                                value = state.model,
+                                onValueChange = { v -> vm.update { it.copy(model = v) } },
+                                label = { Text("Modell") },
+                                placeholder = { Text("Default") },
+                                singleLine = true,
+                                shape = MaterialTheme.shapes.small,
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                            OutlinedTextField(
+                                value = state.branch,
+                                onValueChange = { v -> vm.update { it.copy(branch = v) } },
+                                label = { Text("Basis-Branch (optional)") },
+                                placeholder = { Text("Default-Branch des Repos") },
+                                singleLine = true,
+                                shape = MaterialTheme.shapes.small,
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
+                    }
                 }
             }
 
             state.error?.let {
-                Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                Text(
+                    text = it,
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(horizontal = 28.dp),
+                )
             }
 
+            /* -------- Start -------- */
+            Spacer(modifier = Modifier.height(8.dp))
             Button(
                 onClick = { vm.create() },
                 enabled = !state.busy && state.repoId != null,
-                modifier = Modifier.fillMaxWidth(),
+                shape = PillShape,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp)
+                    .height(52.dp),
             ) {
                 if (state.busy) {
-                    CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.width(18.dp))
+                    CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.size(18.dp))
                     Spacer(modifier = Modifier.width(8.dp))
                 }
                 Text(if (state.busy) "Session startet …" else "Session starten")
             }
+            Spacer(modifier = Modifier.height(20.dp))
         }
     }
 
@@ -388,6 +513,133 @@ fun NewSessionScreen(
             },
         )
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* Agent cards                                                         */
+/* ------------------------------------------------------------------ */
+
+@Composable
+private fun AdapterCard(
+    descriptor: AdapterDescriptor,
+    selected: Boolean,
+    keyPresent: Boolean,
+    onClick: () -> Unit,
+) {
+    Surface(
+        shape = MaterialTheme.shapes.large,
+        color = if (selected) {
+            MaterialTheme.colorScheme.secondaryContainer
+        } else {
+            MaterialTheme.colorScheme.surfaceContainer
+        },
+        border = if (selected) {
+            BorderStroke(2.dp, MaterialTheme.colorScheme.primary)
+        } else {
+            null
+        },
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp)
+            .clickable(onClick = onClick),
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 18.dp, vertical = 14.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = descriptor.name,
+                    style = MaterialTheme.typography.titleMedium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                KeyStatusBadge(keyPresent = keyPresent)
+            }
+            descriptor.description?.takeIf { it.isNotBlank() }?.let {
+                Text(
+                    text = it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            val caps = descriptor.capabilities
+            if (caps.approvals || caps.resume || caps.streaming) {
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    if (caps.approvals) CapabilityChip("Rückfragen")
+                    if (caps.resume) CapabilityChip("Fortsetzen")
+                    if (caps.streaming) CapabilityChip("Streaming")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CapabilityChip(text: String) {
+    Text(
+        text = text,
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier
+            .background(MaterialTheme.colorScheme.surfaceVariant, PillShape)
+            .padding(horizontal = 9.dp, vertical = 3.dp),
+    )
+}
+
+@Composable
+private fun KeyStatusBadge(keyPresent: Boolean) {
+    val s = semantic()
+    val color = if (keyPresent) s.success else s.warning
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Box(
+            modifier = Modifier
+                .size(7.dp)
+                .background(color, CircleShape),
+        )
+        Spacer(modifier = Modifier.width(5.dp))
+        Text(
+            text = if (keyPresent) "Zugang hinterlegt" else "Key fehlt",
+            style = MaterialTheme.typography.labelSmall,
+            color = color,
+        )
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Provider chips                                                      */
+/* ------------------------------------------------------------------ */
+
+@Composable
+private fun ProviderChip(
+    label: String,
+    selected: Boolean,
+    keyPresent: Boolean,
+    onClick: () -> Unit,
+) {
+    val s = semantic()
+    FilterChip(
+        selected = selected,
+        onClick = onClick,
+        shape = PillShape,
+        label = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    modifier = Modifier
+                        .size(7.dp)
+                        .background(if (keyPresent) s.success else s.warning, CircleShape),
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(label)
+            }
+        },
+    )
 }
 
 /* ------------------------------------------------------------------ */
@@ -409,11 +661,12 @@ private fun RepoSelector(
         color = MaterialTheme.colorScheme.surfaceContainer,
         modifier = Modifier
             .fillMaxWidth()
+            .padding(horizontal = 12.dp)
             .clickable { expanded = true },
     ) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.padding(start = 16.dp, end = 8.dp, top = 6.dp, bottom = 6.dp),
+            modifier = Modifier.padding(start = 18.dp, end = 10.dp, top = 10.dp, bottom = 10.dp),
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(
@@ -474,6 +727,7 @@ fun AddRepoDialog(
                     label = { Text("owner/repo") },
                     placeholder = { Text("robinrehbein/remote-control") },
                     singleLine = true,
+                    shape = MaterialTheme.shapes.small,
                     isError = fullName.isNotBlank() && !valid,
                     supportingText = if (fullName.isNotBlank() && !valid) {
                         { Text("Format: owner/repo") }
@@ -487,6 +741,7 @@ fun AddRepoDialog(
                     label = { Text("Basis-Branch (optional)") },
                     placeholder = { Text("main") },
                     singleLine = true,
+                    shape = MaterialTheme.shapes.small,
                 )
                 Text(
                     "Für private Repos zusätzlich ein github-Secret in den Einstellungen hinterlegen.",
@@ -505,8 +760,16 @@ fun AddRepoDialog(
 }
 
 /* ------------------------------------------------------------------ */
-/* Mode tiles                                                          */
+/* Mode tiles (grouped list rows, One UI settings style)               */
 /* ------------------------------------------------------------------ */
+
+@Composable
+private fun TileDivider() {
+    HorizontalDivider(
+        color = MaterialTheme.colorScheme.outlineVariant,
+        modifier = Modifier.padding(start = 56.dp, end = 16.dp),
+    )
+}
 
 @Composable
 private fun ModeTile(
@@ -516,38 +779,29 @@ private fun ModeTile(
     selected: Boolean,
     onClick: () -> Unit,
 ) {
-    Surface(
-        shape = MaterialTheme.shapes.large,
-        color = if (selected) {
-            MaterialTheme.colorScheme.secondaryContainer
-        } else {
-            MaterialTheme.colorScheme.surfaceContainer
-        },
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick),
+            .clickable(onClick = onClick)
+            .padding(start = 4.dp, end = 16.dp, top = 4.dp, bottom = 4.dp),
     ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.padding(start = 4.dp, end = 16.dp, top = 4.dp, bottom = 4.dp),
-        ) {
-            RadioButton(selected = selected, onClick = onClick)
-            Column(modifier = Modifier.padding(start = 4.dp, top = 10.dp, bottom = 10.dp)) {
-                Text(
-                    text = title,
-                    style = MaterialTheme.typography.titleSmall,
-                    color = if (warning && selected) {
-                        MaterialTheme.colorScheme.error
-                    } else {
-                        MaterialTheme.colorScheme.onSurface
-                    },
-                )
-                Text(
-                    text = subtitle,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
+        RadioButton(selected = selected, onClick = onClick)
+        Column(modifier = Modifier.padding(start = 4.dp, top = 10.dp, bottom = 10.dp)) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.titleSmall,
+                color = if (warning && selected) {
+                    MaterialTheme.colorScheme.error
+                } else {
+                    MaterialTheme.colorScheme.onSurface
+                },
+            )
+            Text(
+                text = subtitle,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     }
 }

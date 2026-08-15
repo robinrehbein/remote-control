@@ -13,23 +13,20 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -85,21 +82,13 @@ fun DiffScreen(
     }
     val state by vm.state.collectAsState()
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("Änderungen") },
-                navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Zurück")
-                    }
-                },
-                actions = {
-                    IconButton(onClick = { vm.load() }) {
-                        Icon(Icons.Outlined.Refresh, contentDescription = "Aktualisieren")
-                    }
-                },
-            )
+    OneUiScaffold(
+        title = "Änderungen",
+        onBack = onBack,
+        actions = {
+            IconButton(onClick = { vm.load() }) {
+                Icon(Icons.Outlined.Refresh, contentDescription = "Aktualisieren")
+            }
         },
     ) { padding ->
         when {
@@ -109,7 +98,7 @@ fun DiffScreen(
                     .padding(padding),
                 contentAlignment = Alignment.Center,
             ) {
-                androidx.compose.material3.CircularProgressIndicator()
+                CircularProgressIndicator()
             }
 
             state.error != null -> Box(
@@ -140,7 +129,7 @@ fun DiffScreen(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(padding),
-                contentPadding = PaddingValues(16.dp),
+                contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 24.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 items(state.entries, key = { it.path }) { entry ->
@@ -170,12 +159,12 @@ private fun DiffEntryCard(entry: DiffEntry) {
         color = MaterialTheme.colorScheme.surfaceContainer,
         modifier = Modifier.fillMaxWidth(),
     ) {
-        Column(Modifier.padding(vertical = 10.dp)) {
+        Column(Modifier.padding(vertical = 12.dp)) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 14.dp),
+                    .padding(horizontal = 16.dp),
             ) {
                 Text(
                     text = entry.path.substringAfterLast('/'),
@@ -191,18 +180,18 @@ private fun DiffEntryCard(entry: DiffEntry) {
                 text = entry.path,
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(horizontal = 14.dp, vertical = 2.dp),
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp),
             )
             if (entry.binary == true) {
                 Text(
                     text = "Binäre Datei",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
                 )
             } else {
                 Surface(
-                    color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    color = MaterialTheme.colorScheme.surfaceContainerHighest,
                     shape = MaterialTheme.shapes.medium,
                     modifier = Modifier
                         .fillMaxWidth()

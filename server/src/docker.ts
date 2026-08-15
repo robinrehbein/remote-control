@@ -26,9 +26,15 @@ function docker(): Docker | null {
   return client;
 }
 
-/** true when session containers run on a remote daemon; shim ports are then published on the docker host. */
+/**
+ * true when session containers run on a *remote* daemon; shim ports are then
+ * published on the docker host and policies are forced to 'open'.
+ * A DOCKER_HOST pointing at a docker socket proxy is still the local daemon,
+ * so DOCKER_HOST_IS_LOCAL=1 keeps the full local behaviour (session networks,
+ * egress proxy, no port publishes).
+ */
 export function isRemote(): boolean {
-  return config.dockerHost !== null;
+  return config.dockerHost !== null && !config.dockerHostIsLocal;
 }
 
 export function parseMem(spec: string): number {
@@ -65,10 +71,15 @@ export async function ensureNetwork(): Promise<void> {
 }
 
 /**
- * Attach the orchestrator's own container (socket mode only; HOSTNAME is the
+ * Attach the orchestrator's own container (local mode only; HOSTNAME is the
  * container id inside docker) to a network so it can reach session shims by
  * alias and shims can reach the egress proxy. Idempotent, errors are logged
  * but never thrown (e.g. running outside docker).
+ *
+ * Works for both local variants: raw socket mount and socket proxy, since the
+ * proxy talks to the very same daemon, so HOSTNAME still resolves to a
+ * container the daemon knows. Skipped only for a truly remote daemon, where
+ * HOSTNAME means nothing.
  */
 export async function ensureSelfAttached(networkName: string): Promise<void> {
   const d = docker();
@@ -129,7 +140,7 @@ export async function removeSessionNetwork(sessionId: string): Promise<void> {
   }
 }
 
-/** Remote daemons publish shim ports; session networks only work in socket mode. */
+/** Remote daemons publish shim ports; session networks only work in local mode (socket or socket proxy). */
 function policyFor(session: SessionRow): NetworkPolicy {
   if (isRemote()) return 'open';
   const raw = session.network_policy;

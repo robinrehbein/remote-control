@@ -36,6 +36,12 @@ function dockerHost(): string | null {
   return raw && raw.length > 0 ? raw : null;
 }
 
+/** Marks a set DOCKER_HOST as the *local* daemon reached through a socket proxy. */
+function dockerHostIsLocal(): boolean {
+  const raw = process.env.DOCKER_HOST_IS_LOCAL?.trim();
+  return raw === '1' || raw === 'true';
+}
+
 function dockerAddr(fallbackHost: string | null): string | null {
   const raw = process.env.DOCKER_ADDR?.trim();
   if (raw && raw.length > 0) return raw;
@@ -95,6 +101,13 @@ export const config = {
   dockerEnabled: loadDockerEnabled(),
   /** null => local /var/run/docker.sock; tcp://host:port => remote daemon (session containers run elsewhere, e.g. orchestrator on Fly.io + Docker host at home) */
   dockerHost: dockerHost(),
+  /**
+   * Marks a set DOCKER_HOST as the same local daemon, only reached through a
+   * docker socket proxy (hardening stage 2, e.g. http://socket-proxy:2375).
+   * Session networks and the egress proxy stay active and no shim ports are
+   * published - i.e. everything behaves exactly like plain socket mode.
+   */
+  dockerHostIsLocal: dockerHostIsLocal(),
   /** Hostname/IP the orchestrator uses to reach published shim ports on the docker host (defaults to DOCKER_HOST's hostname) */
   dockerAddr: dockerAddr(dockerHost()),
   dockerTls: {

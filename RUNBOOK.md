@@ -94,6 +94,46 @@ Pull requests R/W je Repo), danach pro Adapter siehe README-Tabelle
 - Verweis: Socket-Härtung via Socket-Proxy und Remote-Runner-Modus (eigene
   Sektionen/README) für mehr Isolation.
 
+## Socket-Proxy (Härtung Stufe 2)
+
+Optional. Standard bleibt der direkte `docker.sock`-Mount — nichts ändert sich,
+solange das Profil nicht gestartet wird.
+
+**Was es bringt:** Der Orchestrator sieht nicht mehr die komplette Docker-API,
+sondern nur die per Env freigeschalteten Endpunkte (Container, Images, Netze,
+Volumes + Schreiboperationen; `EXEC`, `BUILD`, `SWARM`, `SYSTEM` sind aus).
+Der rohe Socket steckt nur noch im Proxy-Container (read-only gemountet), nicht
+mehr im Node-Prozess, der WebSocket-Traffic aus dem Internet verarbeitet. Ein
+RCE im Orchestrator kann damit z. B. kein `docker exec` in fremde Container und
+kein Image-Build mit beliebigem Kontext mehr auslösen.
+
+**Was es NICHT ist:** keine Sicherheitsgrenze. Wer Container erstellen und
+starten darf (das braucht PocketAgent per Definition), kann sich mit
+Bind-Mounts/Privileges praktisch immer Root auf dem Host verschaffen. Der Proxy
+ist eine Hürde und eine Verkleinerung der Angriffsfläche, kein Sandkasten.
+Echte Trennung gibt es erst, wenn der Docker-Daemon auf einer anderen Maschine
+läuft → **Remote-Runner-Modus** (`DOCKER_HOST` auf einen separaten Host, siehe
+`FLY.md`); dann ist ein kompromittierter Orchestrator vom eigenen Host isoliert.
+
+**Aktivieren** (3 Schritte in `docker-compose.yml`, Blöcke sind dort schon
+auskommentiert vorbereitet):
+
+```bash
+# 1. beim orchestrator: Volume-Zeile /var/run/docker.sock entfernen,
+#    networks: [default, socketproxy] aktivieren
+# 2. beim orchestrator: DOCKER_HOST=http://socket-proxy:2375 und DOCKER_HOST_IS_LOCAL=1 setzen
+docker compose --profile socketproxy up -d
+```
+
+`DOCKER_HOST_IS_LOCAL=1` ist Pflicht: ohne das Flag hält der Server jedes
+gesetzte `DOCKER_HOST` für einen entfernten Daemon, erzwingt Netzwerk-Policy
+`open` und published Shim-Ports auf dem Host. Mit dem Flag bleibt alles wie im
+Socket-Modus (Session-Netze, Allowlist-Egress-Proxy, keine Port-Publishes).
+
+Prüfen nach dem Start: `docker compose logs socket-proxy` (403-Zeilen zeigen
+einen zu eng gesetzten Env-Schalter), `/api/health` grün, und eine Testsession
+mit Policy `allowlist` starten — geht Egress durch, stimmen Netze und Proxy.
+
 ## Bekannte Grenzen (bewusst)
 
 - Junie: keine Remote-Approvals (ein-shot-CLI) → App zeigt Warnbanner; ask/acceptEdits

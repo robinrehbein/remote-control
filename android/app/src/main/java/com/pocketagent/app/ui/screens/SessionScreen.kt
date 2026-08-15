@@ -297,6 +297,17 @@ fun SessionScreen(
                             session?.let { StatusBadge(it.status, pulse = it.status == SessionStatus.RUNNING) }
                             InfoChip(session?.adapter ?: "")
                             InfoChip(session?.mode?.wireName() ?: "")
+                            session?.networkPolicy
+                                ?.takeIf { it != "allowlist" }
+                                ?.let { policy ->
+                                    InfoChip(
+                                        when (policy) {
+                                            "open" -> "net: offen"
+                                            "isolated" -> "net: isoliert"
+                                            else -> "net: $policy"
+                                        }
+                                    )
+                                }
                         }
                     }
                 },

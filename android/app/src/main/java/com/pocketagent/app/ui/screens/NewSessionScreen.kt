@@ -72,6 +72,7 @@ class NewSessionViewModel : ViewModel() {
         val model: String = "",
         val mode: AgentMode = AgentMode.AUTO,
         val branch: String = "",
+        val networkPolicy: String = "allowlist",
         val busy: Boolean = false,
         val error: String? = null,
         val createdSessionId: String? = null,
@@ -126,6 +127,7 @@ class NewSessionViewModel : ViewModel() {
                 model = s.model.trim(),
                 mode = s.mode,
                 branch = s.branch.trim().ifBlank { null },
+                networkPolicy = s.networkPolicy,
             )
             result.fold(
                 onSuccess = {
@@ -276,6 +278,32 @@ fun NewSessionScreen(
                 warning = true,
                 selected = state.mode == AgentMode.YOLO,
                 onClick = { vm.update { it.copy(mode = AgentMode.YOLO) } },
+            )
+
+            /* -------- Netzwerk -------- */
+            SectionHeader("Netzwerk", modifier = Modifier.padding(0.dp))
+            ModeTile(
+                title = "Allowlist",
+                subtitle = "Nur GitHub, KI-Anbieter & Paket-Registries (empfohlen)",
+                selected = state.networkPolicy == "allowlist",
+                onClick = { vm.update { it.copy(networkPolicy = "allowlist") } },
+            )
+            ModeTile(
+                title = "Isoliert",
+                subtitle = "Kein Internetzugriff – nur für lokale Aufgaben",
+                selected = state.networkPolicy == "isolated",
+                onClick = { vm.update { it.copy(networkPolicy = "isolated") } },
+            )
+            ModeTile(
+                title = "Offen",
+                subtitle = "Vollständiger Netzwerkzugriff (wie lokal)",
+                selected = state.networkPolicy == "open",
+                onClick = { vm.update { it.copy(networkPolicy = "open") } },
+            )
+            Text(
+                text = "Standard ist Allowlist – der Agent kommt nur an whitelistede Domains.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
 
             /* -------- Erweitert -------- */

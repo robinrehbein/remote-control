@@ -1,11 +1,13 @@
 import Fastify from 'fastify';
 import websocket from '@fastify/websocket';
+import type { Server as HttpServer } from 'node:http';
 import type { PairingConfirmBody } from '@pocketagent/protocol';
 import { SERVER_VERSION, config } from './config.js';
 import { Store } from './db.js';
 import { SessionManager } from './sessions.js';
 import { Hub, registerWs } from './ws.js';
 import { confirmPairing, generatePairingCode, adminTokenOk } from './pairing.js';
+import { startEgressProxy } from './egress-proxy.js';
 
 export interface App {
   app: ReturnType<typeof Fastify>;
@@ -56,12 +58,23 @@ export async function main(): Promise<void> {
   const { app, manager } = await buildApp();
   await app.listen({ port: config.port, host: '0.0.0.0' });
   console.log(`[orchestrator] listening on :${config.port} (docker=${config.dockerEnabled})`);
+  let egress: HttpServer | null = null;
+  if (config.dockerEnabled) {
+    try {
+      egress = startEgressProxy();
+      egress.on('error', (e) => console.error(`[orchestrator] egress proxy error: ${String(e)}`));
+      console.log(`[orchestrator] egress proxy listening on :${config.egressProxyPort}`);
+    } catch (e) {
+      console.error(`[orchestrator] egress proxy failed to start: ${String(e)}`);
+    }
+  }
   manager.start();
   let closing = false;
   const shutdown = (): void => {
     if (closing) return;
     closing = true;
     manager.shutdown();
+    egress?.close();
     void app.close().finally(() => process.exit(0));
   };
   process.on('SIGINT', shutdown);

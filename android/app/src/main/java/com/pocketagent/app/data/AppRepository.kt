@@ -219,9 +219,10 @@ class AppRepository(
         model: String,
         mode: AgentMode,
         branch: String?,
+        networkPolicy: String? = null,
     ): Result<Unit> {
         val response = request { id ->
-            encodeSessionCreate(id, repoId, adapter, provider, model, mode, branch)
+            encodeSessionCreate(id, repoId, adapter, provider, model, mode, branch, networkPolicy)
         }
         return when (response) {
             is ServerMessage.ErrorMsg -> Result.failure(IllegalStateException(response.message))

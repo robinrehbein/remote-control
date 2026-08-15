@@ -110,6 +110,7 @@ data class SessionInfo(
     val createdAt: String,
     val lastActiveAt: String,
     val prUrl: String? = null,
+    val networkPolicy: String? = null,
 )
 
 @Serializable
@@ -529,6 +530,7 @@ fun encodeSessionCreate(
     model: String,
     mode: AgentMode,
     branch: String?,
+    networkPolicy: String? = null,
 ): String = buildJsonObject {
     put("type", "session.create")
     put("requestId", requestId)
@@ -538,6 +540,7 @@ fun encodeSessionCreate(
     put("model", model)
     put("mode", mode.wireName())
     branch?.let { put("branch", it) }
+    networkPolicy?.let { put("networkPolicy", it) }
 }.toString()
 
 fun encodeSessionPrompt(sessionId: String, text: String, mode: AgentMode?): String = buildJsonObject {

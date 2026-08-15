@@ -240,6 +240,17 @@ private fun SessionCard(session: SessionInfo, onClick: () -> Unit) {
                 InfoChip(session.adapter)
                 if (session.model.isNotBlank()) InfoChip(session.model)
                 InfoChip(session.mode.wireName())
+                session.networkPolicy
+                    ?.takeIf { it != "allowlist" }
+                    ?.let { policy ->
+                        InfoChip(
+                            when (policy) {
+                                "open" -> "net: offen"
+                                "isolated" -> "net: isoliert"
+                                else -> "net: $policy"
+                            }
+                        )
+                    }
             }
             session.prUrl?.let { url ->
                 Text(

@@ -5,12 +5,13 @@ import type {
   AgentMode,
   ClientMessage,
   DiffEntry,
+  NetworkPolicy,
   PermissionDecision,
   ServerMessage,
   SessionInfo,
   SessionStatus,
 } from '@pocketagent/protocol';
-import { SERVER_VERSION, config } from './config.js';
+import { SERVER_VERSION, config, isNetworkPolicy } from './config.js';
 import type { LinkRow, RepoRow, SessionRow, Store } from './db.js';
 import { decrypt } from './vault.js';
 import * as docker from './docker.js';
@@ -75,6 +76,7 @@ export class SessionManager {
       pr_url: null,
       shim_endpoint: null,
       link_id: null,
+      network_policy: null,
       created_at: now,
       last_active_at: now,
     };
@@ -99,6 +101,10 @@ export class SessionManager {
     const repo = this.store.getRepo(msg.repoId);
     if (!repo) throw new Error('repo not found');
     if (!getAdapter(msg.adapter)) throw new Error(`unknown adapter "${msg.adapter}"`);
+    if (msg.networkPolicy !== undefined && !isNetworkPolicy(msg.networkPolicy)) {
+      throw new Error(`invalid networkPolicy "${String(msg.networkPolicy)}"`);
+    }
+    const networkPolicy: NetworkPolicy = msg.networkPolicy ?? config.networkPolicyDefault;
     const id = randomUUID();
     const now = new Date().toISOString();
     const row: SessionRow = {
@@ -119,6 +125,7 @@ export class SessionManager {
       pr_url: null,
       shim_endpoint: null,
       link_id: null,
+      network_policy: networkPolicy,
       created_at: now,
       last_active_at: now,
     };
@@ -408,6 +415,7 @@ export class SessionManager {
         await docker.removeContainer(row.container_id);
       }
       if (row.volume_name) await docker.removeVolume(row.volume_name);
+      await docker.removeSessionNetwork(row.id);
     }
     this.store.deleteSession(id);
   }
@@ -430,6 +438,7 @@ export class SessionManager {
       createdAt: row.created_at,
       lastActiveAt: row.last_active_at,
       ...(row.pr_url ? { prUrl: row.pr_url } : {}),
+      ...(isNetworkPolicy(row.network_policy) ? { networkPolicy: row.network_policy } : {}),
     };
   }
 

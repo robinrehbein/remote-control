@@ -1,5 +1,6 @@
 import Docker from 'dockerode';
-import { config } from './config.js';
+import type { NetworkPolicy } from '@pocketagent/protocol';
+import { config, isNetworkPolicy } from './config.js';
 import { adapterImage, getAdapter } from './adapters.js';
 import type { SessionRow } from './db.js';
 
@@ -45,6 +46,9 @@ function envArr(env: Record<string, string | undefined>): string[] {
     .map(([k, v]) => `${k}=${v as string}`);
 }
 
+/** Network alias the orchestrator container gets inside every session network. */
+const ORCHESTRATOR_ALIAS = 'orchestrator';
+
 export async function ensureNetwork(): Promise<void> {
   const d = docker();
   if (!d) return;
@@ -57,6 +61,102 @@ export async function ensureNetwork(): Promise<void> {
       /* already created concurrently */
     }
   }
+  await ensureSelfAttached(config.networkName);
+}
+
+/**
+ * Attach the orchestrator's own container (socket mode only; HOSTNAME is the
+ * container id inside docker) to a network so it can reach session shims by
+ * alias and shims can reach the egress proxy. Idempotent, errors are logged
+ * but never thrown (e.g. running outside docker).
+ */
+export async function ensureSelfAttached(networkName: string): Promise<void> {
+  const d = docker();
+  if (!d || isRemote()) return;
+  const selfId = process.env.HOSTNAME;
+  if (!selfId) return;
+  try {
+    await d.getNetwork(networkName).connect({
+      Container: selfId,
+      EndpointConfig: { Aliases: [ORCHESTRATOR_ALIAS] },
+    });
+  } catch (e) {
+    const msg = String(e);
+    if (!msg.includes('already')) {
+      console.warn(`[docker] self-attach to ${networkName} failed: ${msg}`);
+    }
+  }
+}
+
+export function sessionNetworkName(sessionId: string): string {
+  return `pocketagent-s-${sessionId.slice(0, 12)}`;
+}
+
+async function ensureSessionNetwork(sessionId: string): Promise<string> {
+  const d = docker();
+  const name = sessionNetworkName(sessionId);
+  if (!d) return name;
+  try {
+    await d.getNetwork(name).inspect();
+  } catch {
+    try {
+      await d.createNetwork({ Name: name, Internal: true, CheckDuplicate: true });
+    } catch {
+      /* already created concurrently */
+    }
+  }
+  return name;
+}
+
+/** Delete a session's internal network together with any containers left on it. */
+export async function removeSessionNetwork(sessionId: string): Promise<void> {
+  const d = docker();
+  if (!d) return;
+  const net = d.getNetwork(sessionNetworkName(sessionId));
+  try {
+    const info = await net.inspect();
+    const selfId = process.env.HOSTNAME;
+    for (const cid of Object.keys(info.Containers ?? {})) {
+      if (selfId && cid.startsWith(selfId)) {
+        await net.disconnect({ Container: cid }).catch(() => {});
+      } else {
+        await d.getContainer(cid).remove({ force: true }).catch(() => {});
+      }
+    }
+    await net.remove().catch(() => {});
+  } catch {
+    /* network gone */
+  }
+}
+
+/** Remote daemons publish shim ports; session networks only work in socket mode. */
+function policyFor(session: SessionRow): NetworkPolicy {
+  if (isRemote()) return 'open';
+  const raw = session.network_policy;
+  return isNetworkPolicy(raw) ? raw : config.networkPolicyDefault;
+}
+
+/**
+ * Resolve the container network for a session. 'open' shares the main
+ * network; 'allowlist'/'isolated' get a dedicated internal network and the
+ * orchestrator attaches itself (alias 'orchestrator'). For 'allowlist' the
+ * proxy env vars are injected into `env`.
+ */
+async function sessionNetworking(
+  session: SessionRow,
+  env: Record<string, string | undefined>,
+): Promise<{ EndpointsConfig: Record<string, { Aliases: string[] }> }> {
+  if (policyFor(session) === 'open') {
+    return { EndpointsConfig: { [config.networkName]: { Aliases: [session.id] } } };
+  }
+  const netName = await ensureSessionNetwork(session.id);
+  await ensureSelfAttached(netName);
+  if (policyFor(session) === 'allowlist') {
+    env.HTTP_PROXY = `http://${ORCHESTRATOR_ALIAS}:${config.egressProxyPort}`;
+    env.HTTPS_PROXY = `http://${ORCHESTRATOR_ALIAS}:${config.egressProxyPort}`;
+    env.NO_PROXY = 'localhost,127.0.0.1';
+  }
+  return { EndpointsConfig: { [netName]: { Aliases: [session.id] } } };
 }
 
 export async function ensureVolume(name: string): Promise<void> {
@@ -98,19 +198,23 @@ export async function createSessionContainer(
     await ensureVolume(session.volume_name);
     await pullImage(adapterImage(session.adapter));
     const remote = isRemote();
+    const containerEnv = { ...env };
+    const networking = await sessionNetworking(session, containerEnv);
     const c = await d.createContainer({
       Image: adapterImage(session.adapter),
-      Env: envArr(env),
+      Env: envArr(containerEnv),
       Labels: { 'pocketagent.session': session.id },
       ...(remote ? { ExposedPorts: { '8080/tcp': {} } } : {}),
       HostConfig: {
         Memory: parseMem(config.sessionMemLimit),
         Binds: [`${session.volume_name}:/work`],
+        CapDrop: ['ALL'],
+        SecurityOpt: ['no-new-privileges'],
+        PidsLimit: config.sessionPidsLimit,
+        Tmpfs: { '/tmp': 'rw,size=1g' },
         ...(remote ? { PortBindings: { '8080/tcp': [{ HostPort: '' }] } } : {}),
       },
-      NetworkingConfig: {
-        EndpointsConfig: { [config.networkName]: { Aliases: [session.id] } },
-      },
+      NetworkingConfig: networking,
     });
     return c.id;
   } catch (e) {
@@ -204,12 +308,22 @@ export async function oneShotPush(
   if (!d || !session.volume_name) return false;
   try {
     await pullImage(adapterImage(session.adapter));
+    const containerEnv = { ...env };
+    const networking = await sessionNetworking(session, containerEnv);
     const c = await d.createContainer({
       Image: adapterImage(session.adapter),
-      Env: envArr(env),
+      Env: envArr(containerEnv),
       Cmd: ['node', pushScriptFor(session.adapter)],
       Labels: { 'pocketagent.session': session.id },
-      HostConfig: { Binds: [`${session.volume_name}:/work`] },
+      HostConfig: {
+        Memory: parseMem(config.sessionMemLimit),
+        Binds: [`${session.volume_name}:/work`],
+        CapDrop: ['ALL'],
+        SecurityOpt: ['no-new-privileges'],
+        PidsLimit: config.sessionPidsLimit,
+        Tmpfs: { '/tmp': 'rw,size=1g' },
+      },
+      NetworkingConfig: networking,
     });
     await c.start();
     const res = await c.wait();

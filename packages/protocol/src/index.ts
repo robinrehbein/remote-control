@@ -61,6 +61,15 @@ export interface AdapterDescriptor {
 
 export type AgentMode = 'yolo' | 'auto' | 'acceptEdits' | 'ask';
 
+/**
+ * Per-session network isolation:
+ *  - 'allowlist' (default): internal docker network, egress only via the
+ *    orchestrator's HTTP(S) proxy restricted to an allowlist of hosts.
+ *  - 'isolated': internal docker network, no proxy => no internet at all.
+ *  - 'open': regular docker network with direct internet access.
+ */
+export type NetworkPolicy = 'allowlist' | 'isolated' | 'open';
+
 export type SessionStatus =
   | 'creating'   // container being created / repo being cloned
   | 'running'    // agent actively processing a prompt
@@ -222,6 +231,7 @@ export interface SessionInfo {
   createdAt: string;
   lastActiveAt: string;
   prUrl?: string;
+  networkPolicy?: NetworkPolicy;
 }
 
 export interface RepoInfo {
@@ -259,6 +269,7 @@ export type ClientMessage =
       model: string;
       mode: AgentMode;
       branch?: string;
+      networkPolicy?: NetworkPolicy;
     }
   | { type: 'session.prompt'; sessionId: string; text: string; mode?: AgentMode }
   | { type: 'session.permission'; sessionId: string; permissionId: string; decision: PermissionDecision }

@@ -1,8 +1,15 @@
 import { existsSync } from 'node:fs';
 import { createHash, randomBytes } from 'node:crypto';
 import { resolve } from 'node:path';
+import type { NetworkPolicy } from '@pocketagent/protocol';
 
 export const SERVER_VERSION = '0.1.0';
+
+export const NETWORK_POLICIES = ['allowlist', 'isolated', 'open'] as const;
+
+export function isNetworkPolicy(v: unknown): v is NetworkPolicy {
+  return typeof v === 'string' && (NETWORK_POLICIES as readonly string[]).includes(v);
+}
 
 function loadMasterKey(): Buffer {
   const raw = process.env.MASTER_KEY?.trim();
@@ -48,6 +55,39 @@ function b64Env(name: string): string | undefined {
   return buf.length > 0 ? buf.toString() : undefined;
 }
 
+const DEFAULT_NETWORK_ALLOWLIST = [
+  'github.com',
+  'api.github.com',
+  '*.githubusercontent.com',
+  'objects.githubusercontent.com',
+  'codeload.github.com',
+  'api.anthropic.com',
+  'api.openai.com',
+  'api.moonshot.cn',
+  'open.bigmodel.cn',
+  'api.z.ai',
+  'registry.npmjs.org',
+  'proxy.golang.org',
+  'pypi.org',
+  'files.pythonhosted.org',
+];
+
+function loadNetworkPolicyDefault(): NetworkPolicy {
+  const raw = process.env.NETWORK_POLICY?.trim();
+  if (isNetworkPolicy(raw)) return raw;
+  if (raw) console.warn(`[config] invalid NETWORK_POLICY "${raw}" - falling back to allowlist`);
+  return 'allowlist';
+}
+
+function loadNetworkAllowlist(): string[] {
+  const raw = process.env.NETWORK_ALLOWLIST?.trim();
+  if (!raw) return DEFAULT_NETWORK_ALLOWLIST;
+  return raw
+    .split(',')
+    .map((h) => h.trim().toLowerCase())
+    .filter((h) => h.length > 0);
+}
+
 export const config = {
   port: Number(process.env.PORT ?? 3000),
   dataDir: resolve(process.env.DATA_DIR ?? './data'),
@@ -67,4 +107,8 @@ export const config = {
   idleStopSec: Number(process.env.IDLE_STOP_SEC ?? 900),
   gcDays: Number(process.env.GC_DAYS ?? 14),
   adapterImagePrefix: process.env.ADAPTER_IMAGE_PREFIX ?? 'pocketagent',
+  networkPolicyDefault: loadNetworkPolicyDefault(),
+  networkAllowlist: loadNetworkAllowlist(),
+  egressProxyPort: Number(process.env.EGRESS_PROXY_PORT ?? 3128),
+  sessionPidsLimit: Number(process.env.SESSION_PIDS_LIMIT ?? 512),
 } as const;

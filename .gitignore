@@ -9,7 +9,7 @@ build/
 *.db-journal
 *.db-wal
 *.db-shm
-data/
+/server/data/
 logs/
 .DS_Store
 .gradle/
@@ -21,3 +21,5 @@ google-services.json
 .claude/
 .opencode/
 .kilo/
+.tools/
+dist/

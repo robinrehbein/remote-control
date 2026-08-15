@@ -5,7 +5,7 @@ import { SERVER_VERSION, config } from './config.js';
 import { Store } from './db.js';
 import { SessionManager } from './sessions.js';
 import { Hub, registerWs } from './ws.js';
-import { confirmPairing } from './pairing.js';
+import { confirmPairing, generatePairingCode, adminTokenOk } from './pairing.js';
 
 export interface App {
   app: ReturnType<typeof Fastify>;
@@ -36,6 +36,14 @@ export async function buildApp(): Promise<App> {
     const res = body ? confirmPairing(store, body) : null;
     if (!res) return reply.code(400).send({ ok: false, error: 'invalid or expired code' });
     return res;
+  });
+
+  app.post('/api/pairing/create', async (req, reply) => {
+    const token = (req.headers.authorization ?? '').replace(/^Bearer\s+/i, '');
+    if (!adminTokenOk(token)) return reply.code(401).send({ ok: false, error: 'unauthorized' });
+    const ttlMs = 10 * 60_000;
+    const code = generatePairingCode(store);
+    return { ok: true, code, expiresAt: new Date(Date.now() + ttlMs).toISOString() };
   });
 
   await app.register(websocket);

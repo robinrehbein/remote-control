@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import type { PairingConfirmBody, PairingConfirmResponse } from '@pocketagent/protocol';
 import { sha256, type Store } from './db.js';
 
@@ -8,6 +8,15 @@ export function generatePairingCode(store: Store, tenant = 'default', ttlMs = CO
   const code = randomBytes(4).toString('hex');
   store.createPairingCode(code, tenant, new Date(Date.now() + ttlMs).toISOString());
   return code;
+}
+
+/** Constant-time check of the admin token (env PAIRING_ADMIN_TOKEN); enables remote pairing-code creation when set. */
+export function adminTokenOk(token: string | undefined): boolean {
+  const expected = process.env.PAIRING_ADMIN_TOKEN;
+  if (!expected || !token) return false;
+  const a = Buffer.from(token);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
 }
 
 export function confirmPairing(

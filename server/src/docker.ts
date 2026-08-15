@@ -69,6 +69,25 @@ export async function ensureVolume(name: string): Promise<void> {
   }
 }
 
+/** Pull the adapter image (registry mode, e.g. ghcr.io); no-op when unavailable locally and pull fails are surfaced by the caller's create. */
+export async function pullImage(image: string): Promise<void> {
+  const d = docker();
+  if (!d) return;
+  await new Promise<void>((resolve) => {
+    d.pull(image, (err: Error | null, stream?: NodeJS.ReadableStream) => {
+      if (err || !stream) return resolve();
+      d.modem.followProgress(
+        stream,
+        (finErr: Error | null) => {
+          if (finErr) console.error(`[docker] pull ${image}: ${finErr.message}`);
+          resolve();
+        },
+        () => {},
+      );
+    });
+  });
+}
+
 export async function createSessionContainer(
   session: SessionRow,
   env: Record<string, string | undefined>,
@@ -77,6 +96,7 @@ export async function createSessionContainer(
   if (!d || !session.volume_name) return null;
   try {
     await ensureVolume(session.volume_name);
+    await pullImage(adapterImage(session.adapter));
     const remote = isRemote();
     const c = await d.createContainer({
       Image: adapterImage(session.adapter),
@@ -183,6 +203,7 @@ export async function oneShotPush(
   const d = docker();
   if (!d || !session.volume_name) return false;
   try {
+    await pullImage(adapterImage(session.adapter));
     const c = await d.createContainer({
       Image: adapterImage(session.adapter),
       Env: envArr(env),

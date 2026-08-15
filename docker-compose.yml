@@ -28,5 +28,36 @@ services:
       timeout: 5s
       retries: 3
 
+  # ---- adapter shim images (build-only, never run) --------------------
+  # Build all:  docker compose --profile shims build
+  # Rebuild one: docker compose --profile shims build --no-cache opencode-shim
+  # The orchestrator starts these images on demand as session containers
+  # (tags MUST stay pocketagent/<id>-shim:latest = ADAPTER_IMAGE_PREFIX default).
+  opencode-shim:
+    profiles: ["shims"]
+    build: { context: ., dockerfile: shims/opencode/Dockerfile }
+    image: pocketagent/opencode-shim:latest
+    entrypoint: ["true"]
+  kilo-shim:
+    profiles: ["shims"]
+    build: { context: ., dockerfile: shims/kilo/Dockerfile }
+    image: pocketagent/kilo-shim:latest
+    entrypoint: ["true"]
+  claude-shim:
+    profiles: ["shims"]
+    build: { context: ., dockerfile: shims/claude/Dockerfile }
+    image: pocketagent/claude-shim:latest
+    entrypoint: ["true"]
+  pi-shim:
+    profiles: ["shims"]
+    build: { context: ., dockerfile: shims/pi/Dockerfile }
+    image: pocketagent/pi-shim:latest
+    entrypoint: ["true"]
+  junie-shim:
+    profiles: ["shims"]
+    build: { context: ., dockerfile: shims/junie/Dockerfile }
+    image: pocketagent/junie-shim:latest
+    entrypoint: ["true"]
+
 volumes:
   orchestrator-data:

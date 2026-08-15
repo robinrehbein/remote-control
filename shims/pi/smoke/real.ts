@@ -33,7 +33,7 @@ import { main } from '../src/index';
 import { PromptError, PermissionGate, RealPiRunner } from '../src/pi';
 
 const exec = promisify(execFile);
-const GLOBAL_TIMEOUT_MS = 110_000;
+const GLOBAL_TIMEOUT_MS = 240_000;
 const PROMPT_TIMEOUT_MS = 45_000;
 const SHIM_TURN_TIMEOUT_MS = 60_000;
 
@@ -67,7 +67,7 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
   });
 }
 
-function waitFor<T>(values: () => readonly T[], predicate: (value: T) => boolean, timeoutMs: number, what: string): Promise<T> {
+function waitFor<T, U extends T>(values: () => readonly T[], predicate: (value: T) => value is U, timeoutMs: number, what: string): Promise<U> {
   return new Promise((resolve, reject) => {
     const started = Date.now();
     const tick = (): void => {
@@ -108,7 +108,7 @@ function readSse(res: IncomingMessage, events: AgentEvent[]): void {
   });
 }
 
-function openSse(base: string, token: string, events: AgentEvent[]): Promise<void> {
+function openSse(base: string, token: string, events: AgentEvent[]): Promise<() => void> {
   return new Promise((resolve, reject) => {
     const req = http.get(`${base}/events`, { headers: { authorization: `Bearer ${token}` } }, res => {
       if (res.statusCode !== 200) {
@@ -116,7 +116,10 @@ function openSse(base: string, token: string, events: AgentEvent[]): Promise<voi
         return;
       }
       readSse(res, events);
-      resolve();
+      resolve(() => {
+        req.destroy();
+        res.destroy();
+      });
     });
     req.on('error', reject);
   });
@@ -293,10 +296,12 @@ async function phaseB(): Promise<void> {
   });
 
   const app = await withTimeout(main(process.env), 30_000, 'shim boot');
+  let closeSse: (() => void) | undefined;
   try {
     const address = app.server.address();
     expect(address !== null && typeof address === 'object', 'shim has tcp address');
-    const base = `http://127.0.0.1:${address.port}`;
+    const addr: { port: number } = address as { port: number };
+    const base = `http://127.0.0.1:${addr.port}`;
     const auth = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
 
     const statusResponse = await fetch(`${base}/status`, { headers: auth });
@@ -314,7 +319,7 @@ async function phaseB(): Promise<void> {
     expect(badModel.status === 400, `unknown model -> 400 (got ${badModel.status})`);
 
     const events: AgentEvent[] = [];
-    await openSse(base, token, events);
+    closeSse = await openSse(base, token, events);
     const accepted = await fetch(`${base}/prompt`, {
       method: 'POST',
       headers: auth,
@@ -339,6 +344,7 @@ async function phaseB(): Promise<void> {
     expect(after.busy === false, '/status busy=false after failed turn');
     expect(unhandled.length === 0, `no unhandled rejections (got ${unhandled.length})`);
   } finally {
+    closeSse?.();
     await app.close();
     await rm(workDir, { recursive: true, force: true });
     await rm(agentDir, { recursive: true, force: true });

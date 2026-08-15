@@ -9,7 +9,7 @@ import type { AgentMode, PermissionDecision, PromptRequest, ResumeRequest, ShimS
 import { readEnv, type ShimEnvConfig } from './env';
 import { parsePermissionJson, permissionForMode, writeOpencodeConfig, type PermissionMap } from './modes';
 import * as gitops from './gitops';
-import { OpenCodeClient } from './opencode-client';
+import { OpenCodeClient, type PromptMessageBody } from './opencode-client';
 import { Broadcaster, EventNormalizer } from './events';
 
 const MODES: readonly AgentMode[] = ['yolo', 'auto', 'acceptEdits', 'ask'];
@@ -189,7 +189,7 @@ async function main(): Promise<void> {
     if (opencodeSessionId === undefined) {
       return await reply.code(409).send({ ok: false, error: 'no opencode session' });
     }
-    const payload = {
+    const payload: PromptMessageBody = {
       parts: [{ type: 'text', text }],
       ...(provider !== undefined && model !== undefined ? { model: { providerID: provider, modelID: model } } : {}),
     };

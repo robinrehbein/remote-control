@@ -111,8 +111,11 @@ async function phaseA(): Promise<string> {
   expect(settled !== undefined, `query() settled within ${QUERY_TIMEOUT_MS}ms (no hang)`);
   const failure = settled!;
   console.log(`[A] failure mode: ${failure.kind}`);
-  console.log(`[A] error: ${failure.message.split('\n')[0]}`);
+  console.log(`[A] outcome: ${failure.message.split('\n')[0]}`);
   console.log(`[A] classification: ${classifyFailure(failure.message)}`);
+  // The real SDK (0.3.233) reports missing credentials as a *successful*
+  // result whose assistant message carries the auth hint — any settled,
+  // readable outcome without hang/crash is the controlled path we assert here.
   expect(failure.message.length > 0, 'failure has a readable message');
   expect(unhandled.length === 0, `no unhandled rejections (got ${unhandled.length})`);
   return failure.message;
@@ -219,15 +222,22 @@ async function phaseB(): Promise<void> {
     expect(promptRes.status === 200, `POST /prompt accepted (got ${promptRes.status})`);
     expect((await promptRes.json() as { ok: boolean }).ok === true, 'POST /prompt ok');
 
-    const failure = await sse.wait(
-      (e) => e.type === 'turn.failed',
+    // Without credentials the SDK answers with an assistant message carrying
+    // the auth hint and ends the turn (turn.completed) — or, on other SDK
+    // versions, with turn.failed. Both are controlled outcomes; what must NOT
+    // happen is a hang, a crash, or a stuck busy flag.
+    const terminal = await sse.wait(
+      (e) => e.type === 'turn.failed' || e.type === 'turn.completed',
       QUERY_TIMEOUT_MS,
-      'turn.failed within 60s',
+      'turn.failed|turn.completed within 60s',
     );
-    if (failure.type !== 'turn.failed') throw new Error('unreachable');
-    console.log(`[B] turn.failed: ${failure.error.split('\n')[0]}`);
-    console.log(`[B] classification: ${classifyFailure(failure.error)}`);
-    expect(failure.error.length > 0, 'turn.failed carries a readable error');
+    if (terminal.type === 'turn.failed') {
+      console.log(`[B] turn.failed: ${terminal.error.split('\n')[0]}`);
+    } else {
+      const text = sse.events.find((e): e is AgentEvent & { type: 'message.completed'; text: string } => e.type === 'message.completed');
+      console.log(`[B] turn.completed with auth-hint message: ${((text?.text ?? '').split('\n')[0] ?? '').slice(0, 120)}`);
+      expect((text?.text ?? '').length > 0, 'turn.completed carries a non-empty assistant message');
+    }
 
     const status1 = (await (await fetch(`${base}/status`, { headers: auth })).json()) as Record<string, unknown>;
     expect(status1.busy === false, '/status idle after failed turn');

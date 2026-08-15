@@ -17,6 +17,8 @@ local.properties
 .idea/
 *.keystore
 *.jks
+# committed debug-grade keystore: deterministic APK signing across CI runs
+!android/keystore/pocketagent.keystore
 google-services.json
 .claude/
 .opencode/

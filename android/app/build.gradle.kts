@@ -22,12 +22,23 @@ android {
         buildConfigField("String", "FBM_SENDER_ID", "\"replace-me\"")
     }
 
+    signingConfigs {
+        create("shared") {
+            storeFile = rootProject.file("keystore/pocketagent.keystore")
+            storePassword = "pocketagent-debug-2026"
+            keyAlias = "pocketagent"
+            keyPassword = "pocketagent-debug-2026"
+        }
+    }
+
     buildTypes {
         debug {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("shared")
         }
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("shared")
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }

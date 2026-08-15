@@ -432,26 +432,33 @@ export class ClaudeSession {
     if (this.busy) throw new Error('busy');
     if (opts?.mode) this.mode = opts.mode;
     if (opts?.model) this.model = opts.model;
-    const { runner, reused } = await this.ensureRunner();
-    if (reused) {
-      if (opts?.mode) {
-        try {
-          await runner.setPermissionMode(mapMode(opts.mode));
-        } catch {
-          /* control request unsupported */
-        }
-      }
-      if (opts?.model) {
-        try {
-          await runner.setModel(opts.model);
-        } catch {
-          /* control request unsupported */
-        }
-      }
-    }
+    // Mark busy before booting the runner so boot failures (e.g. missing CLI
+    // binary, spawn errors) surface as turn.failed via SSE instead of a bare
+    // HTTP 500 with no event.
     this.busy = true;
     this.publishStatus();
-    runner.sendPrompt(text);
+    try {
+      const { runner, reused } = await this.ensureRunner();
+      if (reused) {
+        if (opts?.mode) {
+          try {
+            await runner.setPermissionMode(mapMode(opts.mode));
+          } catch {
+            /* control request unsupported */
+          }
+        }
+        if (opts?.model) {
+          try {
+            await runner.setModel(opts.model);
+          } catch {
+            /* control request unsupported */
+          }
+        }
+      }
+      runner.sendPrompt(text);
+    } catch (err) {
+      this.handleRunnerError(errMessage(err));
+    }
   }
 
   async abort(): Promise<void> {

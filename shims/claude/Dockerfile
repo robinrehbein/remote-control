@@ -12,7 +12,9 @@ WORKDIR /app/shims/claude
 
 COPY packages/protocol /app/packages/protocol
 COPY shims/claude/package.json shims/claude/package-lock.json ./
-RUN npm ci --no-audit --no-fund
+# npm ci uses the lockfile (incl. pinned native CLI platform binaries);
+# npm install as fallback in case of lockfile/platform quirks
+RUN npm ci --no-audit --no-fund || npm install --no-audit --no-fund
 
 COPY shims/claude/ ./
 

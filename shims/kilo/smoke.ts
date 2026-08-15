@@ -38,35 +38,72 @@ function sseBroadcast(obj: unknown): void {
   for (const client of sseClients) client.write(frame);
 }
 
-const assistantInfo = { sessionID: 'sess-fake', messageID: 'msg-1', role: 'assistant' };
-
 function runTurn(): void {
+  // kilo 7.x SSE wire format: {id, type, properties} envelopes
   setTimeout(() => sseBroadcast({
-    type: 'permission.ask',
-    sessionID: 'sess-fake',
-    messageID: 'msg-1',
-    permissionID: 'perm-1',
-    title: 'bash: echo hi',
-    patterns: ['bash.echo *'],
-    metadata: { type: 'bash', command: 'echo hi' },
+    type: 'permission.asked',
+    properties: {
+      id: 'perm-1',
+      sessionID: 'sess-fake',
+      permission: 'bash',
+      patterns: ['echo hi'],
+      metadata: { command: 'echo hi' },
+      always: ['bash.echo hi'],
+    },
   }), 100);
-  setTimeout(() => sseBroadcast({ type: 'message.part.updated', info: assistantInfo, part: { id: 'part-1', type: 'text', text: 'Hello' } }), 200);
-  setTimeout(() => sseBroadcast({ type: 'message.part.updated', info: assistantInfo, part: { id: 'part-1', type: 'text', text: 'Hello from fake agent' } }), 350);
   setTimeout(() => sseBroadcast({
     type: 'message.part.updated',
-    info: assistantInfo,
-    part: { id: 'part-2', type: 'tool', tool: 'bash', state: { status: 'running', input: { command: 'echo hi' }, title: 'echo hi' } },
+    properties: { sessionID: 'sess-fake', time: 1, part: { id: 'part-1', messageID: 'msg-1', type: 'text', text: 'Hello' } },
+  }), 200);
+  setTimeout(() => sseBroadcast({
+    type: 'message.part.updated',
+    properties: { sessionID: 'sess-fake', time: 2, part: { id: 'part-1', messageID: 'msg-1', type: 'text', text: 'Hello from fake agent' } },
+  }), 350);
+  setTimeout(() => sseBroadcast({
+    type: 'message.part.updated',
+    properties: {
+      sessionID: 'sess-fake',
+      time: 3,
+      part: {
+        id: 'part-2',
+        messageID: 'msg-1',
+        type: 'tool',
+        callID: 'call-1',
+        tool: 'bash',
+        state: { status: 'running', input: { command: 'echo hi' }, title: 'echo hi', time: { start: 1 } },
+      },
+    },
   }), 450);
   setTimeout(() => sseBroadcast({
     type: 'message.part.updated',
-    info: assistantInfo,
-    part: { id: 'part-2', type: 'tool', tool: 'bash', state: { status: 'completed', input: { command: 'echo hi' }, output: 'hi\n', title: 'echo hi' } },
+    properties: {
+      sessionID: 'sess-fake',
+      time: 4,
+      part: {
+        id: 'part-2',
+        messageID: 'msg-1',
+        type: 'tool',
+        callID: 'call-1',
+        tool: 'bash',
+        state: {
+          status: 'completed',
+          input: { command: 'echo hi' },
+          output: 'hi\n',
+          title: 'echo hi',
+          metadata: {},
+          time: { start: 1, end: 2 },
+        },
+      },
+    },
   }), 550);
   setTimeout(() => sseBroadcast({
     type: 'message.updated',
-    info: { id: 'msg-1', sessionID: 'sess-fake', role: 'assistant', time: { start: 1, end: 2 } },
+    properties: { sessionID: 'sess-fake', info: { id: 'msg-1', role: 'assistant', time: { created: 1, completed: 2 } } },
   }), 650);
-  setTimeout(() => sseBroadcast({ type: 'permission.update', permissionID: 'perm-1', status: 'once' }), 750);
+  setTimeout(() => sseBroadcast({
+    type: 'permission.replied',
+    properties: { sessionID: 'sess-fake', requestID: 'perm-1', reply: 'once' },
+  }), 750);
 }
 
 const fakeServer = createServer((req, res) => {
@@ -77,6 +114,17 @@ const fakeServer = createServer((req, res) => {
   if (method === 'GET' && (path === '/doc' || path === '/')) return sendJson(res, 200, { ok: true });
   if (method === 'POST' && path === '/session') return sendJson(res, 200, { id: 'sess-fake', directory: '/work' });
   if (method === 'GET' && path === '/session') return sendJson(res, 200, [{ id: 'sess-fake', directory: '/work' }]);
+  if (method === 'POST' && path === '/session/sess-fake/prompt_async') {
+    let body = '';
+    req.on('data', (chunk: Buffer) => (body += chunk.toString()));
+    req.on('end', () => {
+      prompts.push(body);
+      res.writeHead(204);
+      res.end();
+      runTurn();
+    });
+    return;
+  }
   if (method === 'POST' && path === '/session/sess-fake/message') {
     let body = '';
     req.on('data', (chunk: Buffer) => (body += chunk.toString()));
@@ -91,8 +139,9 @@ const fakeServer = createServer((req, res) => {
   if (method === 'POST' && path === '/session/sess-fake/permissions/perm-ok') return sendJson(res, 200, { ok: true });
   if (method === 'POST' && path === '/session/sess-fake/permissions/perm-missing') return sendJson(res, 404, {});
   if (method === 'GET' && path === '/session/sess-fake/diff') {
+    // kilo Snapshot.FileDiff shape: {file, patch, ...}
     return sendJson(res, 200, [
-      { path: 'a.txt', content: { type: 'patch', patch: '--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-hi\n+hello\n' } },
+      { file: 'a.txt', patch: '--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-hi\n+hello\n', additions: 1, deletions: 1, status: 'modified' },
     ]);
   }
   if (method === 'GET' && path === '/session/sess-fake/message') return sendJson(res, 200, []);

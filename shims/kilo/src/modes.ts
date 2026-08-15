@@ -3,7 +3,8 @@ import { join } from 'node:path';
 import type { AgentMode } from '@pocketagent/protocol';
 
 export type PermissionValue = 'allow' | 'ask' | 'deny';
-export type PermissionMap = Record<string, PermissionValue>;
+export type PermissionTree = Record<string, PermissionValue | Record<string, PermissionValue>>;
+export type PermissionMap = PermissionTree;
 
 const readAllow: PermissionMap = { read: 'allow', glob: 'allow', grep: 'allow', list: 'allow' };
 
@@ -13,16 +14,32 @@ export function permissionForMode(mode: AgentMode): PermissionMap {
     case 'auto':
       return {
         '*': 'allow',
-        'git push*': 'deny',
-        'bash.git push*': 'deny',
-        'rm -rf *': 'deny',
-        'bash.rm -rf *': 'deny',
+        doom_loop: 'allow',
+        // deny patterns must be nested under the tool permission; a flat
+        // "git push*" key would never match (kilo matches key=permission, value=command pattern)
+        bash: {
+          'git push*': 'deny',
+          'rm -rf *': 'deny',
+        },
       };
     case 'acceptEdits':
       return { ...readAllow, edit: 'allow', write: 'allow', bash: 'ask', webfetch: 'ask', '*': 'ask' };
     case 'ask':
       return { ...readAllow, '*': 'ask' };
   }
+}
+
+function parseValue(key: string, value: unknown): PermissionValue | Record<string, PermissionValue> {
+  if (value === 'allow' || value === 'ask' || value === 'deny') return value;
+  if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+    const nested: Record<string, PermissionValue> = {};
+    for (const [nestedKey, nestedValue] of Object.entries(value)) {
+      if (nestedValue === 'allow' || nestedValue === 'ask' || nestedValue === 'deny') nested[nestedKey] = nestedValue;
+      else throw new Error(`OPENCODE_PERMISSION["${key}"]["${nestedKey}"] must be allow|ask|deny`);
+    }
+    return nested;
+  }
+  throw new Error(`OPENCODE_PERMISSION["${key}"] must be allow|ask|deny or a nested map of those`);
 }
 
 export function parsePermissionJson(json: string): PermissionMap {
@@ -32,25 +49,27 @@ export function parsePermissionJson(json: string): PermissionMap {
   }
   const out: PermissionMap = {};
   for (const [key, value] of Object.entries(parsed)) {
-    if (value === 'allow' || value === 'ask' || value === 'deny') out[key] = value;
-    else throw new Error(`OPENCODE_PERMISSION["${key}"] must be allow|ask|deny`);
+    out[key] = parseValue(key, value);
   }
   return out;
 }
 
 export interface OpencodeConfig {
   permission: PermissionMap;
-  doom_loop?: 'allow';
 }
 
-export function buildConfig(permission: PermissionMap, mode: AgentMode): OpencodeConfig {
-  return mode === 'yolo' || mode === 'auto' ? { permission, doom_loop: 'allow' } : { permission };
+export function buildConfig(permission: PermissionMap, _mode: AgentMode): OpencodeConfig {
+  // kilo rejects config files with unrecognized top-level keys (InvalidError =>
+  // the whole file is skipped), so only send keys that exist in kilo's
+  // ConfigV1 schema; doom_loop belongs inside `permission`.
+  void _mode;
+  return { permission };
 }
 
 export function writeOpencodeConfig(workDir: string, permission: PermissionMap, mode: AgentMode): string {
   const body = JSON.stringify(buildConfig(permission, mode), null, 2) + '\n';
-  // kilo is an OpenCode fork; depending on version it reads kilo.json or
-  // opencode.json, so write both to be safe.
+  // kilo discovers project config for both names ("kilo" and "opencode" walk
+  // up from the instance directory), so write both to be safe.
   const primary = join(workDir, 'kilo.json');
   writeFileSync(primary, body);
   writeFileSync(join(workDir, 'opencode.json'), body);

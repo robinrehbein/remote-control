@@ -62,8 +62,10 @@ export class OpenCodeClient {
     return false;
   }
 
-  async createSession(directory: string): Promise<string | undefined> {
-    const res = await this.json<{ id?: string; data?: { id?: string } }>('POST', '/session', { directory });
+  async createSession(_directory: string): Promise<string | undefined> {
+    // opencode 1.18 POST /session: body optional (empty body -> create({})),
+    // sessions bind to the server's cwd; response is Session.Info with top-level id
+    const res = await this.json<{ id?: string; data?: { id?: string } }>('POST', '/session');
     return res.data?.id ?? res.data?.data?.id;
   }
 
@@ -82,6 +84,15 @@ export class OpenCodeClient {
     return res.status;
   }
 
+  /**
+   * opencode >= 1.18: POST /session/:id/prompt_async returns 204 immediately;
+   * model/turn failures are reported later via `session.error` events on the bus.
+   */
+  async promptMessageAsync(sessionId: string, body: PromptMessageBody): Promise<number> {
+    const res = await this.json('POST', `/session/${encodeURIComponent(sessionId)}/prompt_async`, body, 15000);
+    return res.status;
+  }
+
   async abort(sessionId: string): Promise<number> {
     const res = await this.json('POST', `/session/${encodeURIComponent(sessionId)}/abort`, {});
     return res.status;
@@ -95,17 +106,22 @@ export class OpenCodeClient {
   }
 
   async diff(sessionId: string): Promise<DiffEntry[]> {
+    // opencode 1.18 GET /session/:id/diff returns Snapshot.FileDiff[] entries
+    // shaped {file?, patch?, additions, deletions, status?} — the path field is
+    // `file`; older builds used {path, content: {type, patch}}
     const res = await this.json<unknown>('GET', `/session/${encodeURIComponent(sessionId)}/diff`);
     if (!Array.isArray(res.data)) return [];
     const out: DiffEntry[] = [];
     for (const raw of res.data) {
-      const d = raw as { path?: unknown; patch?: unknown; content?: { type?: unknown; patch?: unknown } } | null;
-      if (d === null || typeof d !== 'object' || typeof d.path !== 'string') continue;
+      const d = raw as { path?: unknown; file?: unknown; patch?: unknown; content?: { type?: unknown; patch?: unknown } } | null;
+      if (d === null || typeof d !== 'object') continue;
+      const path = typeof d.path === 'string' ? d.path : typeof d.file === 'string' ? d.file : undefined;
+      if (path === undefined) continue;
       const patch = typeof d.patch === 'string' ? d.patch : d.content?.patch;
       out.push({
-        path: d.path,
+        path,
         patch: typeof patch === 'string' ? patch : '',
-        binary: d.content?.type === 'binary',
+        binary: d.content?.type === 'binary' || typeof patch !== 'string',
       });
     }
     return out;

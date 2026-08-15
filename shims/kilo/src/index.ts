@@ -1,8 +1,9 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { timingSafeEqual } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { createRequire } from 'node:module';
-import { dirname, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import Fastify, { type FastifyReply } from 'fastify';
 import type { AgentMode, PermissionDecision, PromptRequest, ResumeRequest, ShimStatus } from '@pocketagent/protocol';
 import { readEnv, type ShimEnvConfig } from './env';
@@ -27,9 +28,20 @@ function resolveOpenCodeBin(): string {
 
 function spawnOpenCode(env: ShimEnvConfig, onDead: (reason: string) => void): ChildProcess {
   const bin = resolveOpenCodeBin();
+  // verified against kilo 7.4.22: `kilo serve --port <n> --hostname <h>` boots a
+  // headless server ("kilo server listening on ..."); no login required unless
+  // KILO_SERVER_PASSWORD is set (then HTTP Basic user "kilo" is enforced).
   const args = ['serve', '--port', String(env.opencodePort), '--hostname', '127.0.0.1'];
-  // inherit full env so provider credentials (OPENAI_API_KEY, ...) reach opencode
-  const isJs = /\.(c|m)?js$/.test(bin);
+  // inherit full env so provider credentials (OPENAI_API_KEY, ...) reach opencode.
+  // @kilocode/cli's bin is "./bin/kilo", a Node wrapper script without a .js
+  // extension — detect the shebang so we spawn it through process.execPath.
+  let head = '';
+  try {
+    head = readFileSync(bin, 'utf8').slice(0, 64);
+  } catch {
+    // native binary or unreadable: fall through to direct spawn
+  }
+  const isJs = /\.(c|m)?js$/.test(bin) || /^#!.*\bnode\b/.test(head);
   const child = isJs
     ? spawn(process.execPath, [bin, ...args], { cwd: env.workDir, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] })
     : spawn(bin, args, { cwd: env.workDir, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -53,6 +65,27 @@ function tokenOk(header: string | undefined, expected: string): boolean {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+function writeKiloAuth(): void {
+  // KILO_AUTH_CONTENT carries the kilo gateway auth.json so `kilo serve` can
+  // use gateway models; kilo reads it from $XDG_CONFIG_HOME/kilo/auth.json.
+  const content = process.env.KILO_AUTH_CONTENT;
+  if (content === undefined || content.length === 0) return;
+  try {
+    JSON.parse(content);
+  } catch {
+    console.error('[opencode] KILO_AUTH_CONTENT is not valid JSON; skipping auth.json write');
+    return;
+  }
+  const configDir = process.env.XDG_CONFIG_HOME ?? join(homedir(), '.config');
+  const kiloDir = join(configDir, 'kilo');
+  try {
+    mkdirSync(kiloDir, { recursive: true });
+    writeFileSync(join(kiloDir, 'auth.json'), content);
+  } catch (err) {
+    console.error(`[opencode] could not write kilo auth.json: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 async function main(): Promise<void> {
   const env = readEnv();
   if (!env.shimToken) {
@@ -70,8 +103,11 @@ async function main(): Promise<void> {
 
   const branch = await gitops.ensureRepo(env);
   writeOpencodeConfig(env.workDir, permission, mode);
+  writeKiloAuth();
 
-  const client = new OpenCodeClient(env.opencodeBase);
+  // kilo resolves the instance directory per request (query/header/cwd);
+  // pass workDir so session create/list and /event bind to the right project
+  const client = new OpenCodeClient(env.opencodeBase, env.workDir);
   let child: ChildProcess | undefined;
   if (env.opencodeSpawn) {
     child = spawnOpenCode(env, (reason) => {
@@ -85,7 +121,7 @@ async function main(): Promise<void> {
   }
 
   for (let attempt = 0; attempt < 3 && opencodeSessionId === undefined; attempt++) {
-    opencodeSessionId = await client.createSession(env.workDir);
+    opencodeSessionId = await client.createSession();
     if (opencodeSessionId === undefined) await sleep(500);
   }
   if (opencodeSessionId === undefined && env.opencodeSpawn) {
@@ -153,14 +189,20 @@ async function main(): Promise<void> {
     if (opencodeSessionId === undefined) {
       return await reply.code(409).send({ ok: false, error: 'no opencode session' });
     }
-    const status = await client.promptMessage(opencodeSessionId, {
+    const payload = {
       parts: [{ type: 'text', text }],
       ...(provider !== undefined && model !== undefined ? { model: { providerID: provider, modelID: model } } : {}),
-    });
-    if (status < 200 || status >= 300) {
-      return await reply.code(502).send({ ok: false, error: `opencode message failed (HTTP ${status})` });
-    }
+    };
+    // mark busy up-front: prompt_async returns 204 immediately and turn events
+    // can arrive on the SSE bus before this handler finishes
     normalizer.startPrompt();
+    const status = await client.promptMessage(opencodeSessionId, payload);
+    if (status < 200 || status >= 300) {
+      const error = `opencode message failed (HTTP ${status})`;
+      broadcaster.broadcast({ type: 'error', message: error, fatal: false });
+      normalizer.failTurn(error);
+      return await reply.code(502).send({ ok: false, error });
+    }
     return await reply.send({ ok: true });
   });
 
@@ -175,11 +217,11 @@ async function main(): Promise<void> {
     if (typeof body?.sessionRef !== 'string' || body.sessionRef.length === 0) {
       return await reply.code(400).send({ ok: false, error: 'sessionRef is required' });
     }
-    const sessions = await client.listSessions(env.workDir);
+    const sessions = await client.listSessions();
     if (sessions.includes(body.sessionRef)) {
       opencodeSessionId = body.sessionRef;
     } else {
-      opencodeSessionId = await client.createSession(env.workDir);
+      opencodeSessionId = await client.createSession();
     }
     if (opencodeSessionId === undefined) {
       return await reply.code(502).send({ ok: false, error: 'could not resume or create opencode session' });

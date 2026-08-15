@@ -108,6 +108,8 @@ Android: siehe `android/README.md` (lokal + CI; CI-Workflow liegt in `.github/wo
 
 ## Status / Verifikation
 
-- Alle 7 TS-Pakete: `tsc --noEmit` clean; Smokes grün (Auth, Events, Permission-Flow, Auto-Commit, Diff, Abort, Push-Script, Adapter-Registry mit 5 Manifesten)
-- Android: kompiliert via GitHub Actions (Workflow legt APK als Artifact ab), 2 JVM-Unit-Tests fürs Protocol-Parsing
-- Offen für echten Betrieb: Docker-Images auf dem Zielserver bauen, echtes Repo + echte Credentials, FCM-Service-Account setzen
+- Alle 7 TS-Pakete strict-getyped; Fake-Smokes (ohne Docker/Credentials) decken Auth, Event-Normalisierung, Permission-Flow, Auto-Commit, Diff, Abort, Push-Scripte und die Adapter-Registry ab
+- **Echte Wire-Formate verifiziert**: opencode 1.18.18 und kilo 7.4.22 Event-/HTTP-Protokolle wurden gegen den Runtime-Quellcode verifiziert und die Normalizer entsprechend gebaut (`{id,type,properties}`-Envelopes, `message.part.delta`, `session.error`/`session.status`, `permission.asked/replied`, `time.completed`, `?directory=`-Routing, `/prompt_async`, Diff-`file`-Key, verschachtelte kilo-Permission-Patterns)
+- **Real-Check-Skripte** (`npm run smoke:real`): opencode (echtes `opencode serve`), pi (echtes SDK + Gate-Extension), claude (echtes SDK, deterministischer Fehlerweg ohne Credentials) — Anleitung im `RUNBOOK.md`
+- Claude-SDK: Plattform-Binaries (`linux-x64`/`linux-arm64`, 0.3.233) sind als `optionalDependencies` gepinnt und im Lockfile verankert
+- Offen: ein finaler `npm run typecheck` + Smoke-Durchlauf in einer Shell (die Ausbau-Session hatte keine Command-Rechte) — exakte Schritte in `RUNBOOK.md` Schritt 1–2; Android-Kompilierung via GitHub-Actions beim ersten Push

@@ -123,7 +123,7 @@ export function buildApp(deps: AppDeps): FastifyInstance {
     'application/json',
     { parseAs: 'string' },
     (_request, body, done) => {
-      if (body === '' || body === undefined) {
+      if (body === '') {
         done(null, {});
         return;
       }

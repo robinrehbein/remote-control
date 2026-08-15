@@ -85,9 +85,11 @@ Screens: Pairing (QR), Session-Liste (Status, Adapter/Model-Badges), Session-Cha
 
 ## Risiken / Offene Punkte
 
-- **OpenCode-API-Stabilität**: Permission-Respond-Route teils deprecated → SSE-Event-Bus nutzen; Version pinnen
-- **Junie-Headless**: one-shot pro Prompt (kein bidirektionaler Stream, keine Permission-Callbacks dokumentiert) → Turn-Granularität statt Token-Deltas, Ask/AcceptEdits degrade auf Yolo mit App-Banner; JSON-Output-Format von Versionen abhängig → Version pinnen + defensives Parsing
-- **pi Remote-Approvals**: Spike positiv – `pi.on("tool_call")` Extension-Hook kann blocken → implementiert (ask/auto/acceptEdits Gates)
-- **Claude-Subscription**: programmatische Nutzung läuft über Subscription-Limits (Stand Juni 2026); Token-Ablauf ~1 Jahr → Renewal-Erinnerung in App
+- **Finale Verifikation ausständig**: Letzte Welle (echte Wire-Format-Fixes opencode/kilo, claude-Busy-Fix + Plattform-Binary-Pinning, pi/claude/opencode smoke:real-Skripte) entstand in einer Session ohne Shell-Rechte — manuell reviewed, aber ohne tsc/smoke-Durchlauf. RUNBOOK.md Schritt 1–2 nachziehen.
+- **OpenCode-API-Stabilität**: Permission-Respond-Route teils deprecated → SSE-Event-Bus nutzen; Version pinnen (erfolgt: 1.18.18; Wire-Format gegen Source verifiziert)
+- **Kilo**: Gateway-Modelle brauchen `kilo`-Secret (auth.json-Inhalt → KILO_AUTH_CONTENT); Wire-Format gegen kilo 7.4.22 Source verifiziert (nested permission patterns, `?directory=`-Routing, `/prompt_async`)
+- **Junie-Headless**: one-shot pro Prompt → Turn-Granularität, keine Permission-Callbacks → Ask/AcceptEdits degradieren auf Yolo mit App-Banner; JSON-Output-Format defensiv geparsed
+- **pi Remote-Approvals**: Spike positiv – `pi.on("tool_call")` Extension-Hook kann blocken → implementiert; Real-SDK-Boot gegen 0.84.2 verifiziert
+- **Claude-Subscription**: programmatische Nutzung läuft über Subscription-Limits (Stand Juni 2026); Token-Ablauf ~1 Jahr → Renewal-Erinnerung in App. Plattform-Binaries als optionalDependencies gepinnt (0.3.233)
 - **Docker-Socket = Root-äquivalent**: akzeptabel für Single-User eigenem Server; für kommerzielle Variante auf rootless/VM-isolierte Runner migrieren (out of scope)
-- Codex-Adapter (`codex exec --json`) als später fünfter Adapter vorgemerkt; kommerzielle Variante: GitHub App statt PAT, Multi-Tenant-Isolation, Billing-Hooks – out of scope
+- Codex-Adapter (`codex exec --json`) als später sechster Adapter vorgemerkt; kommerzielle Variante: GitHub App statt PAT, Multi-Tenant-Isolation, Billing-Hooks – out of scope

@@ -67,8 +67,8 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-function permissionKind(metadata: unknown, title: string): PermissionKind {
-  const t = strField(metadata, 'type');
+function permissionKind(permission: string | undefined, metadata: unknown, title: string): PermissionKind {
+  const t = strField(metadata, 'type') ?? permission;
   if (t === 'bash' || t === 'edit' || t === 'webfetch') return t;
   const lower = title.toLowerCase();
   if (lower.includes('bash') || lower.includes('command')) return 'bash';
@@ -93,11 +93,12 @@ function toolOutput(state: unknown): string {
 }
 
 /**
- * Normalizes opencode bus events into the PocketAgent AgentEvent stream.
+ * Normalizes kilo/opencode bus events into the PocketAgent AgentEvent stream.
  *
- * opencode event names vary between versions, so matching is defensive:
- * direct `{type: ...}` frames as well as `{type:"bus.event", properties:{type}, payload}` wrappers
- * are accepted, and multiple aliases per concept are tried.
+ * kilo 7.x SSE frames are `{id, type, properties}` envelopes; older opencode
+ * emitted flat `{type, ...payload}` frames and `{type:"bus.event", properties:{type}, payload}`
+ * wrappers. All three shapes are accepted, and multiple aliases per concept
+ * are tried because event names vary across versions.
  */
 export class EventNormalizer {
   private busy = false;
@@ -106,6 +107,7 @@ export class EventNormalizer {
   private readonly toolDone = new Set<string>();
   private readonly messageTextParts = new Map<string, Map<string, string>>();
   private readonly messageDone = new Set<string>();
+  private readonly messageRole = new Map<string, string>();
   private readonly pollSnapshot = new Map<string, number>();
   private lastSummary = '';
 
@@ -124,6 +126,14 @@ export class EventNormalizer {
     this.finalizeTurn('aborted');
   }
 
+  /** Ends the current turn as failed: emits `turn.failed` once and clears busy. */
+  failTurn(error: string): void {
+    if (!this.busy) return;
+    this.busy = false;
+    this.deps.broadcaster.broadcast({ type: 'turn.failed', error: error.slice(0, 2000) });
+    this.emitStatus();
+  }
+
   emitStatus(): void {
     const pm = this.deps.getProviderModel();
     this.deps.broadcaster.broadcast({
@@ -140,13 +150,21 @@ export class EventNormalizer {
   handleRaw(raw: unknown): void {
     if (typeof raw !== 'object' || raw === null) return;
     const outerType = strField(raw, 'type');
+    if (outerType === undefined) return;
+    // kilo 7.x envelope: payload lives in `properties`
+    const properties = field(raw, 'properties');
+    if (outerType !== 'bus.event' && typeof properties === 'object' && properties !== null) {
+      this.handleTyped(outerType, properties);
+      return;
+    }
     if (outerType === 'bus.event') {
       const innerType = strField(field(raw, 'properties'), 'type');
       const payload = field(raw, 'payload');
       if (innerType !== undefined && payload !== undefined) this.handleTyped(innerType, payload);
       return;
     }
-    if (outerType !== undefined) this.handleTyped(outerType, raw);
+    // legacy flat frame: the frame itself is the payload
+    this.handleTyped(outerType, raw);
   }
 
   private handleTyped(type: string, obj: unknown): void {
@@ -167,6 +185,7 @@ export class EventNormalizer {
       case 'permission.update':
       case 'permission.updated':
       case 'permission.responded':
+      case 'permission.replied':
         this.onPermissionUpdate(obj);
         break;
       case 'error':
@@ -179,17 +198,25 @@ export class EventNormalizer {
   }
 
   private onPartUpdated(obj: unknown): void {
+    // kilo payload: {sessionID, part, time}; legacy: {info, part} or flat part
     const info = field(obj, 'info');
-    const part = field(obj, 'part');
-    if (part === undefined) return;
-    const role = strField(info, 'role') ?? strField(part, 'role');
+    const part = field(obj, 'part') ?? obj;
+    if (typeof part !== 'object' || part === null) return;
     const messageID = strField(info, 'messageID') ?? strField(part, 'messageID');
+    if (messageID !== undefined && strField(info, 'role')) {
+      this.messageRole.set(messageID, strField(info, 'role') ?? '');
+    }
+    // kilo part events carry no role; remember what message.updated told us,
+    // defaulting to assistant (only assistant parts stream mid-turn)
+    const role = messageID !== undefined ? this.messageRole.get(messageID) : undefined;
+    const effectiveRole = role ?? 'assistant';
     const partType = strField(part, 'type');
     const partID = strField(part, 'id') ?? `${messageID ?? 'msg'}:${strField(part, 'tool') ?? partType ?? 'part'}`;
+    const synthetic = field(part, 'synthetic') === true;
 
     if (partType === 'text') {
       const text = strField(part, 'text');
-      if (role === 'assistant' && messageID !== undefined && typeof text === 'string') {
+      if (effectiveRole === 'assistant' && messageID !== undefined && typeof text === 'string' && !synthetic) {
         const prev = this.partTextLen.get(partID) ?? 0;
         if (text.length > prev) {
           this.deps.broadcaster.broadcast({ type: 'message.delta', role: 'assistant', delta: text.slice(prev) });
@@ -210,7 +237,7 @@ export class EventNormalizer {
       const tool = strField(part, 'tool') ?? 'unknown';
       const state = field(part, 'state');
       const status = strField(state, 'status') ?? '';
-      const id = strField(part, 'toolCallID') ?? partID;
+      const id = strField(part, 'toolCallID') ?? strField(part, 'callID') ?? partID;
       if ((status === 'pending' || status === 'running') && !this.toolCalled.has(partID)) {
         this.toolCalled.add(partID);
         this.deps.broadcaster.broadcast({
@@ -238,8 +265,12 @@ export class EventNormalizer {
     const info = field(obj, 'info') ?? obj;
     const id = strField(info, 'id');
     const role = strField(info, 'role');
-    const end = numField(field(info, 'time'), 'end');
-    if (id === undefined || role !== 'assistant' || end <= 0 || this.messageDone.has(id)) return;
+    if (id === undefined) return;
+    if (role !== undefined) this.messageRole.set(id, role);
+    const time = field(info, 'time');
+    // kilo assistant messages end with time.completed; legacy opencode used time.end
+    const end = numField(time, 'completed') || numField(time, 'end');
+    if (role !== 'assistant' || end <= 0 || this.messageDone.has(id)) return;
     this.messageDone.add(id);
     const parts = this.messageTextParts.get(id);
     const text = parts === undefined ? '' : [...parts.values()].join('');
@@ -248,28 +279,34 @@ export class EventNormalizer {
   }
 
   private onPermissionAsk(obj: unknown): void {
+    // kilo permission.asked payload: {id, sessionID, permission, patterns, metadata, always, tool?}
     const permissionId = strField(obj, 'permissionID') ?? strField(obj, 'permissionId') ?? strField(obj, 'id');
     if (permissionId === undefined) return;
-    const title = strField(obj, 'title') ?? 'permission request';
+    const permission = strField(obj, 'permission') ?? strField(obj, 'type');
+    const patterns = strArray(obj, 'patterns');
+    const title =
+      strField(obj, 'title') ??
+      (permission !== undefined ? `${permission}${patterns !== undefined ? `: ${patterns.join(' ')}` : ''}` : 'permission request');
     const metadata = field(obj, 'metadata');
     this.deps.broadcaster.broadcast({
       type: 'permission.request',
       permissionId,
-      kind: permissionKind(metadata, title),
+      kind: permissionKind(permission, metadata, title),
       title,
       detail:
         strField(metadata, 'command')
         ?? strField(metadata, 'path')
         ?? strField(metadata, 'url'),
       diff: strField(metadata, 'diff'),
-      patterns: strArray(obj, 'patterns'),
+      patterns,
     });
   }
 
   private onPermissionUpdate(obj: unknown): void {
-    const permissionId = strField(obj, 'permissionID') ?? strField(obj, 'permissionId') ?? strField(obj, 'id');
+    const permissionId =
+      strField(obj, 'permissionID') ?? strField(obj, 'permissionId') ?? strField(obj, 'requestID') ?? strField(obj, 'id');
     if (permissionId === undefined) return;
-    const status = strField(obj, 'status') ?? strField(obj, 'decision') ?? '';
+    const status = strField(obj, 'status') ?? strField(obj, 'decision') ?? strField(obj, 'reply') ?? '';
     if (status !== 'once' && status !== 'always' && status !== 'rejected' && status !== 'reject') return;
     this.deps.broadcaster.broadcast({
       type: 'permission.resolved',
@@ -278,9 +315,18 @@ export class EventNormalizer {
     });
   }
 
-  private onError(obj: unknown): void {
-    const message = strField(obj, 'message') ?? strField(obj, 'error') ?? 'unknown opencode error';
+  private onError(obj: unknown): string {
+    // kilo session.error carries a NamedError {name, data:{message}}; legacy sent a plain message
+    const err = field(obj, 'error');
+    const message =
+      strField(obj, 'message')
+      ?? (typeof err === 'object' && err !== null
+        ? strField(field(err, 'data'), 'message') ?? strField(err, 'message') ?? strField(err, 'name')
+        : undefined)
+      ?? (typeof err === 'string' ? err : undefined)
+      ?? 'unknown opencode error';
     this.deps.broadcaster.broadcast({ type: 'error', message, fatal: false });
+    return message;
   }
 
   private finalizeTurn(summary: string | undefined): void {
@@ -326,7 +372,7 @@ export class EventNormalizer {
   }
 
   /**
-   * Approximate fallback (opencode event names are not stable across versions):
+   * Approximate fallback (event delivery is not guaranteed across versions):
    * polls GET /session/:id/message and diffs per-message assistant text length.
    * Emits coarse deltas and completions for messages the SSE stream may have missed.
    */
@@ -343,7 +389,7 @@ export class EventNormalizer {
       let text = '';
       if (Array.isArray(parts)) {
         for (const part of parts) {
-          if (strField(part, 'type') === 'text') {
+          if (strField(part, 'type') === 'text' && field(part, 'synthetic') !== true) {
             const t = strField(part, 'text');
             if (typeof t === 'string') text += t;
           }
@@ -355,7 +401,8 @@ export class EventNormalizer {
         this.deps.broadcaster.broadcast({ type: 'message.delta', role: 'assistant', delta: text.slice(prev) });
         this.lastSummary = text;
       }
-      const end = numField(field(info, 'time'), 'end');
+      const time = field(info, 'time');
+      const end = numField(time, 'completed') || numField(time, 'end');
       if (end > 0 && !this.messageDone.has(id)) {
         this.messageDone.add(id);
         this.deps.broadcaster.broadcast({ type: 'message.completed', role: 'assistant', text });

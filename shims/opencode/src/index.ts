@@ -8,7 +8,7 @@ import type { AgentMode, PermissionDecision, PromptRequest, ResumeRequest, ShimS
 import { readEnv, type ShimEnvConfig } from './env';
 import { parsePermissionJson, permissionForMode, writeOpencodeConfig, type PermissionMap } from './modes';
 import * as gitops from './gitops';
-import { OpenCodeClient } from './opencode-client';
+import { OpenCodeClient, type PromptMessageBody } from './opencode-client';
 import { Broadcaster, EventNormalizer } from './events';
 
 const MODES: readonly AgentMode[] = ['yolo', 'auto', 'acceptEdits', 'ask'];
@@ -153,14 +153,25 @@ async function main(): Promise<void> {
     if (opencodeSessionId === undefined) {
       return await reply.code(409).send({ ok: false, error: 'no opencode session' });
     }
-    const status = await client.promptMessage(opencodeSessionId, {
+    const payload: PromptMessageBody = {
       parts: [{ type: 'text', text }],
       ...(provider !== undefined && model !== undefined ? { model: { providerID: provider, modelID: model } } : {}),
-    });
-    if (status < 200 || status >= 300) {
-      return await reply.code(502).send({ ok: false, error: `opencode message failed (HTTP ${status})` });
-    }
+    };
+    // mark busy up-front: the sync /message route only responds after the whole
+    // turn streamed past, so events arrive while the POST is still in flight
     normalizer.startPrompt();
+    // opencode >= 1.18 has /prompt_async (204 now, failures via session.error events);
+    // fall back to the legacy sync /message route for older runtimes
+    let status = await client.promptMessageAsync(opencodeSessionId, payload);
+    if (status === 404 || status === 405 || status === 501) {
+      status = await client.promptMessage(opencodeSessionId, payload);
+    }
+    if (status < 200 || status >= 300) {
+      const error = `opencode message failed (HTTP ${status})`;
+      broadcaster.broadcast({ type: 'error', message: error, fatal: false });
+      normalizer.failTurn(error);
+      return await reply.code(502).send({ ok: false, error });
+    }
     return await reply.send({ ok: true });
   });
 

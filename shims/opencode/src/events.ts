@@ -67,11 +67,31 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/**
+ * Extracts a human readable message from the error shapes opencode 1.18 emits:
+ * NamedError objects `{name: "ProviderAuthError"|"APIError"|..., data: {message}}`,
+ * plain `{message}` objects, or bare strings.
+ */
+function errorText(err: unknown): string | undefined {
+  if (typeof err === 'string') return err.length > 0 ? err : undefined;
+  if (typeof err !== 'object' || err === null) return undefined;
+  const name = strField(err, 'name');
+  const dataMessage = strField(field(err, 'data'), 'message');
+  const message = dataMessage ?? strField(err, 'message');
+  if (message !== undefined) return name !== undefined ? `${name}: ${message}` : message;
+  if (name !== undefined) return name;
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return undefined;
+  }
+}
+
 function permissionKind(metadata: unknown, title: string): PermissionKind {
   const t = strField(metadata, 'type');
   if (t === 'bash' || t === 'edit' || t === 'webfetch') return t;
   const lower = title.toLowerCase();
-  if (lower.includes('bash') || lower.includes('command')) return 'bash';
+  if (lower.includes('bash') || lower.includes('command') || lower.includes('shell')) return 'bash';
   if (lower.includes('edit') || lower.includes('write') || lower.includes('file')) return 'edit';
   if (lower.includes('fetch') || lower.includes('url')) return 'webfetch';
   return 'other';
@@ -95,19 +115,33 @@ function toolOutput(state: unknown): string {
 /**
  * Normalizes opencode bus events into the PocketAgent AgentEvent stream.
  *
- * opencode event names vary between versions, so matching is defensive:
- * direct `{type: ...}` frames as well as `{type:"bus.event", properties:{type}, payload}` wrappers
- * are accepted, and multiple aliases per concept are tried.
+ * Verified against opencode-ai 1.18.18 (`opencode serve`):
+ *  - SSE frames on GET /event are `{id, type, properties}` envelopes; the event
+ *    payload lives in `properties` (no legacy `bus.event` wrapper). The first
+ *    frame is `server.connected`, followed by `server.heartbeat` every 10s.
+ *  - Session events: `message.updated` (assistant done when `info.time.completed`
+ *    is set), `message.part.updated` ({sessionID, part, time} — roles come from
+ *    earlier `message.updated` frames), `message.part.delta` (live token stream),
+ *    `session.error` ({error: {name, data: {message}}}), `session.status`
+ *    ({status: {type: "busy"|"idle"|"retry"}}), `permission.asked`/
+ *    `permission.replied` (v1 shapes with id/patterns/metadata), plus the
+ *    `session.next.*` family (`session.next.step.failed` carries step errors).
+ *
+ * Older frame layouts (direct `{type, ...payload}` and `{type:"bus.event",
+ * properties:{type}, payload}` wrappers) stay supported so the fake-server smoke
+ * test and pre-1.18 runtimes keep working.
  */
 export class EventNormalizer {
   private busy = false;
-  private readonly partTextLen = new Map<string, number>();
+  private readonly messageRoles = new Map<string, string>();
+  private readonly partSentLen = new Map<string, number>();
   private readonly toolCalled = new Set<string>();
   private readonly toolDone = new Set<string>();
   private readonly messageTextParts = new Map<string, Map<string, string>>();
   private readonly messageDone = new Set<string>();
   private readonly pollSnapshot = new Map<string, number>();
   private lastSummary = '';
+  private lastSessionEventAt = Date.now();
 
   constructor(private readonly deps: NormalizerDeps) {}
 
@@ -117,11 +151,20 @@ export class EventNormalizer {
 
   startPrompt(): void {
     this.busy = true;
+    this.lastSessionEventAt = Date.now();
     this.emitStatus();
   }
 
   abortPrompt(): void {
     this.finalizeTurn('aborted');
+  }
+
+  /** Ends the current turn as failed: emits `turn.failed` once and clears busy. */
+  failTurn(error: string): void {
+    if (!this.busy) return;
+    this.busy = false;
+    this.deps.broadcaster.broadcast({ type: 'turn.failed', error: error.slice(0, SUMMARY_MAX) });
+    this.emitStatus();
   }
 
   emitStatus(): void {
@@ -140,24 +183,55 @@ export class EventNormalizer {
   handleRaw(raw: unknown): void {
     if (typeof raw !== 'object' || raw === null) return;
     const outerType = strField(raw, 'type');
+    if (outerType === undefined) return;
     if (outerType === 'bus.event') {
+      // legacy wrapper (pre-1.18): {type:"bus.event", properties:{type}, payload}
       const innerType = strField(field(raw, 'properties'), 'type');
       const payload = field(raw, 'payload');
       if (innerType !== undefined && payload !== undefined) this.handleTyped(innerType, payload);
       return;
     }
-    if (outerType !== undefined) this.handleTyped(outerType, raw);
+    // opencode >= 1.18 envelope: {id, type, properties: {...payload...}}
+    const properties = field(raw, 'properties');
+    this.handleTyped(outerType, typeof properties === 'object' && properties !== null ? properties : raw);
+  }
+
+  private forThisSession(obj: unknown): boolean {
+    const sessionId = this.deps.getSessionId();
+    if (sessionId === undefined) return true;
+    const eventSession = strField(obj, 'sessionID');
+    return eventSession === undefined || eventSession === sessionId;
   }
 
   private handleTyped(type: string, obj: unknown): void {
+    // heartbeats must not count as session activity (they arrive every 10s
+    // even when a model call hangs) and must not reset the quiet-finalize clock
+    if (type !== 'server.heartbeat' && type !== 'server.connected') this.lastSessionEventAt = Date.now();
+    if (type.startsWith('server.') || type.startsWith('global.')) return;
+    if (!this.forThisSession(obj)) return;
     switch (type) {
       case 'message.part.updated':
       case 'message.part.appended':
         this.onPartUpdated(obj);
         break;
+      case 'message.part.delta':
+        this.onPartDelta(obj);
+        break;
       case 'message.updated':
       case 'message.completed':
         this.onMessageUpdated(obj);
+        break;
+      case 'session.status':
+        this.onSessionStatus(obj);
+        break;
+      case 'session.idle':
+        this.finalizeTurn(this.lastSummary);
+        break;
+      case 'session.error':
+        this.onSessionError(obj);
+        break;
+      case 'session.next.step.failed':
+        this.onStepFailed(obj);
         break;
       case 'permission.ask':
       case 'permission.asked':
@@ -166,11 +240,11 @@ export class EventNormalizer {
         break;
       case 'permission.update':
       case 'permission.updated':
+      case 'permission.replied':
       case 'permission.responded':
         this.onPermissionUpdate(obj);
         break;
       case 'error':
-      case 'session.error':
         this.onError(obj);
         break;
       default:
@@ -179,30 +253,19 @@ export class EventNormalizer {
   }
 
   private onPartUpdated(obj: unknown): void {
-    const info = field(obj, 'info');
     const part = field(obj, 'part');
     if (part === undefined) return;
-    const role = strField(info, 'role') ?? strField(part, 'role');
-    const messageID = strField(info, 'messageID') ?? strField(part, 'messageID');
+    const info = field(obj, 'info'); // legacy frames carry {info, part}
+    const messageID = strField(part, 'messageID') ?? strField(info, 'messageID');
+    const role = strField(info, 'role') ?? (messageID !== undefined ? this.messageRoles.get(messageID) : undefined);
     const partType = strField(part, 'type');
     const partID = strField(part, 'id') ?? `${messageID ?? 'msg'}:${strField(part, 'tool') ?? partType ?? 'part'}`;
 
     if (partType === 'text') {
       const text = strField(part, 'text');
-      if (role === 'assistant' && messageID !== undefined && typeof text === 'string') {
-        const prev = this.partTextLen.get(partID) ?? 0;
-        if (text.length > prev) {
-          this.deps.broadcaster.broadcast({ type: 'message.delta', role: 'assistant', delta: text.slice(prev) });
-          this.partTextLen.set(partID, text.length);
-        }
-        let parts = this.messageTextParts.get(messageID);
-        if (parts === undefined) {
-          parts = new Map();
-          this.messageTextParts.set(messageID, parts);
-        }
-        parts.set(partID, text);
-        this.lastSummary = [...parts.values()].join('');
-      }
+      if (messageID === undefined || typeof text !== 'string') return;
+      if (role === 'user') return; // never echo the user prompt back as assistant output
+      this.trackText(messageID, partID, text);
       return;
     }
 
@@ -210,7 +273,7 @@ export class EventNormalizer {
       const tool = strField(part, 'tool') ?? 'unknown';
       const state = field(part, 'state');
       const status = strField(state, 'status') ?? '';
-      const id = strField(part, 'toolCallID') ?? partID;
+      const id = strField(part, 'callID') ?? partID;
       if ((status === 'pending' || status === 'running') && !this.toolCalled.has(partID)) {
         this.toolCalled.add(partID);
         this.deps.broadcaster.broadcast({
@@ -234,12 +297,57 @@ export class EventNormalizer {
     }
   }
 
+  private onPartDelta(obj: unknown): void {
+    const messageID = strField(obj, 'messageID');
+    const partID = strField(obj, 'partID');
+    const delta = strField(obj, 'delta');
+    if (messageID === undefined || partID === undefined || typeof delta !== 'string') return;
+    if (strField(obj, 'field') !== 'text') return;
+    if (this.messageRoles.get(messageID) === 'user') return;
+    const parts = this.ensureParts(messageID);
+    parts.set(partID, (parts.get(partID) ?? '') + delta);
+    this.emitText(messageID, partID, parts);
+  }
+
+  private trackText(messageID: string, partID: string, text: string): void {
+    const parts = this.ensureParts(messageID);
+    parts.set(partID, text);
+    this.emitText(messageID, partID, parts);
+  }
+
+  private emitText(messageID: string, partID: string, parts: Map<string, string>): void {
+    const text = parts.get(partID) ?? '';
+    const prev = this.partSentLen.get(partID) ?? 0;
+    if (text.length > prev) {
+      this.deps.broadcaster.broadcast({ type: 'message.delta', role: 'assistant', delta: text.slice(prev) });
+      this.partSentLen.set(partID, text.length);
+    }
+    this.lastSummary = [...parts.values()].join('');
+  }
+
+  private ensureParts(messageID: string): Map<string, string> {
+    let parts = this.messageTextParts.get(messageID);
+    if (parts === undefined) {
+      parts = new Map();
+      this.messageTextParts.set(messageID, parts);
+    }
+    return parts;
+  }
+
   private onMessageUpdated(obj: unknown): void {
     const info = field(obj, 'info') ?? obj;
     const id = strField(info, 'id');
     const role = strField(info, 'role');
-    const end = numField(field(info, 'time'), 'end');
-    if (id === undefined || role !== 'assistant' || end <= 0 || this.messageDone.has(id)) return;
+    if (id === undefined || role === undefined) return;
+    this.messageRoles.set(id, role);
+    if (role !== 'assistant') return;
+    // 1.18 AssistantMessage.time = {created, completed?}; older builds used {start, end}
+    const completed = numField(field(info, 'time'), 'completed') || numField(field(info, 'time'), 'end');
+    const err = errorText(field(info, 'error'));
+    if (err !== undefined) {
+      this.deps.broadcaster.broadcast({ type: 'error', message: `assistant message failed: ${err}`, fatal: false });
+    }
+    if (completed <= 0 || this.messageDone.has(id)) return;
     this.messageDone.add(id);
     const parts = this.messageTextParts.get(id);
     const text = parts === undefined ? '' : [...parts.values()].join('');
@@ -247,10 +355,41 @@ export class EventNormalizer {
     this.finalizeTurn(text);
   }
 
+  private onSessionStatus(obj: unknown): void {
+    const status = field(obj, 'status');
+    const type = strField(status, 'type');
+    if (type === 'idle') {
+      this.finalizeTurn(this.lastSummary);
+      return;
+    }
+    if (type === 'retry') {
+      const message = strField(status, 'message') ?? 'model call failed';
+      this.deps.broadcaster.broadcast({
+        type: 'error',
+        message: `retrying (attempt ${numField(status, 'attempt')}): ${message}`,
+        fatal: false,
+      });
+    }
+  }
+
+  private onSessionError(obj: unknown): void {
+    const message = errorText(field(obj, 'error')) ?? 'unknown opencode error';
+    this.deps.broadcaster.broadcast({ type: 'error', message, fatal: false });
+    this.failTurn(message);
+  }
+
+  private onStepFailed(obj: unknown): void {
+    const message = errorText(field(obj, 'error'));
+    if (message === undefined) return;
+    this.deps.broadcaster.broadcast({ type: 'error', message: `step failed: ${message}`, fatal: false });
+    this.failTurn(message);
+  }
+
   private onPermissionAsk(obj: unknown): void {
-    const permissionId = strField(obj, 'permissionID') ?? strField(obj, 'permissionId') ?? strField(obj, 'id');
+    const permissionId = strField(obj, 'permissionID') ?? strField(obj, 'id');
     if (permissionId === undefined) return;
-    const title = strField(obj, 'title') ?? 'permission request';
+    // 1.18 `permission.asked` carries `permission` (tool name) instead of a title
+    const title = strField(obj, 'title') ?? strField(obj, 'permission') ?? 'permission request';
     const metadata = field(obj, 'metadata');
     this.deps.broadcaster.broadcast({
       type: 'permission.request',
@@ -267,9 +406,10 @@ export class EventNormalizer {
   }
 
   private onPermissionUpdate(obj: unknown): void {
-    const permissionId = strField(obj, 'permissionID') ?? strField(obj, 'permissionId') ?? strField(obj, 'id');
+    const permissionId = strField(obj, 'permissionID') ?? strField(obj, 'requestID') ?? strField(obj, 'id');
     if (permissionId === undefined) return;
-    const status = strField(obj, 'status') ?? strField(obj, 'decision') ?? '';
+    // 1.18 `permission.replied` carries the decision as `reply`
+    const status = strField(obj, 'reply') ?? strField(obj, 'status') ?? strField(obj, 'decision') ?? '';
     if (status !== 'once' && status !== 'always' && status !== 'rejected' && status !== 'reject') return;
     this.deps.broadcaster.broadcast({
       type: 'permission.resolved',
@@ -279,7 +419,7 @@ export class EventNormalizer {
   }
 
   private onError(obj: unknown): void {
-    const message = strField(obj, 'message') ?? strField(obj, 'error') ?? 'unknown opencode error';
+    const message = errorText(field(obj, 'error')) ?? strField(obj, 'message') ?? 'unknown opencode error';
     this.deps.broadcaster.broadcast({ type: 'error', message, fatal: false });
   }
 
@@ -314,10 +454,15 @@ export class EventNormalizer {
     this.emitStatus();
   }
 
-  /** Every 2s: fallback-poll messages when SSE went silent >10s; safety-finalize after 30s of silence. */
+  /**
+   * Every 2s: fallback-poll messages when the session event bus went silent >10s;
+   * safety-finalize after 30s of silence (measured from the last session event,
+   * NOT from SSE activity — 1.18 sends server.heartbeat frames every 10s that
+   * must not keep a hung turn alive).
+   */
   tick(): void {
     if (!this.busy) return;
-    const silentFor = Date.now() - this.deps.client.lastEventAt;
+    const silentFor = Date.now() - this.lastSessionEventAt;
     if (silentFor > QUIET_FINALIZE_MS) {
       this.finalizeTurn(this.lastSummary);
       return;
@@ -326,9 +471,8 @@ export class EventNormalizer {
   }
 
   /**
-   * Approximate fallback (opencode event names are not stable across versions):
-   * polls GET /session/:id/message and diffs per-message assistant text length.
-   * Emits coarse deltas and completions for messages the SSE stream may have missed.
+   * Fallback when SSE events were missed: polls GET /session/:id/message
+   * (returns [{info, parts}]) and diffs per-message assistant text length.
    */
   private async pollFallback(): Promise<void> {
     const sessionId = this.deps.getSessionId();
@@ -355,7 +499,8 @@ export class EventNormalizer {
         this.deps.broadcaster.broadcast({ type: 'message.delta', role: 'assistant', delta: text.slice(prev) });
         this.lastSummary = text;
       }
-      const end = numField(field(info, 'time'), 'end');
+      const time = field(info, 'time');
+      const end = numField(time, 'completed') || numField(time, 'end');
       if (end > 0 && !this.messageDone.has(id)) {
         this.messageDone.add(id);
         this.deps.broadcaster.broadcast({ type: 'message.completed', role: 'assistant', text });

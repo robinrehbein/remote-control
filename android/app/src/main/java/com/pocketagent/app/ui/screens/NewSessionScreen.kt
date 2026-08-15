@@ -3,7 +3,6 @@
 package com.pocketagent.app.ui.screens
 
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -21,7 +20,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -35,7 +33,6 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -84,7 +81,6 @@ class NewSessionViewModel : ViewModel() {
         val repoId: String? = null,
         val adapter: String = "",
         val provider: String = "",
-        val providerCustom: Boolean = false,
         val model: String = "",
         val mode: AgentMode = AgentMode.AUTO,
         val branch: String = "",
@@ -109,12 +105,18 @@ class NewSessionViewModel : ViewModel() {
         }
     }
 
+    /** Agentwechsel setzt Zugang und Modell auf den Standard des Adapters zurück. */
     fun onAdapterSelected(adapter: AdapterDescriptor) {
         _state.value = _state.value.copy(
             adapter = adapter.id,
             provider = defaultProviderFor(adapter),
-            providerCustom = false,
+            model = "",
         )
+    }
+
+    /** Ergebnis des Modell-Sheets: Zugang und Modell in einem Schritt. */
+    fun onModelPicked(provider: String, model: String) {
+        _state.value = _state.value.copy(provider = provider.trim(), model = model.trim())
     }
 
     private fun defaultProviderFor(adapter: AdapterDescriptor): String =
@@ -189,9 +191,12 @@ private fun fallbackProviderName(key: String): String = when (key) {
 private fun providerDisplayName(key: String, descriptor: AdapterDescriptor?): String =
     descriptor?.providers?.firstOrNull { it.id == key }?.name ?: fallbackProviderName(key)
 
-/** Provider keys in display order: default provider first, then the rest. */
+/**
+ * Provider keys in display order: default provider first, then the rest.
+ * Quelle ist das Manifest (`providers`), sonst die Env-Tabelle.
+ */
 private fun orderedProviderKeys(descriptor: AdapterDescriptor): List<String> {
-    val keys = descriptor.providerEnv.keys.toList()
+    val keys = descriptor.providers.map { it.id }.ifEmpty { descriptor.providerEnv.keys.toList() }
     val def = descriptor.defaults.provider
     return if (def.isNotBlank() && def in keys) {
         listOf(def) + keys.filterNot { it == def }
@@ -200,8 +205,11 @@ private fun orderedProviderKeys(descriptor: AdapterDescriptor): List<String> {
     }
 }
 
-/** True when a usable secret for this adapter exists (card-level status). */
-private fun adapterKeyPresent(descriptor: AdapterDescriptor, secretKinds: Set<String>): Boolean = when {
+/**
+ * True when a usable secret for this adapter exists (card-level status).
+ * Auch der Agent-Wechsel im SessionScreen fragt hierüber.
+ */
+fun adapterKeyPresent(descriptor: AdapterDescriptor, secretKinds: Set<String>): Boolean = when {
     descriptor.credentials.isNotEmpty() -> descriptor.credentials.keys.any { it in secretKinds }
     descriptor.providerEnv.isNotEmpty() -> descriptor.providerEnv.keys.any { it in secretKinds }
     else -> true
@@ -222,6 +230,7 @@ fun NewSessionScreen(
     val secrets by repository.secrets.collectAsState()
 
     var showAddRepo by remember { mutableStateOf(false) }
+    var showModelSheet by remember { mutableStateOf(false) }
     var advanced by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
@@ -331,52 +340,16 @@ fun NewSessionScreen(
                 }
             }
 
-            /* -------- Provider -------- */
+            /* -------- Modell (Zugang + Modell in einer Zeile) -------- */
+            // Adapter mit eigenen Zugangsdaten (Claude Code) haben keine
+            // Provider-Auswahl – dort entfällt die Sektion ganz.
             if (selectedDescriptor != null && selectedDescriptor.providerEnv.isNotEmpty()) {
-                SectionHeader("Provider")
-                GroupCard {
-                    Column(
-                        modifier = Modifier.padding(horizontal = CardInset, vertical = 14.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp),
-                    ) {
-                        FlowRow(
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            verticalArrangement = Arrangement.spacedBy(4.dp),
-                            modifier = Modifier.fillMaxWidth(),
-                        ) {
-                            orderedProviderKeys(selectedDescriptor).forEach { key ->
-                                ProviderChip(
-                                    label = providerDisplayName(key, selectedDescriptor),
-                                    selected = !state.providerCustom && state.provider == key,
-                                    keyMissing = key !in secretKinds,
-                                    onClick = { vm.update { it.copy(provider = key, providerCustom = false) } },
-                                )
-                            }
-                            FilterChip(
-                                selected = state.providerCustom,
-                                onClick = { vm.update { it.copy(providerCustom = true) } },
-                                shape = PillShape,
-                                label = { Text("Anderer …") },
-                            )
-                        }
-                        AnimatedVisibility(visible = state.providerCustom) {
-                            OutlinedTextField(
-                                value = state.provider,
-                                onValueChange = { v -> vm.update { it.copy(provider = v) } },
-                                label = { Text("Provider") },
-                                placeholder = { Text("z. B. deepseek") },
-                                singleLine = true,
-                                shape = MaterialTheme.shapes.small,
-                                keyboardOptions = KeyboardOptions(
-                                    autoCorrectEnabled = false,
-                                    keyboardType = KeyboardType.Ascii,
-                                    imeAction = ImeAction.Done,
-                                ),
-                                modifier = Modifier.fillMaxWidth(),
-                            )
-                        }
-                    }
-                }
+                SectionHeader("Modell")
+                ModelRow(
+                    title = modelRowTitle(state.provider, state.model, selectedDescriptor),
+                    keyMissing = state.provider.trim().let { it.isBlank() || it !in secretKinds },
+                    onClick = { showModelSheet = true },
+                )
             }
 
             /* -------- Key-Warnung -------- */
@@ -497,20 +470,6 @@ fun NewSessionScreen(
                             ),
                         ) {
                             OutlinedTextField(
-                                value = state.model,
-                                onValueChange = { v -> vm.update { it.copy(model = v) } },
-                                label = { Text("Modell") },
-                                placeholder = { Text(selectedDescriptor?.defaults?.model ?: "Standard des Agenten") },
-                                singleLine = true,
-                                shape = MaterialTheme.shapes.small,
-                                keyboardOptions = KeyboardOptions(
-                                    autoCorrectEnabled = false,
-                                    keyboardType = KeyboardType.Ascii,
-                                    imeAction = ImeAction.Next,
-                                ),
-                                modifier = Modifier.fillMaxWidth(),
-                            )
-                            OutlinedTextField(
                                 value = state.branch,
                                 onValueChange = { v -> vm.update { it.copy(branch = v) } },
                                 label = { Text("Basis-Branch") },
@@ -540,6 +499,196 @@ fun NewSessionScreen(
                 showAddRepo = false
             },
         )
+    }
+
+    if (showModelSheet && selectedDescriptor != null) {
+        ModelAccessSheet(
+            descriptor = selectedDescriptor,
+            provider = state.provider,
+            model = state.model,
+            secretKinds = secretKinds,
+            onDismiss = { showModelSheet = false },
+            onOpenSettings = onOpenSettings,
+            onApply = { provider, model ->
+                vm.onModelPicked(provider, model)
+                showModelSheet = false
+            },
+        )
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Modell + Zugang — eine Zeile, ein Sheet                             */
+/* ------------------------------------------------------------------ */
+
+/** Beschriftung der Modell-Zeile: „Z.AI · glm-4.6“ bzw. „Z.AI · Standardmodell“. */
+private fun modelRowTitle(provider: String, model: String, descriptor: AdapterDescriptor): String {
+    val providerLabel = provider.trim()
+        .takeIf { it.isNotBlank() }
+        ?.let { providerDisplayName(it, descriptor) }
+    val modelLabel = model.trim().ifBlank { "Standardmodell" }
+    return listOfNotNull(providerLabel, modelLabel).joinToString(" · ")
+}
+
+/**
+ * Die eine Stelle für Zugang und Modell. Zeile wie der Repo-Wähler:
+ * Titel, Untertitel, Chevron – Details stehen im Sheet.
+ */
+@Composable
+private fun ModelRow(title: String, keyMissing: Boolean, onClick: () -> Unit) {
+    GroupCard {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(onClick = onClick)
+                .heightIn(min = TileMinHeight)
+                .padding(start = CardInset, end = 10.dp),
+        ) {
+            Column(modifier = Modifier.weight(1f).padding(vertical = 10.dp)) {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.titleSmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Spacer(modifier = Modifier.height(2.dp))
+                if (keyMissing) {
+                    DotLabel(color = semantic().warning, label = "Kein Zugang")
+                } else {
+                    Text(
+                        text = "Zugang vorhanden",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            Icon(
+                Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+/**
+ * Zugang wählen und Modell eintragen – beides in einem Sheet, damit es
+ * für dieselbe Entscheidung keine zweite Stelle mehr gibt.
+ */
+@Composable
+private fun ModelAccessSheet(
+    descriptor: AdapterDescriptor,
+    provider: String,
+    model: String,
+    secretKinds: Set<String>,
+    onDismiss: () -> Unit,
+    onOpenSettings: () -> Unit,
+    onApply: (provider: String, model: String) -> Unit,
+) {
+    val known = remember(descriptor) { orderedProviderKeys(descriptor) }
+    // „Anderer …“ ist gewählt, sobald der Provider nicht aus dem Manifest kommt.
+    var custom by remember(provider) { mutableStateOf(provider.isNotBlank() && provider !in known) }
+    var picked by remember(provider) { mutableStateOf(provider.takeIf { it in known }.orEmpty()) }
+    var typed by remember(provider) { mutableStateOf(if (provider in known) "" else provider) }
+    var modelInput by remember(model) { mutableStateOf(model) }
+
+    val effectiveProvider = (if (custom) typed else picked).trim()
+    val keyMissing = effectiveProvider.isBlank() || effectiveProvider !in secretKinds
+
+    SettingSheet(title = "Modell", onDismiss = onDismiss) {
+        GroupCard {
+            Column(
+                modifier = Modifier
+                    .heightIn(max = 320.dp)
+                    .verticalScroll(rememberScrollState()),
+            ) {
+                known.forEach { key ->
+                    SelectableTile(
+                        title = providerDisplayName(key, descriptor),
+                        subtitle = null,
+                        selected = !custom && picked == key,
+                        onClick = { custom = false; picked = key },
+                        trailing = if (key !in secretKinds) {
+                            { DotLabel(color = semantic().warning, label = "Kein Zugang") }
+                        } else {
+                            null
+                        },
+                    )
+                    ListDivider(RadioRowDividerInset)
+                }
+                SelectableTile(
+                    title = "Anderer …",
+                    subtitle = null,
+                    selected = custom,
+                    onClick = { custom = true },
+                )
+                AnimatedVisibility(visible = custom) {
+                    OutlinedTextField(
+                        value = typed,
+                        onValueChange = { typed = it },
+                        label = { Text("Provider-Id") },
+                        placeholder = { Text("deepseek") },
+                        singleLine = true,
+                        shape = MaterialTheme.shapes.small,
+                        keyboardOptions = KeyboardOptions(
+                            autoCorrectEnabled = false,
+                            keyboardType = KeyboardType.Ascii,
+                            imeAction = ImeAction.Next,
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = CardInset, end = CardInset, bottom = 14.dp),
+                    )
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(SectionSpacing))
+        OutlinedTextField(
+            value = modelInput,
+            onValueChange = { modelInput = it },
+            label = { Text("Modell (optional)") },
+            placeholder = { Text("Standard des Agenten") },
+            supportingText = {
+                Text("Leer lassen für den Standard. Format je nach Agent, z. B. zai-coding/glm-5.3")
+            },
+            singleLine = true,
+            shape = MaterialTheme.shapes.small,
+            keyboardOptions = KeyboardOptions(
+                autoCorrectEnabled = false,
+                keyboardType = KeyboardType.Ascii,
+                imeAction = ImeAction.Done,
+            ),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = ScreenGutter),
+        )
+
+        if (keyMissing && effectiveProvider.isNotBlank()) {
+            // Auswahl vorher übernehmen, damit sie den Abstecher überlebt.
+            TextButton(
+                onClick = { onApply(effectiveProvider, modelInput); onOpenSettings() },
+                shape = PillShape,
+                modifier = Modifier
+                    .padding(start = ScreenGutter)
+                    .heightIn(min = 44.dp),
+            ) {
+                Text("Zugang in Einstellungen hinterlegen")
+            }
+        }
+
+        Button(
+            onClick = { onApply(effectiveProvider, modelInput) },
+            enabled = effectiveProvider.isNotBlank(),
+            shape = PillShape,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = ScreenGutter, vertical = 10.dp)
+                .height(PrimaryButtonHeight),
+        ) {
+            Text("Übernehmen")
+        }
     }
 }
 
@@ -583,38 +732,6 @@ private fun AgentTile(
             }
         } else {
             null
-        },
-    )
-}
-
-/* ------------------------------------------------------------------ */
-/* Provider chips                                                      */
-/* ------------------------------------------------------------------ */
-
-@Composable
-private fun ProviderChip(
-    label: String,
-    selected: Boolean,
-    keyMissing: Boolean,
-    onClick: () -> Unit,
-) {
-    FilterChip(
-        selected = selected,
-        onClick = onClick,
-        shape = PillShape,
-        label = {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                // Silence is "fine". Only a missing key gets a marker.
-                if (keyMissing) {
-                    Box(
-                        modifier = Modifier
-                            .size(6.dp)
-                            .background(semantic().warning, CircleShape),
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                }
-                Text(label)
-            }
         },
     )
 }

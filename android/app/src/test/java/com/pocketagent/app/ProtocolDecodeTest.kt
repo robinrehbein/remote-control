@@ -272,6 +272,74 @@ class ProtocolDecodeTest {
     }
 
     @Test
+    fun `decodes notice events as system hints`() {
+        val msg = parseServerMessage(
+            """
+            {
+              "type": "session.event",
+              "sessionId": "s1",
+              "event": {
+                "type": "notice",
+                "message": "Agent gewechselt: kilo → claude …",
+                "futureField": 1
+              }
+            }
+            """.trimIndent(),
+        )
+        assertTrue(msg is ServerMessage.SessionEventMsg)
+        val notice = (msg as ServerMessage.SessionEventMsg).event as AgentEvent.Notice
+        assertEquals("Agent gewechselt: kilo → claude …", notice.message)
+
+        // Ohne message ist der Hinweis wertlos -> Event wird verworfen
+        assertNull(parseServerMessage("""{"type":"session.event","sessionId":"s1","event":{"type":"notice"}}"""))
+    }
+
+    @Test
+    fun `decodes starting status like creating`() {
+        val msg = parseServerMessage(
+            """
+            {
+              "type": "session.status",
+              "sessionId": "s1",
+              "status": "starting",
+              "session": {
+                "id": "s1", "repoId": "r1", "adapter": "claude", "provider": "anthropic",
+                "model": "", "mode": "auto", "status": "starting", "branch": "agent/s1",
+                "createdAt": "2026-01-01T10:00:00Z", "lastActiveAt": "2026-01-01T11:00:00Z"
+              }
+            }
+            """.trimIndent(),
+        )
+        assertTrue(msg is ServerMessage.SessionStatusMsg)
+        val status = msg as ServerMessage.SessionStatusMsg
+        assertEquals(com.pocketagent.app.data.SessionStatus.CREATING, status.status)
+        assertEquals(com.pocketagent.app.data.SessionStatus.CREATING, status.session?.status)
+        assertEquals("claude", status.session?.adapter)
+    }
+
+    @Test
+    fun `encodes session update with adapter switch`() {
+        val switch = com.pocketagent.app.data.encodeSessionUpdate(
+            requestId = "req-1",
+            sessionId = "s1",
+            adapter = "claude",
+        )
+        assertTrue(switch.contains(""""type":"session.update""""))
+        assertTrue(switch.contains(""""adapter":"claude""""))
+        assertFalse(switch.contains("\"mode\""))
+        assertFalse(switch.contains("\"model\""))
+
+        // Ohne Adapter bleibt das Feld weg — der Server ändert dann nichts daran.
+        val modeOnly = com.pocketagent.app.data.encodeSessionUpdate(
+            requestId = "req-2",
+            sessionId = "s1",
+            mode = com.pocketagent.app.data.AgentMode.ACCEPT_EDITS,
+        )
+        assertTrue(modeOnly.contains(""""mode":"acceptEdits""""))
+        assertFalse(modeOnly.contains("\"adapter\""))
+    }
+
+    @Test
     fun `returns null for garbage and unknown types`() {
         assertNull(parseServerMessage("not json"))
         assertNull(parseServerMessage("""{"type":"completely.unknown"}"""))

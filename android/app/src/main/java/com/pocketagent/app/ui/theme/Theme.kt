@@ -8,6 +8,8 @@ import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
@@ -44,8 +46,8 @@ private val LightColors = lightColorScheme(
     onBackground = Color(0xFF171717),
     surface = Color(0xFFF6F6F6),
     onSurface = Color(0xFF171717),
-    surfaceVariant = Color(0xFFEFEFF1),
-    onSurfaceVariant = Color(0xFF78787D),
+    surfaceVariant = Color(0xFFE9E9EC),
+    onSurfaceVariant = Color(0xFF6B6B71),
     surfaceContainer = Color.White,
     surfaceContainerHigh = Color.White,
     surfaceContainerHighest = Color(0xFFEDEDEF),
@@ -161,18 +163,57 @@ private val AppShapes = Shapes(
 /** One UI fully rounded pill (buttons, chips, badges). */
 val PillShape = RoundedCornerShape(50)
 
+/* ------------------------------------------------------------------ */
+/* Spacing tokens — one grid for every screen.                         */
+/* ------------------------------------------------------------------ */
+
+/** Outer gutter of every card, list and full-width button. */
+val ScreenGutter = 12.dp
+
+/** Inner padding of a card — text inside a card starts at Gutter+Card. */
+val CardInset = 16.dp
+
+/** Where free-standing text (section headers, notes) starts: 12+16. */
+val ContentInset = ScreenGutter + CardInset
+
+/** Minimum height of a tappable list row (One UI is generous). */
+val TileMinHeight = 56.dp
+
+/** Android's minimum comfortable touch target. */
+val MinTouchTarget = 48.dp
+
+/** Height of the primary full-width action button. */
+val PrimaryButtonHeight = 52.dp
+
+/** Vertical air between one section's card and the next section header. */
+val SectionSpacing = 20.dp
+
+/** Divider inset for rows with a leading 36dp icon (16 + 36 + 16). */
+val IconRowDividerInset = 68.dp
+
+/** Divider inset for rows with a leading radio button (4 + 48 + 4). */
+val RadioRowDividerInset = 56.dp
+
+private val LocalSemantic = staticCompositionLocalOf { LightSemantic }
+
 @Composable
 fun PocketAgentTheme(
     darkTheme: Boolean = isSystemInDarkTheme(),
     content: @Composable () -> Unit,
 ) {
-    MaterialTheme(
-        colorScheme = if (darkTheme) DarkColors else LightColors,
-        typography = AppTypography,
-        shapes = AppShapes,
-        content = content,
-    )
+    CompositionLocalProvider(LocalSemantic provides if (darkTheme) DarkSemantic else LightSemantic) {
+        MaterialTheme(
+            colorScheme = if (darkTheme) DarkColors else LightColors,
+            typography = AppTypography,
+            shapes = AppShapes,
+            content = content,
+        )
+    }
 }
 
+/**
+ * Status/diff colors. Reads the value the theme published, so it follows
+ * an explicitly forced theme instead of only the system setting.
+ */
 @Composable
-fun semantic(): Semantic = if (isSystemInDarkTheme()) DarkSemantic else LightSemantic
+fun semantic(): Semantic = LocalSemantic.current

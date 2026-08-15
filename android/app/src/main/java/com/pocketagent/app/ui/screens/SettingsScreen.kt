@@ -11,13 +11,17 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.Logout
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Edit
@@ -27,13 +31,10 @@ import androidx.compose.material.icons.outlined.Key
 import androidx.compose.material.icons.outlined.Visibility
 import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -57,7 +58,9 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
@@ -70,7 +73,10 @@ import com.pocketagent.app.PocketAgentApp
 import com.pocketagent.app.data.AdapterDescriptor
 import com.pocketagent.app.data.AppRepository
 import com.pocketagent.app.data.SecretInfo
-import com.pocketagent.app.ui.theme.PillShape
+import com.pocketagent.app.data.WsClient
+import com.pocketagent.app.ui.theme.CardInset
+import com.pocketagent.app.ui.theme.SectionSpacing
+import com.pocketagent.app.ui.theme.TileMinHeight
 import com.pocketagent.app.ui.theme.semantic
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -212,7 +218,9 @@ fun SettingsScreen(onBack: () -> Unit) {
     val repos by repository.repos.collectAsState()
     val adapters by repository.adapters.collectAsState()
     val biometric by repository.tokenStore.biometricEnabled.collectAsState(initial = false)
+    val connState by repository.connState.collectAsState()
     val error by vm.error.collectAsState()
+    val connected = connState is WsClient.ConnState.Connected
 
     val catalog = buildCatalog(adapters)
     val existingKinds = secrets.map { it.kind }.toSet()
@@ -232,22 +240,23 @@ fun SettingsScreen(onBack: () -> Unit) {
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
-                .verticalScroll(rememberScrollState())
-                .padding(bottom = 24.dp),
-            verticalArrangement = Arrangement.spacedBy(0.dp),
+                .verticalScroll(rememberScrollState()),
         ) {
             /* ---------- Server ---------- */
             SectionHeader("Server")
             GroupCard {
-                Column(Modifier.padding(vertical = 8.dp)) {
+                Column(Modifier.padding(vertical = 4.dp)) {
                     val s = stats
-                    SettingsRow(label = "Status", value = if (s != null) "verbunden" else "–")
-                    HorizontalDivider(modifier = Modifier.padding(start = 64.dp))
+                    SettingsRow(
+                        label = "Verbindung",
+                        value = if (connected) "verbunden" else "offline",
+                    )
+                    ListDivider(CardInset)
                     SettingsRow(label = "Aktive Sessions", value = s?.sessionsActive?.toString() ?: "…")
-                    HorizontalDivider(modifier = Modifier.padding(start = 64.dp))
+                    ListDivider(CardInset)
                     SettingsRow(label = "Laufende Container", value = s?.containersRunning?.toString() ?: "…")
-                    HorizontalDivider(modifier = Modifier.padding(start = 64.dp))
-                    SettingsRow(label = "Uptime", value = s?.let { formatUptime(it.uptimeSec) } ?: "…")
+                    ListDivider(CardInset)
+                    SettingsRow(label = "Laufzeit", value = s?.let { formatUptime(it.uptimeSec) } ?: "…")
                 }
             }
 
@@ -258,7 +267,13 @@ fun SettingsScreen(onBack: () -> Unit) {
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                        .toggleable(
+                            value = biometric,
+                            role = Role.Switch,
+                            onValueChange = { vm.setBiometric(it) },
+                        )
+                        .heightIn(min = TileMinHeight)
+                        .padding(horizontal = CardInset, vertical = 8.dp),
                 ) {
                     SettingsIcon(Icons.Outlined.Fingerprint)
                     Column(modifier = Modifier.weight(1f)) {
@@ -269,42 +284,26 @@ fun SettingsScreen(onBack: () -> Unit) {
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
-                    Switch(checked = biometric, onCheckedChange = { vm.setBiometric(it) })
+                    Switch(checked = biometric, onCheckedChange = null)
                 }
             }
 
             /* ---------- Repositories ---------- */
             SectionHeader("Repositories")
             GroupCard {
-                Column(Modifier.padding(vertical = 8.dp)) {
+                Column(Modifier.padding(vertical = 4.dp)) {
                     if (repos.isEmpty()) {
-                        Text(
-                            text = "Noch keine Repos hinzugefügt",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
-                        )
+                        EmptyRow("Noch keine Repositories")
                     }
                     repos.forEachIndexed { index, repo ->
-                        if (index > 0) HorizontalDivider(modifier = Modifier.padding(start = 64.dp))
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 16.dp, vertical = 10.dp),
-                        ) {
-                            SettingsIcon(Icons.Outlined.Folder)
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(repo.fullName, style = MaterialTheme.typography.bodyLarge)
-                                Text(
-                                    text = "Basis: ${repo.defaultBranch}",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            }
-                        }
+                        if (index > 0) ListDivider()
+                        SettingsTile(
+                            icon = Icons.Outlined.Folder,
+                            title = repo.fullName,
+                            subtitle = "Basis: ${repo.defaultBranch}",
+                        )
                     }
-                    HorizontalDivider(modifier = Modifier.padding(start = 64.dp))
+                    ListDivider()
                     AddRow(label = "Repository hinzufügen", onClick = { showAddRepo = true })
                 }
             }
@@ -313,121 +312,106 @@ fun SettingsScreen(onBack: () -> Unit) {
             if (recommended.isNotEmpty()) {
                 SectionHeader("Empfohlen")
                 GroupCard {
-                    Column(Modifier.padding(vertical = 8.dp)) {
+                    Column(Modifier.padding(vertical = 4.dp)) {
                         recommended.forEachIndexed { index, kind ->
-                            if (index > 0) HorizontalDivider(modifier = Modifier.padding(start = 64.dp))
+                            if (index > 0) ListDivider()
                             val meta = metaFor(kind, catalog)
                             val users = adaptersUsing(kind, adapters)
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable {
-                                        secretDialogKind = kind
-                                        showSecretDialog = true
-                                    }
-                                    .padding(horizontal = 16.dp, vertical = 10.dp),
-                            ) {
-                                SettingsIcon(Icons.Filled.Add)
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(meta.displayName, style = MaterialTheme.typography.bodyLarge)
-                                    Text(
-                                        text = if (users.isEmpty()) meta.description
-                                        else "für ${users.joinToString(", ")} — ${meta.description}",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        maxLines = 2,
-                                        overflow = TextOverflow.Ellipsis,
+                            SettingsTile(
+                                icon = Icons.Outlined.Key,
+                                title = meta.displayName,
+                                // The long how-to belongs in the dialog, not here.
+                                subtitle = if (users.isEmpty()) {
+                                    "Noch nicht hinterlegt"
+                                } else {
+                                    "Wird von ${users.joinToString(", ")} gebraucht"
+                                },
+                                onClick = {
+                                    secretDialogKind = kind
+                                    showSecretDialog = true
+                                },
+                                trailing = {
+                                    Icon(
+                                        Icons.Filled.Add,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.size(20.dp),
                                     )
-                                }
-                            }
+                                },
+                            )
                         }
                     }
                 }
             }
 
-            /* ---------- Zugänge & API-Keys ---------- */
-            SectionHeader("Zugänge & API-Keys")
+            /* ---------- Zugänge ---------- */
+            SectionHeader("Zugänge")
             GroupCard {
-                Column(Modifier.padding(vertical = 8.dp)) {
+                Column(Modifier.padding(vertical = 4.dp)) {
                     if (secrets.isEmpty()) {
-                        Text(
-                            text = "Noch keine Zugänge hinterlegt — für private Repos und Provider nötig",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
-                        )
+                        EmptyRow("Noch nichts hinterlegt – nötig für private Repos und Agenten")
                     }
                     secrets.forEachIndexed { index, secret ->
-                        if (index > 0) HorizontalDivider(modifier = Modifier.padding(start = 64.dp))
+                        if (index > 0) ListDivider()
                         val meta = metaFor(secret.kind, catalog)
                         val users = adaptersUsing(secret.kind, adapters)
                         val age = relativeTime(secret.createdAt)
                         val ageText = if (age == "jetzt") "gerade hinterlegt" else "hinterlegt vor $age"
                         SwipeToDismissRow(onDismiss = { vm.deleteSecret(secret.id) }) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .background(MaterialTheme.colorScheme.surfaceContainer)
-                                    .clickable { manageSecret = secret }
-                                    .padding(horizontal = 16.dp, vertical = 10.dp),
-                            ) {
-                                SettingsIcon(Icons.Outlined.Key)
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(meta.displayName, style = MaterialTheme.typography.bodyLarge)
-                                    Text(
-                                        text = if (users.isEmpty()) ageText
-                                        else "für ${users.joinToString(", ")} · $ageText",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                    )
-                                }
-                            }
+                            SettingsTile(
+                                icon = Icons.Outlined.Key,
+                                title = meta.displayName,
+                                subtitle = if (users.isEmpty()) {
+                                    ageText
+                                } else {
+                                    "für ${users.joinToString(", ")} · $ageText"
+                                },
+                                onClick = { manageSecret = secret },
+                                modifier = Modifier.background(MaterialTheme.colorScheme.surfaceContainer),
+                            )
                         }
                     }
-                    HorizontalDivider(modifier = Modifier.padding(start = 64.dp))
+                    ListDivider()
                     AddRow(label = "Zugang hinzufügen", onClick = {
                         secretDialogKind = null
                         showSecretDialog = true
                     })
                 }
             }
-            Text(
-                text = "Werte werden verschlüsselt im Server-Vault gespeichert und nie an die App zurückgeschickt.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(horizontal = 28.dp, vertical = 6.dp),
-            )
+            SectionNote("Werte liegen verschlüsselt im Server-Vault und werden nie an die App zurückgeschickt.")
 
-            error?.let {
-                Text(
-                    it,
-                    color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodySmall,
-                    modifier = Modifier.padding(horizontal = 28.dp, vertical = 8.dp),
-                )
-            }
+            error?.let { SectionError(it) }
 
             /* ---------- Gerät ---------- */
             SectionHeader("Gerät")
             GroupCard {
-                Column(Modifier.padding(horizontal = 16.dp, vertical = 14.dp)) {
-                    Button(
-                        onClick = { confirmLogout = true },
-                        shape = PillShape,
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = MaterialTheme.colorScheme.errorContainer,
-                            contentColor = MaterialTheme.colorScheme.onErrorContainer,
-                        ),
-                        modifier = Modifier.fillMaxWidth(),
+                Column(Modifier.padding(vertical = 4.dp)) {
+                    // A destructive list row, not a red button — same
+                    // vocabulary as every other row on this screen.
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { confirmLogout = true }
+                            .heightIn(min = TileMinHeight)
+                            .padding(horizontal = CardInset),
                     ) {
-                        Text("Von diesem Gerät abmelden", modifier = Modifier.padding(vertical = 4.dp))
+                        Icon(
+                            Icons.AutoMirrored.Outlined.Logout,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.size(20.dp),
+                        )
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Text(
+                            "Von diesem Gerät abmelden",
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = MaterialTheme.colorScheme.error,
+                        )
                     }
                 }
             }
+            Spacer(modifier = Modifier.height(SectionSpacing))
         }
     }
 
@@ -527,12 +511,57 @@ private fun SettingsIcon(icon: ImageVector) {
     Spacer(modifier = Modifier.width(16.dp))
 }
 
+/** Icon + title + subtitle row. Every content row on this screen is one. */
+@Composable
+private fun SettingsTile(
+    icon: ImageVector,
+    title: String,
+    subtitle: String?,
+    modifier: Modifier = Modifier,
+    onClick: (() -> Unit)? = null,
+    trailing: (@Composable () -> Unit)? = null,
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = modifier
+            .fillMaxWidth()
+            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
+            .heightIn(min = TileMinHeight)
+            .padding(horizontal = CardInset, vertical = 8.dp),
+    ) {
+        SettingsIcon(icon)
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.bodyLarge,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (!subtitle.isNullOrBlank()) {
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        trailing?.let {
+            Spacer(modifier = Modifier.width(12.dp))
+            it()
+        }
+    }
+}
+
 @Composable
 private fun SettingsRow(label: String, value: String) {
     Row(
+        verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 11.dp),
+            .heightIn(min = 48.dp)
+            .padding(horizontal = CardInset),
     ) {
         Text(label, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
         Text(
@@ -544,13 +573,24 @@ private fun SettingsRow(label: String, value: String) {
 }
 
 @Composable
+private fun EmptyRow(text: String) {
+    Text(
+        text = text,
+        style = MaterialTheme.typography.bodyMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(horizontal = CardInset, vertical = 12.dp),
+    )
+}
+
+@Composable
 private fun AddRow(label: String, onClick: () -> Unit) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick)
-            .padding(horizontal = 16.dp, vertical = 13.dp),
+            .heightIn(min = TileMinHeight)
+            .padding(horizontal = CardInset),
     ) {
         Icon(
             Icons.Filled.Add,
@@ -576,7 +616,8 @@ private fun DialogActionRow(
             .fillMaxWidth()
             .clip(MaterialTheme.shapes.small)
             .clickable(onClick = onClick)
-            .padding(horizontal = 8.dp, vertical = 13.dp),
+            .heightIn(min = TileMinHeight)
+            .padding(horizontal = 8.dp),
     ) {
         Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(20.dp))
         Spacer(modifier = Modifier.width(14.dp))
@@ -721,6 +762,12 @@ private fun SecretDialog(
                         label = { Text("Eigene Art") },
                         supportingText = { Text("Kleinbuchstaben und Unterstriche, z. B. mein_provider") },
                         singleLine = true,
+                        shape = MaterialTheme.shapes.small,
+                        keyboardOptions = KeyboardOptions(
+                            autoCorrectEnabled = false,
+                            keyboardType = KeyboardType.Ascii,
+                            imeAction = ImeAction.Next,
+                        ),
                         modifier = Modifier.fillMaxWidth(),
                     )
                 }
@@ -740,6 +787,8 @@ private fun SecretDialog(
                         label = { Text("Wert") },
                         minLines = 3,
                         maxLines = 6,
+                        shape = MaterialTheme.shapes.small,
+                        keyboardOptions = KeyboardOptions(autoCorrectEnabled = false),
                         modifier = Modifier.fillMaxWidth(),
                     )
                 } else {
@@ -748,8 +797,13 @@ private fun SecretDialog(
                         onValueChange = { value = it },
                         label = { Text("Wert") },
                         singleLine = true,
+                        shape = MaterialTheme.shapes.small,
                         visualTransformation = if (showValue) VisualTransformation.None else PasswordVisualTransformation(),
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        keyboardOptions = KeyboardOptions(
+                            autoCorrectEnabled = false,
+                            keyboardType = KeyboardType.Password,
+                            imeAction = ImeAction.Done,
+                        ),
                         trailingIcon = {
                             IconButton(onClick = { showValue = !showValue }) {
                                 Icon(

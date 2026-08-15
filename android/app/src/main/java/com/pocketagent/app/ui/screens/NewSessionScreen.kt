@@ -3,7 +3,6 @@
 package com.pocketagent.app.ui.screens
 
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -16,11 +15,14 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
@@ -34,12 +36,9 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -52,7 +51,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
@@ -62,7 +64,14 @@ import com.pocketagent.app.PocketAgentApp
 import com.pocketagent.app.data.AdapterDescriptor
 import com.pocketagent.app.data.AgentMode
 import com.pocketagent.app.data.AppRepository
+import com.pocketagent.app.data.RepoInfo
+import com.pocketagent.app.ui.theme.CardInset
 import com.pocketagent.app.ui.theme.PillShape
+import com.pocketagent.app.ui.theme.PrimaryButtonHeight
+import com.pocketagent.app.ui.theme.RadioRowDividerInset
+import com.pocketagent.app.ui.theme.ScreenGutter
+import com.pocketagent.app.ui.theme.SectionSpacing
+import com.pocketagent.app.ui.theme.TileMinHeight
 import com.pocketagent.app.ui.theme.semantic
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -224,18 +233,48 @@ fun NewSessionScreen(
     val secretKinds = remember(secrets) { secrets.map { it.kind }.toSet() }
     val selectedDescriptor = adapters.firstOrNull { it.id == state.adapter }
 
-    OneUiScaffold(title = "Neue Session", onBack = onBack) { padding ->
+    OneUiScaffold(
+        title = "Neue Session",
+        onBack = onBack,
+        bottomBar = {
+            // The commit action stays in the thumb zone instead of hiding
+            // at the end of a long scroll.
+            Surface(color = MaterialTheme.colorScheme.background, tonalElevation = 0.dp) {
+                Column(modifier = Modifier.navigationBarsPadding()) {
+                    state.error?.let { SectionError(it) }
+                    Button(
+                        onClick = { vm.create() },
+                        enabled = !state.busy && state.repoId != null,
+                        shape = PillShape,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = ScreenGutter, vertical = 10.dp)
+                            .height(PrimaryButtonHeight),
+                    ) {
+                        if (state.busy) {
+                            CircularProgressIndicator(
+                                strokeWidth = 2.dp,
+                                color = MaterialTheme.colorScheme.onPrimary,
+                                modifier = Modifier.size(18.dp),
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                        }
+                        Text(if (state.busy) "Session startet …" else "Session starten")
+                    }
+                }
+            }
+        },
+    ) { padding ->
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
                 .verticalScroll(rememberScrollState()),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             /* -------- Repository -------- */
             SectionHeader("Repository")
             RepoSelector(
-                repos = repos.map { it.id to it.fullName },
+                repos = repos,
                 selectedId = state.repoId,
                 onSelect = { id -> vm.update { it.copy(repoId = id) } },
                 onAddRepo = { showAddRepo = true },
@@ -243,42 +282,44 @@ fun NewSessionScreen(
 
             /* -------- Agent -------- */
             SectionHeader("Agent")
-            if (adapters.isEmpty()) {
-                GroupCard {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.padding(16.dp),
-                    ) {
-                        CircularProgressIndicator(
-                            strokeWidth = 2.dp,
-                            modifier = Modifier.size(18.dp),
-                        )
-                        Text(
-                            text = "Lade verfügbare Agenten …",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(start = 12.dp),
+            GroupCard {
+                Column {
+                    if (adapters.isEmpty()) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .heightIn(min = TileMinHeight)
+                                .padding(horizontal = CardInset),
+                        ) {
+                            CircularProgressIndicator(
+                                strokeWidth = 2.dp,
+                                modifier = Modifier.size(18.dp),
+                            )
+                            Text(
+                                text = "Lade verfügbare Agenten …",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(start = 12.dp),
+                            )
+                        }
+                    }
+                    adapters.forEachIndexed { index, descriptor ->
+                        if (index > 0) ListDivider(RadioRowDividerInset)
+                        AgentTile(
+                            descriptor = descriptor,
+                            selected = state.adapter == descriptor.id,
+                            keyMissing = !adapterKeyPresent(descriptor, secretKinds),
+                            onClick = { vm.onAdapterSelected(descriptor) },
                         )
                     }
                 }
-            } else {
-                adapters.forEach { descriptor ->
-                    AdapterCard(
-                        descriptor = descriptor,
-                        selected = state.adapter == descriptor.id,
-                        keyPresent = adapterKeyPresent(descriptor, secretKinds),
-                        onClick = { vm.onAdapterSelected(descriptor) },
+            }
+            selectedDescriptor?.let { selected ->
+                if (!selected.capabilities.approvals && state.mode != AgentMode.YOLO) {
+                    SectionNote(
+                        "${selected.name} kann nicht remote nachfragen – Ask und Accept Edits " +
+                            "laufen bei diesem Agenten ohne Rückfragen durch.",
                     )
-                }
-                selectedDescriptor?.let { selected ->
-                    if (!selected.capabilities.approvals && state.mode != AgentMode.YOLO) {
-                        Text(
-                            text = "${selected.name} unterstützt keine Remote-Approvals – Ask/AcceptEdits laufen ohne Nachfragen durch.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.tertiary,
-                            modifier = Modifier.padding(horizontal = 28.dp),
-                        )
-                    }
                 }
             }
 
@@ -287,7 +328,7 @@ fun NewSessionScreen(
                 SectionHeader("Provider")
                 GroupCard {
                     Column(
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
+                        modifier = Modifier.padding(horizontal = CardInset, vertical = 14.dp),
                         verticalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
                         FlowRow(
@@ -299,7 +340,7 @@ fun NewSessionScreen(
                                 ProviderChip(
                                     label = providerDisplayName(key),
                                     selected = !state.providerCustom && state.provider == key,
-                                    keyPresent = key in secretKinds,
+                                    keyMissing = key !in secretKinds,
                                     onClick = { vm.update { it.copy(provider = key, providerCustom = false) } },
                                 )
                             }
@@ -307,7 +348,7 @@ fun NewSessionScreen(
                                 selected = state.providerCustom,
                                 onClick = { vm.update { it.copy(providerCustom = true) } },
                                 shape = PillShape,
-                                label = { Text("Anderer Provider …") },
+                                label = { Text("Anderer …") },
                             )
                         }
                         AnimatedVisibility(visible = state.providerCustom) {
@@ -318,6 +359,11 @@ fun NewSessionScreen(
                                 placeholder = { Text("z. B. deepseek") },
                                 singleLine = true,
                                 shape = MaterialTheme.shapes.small,
+                                keyboardOptions = KeyboardOptions(
+                                    autoCorrectEnabled = false,
+                                    keyboardType = KeyboardType.Ascii,
+                                    imeAction = ImeAction.Done,
+                                ),
                                 modifier = Modifier.fillMaxWidth(),
                             )
                         }
@@ -334,24 +380,13 @@ fun NewSessionScreen(
                     if (p.isNotEmpty() && p !in secretKinds) providerDisplayName(p) else null
                 }
                 if (missingFor != null) {
-                    Surface(
-                        shape = MaterialTheme.shapes.large,
-                        color = MaterialTheme.colorScheme.tertiaryContainer,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 12.dp),
-                    ) {
-                        Column(modifier = Modifier.padding(start = 20.dp, end = 12.dp, top = 14.dp, bottom = 4.dp)) {
-                            Text(
-                                text = "Für $missingFor ist noch kein Key hinterlegt.",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onTertiaryContainer,
-                            )
-                            TextButton(onClick = onOpenSettings) {
-                                Text("Zu den Einstellungen")
-                            }
-                        }
-                    }
+                    Spacer(modifier = Modifier.height(SectionSpacing))
+                    NoticeCard(
+                        text = "Für $missingFor ist noch kein Zugang hinterlegt – die Session " +
+                            "startet, der Agent kann aber nicht arbeiten.",
+                        actionLabel = "Zugang hinterlegen",
+                        onAction = onOpenSettings,
+                    )
                 }
             }
 
@@ -359,32 +394,36 @@ fun NewSessionScreen(
             SectionHeader("Autonomie")
             GroupCard {
                 Column {
-                    ModeTile(
+                    SelectableTile(
                         title = "Ask",
-                        subtitle = "Jede Aktion wird vor der Ausführung bestätigt",
+                        subtitle = "Jede Aktion wird vorher bestätigt",
                         selected = state.mode == AgentMode.ASK,
                         onClick = { vm.update { it.copy(mode = AgentMode.ASK) } },
                     )
-                    TileDivider()
-                    ModeTile(
+                    ListDivider(RadioRowDividerInset)
+                    SelectableTile(
                         title = "Accept Edits",
-                        subtitle = "Datei-Änderungen laufen automatisch, alles andere wird gefragt",
+                        subtitle = "Datei-Änderungen laufen durch, alles andere wird gefragt",
                         selected = state.mode == AgentMode.ACCEPT_EDITS,
                         onClick = { vm.update { it.copy(mode = AgentMode.ACCEPT_EDITS) } },
                     )
-                    TileDivider()
-                    ModeTile(
+                    ListDivider(RadioRowDividerInset)
+                    SelectableTile(
                         title = "Auto",
                         subtitle = "Agent entscheidet selbst, Push nur manuell",
                         selected = state.mode == AgentMode.AUTO,
                         onClick = { vm.update { it.copy(mode = AgentMode.AUTO) } },
                     )
-                    TileDivider()
-                    ModeTile(
+                    ListDivider(RadioRowDividerInset)
+                    SelectableTile(
                         title = "Yolo",
-                        subtitle = "Vollautomatisch inkl. Push und Draft-PR – ohne Nachfrage",
-                        warning = true,
+                        subtitle = "Vollautomatisch inklusive Push und Draft-PR",
                         selected = state.mode == AgentMode.YOLO,
+                        titleColor = if (state.mode == AgentMode.YOLO) {
+                            MaterialTheme.colorScheme.error
+                        } else {
+                            Color.Unspecified
+                        },
                         onClick = { vm.update { it.copy(mode = AgentMode.YOLO) } },
                     )
                 }
@@ -394,37 +433,31 @@ fun NewSessionScreen(
             SectionHeader("Netzwerk")
             GroupCard {
                 Column {
-                    ModeTile(
+                    SelectableTile(
                         title = "Allowlist",
-                        subtitle = "Nur GitHub, KI-Anbieter & Paket-Registries (empfohlen)",
+                        subtitle = "Nur GitHub, KI-Anbieter und Paket-Registries (empfohlen)",
                         selected = state.networkPolicy == "allowlist",
                         onClick = { vm.update { it.copy(networkPolicy = "allowlist") } },
                     )
-                    TileDivider()
-                    ModeTile(
+                    ListDivider(RadioRowDividerInset)
+                    SelectableTile(
                         title = "Isoliert",
                         subtitle = "Kein Internetzugriff – nur für lokale Aufgaben",
                         selected = state.networkPolicy == "isolated",
                         onClick = { vm.update { it.copy(networkPolicy = "isolated") } },
                     )
-                    TileDivider()
-                    ModeTile(
+                    ListDivider(RadioRowDividerInset)
+                    SelectableTile(
                         title = "Offen",
-                        subtitle = "Vollständiger Netzwerkzugriff (wie lokal)",
+                        subtitle = "Vollständiger Netzwerkzugriff wie lokal",
                         selected = state.networkPolicy == "open",
                         onClick = { vm.update { it.copy(networkPolicy = "open") } },
                     )
                 }
             }
-            Text(
-                text = "Standard ist Allowlist – der Agent kommt nur an whitelistede Domains.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(horizontal = 28.dp),
-            )
 
             /* -------- Erweitert -------- */
-            Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(SectionSpacing))
             GroupCard {
                 Column {
                     Row(
@@ -432,75 +465,62 @@ fun NewSessionScreen(
                         modifier = Modifier
                             .fillMaxWidth()
                             .clickable { advanced = !advanced }
-                            .padding(start = 20.dp, end = 8.dp, top = 6.dp, bottom = 6.dp),
+                            .heightIn(min = TileMinHeight)
+                            .padding(horizontal = CardInset),
                     ) {
                         Text(
                             text = "Erweitert",
                             style = MaterialTheme.typography.titleSmall,
                             modifier = Modifier.weight(1f),
                         )
-                        IconButton(onClick = { advanced = !advanced }) {
-                            Icon(
-                                if (advanced) Icons.Outlined.UnfoldLess else Icons.Outlined.UnfoldMore,
-                                contentDescription = null,
-                            )
-                        }
+                        Icon(
+                            if (advanced) Icons.Outlined.UnfoldLess else Icons.Outlined.UnfoldMore,
+                            contentDescription = if (advanced) "Erweitert einklappen" else "Erweitert ausklappen",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
                     }
                     AnimatedVisibility(visible = advanced) {
                         Column(
                             verticalArrangement = Arrangement.spacedBy(12.dp),
-                            modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 16.dp),
+                            modifier = Modifier.padding(
+                                start = CardInset,
+                                end = CardInset,
+                                bottom = CardInset,
+                            ),
                         ) {
                             OutlinedTextField(
                                 value = state.model,
                                 onValueChange = { v -> vm.update { it.copy(model = v) } },
                                 label = { Text("Modell") },
-                                placeholder = { Text("Default") },
+                                placeholder = { Text(selectedDescriptor?.defaults?.model ?: "Standard des Agenten") },
                                 singleLine = true,
                                 shape = MaterialTheme.shapes.small,
+                                keyboardOptions = KeyboardOptions(
+                                    autoCorrectEnabled = false,
+                                    keyboardType = KeyboardType.Ascii,
+                                    imeAction = ImeAction.Next,
+                                ),
                                 modifier = Modifier.fillMaxWidth(),
                             )
                             OutlinedTextField(
                                 value = state.branch,
                                 onValueChange = { v -> vm.update { it.copy(branch = v) } },
-                                label = { Text("Basis-Branch (optional)") },
+                                label = { Text("Basis-Branch") },
                                 placeholder = { Text("Default-Branch des Repos") },
                                 singleLine = true,
                                 shape = MaterialTheme.shapes.small,
+                                keyboardOptions = KeyboardOptions(
+                                    autoCorrectEnabled = false,
+                                    keyboardType = KeyboardType.Ascii,
+                                    imeAction = ImeAction.Done,
+                                ),
                                 modifier = Modifier.fillMaxWidth(),
                             )
                         }
                     }
                 }
             }
-
-            state.error?.let {
-                Text(
-                    text = it,
-                    color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodySmall,
-                    modifier = Modifier.padding(horizontal = 28.dp),
-                )
-            }
-
-            /* -------- Start -------- */
-            Spacer(modifier = Modifier.height(8.dp))
-            Button(
-                onClick = { vm.create() },
-                enabled = !state.busy && state.repoId != null,
-                shape = PillShape,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 12.dp)
-                    .height(52.dp),
-            ) {
-                if (state.busy) {
-                    CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.size(18.dp))
-                    Spacer(modifier = Modifier.width(8.dp))
-                }
-                Text(if (state.busy) "Session startet …" else "Session starten")
-            }
-            Spacer(modifier = Modifier.height(20.dp))
+            Spacer(modifier = Modifier.height(SectionSpacing))
         }
     }
 
@@ -516,100 +536,47 @@ fun NewSessionScreen(
 }
 
 /* ------------------------------------------------------------------ */
-/* Agent cards                                                         */
+/* Agent list                                                          */
 /* ------------------------------------------------------------------ */
 
+/**
+ * An agent is picked the same way an autonomy mode is picked: a radio row
+ * in a grouped card. Capabilities ride along as neutral chips; only a
+ * *missing* key is called out, because only that needs acting on.
+ */
 @Composable
-private fun AdapterCard(
+private fun AgentTile(
     descriptor: AdapterDescriptor,
     selected: Boolean,
-    keyPresent: Boolean,
+    keyMissing: Boolean,
     onClick: () -> Unit,
 ) {
-    Surface(
-        shape = MaterialTheme.shapes.large,
-        color = if (selected) {
-            MaterialTheme.colorScheme.secondaryContainer
-        } else {
-            MaterialTheme.colorScheme.surfaceContainer
-        },
-        border = if (selected) {
-            BorderStroke(2.dp, MaterialTheme.colorScheme.primary)
+    val caps = descriptor.capabilities
+    SelectableTile(
+        title = descriptor.name,
+        subtitle = descriptor.description?.takeIf { it.isNotBlank() },
+        selected = selected,
+        onClick = onClick,
+        trailing = if (keyMissing) {
+            { DotLabel(color = semantic().warning, label = "Kein Zugang") }
         } else {
             null
         },
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 12.dp)
-            .clickable(onClick = onClick),
-    ) {
-        Column(
-            modifier = Modifier.padding(horizontal = 18.dp, vertical = 14.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    text = descriptor.name,
-                    style = MaterialTheme.typography.titleMedium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f),
-                )
-                KeyStatusBadge(keyPresent = keyPresent)
-            }
-            descriptor.description?.takeIf { it.isNotBlank() }?.let {
-                Text(
-                    text = it,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-            val caps = descriptor.capabilities
-            if (caps.approvals || caps.resume || caps.streaming) {
+        extra = if (caps.approvals || caps.resume || caps.streaming) {
+            {
                 FlowRow(
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
-                    if (caps.approvals) CapabilityChip("Rückfragen")
-                    if (caps.resume) CapabilityChip("Fortsetzen")
-                    if (caps.streaming) CapabilityChip("Streaming")
+                    if (caps.approvals) InfoChip("Rückfragen")
+                    if (caps.resume) InfoChip("Fortsetzen")
+                    if (caps.streaming) InfoChip("Streaming")
                 }
             }
-        }
-    }
-}
-
-@Composable
-private fun CapabilityChip(text: String) {
-    Text(
-        text = text,
-        style = MaterialTheme.typography.labelSmall,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-        modifier = Modifier
-            .background(MaterialTheme.colorScheme.surfaceVariant, PillShape)
-            .padding(horizontal = 9.dp, vertical = 3.dp),
+        } else {
+            null
+        },
     )
-}
-
-@Composable
-private fun KeyStatusBadge(keyPresent: Boolean) {
-    val s = semantic()
-    val color = if (keyPresent) s.success else s.warning
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Box(
-            modifier = Modifier
-                .size(7.dp)
-                .background(color, CircleShape),
-        )
-        Spacer(modifier = Modifier.width(5.dp))
-        Text(
-            text = if (keyPresent) "Zugang hinterlegt" else "Key fehlt",
-            style = MaterialTheme.typography.labelSmall,
-            color = color,
-        )
-    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -620,22 +587,24 @@ private fun KeyStatusBadge(keyPresent: Boolean) {
 private fun ProviderChip(
     label: String,
     selected: Boolean,
-    keyPresent: Boolean,
+    keyMissing: Boolean,
     onClick: () -> Unit,
 ) {
-    val s = semantic()
     FilterChip(
         selected = selected,
         onClick = onClick,
         shape = PillShape,
         label = {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Box(
-                    modifier = Modifier
-                        .size(7.dp)
-                        .background(if (keyPresent) s.success else s.warning, CircleShape),
-                )
-                Spacer(modifier = Modifier.width(6.dp))
+                // Silence is "fine". Only a missing key gets a marker.
+                if (keyMissing) {
+                    Box(
+                        modifier = Modifier
+                            .size(6.dp)
+                            .background(semantic().warning, CircleShape),
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                }
                 Text(label)
             }
         },
@@ -648,60 +617,77 @@ private fun ProviderChip(
 
 @Composable
 private fun RepoSelector(
-    repos: List<Pair<String, String>>,
+    repos: List<RepoInfo>,
     selectedId: String?,
     onSelect: (String) -> Unit,
     onAddRepo: () -> Unit,
 ) {
     var expanded by remember { mutableStateOf(false) }
-    val selectedLabel = repos.firstOrNull { it.first == selectedId }?.second
+    val selected = repos.firstOrNull { it.id == selectedId }
 
-    Surface(
-        shape = MaterialTheme.shapes.large,
-        color = MaterialTheme.colorScheme.surfaceContainer,
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 12.dp)
-            .clickable { expanded = true },
-    ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.padding(start = 18.dp, end = 10.dp, top = 10.dp, bottom = 10.dp),
-        ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = "Repository",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Text(
-                    text = selectedLabel ?: "Wähle ein Repository …",
-                    style = MaterialTheme.typography.titleSmall,
+    Box {
+        GroupCard {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { expanded = true }
+                    .heightIn(min = TileMinHeight)
+                    .padding(start = CardInset, end = 10.dp),
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = selected?.fullName ?: "Repository wählen",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = if (selected == null) {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        } else {
+                            MaterialTheme.colorScheme.onSurface
+                        },
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    selected?.let {
+                        Text(
+                            text = "Basis: ${it.defaultBranch}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                Icon(
+                    Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            Icon(
-                Icons.AutoMirrored.Filled.KeyboardArrowRight,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
         }
-    }
-    DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-        if (repos.isEmpty()) {
+        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            if (repos.isEmpty()) {
+                DropdownMenuItem(
+                    text = { Text("Noch keine Repositories") },
+                    enabled = false,
+                    onClick = {},
+                )
+            }
+            repos.forEach { repo ->
+                DropdownMenuItem(
+                    text = { Text(repo.fullName) },
+                    onClick = { onSelect(repo.id); expanded = false },
+                )
+            }
             DropdownMenuItem(
-                text = { Text("Noch keine Repos") },
-                enabled = false,
-                onClick = {},
+                text = { Text("Repository hinzufügen", color = MaterialTheme.colorScheme.primary) },
+                leadingIcon = {
+                    Icon(
+                        Icons.Filled.Add,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                    )
+                },
+                onClick = { expanded = false; onAddRepo() },
             )
         }
-        repos.forEach { (id, label) ->
-            DropdownMenuItem(text = { Text(label) }, onClick = { onSelect(id); expanded = false })
-        }
-        DropdownMenuItem(
-            text = { Text("Repository hinzufügen …", color = MaterialTheme.colorScheme.primary) },
-            leadingIcon = { Icon(Icons.Filled.Add, contentDescription = null) },
-            onClick = { expanded = false; onAddRepo() },
-        )
     }
 }
 
@@ -729,22 +715,34 @@ fun AddRepoDialog(
                     singleLine = true,
                     shape = MaterialTheme.shapes.small,
                     isError = fullName.isNotBlank() && !valid,
+                    keyboardOptions = KeyboardOptions(
+                        autoCorrectEnabled = false,
+                        keyboardType = KeyboardType.Ascii,
+                        imeAction = ImeAction.Next,
+                    ),
                     supportingText = if (fullName.isNotBlank() && !valid) {
                         { Text("Format: owner/repo") }
                     } else {
                         null
                     },
+                    modifier = Modifier.fillMaxWidth(),
                 )
                 OutlinedTextField(
                     value = branch,
                     onValueChange = { branch = it },
-                    label = { Text("Basis-Branch (optional)") },
+                    label = { Text("Basis-Branch") },
                     placeholder = { Text("main") },
                     singleLine = true,
                     shape = MaterialTheme.shapes.small,
+                    keyboardOptions = KeyboardOptions(
+                        autoCorrectEnabled = false,
+                        keyboardType = KeyboardType.Ascii,
+                        imeAction = ImeAction.Done,
+                    ),
+                    modifier = Modifier.fillMaxWidth(),
                 )
                 Text(
-                    "Für private Repos zusätzlich ein github-Secret in den Einstellungen hinterlegen.",
+                    "Private Repos brauchen zusätzlich einen GitHub-Zugang in den Einstellungen.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -759,49 +757,3 @@ fun AddRepoDialog(
     )
 }
 
-/* ------------------------------------------------------------------ */
-/* Mode tiles (grouped list rows, One UI settings style)               */
-/* ------------------------------------------------------------------ */
-
-@Composable
-private fun TileDivider() {
-    HorizontalDivider(
-        color = MaterialTheme.colorScheme.outlineVariant,
-        modifier = Modifier.padding(start = 56.dp, end = 16.dp),
-    )
-}
-
-@Composable
-private fun ModeTile(
-    title: String,
-    subtitle: String,
-    warning: Boolean = false,
-    selected: Boolean,
-    onClick: () -> Unit,
-) {
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(onClick = onClick)
-            .padding(start = 4.dp, end = 16.dp, top = 4.dp, bottom = 4.dp),
-    ) {
-        RadioButton(selected = selected, onClick = onClick)
-        Column(modifier = Modifier.padding(start = 4.dp, top = 10.dp, bottom = 10.dp)) {
-            Text(
-                text = title,
-                style = MaterialTheme.typography.titleSmall,
-                color = if (warning && selected) {
-                    MaterialTheme.colorScheme.error
-                } else {
-                    MaterialTheme.colorScheme.onSurface
-                },
-            )
-            Text(
-                text = subtitle,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-    }
-}

@@ -7,7 +7,6 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -57,7 +56,8 @@ fun MarkdownText(text: String, modifier: Modifier = Modifier) {
                     Text(
                         text = block.marker,
                         style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.primary,
+                        // Grey: a bullet is punctuation, not an accent.
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.width(20.dp),
                     )
                     Text(
@@ -218,7 +218,9 @@ private fun CodeBlock(block: Block.Code) {
         modifier = Modifier
             .padding(vertical = 6.dp)
             .fillMaxWidth()
-            .background(MaterialTheme.colorScheme.surfaceContainerHigh, RoundedCornerShape(12.dp)),
+            // Highest, not High: in light mode High is white — the same
+            // color as the bubble the code block sits in.
+            .background(MaterialTheme.colorScheme.surfaceContainerHighest, RoundedCornerShape(12.dp)),
     ) {
         Row(
             verticalAlignment = Alignment.CenterVertically,

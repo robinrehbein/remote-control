@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
@@ -25,6 +26,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -45,6 +47,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -69,6 +72,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardCapitalization
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -81,8 +88,12 @@ import com.pocketagent.app.data.SessionInfo
 import com.pocketagent.app.data.SessionStatus
 import com.pocketagent.app.data.wireName
 import com.pocketagent.app.ui.components.MarkdownText
+import com.pocketagent.app.ui.theme.CardInset
+import com.pocketagent.app.ui.theme.ContentInset
+import com.pocketagent.app.ui.theme.MinTouchTarget
 import com.pocketagent.app.ui.theme.MonoMedium
 import com.pocketagent.app.ui.theme.PillShape
+import com.pocketagent.app.ui.theme.ScreenGutter
 import com.pocketagent.app.ui.theme.semantic
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -296,26 +307,20 @@ fun SessionScreen(
                         Text(
                             text = session?.repoFullName ?: "Session",
                             style = MaterialTheme.typography.titleMedium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
                         )
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                            modifier = Modifier.padding(top = 2.dp),
-                        ) {
-                            session?.let { StatusBadge(it.status, pulse = it.status == SessionStatus.RUNNING) }
-                            InfoChip(session?.adapter ?: "")
-                            InfoChip(session?.mode?.wireName() ?: "")
-                            session?.networkPolicy
-                                ?.takeIf { it != "allowlist" }
-                                ?.let { policy ->
-                                    InfoChip(
-                                        when (policy) {
-                                            "open" -> "net: offen"
-                                            "isolated" -> "net: isoliert"
-                                            else -> "net: $policy"
-                                        }
-                                    )
-                                }
+                        // One quiet line instead of a badge plus four chips.
+                        session?.let { s ->
+                            StatusLine(
+                                status = s.status,
+                                details = listOfNotNull(
+                                    s.adapter,
+                                    s.mode.wireName(),
+                                    s.networkPolicy?.takeIf { it != "allowlist" }?.let(::networkPolicyLabel),
+                                ),
+                                modifier = Modifier.padding(top = 2.dp),
+                            )
                         }
                     }
                 },
@@ -327,22 +332,24 @@ fun SessionScreen(
                 actions = {
                     if (busy || session?.status == SessionStatus.RUNNING) {
                         IconButton(onClick = { vm.abort() }) {
-                            Icon(Icons.Filled.Stop, contentDescription = "Abbrechen")
-                        }
-                    }
-                    if (session?.mode != com.pocketagent.app.data.AgentMode.YOLO) {
-                        IconButton(onClick = { vm.push() }) {
-                            Icon(Icons.Filled.CloudUpload, contentDescription = "Push + Draft-PR")
+                            Icon(Icons.Filled.Stop, contentDescription = "Agent anhalten")
                         }
                     }
                     IconButton(onClick = { onOpenDiff(sessionId) }) {
-                        Icon(Icons.Filled.Difference, contentDescription = "Änderungen")
+                        Icon(Icons.Filled.Difference, contentDescription = "Änderungen ansehen")
                     }
                     Box {
                         IconButton(onClick = { menuOpen = true }) {
-                            Icon(Icons.Filled.MoreVert, contentDescription = "Mehr")
+                            Icon(Icons.Filled.MoreVert, contentDescription = "Weitere Aktionen")
                         }
                         DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                            if (session?.mode != com.pocketagent.app.data.AgentMode.YOLO) {
+                                DropdownMenuItem(
+                                    text = { Text("Pushen & Draft-PR") },
+                                    leadingIcon = { Icon(Icons.Filled.CloudUpload, contentDescription = null) },
+                                    onClick = { menuOpen = false; vm.push() },
+                                )
+                            }
                             if (session?.status == SessionStatus.STOPPED) {
                                 DropdownMenuItem(
                                     text = { Text("Fortsetzen") },
@@ -351,7 +358,7 @@ fun SessionScreen(
                                 )
                             } else {
                                 DropdownMenuItem(
-                                    text = { Text("Anhalten (Container stoppen)") },
+                                    text = { Text("Container anhalten") },
                                     leadingIcon = { Icon(Icons.Outlined.Close, contentDescription = null) },
                                     onClick = { menuOpen = false; vm.stop() },
                                 )
@@ -372,17 +379,17 @@ fun SessionScreen(
                     AnimatedVisibility(visible = busy, enter = fadeIn(), exit = fadeOut()) {
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier.padding(start = 20.dp, top = 6.dp, bottom = 2.dp),
+                            modifier = Modifier.padding(start = ContentInset, top = 6.dp, bottom = 2.dp),
                         ) {
                             PulsingDot(
                                 color = MaterialTheme.colorScheme.primary,
                                 pulse = true,
-                                size = 7.dp,
+                                size = 6.dp,
                             )
-                            Spacer(modifier = Modifier.width(8.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
                             Text(
                                 text = "Agent arbeitet …",
-                                style = MaterialTheme.typography.labelMedium,
+                                style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
@@ -391,15 +398,19 @@ fun SessionScreen(
                         verticalAlignment = Alignment.Bottom,
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                            .padding(start = ScreenGutter, end = ScreenGutter, top = 4.dp, bottom = 8.dp),
                     ) {
                         OutlinedTextField(
                             value = input,
                             onValueChange = vm::updateInput,
-                            placeholder = { Text("Nachricht an den Agenten …") },
+                            placeholder = { Text("Aufgabe oder Rückfrage …") },
                             modifier = Modifier.weight(1f),
                             maxLines = 5,
                             shape = PillShape,
+                            keyboardOptions = KeyboardOptions(
+                                capitalization = KeyboardCapitalization.Sentences,
+                                imeAction = ImeAction.Default,
+                            ),
                             colors = OutlinedTextFieldDefaults.colors(
                                 focusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
                                 unfocusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
@@ -409,20 +420,18 @@ fun SessionScreen(
                                 disabledBorderColor = Color.Transparent,
                             ),
                         )
-                        IconButton(
+                        Spacer(modifier = Modifier.width(6.dp))
+                        // Filled circle when there is something to send: the
+                        // primary action of this screen should look like one.
+                        FilledIconButton(
                             onClick = { vm.sendPrompt() },
                             enabled = input.isNotBlank(),
-                            modifier = Modifier.padding(start = 4.dp, bottom = 4.dp),
+                            shape = CircleShape,
+                            modifier = Modifier
+                                .padding(bottom = 4.dp)
+                                .size(MinTouchTarget),
                         ) {
-                            Icon(
-                                Icons.AutoMirrored.Filled.Send,
-                                contentDescription = "Senden",
-                                tint = if (input.isNotBlank()) {
-                                    MaterialTheme.colorScheme.primary
-                                } else {
-                                    MaterialTheme.colorScheme.outline
-                                },
-                            )
+                            Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Senden")
                         }
                     }
                 }
@@ -436,17 +445,21 @@ fun SessionScreen(
                     .padding(padding),
                 contentAlignment = Alignment.Center,
             ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.padding(horizontal = 40.dp),
+                ) {
                     Text(
-                        text = "Worauf sollen wir arbeiten?",
+                        text = "Woran soll gearbeitet werden?",
                         style = MaterialTheme.typography.titleMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     Text(
-                        text = "Beschreibe die Aufgabe – der Agent erledigt den Rest.",
+                        text = "Beschreibe die Aufgabe unten – zum Beispiel „Fixe den Login-Timeout und " +
+                            "schreib einen Test dafür“.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(top = 4.dp, start = 32.dp, end = 32.dp),
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(top = 6.dp),
                     )
                 }
             }
@@ -456,7 +469,12 @@ fun SessionScreen(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(padding),
-                contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 10.dp, bottom = 16.dp),
+                contentPadding = PaddingValues(
+                    start = ScreenGutter,
+                    end = ScreenGutter,
+                    top = 10.dp,
+                    bottom = 16.dp,
+                ),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 items(items) { item -> TimelineItemView(item, vm) }
@@ -547,7 +565,7 @@ private fun ToolCard(item: TimelineItem.Tool) {
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(start = 14.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+                    .padding(start = CardInset, end = 4.dp, top = 4.dp, bottom = 4.dp),
             ) {
                 val s = semantic()
                 val (dotColor, statusText) = when {
@@ -609,7 +627,7 @@ private fun ToolCard(item: TimelineItem.Tool) {
                     }
                     item.result?.let { result ->
                         Surface(
-                            color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                            color = MaterialTheme.colorScheme.surfaceContainerHighest,
                             shape = MaterialTheme.shapes.small,
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -673,43 +691,55 @@ private fun ApprovalCard(item: TimelineItem.Approval, vm: SessionViewModel) {
                         .fillMaxWidth()
                         .padding(top = 8.dp),
                 ) {
-                    Column(
+                    DiffBody(
+                        lines = diff.lines(),
+                        style = MonoMedium,
                         modifier = Modifier
                             .heightIn(max = 300.dp)
                             .verticalScroll(rememberScrollState())
-                            .padding(vertical = 6.dp)
-                    ) {
-                        diff.lines().forEach { line -> DiffLine(line = line, style = MonoMedium) }
-                    }
+                            .padding(vertical = 6.dp),
+                    )
                 }
             }
             when (item.resolved) {
-                null -> Column(modifier = Modifier.padding(top = 12.dp)) {
+                // Same button heights, same pill shape, one accent: the
+                // safe default is filled, the wider grant is tonal, the
+                // refusal is quiet text.
+                null -> Column(modifier = Modifier.padding(top = 14.dp)) {
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(
                             shape = PillShape,
                             onClick = { vm.decide(item.permissionId, PermissionDecision.ONCE) },
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(MinTouchTarget),
                         ) {
                             Text("Erlauben")
                         }
                         FilledTonalButton(
                             shape = PillShape,
                             onClick = { vm.decide(item.permissionId, PermissionDecision.ALWAYS) },
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(MinTouchTarget),
                         ) {
-                            Text("Immer erlauben")
+                            Text("Immer")
                         }
                     }
                     TextButton(
                         shape = PillShape,
                         onClick = { vm.decide(item.permissionId, PermissionDecision.REJECT) },
+                        modifier = Modifier
+                            .padding(top = 4.dp)
+                            .heightIn(min = MinTouchTarget),
                     ) {
                         Text("Ablehnen")
                     }
                 }
 
-                PermissionDecision.ONCE -> ResolvedLabel("erlaubt")
-                PermissionDecision.ALWAYS -> ResolvedLabel("immer erlaubt")
-                PermissionDecision.REJECT -> ResolvedLabel("abgelehnt")
+                PermissionDecision.ONCE -> ResolvedLabel("Erlaubt")
+                PermissionDecision.ALWAYS -> ResolvedLabel("Immer erlaubt")
+                PermissionDecision.REJECT -> ResolvedLabel("Abgelehnt")
             }
         }
     }
@@ -751,22 +781,14 @@ private fun TurnEndSeparator(item: TimelineItem.TurnEnd) {
             Icon(
                 Icons.Outlined.Check,
                 contentDescription = null,
-                tint = MaterialTheme.colorScheme.outline,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.size(14.dp),
             )
             Text(
-                text = "fertig",
+                text = listOfNotNull("Fertig", item.commitSha?.take(7)).joinToString(" · "),
                 style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.outline,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
                 fontWeight = FontWeight.Medium,
-            )
-        }
-        item.commitSha?.let { sha ->
-            Text(
-                text = sha.take(10),
-                style = MonoMedium.copy(fontSize = MaterialTheme.typography.labelSmall.fontSize),
-                color = MaterialTheme.colorScheme.outline,
-                modifier = Modifier.padding(top = 2.dp),
             )
         }
     }
@@ -785,10 +807,15 @@ private fun PushCard(item: TimelineItem.Pushed) {
                     Icons.Filled.CloudUpload,
                     contentDescription = null,
                     tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                    modifier = Modifier.size(20.dp),
                 )
                 Text(
-                    text = if (item.auto) "Automatisch gepusht" else "Gepusht",
+                    text = listOfNotNull(
+                        if (item.auto) "Automatisch gepusht" else "Gepusht",
+                        item.prUrl?.let { "Draft-PR erstellt" },
+                    ).joinToString(" · "),
                     style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer,
                     modifier = Modifier.padding(start = 8.dp),
                 )
             }
@@ -798,14 +825,6 @@ private fun PushCard(item: TimelineItem.Pushed) {
                 color = MaterialTheme.colorScheme.onPrimaryContainer,
                 modifier = Modifier.padding(top = 6.dp),
             )
-            item.prUrl?.let {
-                Text(
-                    text = "Pull Request erstellt",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.padding(top = 4.dp),
-                )
-            }
         }
     }
 }

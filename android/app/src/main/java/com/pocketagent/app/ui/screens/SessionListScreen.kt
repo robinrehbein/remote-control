@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -43,6 +44,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.pocketagent.app.PocketAgentApp
@@ -51,7 +53,8 @@ import com.pocketagent.app.data.SessionStatus
 import com.pocketagent.app.data.WsClient
 import com.pocketagent.app.data.wireName
 import com.pocketagent.app.ui.theme.PillShape
-import com.pocketagent.app.ui.theme.semantic
+import com.pocketagent.app.ui.theme.PrimaryButtonHeight
+import com.pocketagent.app.ui.theme.ScreenGutter
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -88,11 +91,13 @@ fun SessionListScreen(
                 .fillMaxSize()
                 .padding(padding),
         ) {
-            Row(
-                horizontalArrangement = Arrangement.Center,
-                modifier = Modifier.fillMaxWidth(),
+            // Connection chrome only when it is actually worth knowing.
+            AnimatedVisibility(
+                visible = connState !is WsClient.ConnState.Connected,
+                enter = fadeIn(),
+                exit = fadeOut(),
             ) {
-                ConnLabel(connState)
+                OfflineNotice(connState)
             }
             PullToRefreshBox(
                 isRefreshing = refreshing,
@@ -113,7 +118,12 @@ fun SessionListScreen(
                 } else {
                     LazyColumn(
                         modifier = Modifier.fillMaxSize(),
-                        contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 96.dp),
+                        contentPadding = PaddingValues(
+                            start = ScreenGutter,
+                            end = ScreenGutter,
+                            top = 8.dp,
+                            bottom = 96.dp,
+                        ),
                         verticalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
                         items(sessions, key = { it.id }) { session ->
@@ -150,20 +160,25 @@ private fun EmptySessions(onNewSession: () -> Unit) {
             }
         }
         Text(
-            text = "Deine Agenten warten",
+            text = "Noch keine Session",
             style = MaterialTheme.typography.headlineSmall,
+            textAlign = TextAlign.Center,
             modifier = Modifier.padding(top = 20.dp),
         )
         Text(
-            text = "Starte eine Session, um ein Repository von deinem Telefon aus zu bearbeiten – Approvals, Diffs und Push inklusive.",
+            text = "Wähle ein Repository und einen Agenten – ab dann arbeitest du vom Telefon aus: " +
+                "Aufgabe stellen, Rückfragen beantworten, Diff prüfen, pushen.",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
             modifier = Modifier.padding(top = 8.dp),
         )
         Button(
             onClick = onNewSession,
             shape = PillShape,
-            modifier = Modifier.padding(top = 24.dp),
+            modifier = Modifier
+                .padding(top = 24.dp)
+                .height(PrimaryButtonHeight),
         ) {
             Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(18.dp))
             Spacer(modifier = Modifier.width(8.dp))
@@ -173,25 +188,28 @@ private fun EmptySessions(onNewSession: () -> Unit) {
 }
 
 @Composable
-private fun ConnLabel(state: WsClient.ConnState) {
-    val (label, active) = when (state) {
-        is WsClient.ConnState.Connected -> "verbunden" to true
-        is WsClient.ConnState.Connecting -> "verbinde…" to false
-        is WsClient.ConnState.Waiting -> "warte…" to false
-        is WsClient.ConnState.Failed -> "offline" to false
-        WsClient.ConnState.Idle -> "offline" to false
+private fun OfflineNotice(state: WsClient.ConnState) {
+    val label = when (state) {
+        is WsClient.ConnState.Connecting -> "Verbinde mit dem Server …"
+        is WsClient.ConnState.Waiting -> "Warte auf den Server …"
+        else -> "Offline – Sessions sind womöglich nicht aktuell"
     }
-    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 1.dp)) {
-        PulsingDot(
-            color = if (active) semantic().success else MaterialTheme.colorScheme.error,
-            pulse = state is WsClient.ConnState.Connecting || state is WsClient.ConnState.Waiting,
-            size = 6.dp,
-        )
-        Spacer(modifier = Modifier.width(5.dp))
-        Text(
-            text = label,
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.Center,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = ScreenGutter, vertical = 4.dp),
+    ) {
+        val live = state is WsClient.ConnState.Connecting || state is WsClient.ConnState.Waiting
+        DotLabel(
+            color = if (live) {
+                MaterialTheme.colorScheme.onSurfaceVariant
+            } else {
+                MaterialTheme.colorScheme.error
+            },
+            label = label,
+            pulse = live,
         )
     }
 }
@@ -216,51 +234,44 @@ private fun SessionCard(session: SessionInfo, onClick: () -> Unit) {
                         overflow = TextOverflow.Ellipsis,
                     )
                     Text(
-                        text = relativeTime(session.lastActiveAt),
+                        text = if (session.status == SessionStatus.CREATING) {
+                            "Container wird gestartet …"
+                        } else {
+                            relativeTime(session.lastActiveAt)
+                        },
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
                     )
                 }
-                StatusBadge(
-                    status = session.status,
-                    pulse = session.status == SessionStatus.RUNNING || session.status == SessionStatus.CREATING,
-                )
-            }
-            AnimatedVisibility(visible = session.status == SessionStatus.CREATING, enter = fadeIn(), exit = fadeOut()) {
-                Text(
-                    text = "Container wird gestartet …",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(top = 8.dp),
-                )
+                Spacer(modifier = Modifier.width(10.dp))
+                StatusBadge(status = session.status)
             }
             Row(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                 modifier = Modifier.padding(top = 10.dp),
             ) {
                 InfoChip(session.adapter)
-                if (session.model.isNotBlank()) InfoChip(session.model)
                 InfoChip(session.mode.wireName())
                 session.networkPolicy
                     ?.takeIf { it != "allowlist" }
-                    ?.let { policy ->
-                        InfoChip(
-                            when (policy) {
-                                "open" -> "net: offen"
-                                "isolated" -> "net: isoliert"
-                                else -> "net: $policy"
-                            }
-                        )
-                    }
+                    ?.let { policy -> InfoChip(networkPolicyLabel(policy)) }
             }
-            session.prUrl?.let { url ->
+            if (session.prUrl != null) {
                 Text(
-                    text = "Pull Request geöffnet",
+                    text = "Pull Request offen",
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.padding(top = 8.dp),
+                    modifier = Modifier.padding(top = 10.dp),
                 )
             }
         }
     }
+}
+
+/** Shared wording for the non-default network policies. */
+fun networkPolicyLabel(policy: String): String = when (policy) {
+    "open" -> "Netz: offen"
+    "isolated" -> "Netz: isoliert"
+    else -> "Netz: $policy"
 }

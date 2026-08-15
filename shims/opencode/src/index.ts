@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, resolve } from 'node:path';
 import Fastify, { type FastifyReply } from 'fastify';
+import { selectModel } from '@pocketagent/protocol';
 import type { AgentMode, PermissionDecision, PromptRequest, ResumeRequest, ShimStatus } from '@pocketagent/protocol';
 import { readEnv, type ShimEnvConfig } from './env';
 import { parsePermissionJson, permissionForMode, writeOpencodeConfig, type PermissionMap } from './modes';
@@ -47,31 +48,13 @@ function spawnOpenCode(env: ShimEnvConfig, onDead: (reason: string) => void): Ch
 }
 
 /**
- * Model selection for one prompt. opencode addresses models as
- * {providerID, modelID}, so `model` may carry the `provider/model` form the
- * shim's GET /models returns; an empty string falls back to opencode's default.
+ * Auto-push is a property of the *mode of the current turn*, not of the mode
+ * the container happened to boot with: `session.update` switches yolo<->ask
+ * mid-session and the orchestrator carries the effective mode on every prompt.
+ * Prompts without a mode (older orchestrators) keep the AUTO_PUSH env default.
  */
-export function selectModel(
-  current: { provider?: string; model?: string },
-  body: { provider?: unknown; model?: unknown },
-): { provider?: string; model?: string } {
-  const next = { ...current };
-  if (typeof body.provider === 'string' && body.provider.length > 0) next.provider = body.provider;
-  if (typeof body.model !== 'string') return next;
-  const raw = body.model.trim();
-  if (raw.length === 0) {
-    // explicit reset: let opencode pick its configured default again
-    next.model = undefined;
-    return next;
-  }
-  const slash = raw.indexOf('/');
-  if (slash > 0) {
-    next.provider = raw.slice(0, slash);
-    next.model = raw.slice(slash + 1);
-  } else {
-    next.model = raw;
-  }
-  return next;
+function autoPushForMode(mode: AgentMode | undefined, envDefault: boolean): boolean {
+  return mode === undefined ? envDefault : mode === 'yolo';
 }
 
 function tokenOk(header: string | undefined, expected: string): boolean {
@@ -95,6 +78,10 @@ async function main(): Promise<void> {
   let provider: string | undefined;
   let model: string | undefined;
   let opencodeSessionId: string | undefined;
+  let autoPush = env.autoPush;
+  // last mode written to opencode.json - re-writing it on every prompt is
+  // pointless work, so the config is only rewritten when the mode changed
+  let appliedMode: AgentMode = mode;
 
   const branch = await gitops.ensureRepo(env);
   writeOpencodeConfig(env.workDir, permission, mode);
@@ -131,7 +118,7 @@ async function main(): Promise<void> {
     getBranch: () => branch,
     getMode: () => mode,
     getProviderModel: () => ({ provider, model }),
-    isAutoPush: () => env.autoPush,
+    isAutoPush: () => autoPush,
     commitTurn: () => gitops.commitTurn(env.workDir),
     pushTurn: () => gitops.pushAndDraftPR(env),
   });
@@ -170,12 +157,17 @@ async function main(): Promise<void> {
     if (typeof text !== 'string' || text.length === 0) {
       return await reply.code(400).send({ ok: false, error: 'text is required' });
     }
-    if (body?.mode !== undefined && MODES.includes(body.mode)) {
-      mode = body.mode;
-      permission = permissionForMode(mode);
-      // best effort: opencode may pick up config changes on new turns
-      writeOpencodeConfig(env.workDir, permission, mode);
+    const promptMode = body?.mode !== undefined && MODES.includes(body.mode) ? body.mode : undefined;
+    if (promptMode !== undefined) {
+      mode = promptMode;
+      if (mode !== appliedMode) {
+        permission = permissionForMode(mode);
+        // best effort: opencode may pick up config changes on new turns
+        writeOpencodeConfig(env.workDir, permission, mode);
+        appliedMode = mode;
+      }
     }
+    autoPush = autoPushForMode(promptMode, env.autoPush);
     // reasoningEffort is intentionally ignored: opencode has no per-prompt
     // effort knob, so the manifest reports capabilities.reasoning === false.
     const selected = selectModel({ provider, model }, body ?? {});

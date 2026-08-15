@@ -9,7 +9,8 @@
  * Run: npm run smoke -w cli   (from repo root; needs workspace deps installed)
  */
 import { spawn, type ChildProcess } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -43,9 +44,17 @@ interface CliResult {
   code: number | null;
 }
 
-function runCli(cliEntry: string, args: string[], stdinData?: string): Promise<CliResult> {
+function runCli(
+  cliEntry: string,
+  args: string[],
+  stdinData?: string,
+  env?: NodeJS.ProcessEnv,
+): Promise<CliResult> {
   return new Promise((res, rej) => {
-    const child = spawn(process.execPath, [cliEntry, ...args], { stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(process.execPath, [cliEntry, ...args], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: env ?? process.env,
+    });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (c: Buffer) => (stdout += c.toString()));
@@ -55,6 +64,43 @@ function runCli(cliEntry: string, args: string[], stdinData?: string): Promise<C
     if (stdinData !== undefined) child.stdin.write(stdinData);
     child.stdin.end();
   });
+}
+
+interface PostedSecret {
+  kind?: string;
+  value?: string;
+}
+
+/** Minimal stand-in for POST /api/secrets that records what the CLI sent. */
+function startSecretRecorder(posted: PostedSecret[]): Promise<{ url: string; close: () => void }> {
+  return new Promise((res) => {
+    const srv = http.createServer((req, response) => {
+      let body = '';
+      req.on('data', (c: Buffer) => (body += c.toString()));
+      req.on('end', () => {
+        try {
+          posted.push(JSON.parse(body) as PostedSecret);
+        } catch {
+          posted.push({});
+        }
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(
+          JSON.stringify({ secret: { id: 'stub', kind: 'claude_oauth', createdAt: '2026-01-01T00:00:00Z' } }),
+        );
+      });
+    });
+    srv.listen(0, '127.0.0.1', () => {
+      const addr = srv.address();
+      const port = addr !== null && typeof addr !== 'string' ? addr.port : 0;
+      res({ url: `http://127.0.0.1:${port}`, close: () => srv.close() });
+    });
+  });
+}
+
+/** Writes a fake `claude` onto PATH that prints `stdout` and exits 0. */
+function fakeClaudeEnv(dir: string, stdout: string): NodeJS.ProcessEnv {
+  writeFileSync(join(dir, 'claude'), `#!/bin/sh\ncat <<'PA_EOF'\n${stdout}\nPA_EOF\n`, { mode: 0o755 });
+  return { ...process.env, PATH: `${dir}:${process.env.PATH ?? ''}` };
 }
 
 async function main(): Promise<void> {
@@ -114,6 +160,48 @@ async function main(): Promise<void> {
     // invalid kind -> non-zero exit, no server round trip needed
     const badKind = await runCli(cliEntry, ['Not Valid', '--url', base, '--token', adminToken], 'x\n');
     expect(badKind.code !== 0, 'invalid kind rejected by cli');
+
+    // `claude setup-token`: the token is recognized by pattern, so a trailing
+    // hint line never ends up in the vault; no match at all aborts instead.
+    const posted: PostedSecret[] = [];
+    const recorder = await startSecretRecorder(posted);
+    const binDir = mkdtempSync(join(tmpdir(), 'cli-smoke-bin-'));
+    try {
+      const okEnv = fakeClaudeEnv(
+        binDir,
+        [
+          'Anmeldung im Browser abgeschlossen.',
+          'sk-ant-oat01-SMOKEabcdefghijklmnopqrstuvwx',
+          'Kopiere den Token in deine Umgebung.',
+        ].join('\n'),
+      );
+      const claudeOk = await runCli(
+        cliEntry,
+        ['claude', '--url', recorder.url, '--token', adminToken],
+        undefined,
+        okEnv,
+      );
+      expect(claudeOk.code === 0, `claude flow exits 0 (stderr: ${claudeOk.stderr})`);
+      expect(posted.length === 1, `exactly one secret posted (got ${posted.length})`);
+      expect(posted[0]?.kind === 'claude_oauth', 'claude is stored as kind claude_oauth');
+      expect(
+        posted[0]?.value === 'sk-ant-oat01-SMOKEabcdefghijklmnopqrstuvwx',
+        `token taken from the sk-ant line, not the trailing footer (got ${String(posted[0]?.value)})`,
+      );
+
+      const badEnv = fakeClaudeEnv(binDir, 'Anmeldung fehlgeschlagen, bitte erneut versuchen.');
+      const claudeBad = await runCli(
+        cliEntry,
+        ['claude', '--url', recorder.url, '--token', adminToken],
+        undefined,
+        badEnv,
+      );
+      expect(claudeBad.code !== 0, 'output without a token aborts instead of storing garbage');
+      expect(posted.length === 1, 'nothing posted when no token could be extracted');
+    } finally {
+      recorder.close();
+      rmSync(binDir, { recursive: true, force: true });
+    }
 
     console.log('\nCLI SMOKE OK');
   } finally {

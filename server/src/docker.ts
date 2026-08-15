@@ -91,10 +91,13 @@ let gatewayReady: Promise<string | null> | null = null;
 export async function ensureGatewayContainer(): Promise<string | null> {
   if (!gatewayEnabled()) return null;
   if (!gatewayReady) {
-    gatewayReady = createGateway().catch((e) => {
-      console.error(`[docker] gateway container failed: ${String(e)}`);
+    gatewayReady = createGateway().catch((e: unknown) => {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(`[docker] gateway container failed: ${msg}`);
+      // drop the failed attempt so the next session retries instead of being
+      // served a permanently broken cache entry
       gatewayReady = null;
-      return null;
+      throw new Error(`gateway container unavailable: ${msg}`);
     });
   }
   return gatewayReady;
@@ -104,12 +107,27 @@ async function createGateway(): Promise<string | null> {
   const d = docker();
   if (!d) return null;
   const existing = d.getContainer(GATEWAY_CONTAINER_NAME);
+  let info: Awaited<ReturnType<typeof existing.inspect>> | null = null;
   try {
-    const info = await existing.inspect();
-    if (!info.State?.Running) await existing.start().catch(() => {});
-    return info.Id;
+    info = await existing.inspect();
   } catch {
     /* not created yet */
+  }
+  if (info !== null) {
+    // A failing start (host port taken, bad image, ...) must not be reported as
+    // success: the caller would otherwise time out later in waitForShim with a
+    // misleading message. "already started" is a benign race and stays success.
+    if (!info.State?.Running) {
+      try {
+        await existing.start();
+      } catch (e) {
+        const msg = String(e);
+        if (!msg.includes('already started')) {
+          throw new Error(`could not start existing gateway container ${GATEWAY_CONTAINER_NAME}: ${msg}`);
+        }
+      }
+    }
+    return info.Id;
   }
   await pullImage(config.gatewayImage);
   const c = await d.createContainer({
@@ -138,26 +156,41 @@ async function createGateway(): Promise<string | null> {
   return c.id;
 }
 
-/** Attach the gateway to a session network so shims can reach it as 'gateway'. */
-async function attachGateway(networkName: string): Promise<void> {
-  const d = docker();
-  const id = await ensureGatewayContainer();
-  if (!d || !id) return;
+/** Connect the gateway container to a network; returns the error message, or undefined when attached (or already attached). */
+async function connectGateway(d: Docker, networkName: string, id: string): Promise<string | undefined> {
   try {
     await d.getNetwork(networkName).connect({
       Container: id,
       EndpointConfig: { Aliases: [GATEWAY_ALIAS] },
     });
+    return undefined;
   } catch (e) {
     const msg = String(e);
-    if (msg.includes('No such container') || msg.includes('404')) {
-      // gateway was removed behind our back - drop the cache so the next
-      // session recreates it
-      gatewayReady = null;
-    }
-    if (!msg.includes('already')) {
-      console.warn(`[docker] gateway attach to ${networkName} failed: ${msg}`);
-    }
+    return msg.includes('already') ? undefined : msg;
+  }
+}
+
+/** Attach the gateway to a session network so shims can reach it as 'gateway'. */
+async function attachGateway(networkName: string): Promise<void> {
+  const d = docker();
+  const id = await ensureGatewayContainer();
+  if (!d || !id) return;
+  const failure = await connectGateway(d, networkName, id);
+  if (failure === undefined) return;
+  if (!failure.includes('No such container') && !failure.includes('404')) {
+    console.warn(`[docker] gateway attach to ${networkName} failed: ${failure}`);
+    return;
+  }
+  // The gateway was removed behind our back. Dropping the cache alone would
+  // leave *this* session without any relay, so recreate it and retry once;
+  // if that fails too the error propagates and the session fails cleanly.
+  gatewayReady = null;
+  console.warn(`[docker] gateway container gone (${failure}) - recreating it for ${networkName}`);
+  const recreated = await ensureGatewayContainer();
+  if (!recreated) throw new Error(`gateway container could not be recreated for ${networkName}`);
+  const retryFailure = await connectGateway(d, networkName, recreated);
+  if (retryFailure !== undefined) {
+    throw new Error(`gateway attach to ${networkName} failed after recreating the gateway: ${retryFailure}`);
   }
 }
 
@@ -338,14 +371,17 @@ export async function createSessionContainer(
 ): Promise<string | null> {
   const d = docker();
   if (!d || !session.volume_name) return null;
+  // Networking is resolved before the try block on purpose: a broken gateway
+  // must fail the session with its own cause instead of being flattened into
+  // the generic "failed to create session container" of the null return below.
+  const containerEnv = { ...env };
+  const networking = await sessionNetworking(session, containerEnv);
   try {
     await ensureVolume(session.volume_name);
     await pullImage(adapterImage(session.adapter));
     // With a gateway the shim is reached through it, so no host port is published
     // (an internal per-session network could not serve one anyway).
     const remote = isRemote() && !gatewayEnabled();
-    const containerEnv = { ...env };
-    const networking = await sessionNetworking(session, containerEnv);
     const c = await d.createContainer({
       Image: adapterImage(session.adapter),
       Env: envArr(containerEnv),

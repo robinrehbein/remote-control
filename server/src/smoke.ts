@@ -12,6 +12,7 @@ process.env.PORT = '0';
 const { buildApp } = await import('./index.js');
 const { generatePairingCode } = await import('./pairing.js');
 const { validateSecret } = await import('./secret-validate.js');
+const { buildPromptBody } = await import('./sessions.js');
 type FetchLike = import('./secret-validate.js').FetchLike;
 
 function assert(cond: unknown, msg: string): asserts cond {
@@ -399,6 +400,23 @@ async function main(): Promise<void> {
     row?.mode === 'ask' && row.model === 'glm-4.6-air' && row.reasoningEffort === 'high',
     'session.update persists mode/model/reasoningEffort',
   );
+
+  /* ---- prompt body: model '' is the documented "adapter default" reset ---- */
+  const rowWithModel = store.getSession(sessionId);
+  assert(rowWithModel !== undefined, 'session row readable');
+  assert(buildPromptBody(rowWithModel, 'hi').model === 'glm-4.6-air', 'prompt body carries the session model');
+  const resetUpdate = await request(c2, {
+    type: 'session.update',
+    requestId: 'upd2',
+    sessionId,
+    model: '',
+  });
+  assert(resetUpdate.type === 'request.ok', 'session.update accepts an empty model');
+  const rowReset = store.getSession(sessionId);
+  assert(rowReset !== undefined && rowReset.model === '', 'empty model persisted');
+  const resetBody = buildPromptBody(rowReset, 'hi');
+  assert('model' in resetBody && resetBody.model === '', "prompt body sends model:'' instead of dropping the reset");
+  assert(resetBody.mode === 'ask', 'prompt body carries the switched mode');
 
   const models = await request(c2, { type: 'session.models.get', requestId: 'mod1', sessionId });
   assert(

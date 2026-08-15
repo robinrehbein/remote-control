@@ -35,6 +35,28 @@ export function isReasoningEffort(v: unknown): v is ReasoningEffort {
   return typeof v === 'string' && (REASONING_EFFORTS as readonly string[]).includes(v);
 }
 
+/**
+ * Prompt body from the session row: mode/model/reasoningEffort are session
+ * state (switchable via `session.update`), so every turn carries them.
+ * Provider only rides along with a model, since runtimes that address models
+ * as provider+model need both.
+ *
+ * `model` is sent whenever the column holds a string - including the empty
+ * string, which is the documented "adapter default" reset every shim
+ * implements (and a no-op for sessions that never picked a model).
+ */
+export function buildPromptBody(row: SessionRow, text: string, mode?: AgentMode): PromptRequest {
+  const effectiveMode = mode ?? (isAgentMode(row.mode) ? row.mode : undefined);
+  return {
+    text,
+    ...(effectiveMode !== undefined ? { mode: effectiveMode } : {}),
+    ...(typeof row.model === 'string'
+      ? { model: row.model, ...(row.provider ? { provider: row.provider } : {}) }
+      : {}),
+    ...(isReasoningEffort(row.reasoning_effort) ? { reasoningEffort: row.reasoning_effort } : {}),
+  };
+}
+
 type CreateMsg = Extract<ClientMessage, { type: 'session.create' }>;
 type UpdateMsg = Extract<ClientMessage, { type: 'session.update' }>;
 type LinkHello = Extract<ClientMessage, { type: 'agent.hello' }>;
@@ -306,25 +328,9 @@ export class SessionManager {
     return { ok: true, body: res.body };
   }
 
-  /**
-   * Prompt body from the session row: mode/model/reasoningEffort are session
-   * state (switchable via `session.update`), so every turn carries them.
-   * Provider only rides along with a model, since runtimes that address models
-   * as provider+model need both.
-   */
-  private promptBody(row: SessionRow, text: string, mode?: AgentMode): PromptRequest {
-    const effectiveMode = mode ?? (isAgentMode(row.mode) ? row.mode : undefined);
-    return {
-      text,
-      ...(effectiveMode !== undefined ? { mode: effectiveMode } : {}),
-      ...(row.model ? { model: row.model, ...(row.provider ? { provider: row.provider } : {}) } : {}),
-      ...(isReasoningEffort(row.reasoning_effort) ? { reasoningEffort: row.reasoning_effort } : {}),
-    };
-  }
-
   async prompt(id: string, text: string, mode?: AgentMode): Promise<void> {
     const row = this.requireSession(id);
-    const body = this.promptBody(row, text, mode);
+    const body = buildPromptBody(row, text, mode);
     if (row.link_id) {
       const res = await this.linkCall(row, '/prompt', 'POST', body);
       if (!res.ok) {

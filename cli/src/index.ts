@@ -172,6 +172,28 @@ async function resolveValue(explicitValue: string | undefined): Promise<string> 
   return (await readAllStdin()).trim();
 }
 
+/**
+ * Fish the OAuth token out of `claude setup-token` stdout.
+ *
+ * "last non-empty line" is not good enough: the CLI may print a footer/hint
+ * after the token, and storing that in the vault would silently break every
+ * claude session. So the output is scanned for an actual token instead:
+ * `sk-ant-...` first, otherwise exactly one long whitespace-free line.
+ * Anything ambiguous returns undefined so the caller can abort loudly.
+ */
+export function extractClaudeToken(stdout: string): string | undefined {
+  const lines = stdout
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+  const tokens = lines.filter((l) => /^sk-ant-[A-Za-z0-9_-]{20,}$/.test(l));
+  if (tokens.length > 0) return tokens[tokens.length - 1];
+  // fallback for token formats we do not know: a single long line without any
+  // whitespace looks like a credential, several of them are too ambiguous
+  const candidates = lines.filter((l) => l.length > 40 && !/\s/.test(l));
+  return candidates.length === 1 ? candidates[0] : undefined;
+}
+
 /** Runs `claude setup-token` inheriting stdin/stderr (interactive OAuth login) while
  * still capturing stdout to fish the token out - true `stdio: 'inherit'` would forward
  * stdout straight to the terminal with no way for us to read it back. */
@@ -200,13 +222,15 @@ async function runClaudeSetupToken(): Promise<string> {
         reject(new CliError(`\`claude setup-token\` wurde mit Exit-Code ${code} beendet.`));
         return;
       }
-      const lines = captured
-        .split(/\r?\n/)
-        .map((l) => l.trim())
-        .filter((l) => l.length > 0);
-      const token = lines[lines.length - 1];
+      const token = extractClaudeToken(captured);
       if (!token) {
-        reject(new CliError('Konnte keinen Token aus der Ausgabe von `claude setup-token` extrahieren.'));
+        reject(
+          new CliError(
+            'Konnte keinen Token aus der Ausgabe von `claude setup-token` extrahieren ' +
+              '(erwartet: eine Zeile "sk-ant-..."). Token bitte manuell übergeben: ' +
+              '`pocketagent-secret claude_oauth <token>`.',
+          ),
+        );
         return;
       }
       resolve(token);

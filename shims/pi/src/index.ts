@@ -20,6 +20,17 @@ const AGENT_MODES: readonly AgentMode[] = ['yolo', 'auto', 'acceptEdits', 'ask']
 const REASONING_EFFORTS: readonly ReasoningEffort[] = ['low', 'medium', 'high'];
 
 /**
+ * Auto-push is a property of the *mode of the current turn*, not of the mode
+ * the container booted with: `session.update` switches yolo<->ask mid-session
+ * and the orchestrator carries the effective mode on every prompt, while
+ * AUTO_PUSH is frozen at container start. Prompts without a mode (older
+ * orchestrators) keep the env default.
+ */
+export function autoPushForMode(mode: AgentMode | undefined, envDefault: boolean): boolean {
+  return mode === undefined ? envDefault : mode === 'yolo';
+}
+
+/**
  * pi addresses models as provider + id, so `model` may carry the
  * `<provider>/<modelId>` form that GET /models returns; the leading segment
  * then overrides the request's `provider`.
@@ -314,7 +325,7 @@ export function buildApp(deps: AppDeps): FastifyInstance {
         usage: outcome.usage,
         commitSha,
       });
-      if (config.autoPush) await autoPush();
+      if (autoPushForMode(request.mode, config.autoPush)) await autoPush();
     }
     if (commitError) bus.publish({ type: 'error', message: commitError });
     publishStatus();

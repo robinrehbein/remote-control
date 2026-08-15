@@ -57,7 +57,7 @@ Jeder Shim muss bereitstellen (Details + Typen: `packages/protocol/src/index.ts`
 - `GET /status` → `ShimStatus`; `GET /diff` → `DiffEntry[]`
 - `GET /events` → SSE (`event: agent`) mit normierten `AgentEvent`s (`message.delta`, `tool.call`, `permission.request`, `turn.completed`, …)
 
-Konventionen: Repo-Checkout liegt in `$WORK_DIR` (Volume `/work`), Branch `agent/$SESSION_ID`, Auto-Commit nach jedem Turn, Auto-Push + Draft-PR bei `AUTO_PUSH=1` (Yolo), `scripts/push.js` für Tap-Push durch den Orchestrator, Provider-Credentials kommen ausschließlich als Env (nie loggen).
+Konventionen: Repo-Checkout liegt in `$WORK_DIR` (Volume `/work`), Branch `agent/$SESSION_ID`, Auto-Commit nach jedem Turn, Auto-Push + Draft-PR im Yolo-Modus (pro Turn aus `PromptRequest.mode` abgeleitet, `AUTO_PUSH=1` ist nur der Startwert für Prompts ohne `mode`), `scripts/push.js` für Tap-Push durch den Orchestrator, Provider-Credentials kommen ausschließlich als Env (nie loggen).
 
 ## Registrierung im Detail
 

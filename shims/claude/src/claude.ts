@@ -390,12 +390,25 @@ export class ClaudeSession {
   private sessionId?: string;
   private busy = false;
   private runner: ClaudeRunner | null = null;
+  /**
+   * Auto-push follows the mode of the current turn: `session.update` switches
+   * yolo<->ask mid-session and the orchestrator carries the effective mode on
+   * every prompt, while AUTO_PUSH is frozen at container start. Prompts without
+   * a mode (older orchestrators) keep the env default.
+   */
+  private autoPush: boolean;
+  /** Values the live runner was last configured with (control requests are skipped when unchanged). */
+  private appliedPermissionMode: PermissionMode;
+  private appliedModel?: string;
   private readonly pendingPermissions = new Map<string, PendingPermission>();
   private readonly toolNames = new Map<string, string>();
 
   constructor(private readonly deps: ClaudeSessionDeps) {
     this.mode = deps.mode;
     this.model = deps.model;
+    this.autoPush = deps.autoPush;
+    this.appliedPermissionMode = mapMode(deps.mode);
+    this.appliedModel = deps.model;
   }
 
   status(): ShimStatus {
@@ -447,6 +460,9 @@ export class ClaudeSession {
     );
     await runner.start();
     this.runner = runner;
+    // a fresh query starts with mode/model baked into its options
+    this.appliedPermissionMode = mapMode(this.mode);
+    this.appliedModel = this.model;
     return { runner, reused: false };
   }
 
@@ -455,7 +471,10 @@ export class ClaudeSession {
     opts?: { mode?: AgentMode; model?: string; reasoningEffort?: ReasoningEffort },
   ): Promise<void> {
     if (this.busy) throw new Error('busy');
-    if (opts?.mode) this.mode = opts.mode;
+    if (opts?.mode) {
+      this.mode = opts.mode;
+      this.autoPush = opts.mode === 'yolo';
+    }
     if (opts?.model !== undefined) this.model = opts.model.length > 0 ? opts.model : undefined;
     if (opts?.reasoningEffort && opts.reasoningEffort !== this.effort) {
       this.effort = opts.reasoningEffort;
@@ -472,17 +491,21 @@ export class ClaudeSession {
     try {
       const { runner, reused } = await this.ensureRunner();
       if (reused) {
-        if (opts?.mode) {
+        // only send control requests for values that actually changed
+        const permissionMode = mapMode(this.mode);
+        if (permissionMode !== this.appliedPermissionMode) {
           try {
-            await runner.setPermissionMode(mapMode(opts.mode));
+            await runner.setPermissionMode(permissionMode);
+            this.appliedPermissionMode = permissionMode;
           } catch {
             /* control request unsupported */
           }
         }
-        if (opts?.model !== undefined) {
+        if (this.model !== this.appliedModel) {
           try {
             // undefined resets the runner to the CLI default
             await runner.setModel(this.model);
+            this.appliedModel = this.model;
           } catch {
             /* control request unsupported */
           }
@@ -570,7 +593,7 @@ export class ClaudeSession {
           usage,
           ...(commitSha !== undefined ? { commitSha } : {}),
         });
-        if (this.deps.autoPush) {
+        if (this.autoPush) {
           try {
             const pushed = await this.deps.pushBranch();
             if (pushed) {

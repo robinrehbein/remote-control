@@ -7,8 +7,12 @@
  *  - App <-> Orchestrator WebSocket messages
  *  - Pairing REST types
  *
- * Pure TypeScript types, zero runtime dependencies.
+ * Pure TypeScript types, zero runtime dependencies. The single exception is
+ * `./opencode-catalog.ts` (re-exported below): pure, dependency-free helpers
+ * shared verbatim by the opencode and kilo shims.
  */
+
+export { parseProviderCatalog, selectModel } from './opencode-catalog.js';
 
 /* ------------------------------------------------------------------ */
 /* Common enums                                                        */
@@ -218,7 +222,12 @@ export interface ShimEnv {
   REPO_BRANCH?: string;          // base branch to start from (default: repo default branch)
   GITHUB_PAT?: string;           // injected when push is allowed
   REPO_FULL_NAME: string;        // owner/name for PR API calls
-  AUTO_PUSH: '1' | '0';          // yolo => 1 (auto push + draft PR after each completed turn)
+  /**
+   * Start value only (yolo => 1): auto push + draft PR after each completed
+   * turn. Since mode is switchable mid-session, shims derive the decision per
+   * turn from `PromptRequest.mode` and fall back to this env when it is absent.
+   */
+  AUTO_PUSH: '1' | '0';
   /** Only provider credential relevant for this session, e.g. OPENAI_API_KEY / ZAI_API_KEY / CLAUDE_CODE_OAUTH_TOKEN. */
   [key: string]: string | undefined;
 }

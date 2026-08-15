@@ -1,18 +1,14 @@
 package com.pocketagent.app.ui.theme
 
-import android.os.Build
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Shapes
 import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
-import androidx.compose.material3.dynamicDarkColorScheme
-import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -20,80 +16,71 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
 /* ------------------------------------------------------------------ */
-/* Material 3 first: dynamic color on Android 12+ (the Android         */
-/* design language). Hand-tuned tonal fallback below, built around     */
-/* a single indigo accent. The craft goal is hierarchy & calm, not     */
-/* decoration.                                                         */
+/* One UI (Samsung) design language: signature blue accent, grouped    */
+/* white cards on a soft gray canvas, chunky 26dp rounds, pill         */
+/* buttons, near-black OLED dark mode. Dynamic color is intentionally  */
+/* off — the Samsung palette is the brand.                             */
 /* ------------------------------------------------------------------ */
 
-private val Indigo40 = Color(0xFF4655F0)
-private val Indigo80 = Color(0xFFB9C3FF)
-private val Indigo90 = Color(0xFFDDE0FF)
-private val Indigo10 = Color(0xFF000CAD)
-private val Indigo20 = Color(0xFF10249B)
-private val Indigo30 = Color(0xFF2A41C9)
-
-private val Neutral90 = Color(0xFFE9E9F2)
-private val Neutral10 = Color(0xFF1A1B21)
-private val Neutral99 = Color(0xFFFCF8FF)
-private val NeutralVariant90 = Color(0xFFE2E1EC)
-private val NeutralVariant30 = Color(0xFF46464F)
-private val NeutralVariant60 = Color(0xFF90909B)
+private val OneUiBlue = Color(0xFF0381FE)
+private val OneUiBlueDark = Color(0xFF3E91FF)
+private val OneUiBlueDeep = Color(0xFF003A75)
+private val OneUiBlueTint = Color(0xFFD8E9FF)
 
 private val LightColors = lightColorScheme(
-    primary = Indigo40,
+    primary = OneUiBlue,
     onPrimary = Color.White,
-    primaryContainer = Indigo90,
-    onPrimaryContainer = Indigo10,
-    secondary = Color(0xFF595E71),
+    primaryContainer = OneUiBlueTint,
+    onPrimaryContainer = OneUiBlueDeep,
+    secondary = Color(0xFF54555C),
     onSecondary = Color.White,
-    secondaryContainer = Color(0xFFDDE1F9),
-    onSecondaryContainer = Color(0xFF161B2C),
-    tertiary = Color(0xFF75546F),
+    secondaryContainer = Color(0xFFE5F0FF),
+    onSecondaryContainer = Color(0xFF0A3F78),
+    tertiary = Color(0xFF7A5900),
     onTertiary = Color.White,
-    tertiaryContainer = Color(0xFFFFD7F3),
-    onTertiaryContainer = Color(0xFF2C1229),
-    background = Neutral99,
-    onBackground = Neutral10,
-    surface = Neutral99,
-    onSurface = Neutral10,
-    surfaceVariant = NeutralVariant90,
-    onSurfaceVariant = Color(0xFF45464F),
-    surfaceContainer = Color(0xFFEFEDF4),
-    surfaceContainerHigh = Color(0xFFE9E7EF),
-    surfaceContainerHighest = Color(0xFFE3E1E9),
-    outline = Color(0xFF757680),
-    outlineVariant = Color(0xFFC6C5D0),
-    error = Color(0xFFBA1A1A),
+    tertiaryContainer = Color(0xFFFFE2A8),
+    onTertiaryContainer = Color(0xFF4A3800),
+    background = Color(0xFFF6F6F6),
+    onBackground = Color(0xFF171717),
+    surface = Color(0xFFF6F6F6),
+    onSurface = Color(0xFF171717),
+    surfaceVariant = Color(0xFFEFEFF1),
+    onSurfaceVariant = Color(0xFF78787D),
+    surfaceContainer = Color.White,
+    surfaceContainerHigh = Color.White,
+    surfaceContainerHighest = Color(0xFFEDEDEF),
+    outline = Color(0xFFC7C7CB),
+    outlineVariant = Color(0xFFE8E8EA),
+    error = Color(0xFFD93831),
     onError = Color.White,
     errorContainer = Color(0xFFFFDAD6),
     onErrorContainer = Color(0xFF410002),
 )
 
 private val DarkColors = darkColorScheme(
-    primary = Indigo80,
-    onPrimary = Color(0xFF0A1BAA),
-    primaryContainer = Indigo30,
-    onPrimaryContainer = Indigo90,
-    secondary = Color(0xFFC1C5DD),
-    onSecondary = Color(0xFF2B3042),
-    secondaryContainer = Color(0xFF414659),
-    onSecondaryContainer = Color(0xFFDDE1F9),
-    tertiary = Color(0xFFE4BAD7),
-    onTertiary = Color(0xFF43273F),
-    tertiaryContainer = Color(0xFF5B3D56),
-    onTertiaryContainer = Color(0xFFFFD7F3),
-    background = Color(0xFF121318),
-    onBackground = Neutral90,
-    surface = Color(0xFF121318),
-    onSurface = Neutral90,
-    surfaceVariant = Color(0xFF46464F),
-    onSurfaceVariant = NeutralVariant90,
-    surfaceContainer = Color(0xFF1E1F25),
-    surfaceContainerHigh = Color(0xFF292A2F),
-    surfaceContainerHighest = Color(0xFF34343A),
-    outline = NeutralVariant60,
-    outlineVariant = Color(0xFF46464F),
+    primary = OneUiBlueDark,
+    onPrimary = Color.White,
+    primaryContainer = OneUiBlueDeep,
+    onPrimaryContainer = Color(0xFFCFE4FF),
+    secondary = Color(0xFFB9BAC2),
+    onSecondary = Color(0xFF26272C),
+    secondaryContainer = Color(0xFF103D66),
+    onSecondaryContainer = Color(0xFFCBE2FF),
+    tertiary = Color(0xFFEFC04B),
+    onTertiary = Color(0xFF3E2E00),
+    tertiaryContainer = Color(0xFF5A4300),
+    onTertiaryContainer = Color(0xFFFFE2A8),
+    background = Color(0xFF050507),
+    onBackground = Color(0xFFEDEDEF),
+    surface = Color(0xFF050507),
+    onSurface = Color(0xFFEDEDEF),
+    surfaceVariant = Color(0xFF2A2A2F),
+    onSurfaceVariant = Color(0xFFA5A5AC),
+    surfaceContainer = Color(0xFF19191C),
+    surfaceContainerHigh = Color(0xFF232327),
+    surfaceContainerHighest = Color(0xFF2D2D32),
+    outline = Color(0xFF5A5A61),
+    outlineVariant = Color(0xFF2C2C31),
     error = Color(0xFFFFB4AB),
     onError = Color(0xFF690005),
     errorContainer = Color(0xFF93000A),
@@ -134,18 +121,20 @@ val DarkSemantic = Semantic(
     removedBg = Color(0xFF4A1611),
 )
 
-/* Type: M3 roles with slightly tightened titles. */
+/* Type: One UI leans on medium/semibold titles and roomy body text. */
 private val AppTypography = Typography(
-    headlineSmall = TextStyle(fontWeight = FontWeight.SemiBold, fontSize = 24.sp, letterSpacing = 0.sp),
+    headlineLarge = TextStyle(fontWeight = FontWeight.SemiBold, fontSize = 30.sp, letterSpacing = 0.sp),
+    headlineMedium = TextStyle(fontWeight = FontWeight.SemiBold, fontSize = 26.sp, letterSpacing = 0.sp),
+    headlineSmall = TextStyle(fontWeight = FontWeight.SemiBold, fontSize = 23.sp, letterSpacing = 0.sp),
     titleLarge = TextStyle(fontWeight = FontWeight.SemiBold, fontSize = 20.sp),
     titleMedium = TextStyle(fontWeight = FontWeight.SemiBold, fontSize = 16.sp),
-    titleSmall = TextStyle(fontWeight = FontWeight.Medium, fontSize = 14.sp),
-    bodyLarge = TextStyle(fontSize = 16.sp, lineHeight = 24.sp, letterSpacing = 0.3.sp),
-    bodyMedium = TextStyle(fontSize = 14.sp, lineHeight = 21.sp, letterSpacing = 0.2.sp),
-    bodySmall = TextStyle(fontSize = 12.5.sp, lineHeight = 18.sp, letterSpacing = 0.2.sp),
+    titleSmall = TextStyle(fontWeight = FontWeight.Medium, fontSize = 14.5.sp),
+    bodyLarge = TextStyle(fontSize = 16.sp, lineHeight = 23.sp, letterSpacing = 0.2.sp),
+    bodyMedium = TextStyle(fontSize = 14.sp, lineHeight = 20.sp, letterSpacing = 0.1.sp),
+    bodySmall = TextStyle(fontSize = 12.5.sp, lineHeight = 17.sp, letterSpacing = 0.1.sp),
     labelLarge = TextStyle(fontWeight = FontWeight.Medium, fontSize = 14.sp),
     labelMedium = TextStyle(fontWeight = FontWeight.Medium, fontSize = 12.sp),
-    labelSmall = TextStyle(fontWeight = FontWeight.Medium, fontSize = 11.sp, letterSpacing = 0.4.sp),
+    labelSmall = TextStyle(fontWeight = FontWeight.Medium, fontSize = 11.sp, letterSpacing = 0.2.sp),
 )
 
 val MonoSmall = TextStyle(
@@ -160,34 +149,25 @@ val MonoMedium = TextStyle(
     lineHeight = 18.sp,
 )
 
-/* Shape ramp tuned towards One UI: soft, chunky rounds, pill buttons. */
+/* One UI shape ramp: soft, chunky rounds everywhere, 26dp cards. */
 private val AppShapes = Shapes(
     extraSmall = RoundedCornerShape(10.dp),
-    small = RoundedCornerShape(14.dp),
-    medium = RoundedCornerShape(18.dp),
-    large = RoundedCornerShape(24.dp),
-    extraLarge = RoundedCornerShape(28.dp),
+    small = RoundedCornerShape(16.dp),
+    medium = RoundedCornerShape(20.dp),
+    large = RoundedCornerShape(26.dp),
+    extraLarge = RoundedCornerShape(30.dp),
 )
 
-/** One UI-style fully rounded pill (buttons, input chips). */
+/** One UI fully rounded pill (buttons, chips, badges). */
 val PillShape = RoundedCornerShape(50)
 
 @Composable
 fun PocketAgentTheme(
     darkTheme: Boolean = isSystemInDarkTheme(),
-    dynamicColor: Boolean = true,
     content: @Composable () -> Unit,
 ) {
-    val colorScheme = when {
-        dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
-            val context = LocalContext.current
-            if (darkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
-        }
-        darkTheme -> DarkColors
-        else -> LightColors
-    }
     MaterialTheme(
-        colorScheme = colorScheme,
+        colorScheme = if (darkTheme) DarkColors else LightColors,
         typography = AppTypography,
         shapes = AppShapes,
         content = content,

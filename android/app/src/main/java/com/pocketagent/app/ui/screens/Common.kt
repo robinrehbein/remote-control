@@ -12,7 +12,9 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -20,9 +22,18 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.LargeTopAppBar
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.rememberTopAppBarState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -30,8 +41,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.pocketagent.app.data.SessionStatus
 import com.pocketagent.app.ui.theme.semantic
@@ -112,14 +125,75 @@ fun PulsingDot(color: Color, pulse: Boolean, size: androidx.compose.ui.unit.Dp =
 }
 
 /* ------------------------------------------------------------------ */
-/* Grouped list containers (iOS settings style)                        */
+/* One UI scaffold: collapsing large title, centered when expanded     */
 /* ------------------------------------------------------------------ */
 
-/** Material grouped-list container: quiet tonal fill, M3 shape. */
+/**
+ * Samsung One UI style screen scaffold: tall app bar with the title
+ * centered in the expanded area, collapsing into a compact bar on
+ * scroll. All screens share this so the app reads as one system.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun OneUiScaffold(
+    title: String,
+    onBack: (() -> Unit)? = null,
+    actions: @Composable RowScope.() -> Unit = {},
+    floatingActionButton: @Composable () -> Unit = {},
+    bottomBar: @Composable () -> Unit = {},
+    content: @Composable (PaddingValues) -> Unit,
+) {
+    val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior(rememberTopAppBarState())
+    Scaffold(
+        modifier = Modifier.nestedScroll(scrollBehavior.nestedScrollConnection),
+        containerColor = MaterialTheme.colorScheme.background,
+        floatingActionButton = floatingActionButton,
+        bottomBar = bottomBar,
+        topBar = {
+            LargeTopAppBar(
+                title = {
+                    val collapsed = scrollBehavior.state.collapsedFraction > 0.5f
+                    Box(modifier = Modifier.fillMaxWidth()) {
+                        Text(
+                            text = title,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier
+                                .align(if (collapsed) Alignment.CenterStart else Alignment.Center)
+                                .padding(end = if (collapsed) 12.dp else 0.dp),
+                        )
+                    }
+                },
+                navigationIcon = {
+                    if (onBack != null) {
+                        IconButton(onClick = onBack) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Zurück")
+                        }
+                    }
+                },
+                actions = actions,
+                colors = TopAppBarDefaults.largeTopAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.background,
+                    scrolledContainerColor = MaterialTheme.colorScheme.background,
+                ),
+                scrollBehavior = scrollBehavior,
+            )
+        },
+        content = content,
+    )
+}
+
+/* ------------------------------------------------------------------ */
+/* Grouped list containers (One UI settings style)                     */
+/* ------------------------------------------------------------------ */
+
+/** One UI grouped-list container: white/dark card, 26dp rounds. */
 @Composable
 fun GroupCard(modifier: Modifier = Modifier, content: @Composable () -> Unit) {
     Surface(
-        modifier = modifier.fillMaxWidth(),
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp),
         shape = MaterialTheme.shapes.large,
         color = MaterialTheme.colorScheme.surfaceContainer,
         tonalElevation = 0.dp,
@@ -129,10 +203,11 @@ fun GroupCard(modifier: Modifier = Modifier, content: @Composable () -> Unit) {
 @Composable
 fun SectionHeader(text: String, modifier: Modifier = Modifier) {
     Text(
-        text = text.uppercase(),
-        style = MaterialTheme.typography.labelSmall,
-        color = MaterialTheme.colorScheme.primary,
-        modifier = modifier.padding(start = 28.dp, top = 18.dp, bottom = 7.dp),
+        text = text,
+        style = MaterialTheme.typography.labelMedium,
+        fontWeight = FontWeight.SemiBold,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = modifier.padding(start = 28.dp, end = 28.dp, top = 20.dp, bottom = 8.dp),
     )
 }
 

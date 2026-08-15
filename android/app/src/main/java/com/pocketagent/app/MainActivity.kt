@@ -97,7 +97,11 @@ private fun BiometricGate(enabled: Boolean, unlocked: Boolean, onUnlocked: () ->
     val context = LocalContext.current
     val activity = context as? FragmentActivity
     LaunchedEffect(enabled) {
-        if (!enabled || unlocked || activity == null) return@LaunchedEffect
+        if (unlocked || activity == null) return@LaunchedEffect
+        if (!enabled) {
+            onUnlocked() // lock disabled: show content immediately
+            return@LaunchedEffect
+        }
         val manager = BiometricManager.from(context)
         val canAuth = manager.canAuthenticate(
             BiometricManager.Authenticators.BIOMETRIC_WEAK or

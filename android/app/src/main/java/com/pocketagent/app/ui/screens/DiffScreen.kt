@@ -14,7 +14,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.automirrored.filled.Refresh
+import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -96,7 +96,7 @@ fun DiffScreen(
                 },
                 actions = {
                     IconButton(onClick = { vm.load() }) {
-                        Icon(Icons.AutoMirrored.Filled.Refresh, contentDescription = "Aktualisieren")
+                        Icon(Icons.Outlined.Refresh, contentDescription = "Aktualisieren")
                     }
                 },
             )

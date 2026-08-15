@@ -233,9 +233,9 @@ fun NewSessionScreen(
                     }
                 }
                 adapterList.firstOrNull { it.id == state.adapter }?.let { selected ->
-                    if (selected.description.isNotBlank()) {
+                    selected.description?.takeIf { it.isNotBlank() }?.let {
                         Text(
-                            text = selected.description,
+                            text = it,
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )

@@ -1,25 +1,24 @@
-# Build from the monorepo root (protocol package is referenced via file:../../packages/protocol):
-#   docker build -f shims/kilo/Dockerfile -t pocketagent/kilo-shim .
+# Build from the monorepo root so the protocol workspace is in scope:
+#   docker build -f shims/kilo/Dockerfile -t pocketagent/kilo-shim:latest .
 FROM node:22-bookworm-slim
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+WORKDIR /app/shims/kilo
 
-# tsconfig extends ../../tsconfig.base.json relative to /app
-COPY tsconfig.base.json /tsconfig.base.json
-# file:../../packages/protocol resolves to /packages/protocol from /app
-COPY packages/protocol /packages/protocol
-
+COPY tsconfig.base.json /app/tsconfig.base.json
+COPY packages/protocol /app/packages/protocol
 COPY shims/kilo/package.json shims/kilo/package-lock.json ./
 RUN npm ci --no-audit --no-fund
 
-COPY shims/kilo/tsconfig.json /app/tsconfig.json
-COPY shims/kilo/src /app/src
-COPY shims/kilo/scripts /app/scripts
+COPY shims/kilo/tsconfig.json ./
+COPY shims/kilo/src ./src
+COPY shims/kilo/scripts ./scripts
 
-EXPOSE 8080
 ENV NODE_ENV=production
-CMD ["/app/node_modules/.bin/tsx", "src/index.ts"]
+ENV PORT=8080
+EXPOSE 8080
+
+CMD ["npx", "tsx", "src/index.ts"]

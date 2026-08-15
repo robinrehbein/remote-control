@@ -4,7 +4,6 @@
   "name": "Kilo Code",
   "description": "Kilo CLI (OpenCode-compatible fork); BYO provider keys or Kilo Gateway auth.json content.",
   "capabilities": { "approvals": true, "resume": true, "streaming": true, "autoPush": true },
-  "pushScript": "/app/scripts/push.js",
   "credentials": {
     "kilo": ["KILO_AUTH_CONTENT"]
   },

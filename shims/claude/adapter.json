@@ -1,0 +1,13 @@
+{
+  "$schema": "https://pocketagent.dev/schemas/adapter.json",
+  "id": "claude",
+  "name": "Claude Code",
+  "description": "Claude Code via Agent SDK; Pro/Max subscription through setup-token or Anthropic API key.",
+  "capabilities": { "approvals": true, "resume": true, "streaming": true, "autoPush": true },
+  "credentials": {
+    "claude_oauth": ["CLAUDE_CODE_OAUTH_TOKEN"],
+    "anthropic": ["ANTHROPIC_API_KEY"]
+  },
+  "providerEnv": {},
+  "defaults": { "provider": "anthropic", "model": "" }
+}

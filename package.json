@@ -1,0 +1,20 @@
+{
+  "name": "pocketagent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Provider-agnostic mobile agent platform: Android app + orchestrator + adapter shim plugins (opencode, kilo, claude, pi, junie)",
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "server",
+    "shims/*"
+  ],
+  "scripts": {
+    "typecheck": "tsc -p packages/protocol && tsc -p server && tsc -p shims/opencode && tsc -p shims/kilo && tsc -p shims/claude && tsc -p shims/pi && tsc -p shims/junie",
+    "smoke:server": "npm run smoke -w server --if-present",
+    "smoke:shims": "npm run smoke -w shims/opencode --if-present && npm run smoke -w shims/kilo --if-present && npm run smoke -w shims/claude --if-present && npm run smoke -w shims/pi --if-present && npm run smoke -w shims/junie --if-present"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

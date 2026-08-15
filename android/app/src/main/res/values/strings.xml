@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">PocketAgent</string>
+    <string name="pairing_hint_code">Pairing-Code auf dem Server erzeugen mit: npm run pair</string>
+    <string name="pairing_title">Gerät koppeln</string>
+    <string name="pairing_server_url">Server-URL</string>
+    <string name="pairing_code">Pairing-Code</string>
+    <string name="pairing_device_name">Gerätename</string>
+    <string name="pairing_button">Koppeln</string>
+    <string name="session_list_title">Sessions</string>
+    <string name="session_list_empty">Noch keine Sessions.\nNeue Session über + starten.</string>
+    <string name="new_session_title">Neue Session</string>
+    <string name="new_session_repo">Repository</string>
+    <string name="new_session_create">Session erstellen</string>
+    <string name="session_prompt_hint">Nachricht an den Agenten…</string>
+    <string name="settings_title">Einstellungen</string>
+    <string name="notification_channel_sessions">Sessions</string>
+    <string name="fcm_error">Kein FCM-Token (Firebase nicht konfiguriert)</string>
+</resources>

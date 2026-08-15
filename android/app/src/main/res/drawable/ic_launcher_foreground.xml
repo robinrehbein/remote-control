@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Terminal window body -->
+    <path
+        android:fillColor="#E2E8F0"
+        android:pathData="M26,40 h56 a4,4 0 0 1 4,4 v28 a4,4 0 0 1 -4,4 h-56 a4,4 0 0 1 -4,-4 v-28 a4,4 0 0 1 4,-4 z" />
+
+    <!-- Terminal header bar -->
+    <path
+        android:fillColor="#94A3B8"
+        android:pathData="M22,40 a4,4 0 0 1 4,-4 h56 a4,4 0 0 1 4,4 v6 h-64 z" />
+
+    <!-- Header dots -->
+    <path android:fillColor="#F87171" android:pathData="M28,41 m-2,0 a2,2 0 1 0 4,0 a2,2 0 1 0 -4,0" />
+    <path android:fillColor="#FBBF24" android:pathData="M36,41 m-2,0 a2,2 0 1 0 4,0 a2,2 0 1 0 -4,0" />
+    <path android:fillColor="#34D399" android:pathData="M44,41 m-2,0 a2,2 0 1 0 4,0 a2,2 0 1 0 -4,0" />
+
+    <!-- Prompt chevron > -->
+    <path
+        android:fillColor="#0F172A"
+        android:pathData="M32,54 l8,6 l-8,6 l0,-4 l4,-2 l-4,-2 z" />
+
+    <!-- Prompt underscore -->
+    <path android:fillColor="#0F172A" android:pathData="M44,64 h16 v3 h-16 z" />
+
+    <!-- Cloud (top right) -->
+    <path android:fillColor="#FFFFFF" android:pathData="M66,32 m-6,0 a6,6 0 1 0 12,0 a6,6 0 1 0 -12,0" />
+    <path android:fillColor="#FFFFFF" android:pathData="M78,34 m-5,0 a5,5 0 1 0 10,0 a5,5 0 1 0 -10,0" />
+    <path android:fillColor="#FFFFFF" android:pathData="M66,28 h12 v8 h-12 z" />
+</vector>

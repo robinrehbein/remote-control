@@ -1,0 +1,18 @@
+{
+  "$schema": "https://pocketagent.dev/schemas/adapter.json",
+  "id": "junie",
+  "name": "Junie",
+  "description": "JetBrains Junie CLI headless one-shot; Junie API key or BYOK. No remote approvals (app shows banner).",
+  "capabilities": { "approvals": false, "resume": false, "streaming": false, "autoPush": true },
+  "credentials": {
+    "junie": ["JUNIE_API_KEY"]
+  },
+  "providerEnv": {
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "google": "GOOGLE_API_KEY",
+    "xai": "XAI_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY"
+  },
+  "defaults": { "provider": "openai", "model": "" }
+}

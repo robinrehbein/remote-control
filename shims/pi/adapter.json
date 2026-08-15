@@ -1,0 +1,17 @@
+{
+  "$schema": "https://pocketagent.dev/schemas/adapter.json",
+  "id": "pi",
+  "name": "pi",
+  "description": "pi coding agent (badlogic) embedded via SDK; ZAI/Kimi/Qwen catalogs, remote approvals via tool_call hook.",
+  "capabilities": { "approvals": true, "resume": true, "streaming": true, "autoPush": true },
+  "credentials": {},
+  "providerEnv": {
+    "openai": "OPENAI_API_KEY",
+    "zai": "ZAI_API_KEY",
+    "moonshot": "KIMI_API_KEY",
+    "kimi": "KIMI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "google": "GEMINI_API_KEY"
+  },
+  "defaults": { "provider": "openai", "model": "" }
+}

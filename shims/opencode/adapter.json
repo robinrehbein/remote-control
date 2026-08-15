@@ -1,0 +1,19 @@
+{
+  "$schema": "https://pocketagent.dev/schemas/adapter.json",
+  "id": "opencode",
+  "name": "OpenCode",
+  "description": "OpenCode headless server; 75+ providers via Models.dev, custom OpenAI-compatible endpoints. Kilo-CLI-compatible API.",
+  "capabilities": { "approvals": true, "resume": true, "streaming": true, "autoPush": true },
+  "pushScript": "/app/scripts/push.js",
+  "credentials": {},
+  "providerEnv": {
+    "openai": "OPENAI_API_KEY",
+    "zai": "ZAI_API_KEY",
+    "moonshot": "MOONSHOT_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "google": "GEMINI_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY"
+  },
+  "defaults": { "provider": "zai", "model": "" }
+}

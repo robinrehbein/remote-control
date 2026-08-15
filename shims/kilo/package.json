@@ -1,0 +1,26 @@
+{
+  "name": "@pocketagent/shim-kilo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "PocketAgent adapter shim wrapping `kilo serve` (Kilo CLI, OpenCode-compatible fork) behind the unified PocketAgent HTTP protocol",
+  "scripts": {
+    "typecheck": "tsc -p . --noEmit",
+    "smoke": "tsx smoke.ts",
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@pocketagent/protocol": "file:../../packages/protocol",
+    "fastify": "^5.2.0",
+    "@kilocode/cli": "7.4.22",
+    "tsx": "^4.20.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.9.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

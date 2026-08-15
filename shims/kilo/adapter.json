@@ -1,0 +1,21 @@
+{
+  "$schema": "https://pocketagent.dev/schemas/adapter.json",
+  "id": "kilo",
+  "name": "Kilo Code",
+  "description": "Kilo CLI (OpenCode-compatible fork); BYO provider keys or Kilo Gateway auth.json content.",
+  "capabilities": { "approvals": true, "resume": true, "streaming": true, "autoPush": true },
+  "pushScript": "/app/scripts/push.js",
+  "credentials": {
+    "kilo": ["KILO_AUTH_CONTENT"]
+  },
+  "providerEnv": {
+    "openai": "OPENAI_API_KEY",
+    "zai": "ZAI_API_KEY",
+    "moonshot": "MOONSHOT_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "google": "GEMINI_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY"
+  },
+  "defaults": { "provider": "zai", "model": "" }
+}

@@ -1,0 +1,26 @@
+{
+  "name": "@pocketagent/shim-pi",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "PocketAgent adapter shim embedding the pi coding agent SDK (badlogic) behind the unified HTTP protocol",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "typecheck": "tsc -p . --noEmit",
+    "smoke": "tsx smoke/smoke.ts"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.2",
+    "@pocketagent/protocol": "file:../../packages/protocol",
+    "fastify": "^5.2.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

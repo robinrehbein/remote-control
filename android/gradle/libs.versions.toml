@@ -11,6 +11,7 @@ serializationJson = "1.7.3"
 okhttp = "4.12.0"
 datastore = "1.1.1"
 firebaseMessaging = "24.0.3"
+biometric = "1.1.0"
 junit = "4.13.2"
 
 [libraries]
@@ -31,6 +32,7 @@ kotlinx-serialization-json = { group = "org.jetbrains.kotlinx", name = "kotlinx-
 okhttp = { group = "com.squareup.okhttp3", name = "okhttp", version.ref = "okhttp" }
 androidx-datastore-preferences = { group = "androidx.datastore", name = "datastore-preferences", version.ref = "datastore" }
 firebase-messaging = { group = "com.google.firebase", name = "firebase-messaging", version.ref = "firebaseMessaging" }
+androidx-biometric = { group = "androidx.biometric", name = "biometric", version.ref = "biometric" }
 junit = { group = "junit", name = "junit", version.ref = "junit" }
 
 [plugins]

@@ -2,9 +2,14 @@
 
 package com.pocketagent.app.ui.screens
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -13,10 +18,13 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -27,16 +35,17 @@ import androidx.compose.material.icons.filled.Difference
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.MoreVert
-import androidx.compose.material.icons.filled.Pause
-import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.outlined.Check
+import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.DoneAll
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.AssistChip
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -57,7 +66,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
@@ -70,6 +78,8 @@ import com.pocketagent.app.data.PermissionDecision
 import com.pocketagent.app.data.SessionInfo
 import com.pocketagent.app.data.SessionStatus
 import com.pocketagent.app.data.wireName
+import com.pocketagent.app.ui.components.MarkdownText
+import com.pocketagent.app.ui.theme.MonoMedium
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
@@ -127,6 +137,9 @@ class SessionViewModel : ViewModel() {
 
     private val _input = MutableStateFlow("")
     val input: StateFlow<String> = _input
+
+    private val _busy = MutableStateFlow(false)
+    val busy: StateFlow<Boolean> = _busy
 
     private val _deleted = MutableStateFlow(false)
     val deleted: StateFlow<Boolean> = _deleted
@@ -188,12 +201,12 @@ class SessionViewModel : ViewModel() {
             }
 
             is AgentEvent.TurnCompleted -> append(TimelineItem.TurnEnd(event.summary, event.commitSha))
-
             is AgentEvent.Pushed -> append(TimelineItem.Pushed(event.branch, event.prUrl, event.auto))
-
             is AgentEvent.TurnFailed -> append(TimelineItem.Error("Turn fehlgeschlagen: ${event.error}"))
             is AgentEvent.ErrorEvent -> append(TimelineItem.Error(event.message))
-            is AgentEvent.Status, is AgentEvent.MessageDelta, is AgentEvent.Ping -> Unit
+
+            is AgentEvent.Status -> _busy.value = event.busy
+            is AgentEvent.MessageDelta, is AgentEvent.Ping -> Unit
         }
     }
 
@@ -210,6 +223,7 @@ class SessionViewModel : ViewModel() {
         if (text.isEmpty()) return
         repository.sendPrompt(sessionId, text, null)
         _input.value = ""
+        _busy.value = true
         append(TimelineItem.Chat("user", text))
     }
 
@@ -252,6 +266,7 @@ fun SessionScreen(
     val items by vm.items.collectAsState()
     val session by vm.session.collectAsState()
     val input by vm.input.collectAsState()
+    val busy by vm.busy.collectAsState()
     val deleted by vm.deleted.collectAsState()
 
     LaunchedEffect(deleted) { if (deleted) onBack() }
@@ -273,12 +288,14 @@ fun SessionScreen(
                             text = session?.repoFullName ?: "Session",
                             style = MaterialTheme.typography.titleMedium,
                         )
-                        session?.let { s ->
-                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                StatusBadge(s.status)
-                                InfoChip(s.adapter)
-                                InfoChip(s.mode.wireName())
-                            }
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            modifier = Modifier.padding(top = 2.dp),
+                        ) {
+                            session?.let { StatusBadge(it.status, pulse = it.status == SessionStatus.RUNNING) }
+                            InfoChip(session?.adapter ?: "")
+                            InfoChip(session?.mode?.wireName() ?: "")
                         }
                     }
                 },
@@ -288,14 +305,10 @@ fun SessionScreen(
                     }
                 },
                 actions = {
-                    IconButton(onClick = { vm.abort() }, enabled = session?.status == SessionStatus.RUNNING) {
-                        Icon(Icons.Filled.Stop, contentDescription = "Abbrechen")
-                    }
-                    IconButton(onClick = { vm.stop() }) {
-                        Icon(Icons.Filled.Pause, contentDescription = "Stoppen")
-                    }
-                    IconButton(onClick = { vm.resume() }) {
-                        Icon(Icons.Filled.PlayArrow, contentDescription = "Fortsetzen")
+                    if (busy || session?.status == SessionStatus.RUNNING) {
+                        IconButton(onClick = { vm.abort() }) {
+                            Icon(Icons.Filled.Stop, contentDescription = "Abbrechen")
+                        }
                     }
                     if (session?.mode != com.pocketagent.app.data.AgentMode.YOLO) {
                         IconButton(onClick = { vm.push() }) {
@@ -303,20 +316,30 @@ fun SessionScreen(
                         }
                     }
                     IconButton(onClick = { onOpenDiff(sessionId) }) {
-                        Icon(Icons.Filled.Difference, contentDescription = "Diff")
+                        Icon(Icons.Filled.Difference, contentDescription = "Änderungen")
                     }
                     Box {
                         IconButton(onClick = { menuOpen = true }) {
                             Icon(Icons.Filled.MoreVert, contentDescription = "Mehr")
                         }
                         DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                            if (session?.status == SessionStatus.STOPPED) {
+                                DropdownMenuItem(
+                                    text = { Text("Fortsetzen") },
+                                    leadingIcon = { Icon(Icons.Outlined.Check, contentDescription = null) },
+                                    onClick = { menuOpen = false; vm.resume() },
+                                )
+                            } else {
+                                DropdownMenuItem(
+                                    text = { Text("Anhalten (Container stoppen)") },
+                                    leadingIcon = { Icon(Icons.Outlined.Close, contentDescription = null) },
+                                    onClick = { menuOpen = false; vm.stop() },
+                                )
+                            }
                             DropdownMenuItem(
                                 text = { Text("Session löschen") },
                                 leadingIcon = { Icon(Icons.Filled.Delete, contentDescription = null) },
-                                onClick = {
-                                    menuOpen = false
-                                    confirmDelete = true
-                                },
+                                onClick = { menuOpen = false; confirmDelete = true },
                             )
                         }
                     }
@@ -325,27 +348,54 @@ fun SessionScreen(
         },
         bottomBar = {
             Surface(tonalElevation = 3.dp) {
-                Row(
-                    verticalAlignment = Alignment.Bottom,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 12.dp, vertical = 8.dp)
-                        .navigationBarsPadding()
-                        .imePadding(),
-                ) {
-                    OutlinedTextField(
-                        value = input,
-                        onValueChange = vm::updateInput,
-                        placeholder = { Text("Nachricht an den Agenten…") },
-                        modifier = Modifier.weight(1f),
-                        maxLines = 5,
-                    )
-                    IconButton(
-                        onClick = { vm.sendPrompt() },
-                        enabled = input.isNotBlank(),
-                        modifier = Modifier.padding(start = 4.dp, bottom = 4.dp),
+                Column(modifier = Modifier.navigationBarsPadding().imePadding()) {
+                    AnimatedVisibility(visible = busy, enter = fadeIn(), exit = fadeOut()) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.padding(start = 20.dp, top = 6.dp, bottom = 2.dp),
+                        ) {
+                            PulsingDot(
+                                color = MaterialTheme.colorScheme.primary,
+                                pulse = true,
+                                size = 7.dp,
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "Agent arbeitet …",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                    Row(
+                        verticalAlignment = Alignment.Bottom,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
                     ) {
-                        Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Senden")
+                        OutlinedTextField(
+                            value = input,
+                            onValueChange = vm::updateInput,
+                            placeholder = { Text("Nachricht an den Agenten …") },
+                            modifier = Modifier.weight(1f),
+                            maxLines = 5,
+                            shape = MaterialTheme.shapes.extraLarge,
+                        )
+                        IconButton(
+                            onClick = { vm.sendPrompt() },
+                            enabled = input.isNotBlank(),
+                            modifier = Modifier.padding(start = 4.dp, bottom = 4.dp),
+                        ) {
+                            Icon(
+                                Icons.AutoMirrored.Filled.Send,
+                                contentDescription = "Senden",
+                                tint = if (input.isNotBlank()) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.outline
+                                },
+                            )
+                        }
                     }
                 }
             }
@@ -358,11 +408,19 @@ fun SessionScreen(
                     .padding(padding),
                 contentAlignment = Alignment.Center,
             ) {
-                Text(
-                    text = "Noch keine Ereignisse.\nSende die erste Nachricht!",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    style = MaterialTheme.typography.bodyMedium,
-                )
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        text = "Worauf sollen wir arbeiten?",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                        text = "Beschreibe die Aufgabe – der Agent erledigt den Rest.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 4.dp, start = 32.dp, end = 32.dp),
+                    )
+                }
             }
         } else {
             LazyColumn(
@@ -370,9 +428,7 @@ fun SessionScreen(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(padding),
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(
-                    start = 12.dp, end = 12.dp, top = 8.dp, bottom = 16.dp,
-                ),
+                contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 10.dp, bottom = 16.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 items(items) { item -> TimelineItemView(item, vm) }
@@ -402,7 +458,7 @@ fun SessionScreen(
 @Composable
 private fun TimelineItemView(item: TimelineItem, vm: SessionViewModel) {
     when (item) {
-        is TimelineItem.Chat -> ChatCard(item)
+        is TimelineItem.Chat -> ChatBubble(item)
         is TimelineItem.Tool -> ToolCard(item)
         is TimelineItem.Approval -> ApprovalCard(item, vm)
         is TimelineItem.TurnEnd -> TurnEndSeparator(item)
@@ -412,93 +468,140 @@ private fun TimelineItemView(item: TimelineItem, vm: SessionViewModel) {
 }
 
 @Composable
-private fun ChatCard(item: TimelineItem.Chat) {
+private fun ChatBubble(item: TimelineItem.Chat) {
     val isUser = item.role == "user"
     Row(
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         modifier = Modifier.fillMaxWidth(),
     ) {
-        if (isUser) Spacer(modifier = Modifier.width(32.dp))
+        if (isUser) Spacer(modifier = Modifier.width(40.dp))
         Surface(
-            shape = MaterialTheme.shapes.medium,
+            shape = RoundedCornerShape(
+                topStart = 18.dp,
+                topEnd = 18.dp,
+                bottomStart = if (isUser) 18.dp else 4.dp,
+                bottomEnd = if (isUser) 4.dp else 18.dp,
+            ),
             color = if (isUser) {
-                MaterialTheme.colorScheme.surfaceVariant
-            } else {
                 MaterialTheme.colorScheme.primaryContainer
+            } else {
+                MaterialTheme.colorScheme.surfaceContainer
             },
             modifier = Modifier.weight(1f),
         ) {
-            Column(Modifier.padding(10.dp)) {
+            if (isUser) {
                 Text(
-                    text = if (isUser) "Du" else "Agent",
-                    style = MaterialTheme.typography.labelSmall,
-                    fontWeight = FontWeight.SemiBold,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    text = item.text,
+                    style = MaterialTheme.typography.bodyLarge,
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
                 )
-                Text(text = item.text, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 2.dp))
+            } else {
+                MarkdownText(
+                    text = item.text,
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                )
             }
         }
-        if (!isUser) Spacer(modifier = Modifier.width(32.dp))
+        if (!isUser) Spacer(modifier = Modifier.width(40.dp))
     }
 }
 
 @Composable
 private fun ToolCard(item: TimelineItem.Tool) {
     var expanded by remember { mutableStateOf(false) }
-    Card(
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+    Surface(
+        shape = MaterialTheme.shapes.large,
+        color = MaterialTheme.colorScheme.surfaceContainer,
         modifier = Modifier.fillMaxWidth(),
     ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(start = 12.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
-        ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = item.title ?: "Tool: ${item.tool}",
-                    style = MaterialTheme.typography.titleMedium,
-                )
-                val status = when {
-                    item.result == null -> "läuft…"
-                    item.result.isError == true -> "Fehler"
-                    else -> "ok"
+        Column {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 14.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+            ) {
+                val s = semantic()
+                val (dotColor, statusText) = when {
+                    item.result == null -> MaterialTheme.colorScheme.primary to "läuft"
+                    item.result.isError == true -> MaterialTheme.colorScheme.error to "Fehler"
+                    else -> s.success to "ok"
                 }
-                Text(
-                    text = "${item.tool} · $status",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-            IconButton(onClick = { expanded = !expanded }) {
-                Icon(
-                    if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
-                    contentDescription = if (expanded) "Einklappen" else "Ausklappen",
-                )
-            }
-        }
-        if (expanded) {
-            Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
-                item.input?.let { input ->
+                Box(
+                    modifier = Modifier
+                        .size(28.dp)
+                        .background(dotColor.copy(alpha = 0.14f), CircleShape),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    if (item.result == null) {
+                        CircularProgressIndicator(
+                            strokeWidth = 2.dp,
+                            modifier = Modifier.size(13.dp),
+                        )
+                    } else {
+                        Box(modifier = Modifier.size(8.dp).background(dotColor, CircleShape))
+                    }
+                }
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(start = 10.dp, top = 8.dp, bottom = 8.dp)
+                ) {
                     Text(
-                        text = input.toString().take(4000),
-                        style = MaterialTheme.typography.bodySmall,
-                        fontFamily = FontFamily.Monospace,
+                        text = item.title ?: item.tool,
+                        style = MaterialTheme.typography.titleSmall,
+                        maxLines = 1,
+                    )
+                    Text(
+                        text = "${item.tool} · $statusText",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
-                item.result?.let { result ->
-                    Text(
-                        text = result.output.take(4000),
-                        style = MaterialTheme.typography.bodySmall,
-                        fontFamily = FontFamily.Monospace,
-                        color = if (result.isError == true) {
-                            MaterialTheme.colorScheme.error
-                        } else {
-                            MaterialTheme.colorScheme.onSurface
-                        },
-                        modifier = Modifier.padding(top = 8.dp),
+                IconButton(onClick = { expanded = !expanded }) {
+                    Icon(
+                        if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                        contentDescription = if (expanded) "Einklappen" else "Ausklappen",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                }
+            }
+            AnimatedVisibility(visible = expanded) {
+                Column(
+                    Modifier
+                        .padding(horizontal = 14.dp, vertical = 4.dp)
+                        .padding(bottom = 10.dp)
+                ) {
+                    item.input?.let { input ->
+                        Text(
+                            text = input.toString().take(4000),
+                            style = MonoMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    item.result?.let { result ->
+                        Surface(
+                            color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                            shape = MaterialTheme.shapes.small,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(top = 6.dp),
+                        ) {
+                            Text(
+                                text = result.output.take(4000),
+                                style = MonoMedium,
+                                color = if (result.isError == true) {
+                                    MaterialTheme.colorScheme.error
+                                } else {
+                                    MaterialTheme.colorScheme.onSurface
+                                },
+                                modifier = Modifier
+                                    .heightIn(max = 260.dp)
+                                    .verticalScroll(rememberScrollState())
+                                    .padding(10.dp),
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -507,25 +610,26 @@ private fun ToolCard(item: TimelineItem.Tool) {
 
 @Composable
 private fun ApprovalCard(item: TimelineItem.Approval, vm: SessionViewModel) {
-    Card(
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer),
+    Surface(
+        shape = MaterialTheme.shapes.large,
+        color = MaterialTheme.colorScheme.tertiaryContainer,
         modifier = Modifier.fillMaxWidth(),
     ) {
-        Column(Modifier.padding(12.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                AssistChip(onClick = {}, label = { Text(item.kind) })
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = item.title,
-                    style = MaterialTheme.typography.titleMedium,
-                    modifier = Modifier.weight(1f),
-                )
-            }
+        Column(Modifier.padding(14.dp)) {
+            Text(
+                text = "Bestätigung erforderlich",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onTertiaryContainer,
+            )
+            Text(
+                text = item.title,
+                style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.padding(top = 2.dp),
+            )
             item.detail?.let { detail ->
                 Text(
                     text = detail.take(2000),
-                    style = MaterialTheme.typography.bodySmall,
-                    fontFamily = FontFamily.Monospace,
+                    style = MonoMedium,
                     modifier = Modifier
                         .padding(top = 8.dp)
                         .heightIn(max = 200.dp)
@@ -535,7 +639,7 @@ private fun ApprovalCard(item: TimelineItem.Approval, vm: SessionViewModel) {
             item.diff?.let { diff ->
                 Surface(
                     color = MaterialTheme.colorScheme.surface,
-                    shape = MaterialTheme.shapes.small,
+                    shape = MaterialTheme.shapes.medium,
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(top = 8.dp),
@@ -544,24 +648,23 @@ private fun ApprovalCard(item: TimelineItem.Approval, vm: SessionViewModel) {
                         modifier = Modifier
                             .heightIn(max = 300.dp)
                             .verticalScroll(rememberScrollState())
-                            .padding(8.dp)
+                            .padding(vertical = 6.dp)
                     ) {
-                        diff.lines().forEach { line -> DiffColoredLine(line = line, monospace = MaterialTheme.typography.bodySmall) }
+                        diff.lines().forEach { line -> DiffLine(line = line, style = MonoMedium) }
                     }
                 }
             }
             when (item.resolved) {
-                null -> Row(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    modifier = Modifier.padding(top = 12.dp),
-                ) {
-                    OutlinedButton(onClick = { vm.decide(item.permissionId, PermissionDecision.ONCE) }) {
-                        Text("Erlauben")
+                null -> Column(modifier = Modifier.padding(top = 12.dp)) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(onClick = { vm.decide(item.permissionId, PermissionDecision.ONCE) }) {
+                            Text("Erlauben")
+                        }
+                        FilledTonalButton(onClick = { vm.decide(item.permissionId, PermissionDecision.ALWAYS) }) {
+                            Text("Immer erlauben")
+                        }
                     }
-                    OutlinedButton(onClick = { vm.decide(item.permissionId, PermissionDecision.ALWAYS) }) {
-                        Text("Immer")
-                    }
-                    OutlinedButton(onClick = { vm.decide(item.permissionId, PermissionDecision.REJECT) }) {
+                    TextButton(onClick = { vm.decide(item.permissionId, PermissionDecision.REJECT) }) {
                         Text("Ablehnen")
                     }
                 }
@@ -576,67 +679,91 @@ private fun ApprovalCard(item: TimelineItem.Approval, vm: SessionViewModel) {
 
 @Composable
 private fun ResolvedLabel(label: String) {
-    Text(
-        text = "✓ $label",
-        style = MaterialTheme.typography.labelSmall,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-        modifier = Modifier.padding(top = 8.dp),
-    )
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.padding(top = 10.dp),
+    ) {
+        Icon(
+            Icons.Outlined.DoneAll,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.size(15.dp),
+        )
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(start = 6.dp),
+        )
+    }
 }
 
 @Composable
 private fun TurnEndSeparator(item: TimelineItem.TurnEnd) {
-    Surface(
-        shape = MaterialTheme.shapes.small,
-        color = MaterialTheme.colorScheme.secondaryContainer,
-        modifier = Modifier.fillMaxWidth(),
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 6.dp),
     ) {
-        Column(Modifier.padding(10.dp)) {
-            Text(
-                text = "Turn abgeschlossen",
-                style = MaterialTheme.typography.labelSmall,
-                fontWeight = FontWeight.SemiBold,
-                color = MaterialTheme.colorScheme.onSecondaryContainer,
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Icon(
+                Icons.Outlined.Check,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.outline,
+                modifier = Modifier.size(14.dp),
             )
-            item.summary?.let {
-                Text(
-                    text = it,
-                    style = MaterialTheme.typography.bodySmall,
-                    modifier = Modifier.padding(top = 2.dp),
-                )
-            }
-            item.commitSha?.let { sha ->
-                Text(
-                    text = "Commit: ${sha.take(10)}",
-                    style = MaterialTheme.typography.labelSmall,
-                    fontFamily = FontFamily.Monospace,
-                    modifier = Modifier.padding(top = 2.dp),
-                )
-            }
+            Text(
+                text = "fertig",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.outline,
+                fontWeight = FontWeight.Medium,
+            )
+        }
+        item.commitSha?.let { sha ->
+            Text(
+                text = sha.take(10),
+                style = MonoMedium.copy(fontSize = MaterialTheme.typography.labelSmall.fontSize),
+                color = MaterialTheme.colorScheme.outline,
+                modifier = Modifier.padding(top = 2.dp),
+            )
         }
     }
 }
 
 @Composable
 private fun PushCard(item: TimelineItem.Pushed) {
-    Card(
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
+    Surface(
+        shape = MaterialTheme.shapes.large,
+        color = MaterialTheme.colorScheme.primaryContainer,
         modifier = Modifier.fillMaxWidth(),
     ) {
-        Column(Modifier.padding(12.dp)) {
-            Text(
-                text = if (item.auto) "Automatisch gepusht" else "Gepusht",
-                style = MaterialTheme.typography.titleMedium,
-            )
+        Column(Modifier.padding(14.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    Icons.Filled.CloudUpload,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                )
+                Text(
+                    text = if (item.auto) "Automatisch gepusht" else "Gepusht",
+                    style = MaterialTheme.typography.titleSmall,
+                    modifier = Modifier.padding(start = 8.dp),
+                )
+            }
             Text(
                 text = item.branch,
-                style = MaterialTheme.typography.labelSmall,
-                fontFamily = FontFamily.Monospace,
+                style = MonoMedium,
+                color = MaterialTheme.colorScheme.onPrimaryContainer,
+                modifier = Modifier.padding(top = 6.dp),
             )
-            item.prUrl?.let { url ->
+            item.prUrl?.let {
                 Text(
-                    text = url,
-                    style = MaterialTheme.typography.labelSmall,
+                    text = "Pull Request erstellt",
+                    style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.padding(top = 4.dp),
                 )
@@ -647,15 +774,16 @@ private fun PushCard(item: TimelineItem.Pushed) {
 
 @Composable
 private fun ErrorCard(item: TimelineItem.Error) {
-    Card(
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+    Surface(
+        shape = MaterialTheme.shapes.large,
+        color = MaterialTheme.colorScheme.errorContainer,
         modifier = Modifier.fillMaxWidth(),
     ) {
         Text(
             text = item.message,
             color = MaterialTheme.colorScheme.onErrorContainer,
-            style = MaterialTheme.typography.bodySmall,
-            modifier = Modifier.padding(12.dp),
+            style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.padding(14.dp),
         )
     }
 }

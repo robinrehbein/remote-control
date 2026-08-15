@@ -2,6 +2,7 @@ package com.pocketagent.app.data
 
 import android.content.Context
 import android.util.Base64
+import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
@@ -34,6 +35,14 @@ class TokenStore(private val context: Context) {
         val DEVICE_ID = stringPreferencesKey("device_id")
         val DEVICE_NAME = stringPreferencesKey("device_name")
         val DEVICE_TOKEN_ENC = stringPreferencesKey("device_token_enc")
+        val BIOMETRIC_ENABLED = booleanPreferencesKey("biometric_enabled")
+    }
+
+    val biometricEnabled: Flow<Boolean> =
+        context.dataStore.data.map { prefs -> prefs[Keys.BIOMETRIC_ENABLED] ?: false }
+
+    suspend fun setBiometricEnabled(enabled: Boolean) {
+        context.dataStore.edit { prefs -> prefs[Keys.BIOMETRIC_ENABLED] = enabled }
     }
 
     val setup: Flow<DeviceSetup?> = context.dataStore.data.map { prefs ->

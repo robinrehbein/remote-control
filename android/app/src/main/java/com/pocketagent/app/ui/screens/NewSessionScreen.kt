@@ -2,19 +2,26 @@
 
 package com.pocketagent.app.ui.screens
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.outlined.UnfoldLess
+import androidx.compose.material.icons.outlined.UnfoldMore
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -22,14 +29,15 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -91,6 +99,17 @@ class NewSessionViewModel : ViewModel() {
         )
     }
 
+    fun addRepo(fullName: String, defaultBranch: String) {
+        viewModelScope.launch {
+            repository.addRepo(fullName, defaultBranch).fold(
+                onSuccess = { repo ->
+                    _state.value = _state.value.copy(repoId = repo.id, error = null)
+                },
+                onFailure = { t -> _state.value = _state.value.copy(error = t.message) },
+            )
+        }
+    }
+
     fun create() {
         val s = _state.value
         if (s.busy) return
@@ -110,7 +129,6 @@ class NewSessionViewModel : ViewModel() {
             )
             result.fold(
                 onSuccess = {
-                    // find fresh session for this repo+adapter (created by server)
                     val created = repository.sessions.value.firstOrNull { sess ->
                         sess.repoId == repoId && sess.adapter == s.adapter
                     }
@@ -136,10 +154,16 @@ fun NewSessionScreen(
     val repos by repository.repos.collectAsState()
     val adapters by repository.adapters.collectAsState()
 
+    var showAddRepo by remember { mutableStateOf(false) }
+    var advanced by remember { mutableStateOf(false) }
+
     LaunchedEffect(Unit) { repository.refreshRepos(); repository.refreshSessions(); repository.refreshAdapters() }
     LaunchedEffect(adapters) { vm.syncAdapterDefaults(adapters) }
-    LaunchedEffect(state.createdSessionId) {
-        state.createdSessionId?.let { onCreated(it) }
+    LaunchedEffect(state.createdSessionId) { state.createdSessionId?.let { onCreated(it) } }
+    LaunchedEffect(repos) {
+        if (repos.isNotEmpty() && state.repoId == null && repos.none { it.id == state.repoId }) {
+            vm.update { it.copy(repoId = repos.first().id) }
+        }
     }
 
     Scaffold(
@@ -162,18 +186,39 @@ fun NewSessionScreen(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            SectionLabel("Repository")
-            RepoDropdown(
+            /* -------- Repository -------- */
+            SectionHeader("Repository", modifier = Modifier.padding(0.dp))
+            RepoSelector(
                 repos = repos.map { it.id to it.fullName },
                 selectedId = state.repoId,
                 onSelect = { id -> vm.update { it.copy(repoId = id) } },
+                onAddRepo = { showAddRepo = true },
             )
 
-            SectionLabel("Adapter")
+            /* -------- Adapter -------- */
+            SectionHeader("Agent", modifier = Modifier.padding(0.dp))
             val adapterList = adapters
             if (adapterList.isEmpty()) {
-                OutlinedButton(onClick = { }, enabled = false, modifier = Modifier.fillMaxWidth()) {
-                    Text("Lade Adapter…")
+                Surface(
+                    shape = MaterialTheme.shapes.large,
+                    color = MaterialTheme.colorScheme.surfaceContainer,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(16.dp),
+                    ) {
+                        CircularProgressIndicator(
+                            strokeWidth = 2.dp,
+                            modifier = Modifier.width(18.dp),
+                        )
+                        Text(
+                            text = "Lade verfügbare Agenten …",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(start = 12.dp),
+                        )
+                    }
                 }
             } else {
                 SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
@@ -187,76 +232,106 @@ fun NewSessionScreen(
                         }
                     }
                 }
-                adapterList.firstOrNull { it.id == state.adapter }?.description?.let {
-                    Text(
-                        text = it,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-                val selected = adapterList.firstOrNull { it.id == state.adapter }
-                if (selected != null && !selected.capabilities.approvals && state.mode != AgentMode.YOLO) {
-                    Text(
-                        text = "${selected.name}: keine Remote-Approvals – Ask/AcceptEdits laufen ohne Gates",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error,
-                    )
+                adapterList.firstOrNull { it.id == state.adapter }?.let { selected ->
+                    if (selected.description.isNotBlank()) {
+                        Text(
+                            text = selected.description,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    if (!selected.capabilities.approvals && state.mode != AgentMode.YOLO) {
+                        Text(
+                            text = "${selected.name} unterstützt keine Remote-Approvals – Ask/AcceptEdits laufen ohne Nachfragen durch.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.tertiary,
+                        )
+                    }
                 }
             }
 
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
-                OutlinedTextField(
-                    value = state.provider,
-                    onValueChange = { v -> vm.update { it.copy(provider = v) } },
-                    label = { Text("Provider") },
-                    singleLine = true,
-                    modifier = Modifier.weight(1f),
-                )
-                OutlinedTextField(
-                    value = state.model,
-                    onValueChange = { v -> vm.update { it.copy(model = v) } },
-                    label = { Text("Modell") },
-                    placeholder = { Text("Default") },
-                    singleLine = true,
-                    modifier = Modifier.weight(1f),
-                )
-            }
-
-            SectionLabel("Modus")
-            ModeCard(
+            /* -------- Modus -------- */
+            SectionHeader("Autonomie", modifier = Modifier.padding(0.dp))
+            ModeTile(
+                title = "Ask",
+                subtitle = "Jede Aktion wird vor der Ausführung bestätigt",
+                selected = state.mode == AgentMode.ASK,
+                onClick = { vm.update { it.copy(mode = AgentMode.ASK) } },
+            )
+            ModeTile(
+                title = "Accept Edits",
+                subtitle = "Datei-Änderungen laufen automatisch, alles andere wird gefragt",
+                selected = state.mode == AgentMode.ACCEPT_EDITS,
+                onClick = { vm.update { it.copy(mode = AgentMode.ACCEPT_EDITS) } },
+            )
+            ModeTile(
+                title = "Auto",
+                subtitle = "Agent entscheidet selbst, Push nur manuell",
+                selected = state.mode == AgentMode.AUTO,
+                onClick = { vm.update { it.copy(mode = AgentMode.AUTO) } },
+            )
+            ModeTile(
                 title = "Yolo",
-                subtitle = "Vollautomatisch: Auto-Push + Draft-PR nach jedem Turn. Vorsicht!",
+                subtitle = "Vollautomatisch inkl. Push und Draft-PR – ohne Nachfrage",
                 warning = true,
                 selected = state.mode == AgentMode.YOLO,
                 onClick = { vm.update { it.copy(mode = AgentMode.YOLO) } },
             )
-            ModeCard(
-                title = "Auto",
-                subtitle = "Agent entscheidet selbst, Push manuell per Button.",
-                selected = state.mode == AgentMode.AUTO,
-                onClick = { vm.update { it.copy(mode = AgentMode.AUTO) } },
-            )
-            ModeCard(
-                title = "Accept Edits",
-                subtitle = "Datei-Änderungen werden automatisch akzeptiert.",
-                selected = state.mode == AgentMode.ACCEPT_EDITS,
-                onClick = { vm.update { it.copy(mode = AgentMode.ACCEPT_EDITS) } },
-            )
-            ModeCard(
-                title = "Ask",
-                subtitle = "Jede Aktion muss bestätigt werden.",
-                selected = state.mode == AgentMode.ASK,
-                onClick = { vm.update { it.copy(mode = AgentMode.ASK) } },
-            )
 
-            OutlinedTextField(
-                value = state.branch,
-                onValueChange = { v -> vm.update { it.copy(branch = v) } },
-                label = { Text("Basis-Branch (optional)") },
-                placeholder = { Text("Default-Branch des Repos") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-            )
+            /* -------- Erweitert -------- */
+            Surface(
+                shape = MaterialTheme.shapes.large,
+                color = MaterialTheme.colorScheme.surfaceContainer,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { advanced = !advanced },
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.padding(start = 16.dp, end = 8.dp, top = 6.dp, bottom = 6.dp),
+                ) {
+                    Text(
+                        text = "Erweitert",
+                        style = MaterialTheme.typography.titleSmall,
+                        modifier = Modifier.weight(1f),
+                    )
+                    IconButton(onClick = { advanced = !advanced }) {
+                        Icon(
+                            if (advanced) Icons.Outlined.UnfoldLess else Icons.Outlined.UnfoldMore,
+                            contentDescription = null,
+                        )
+                    }
+                }
+            }
+            AnimatedVisibility(visible = advanced) {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
+                        OutlinedTextField(
+                            value = state.provider,
+                            onValueChange = { v -> vm.update { it.copy(provider = v) } },
+                            label = { Text("Provider") },
+                            singleLine = true,
+                            modifier = Modifier.weight(1f),
+                        )
+                        OutlinedTextField(
+                            value = state.model,
+                            onValueChange = { v -> vm.update { it.copy(model = v) } },
+                            label = { Text("Modell") },
+                            placeholder = { Text("Default") },
+                            singleLine = true,
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                    OutlinedTextField(
+                        value = state.branch,
+                        onValueChange = { v -> vm.update { it.copy(branch = v) } },
+                        label = { Text("Basis-Branch (optional)") },
+                        placeholder = { Text("Default-Branch des Repos") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+            }
 
             state.error?.let {
                 Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
@@ -268,83 +343,181 @@ fun NewSessionScreen(
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 if (state.busy) {
-                    CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.padding(end = 8.dp))
+                    CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.width(18.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
                 }
-                Text("Session erstellen")
+                Text(if (state.busy) "Session startet …" else "Session starten")
             }
         }
     }
+
+    if (showAddRepo) {
+        AddRepoDialog(
+            onDismiss = { showAddRepo = false },
+            onSave = { fullName, branch ->
+                vm.addRepo(fullName, branch)
+                showAddRepo = false
+            },
+        )
+    }
 }
 
-@Composable
-private fun SectionLabel(text: String) {
-    Text(
-        text = text,
-        style = MaterialTheme.typography.titleMedium,
-        fontWeight = FontWeight.SemiBold,
-    )
-}
+/* ------------------------------------------------------------------ */
+/* Repos                                                               */
+/* ------------------------------------------------------------------ */
 
 @Composable
-private fun RepoDropdown(
+private fun RepoSelector(
     repos: List<Pair<String, String>>,
     selectedId: String?,
     onSelect: (String) -> Unit,
+    onAddRepo: () -> Unit,
 ) {
     var expanded by remember { mutableStateOf(false) }
     val selectedLabel = repos.firstOrNull { it.first == selectedId }?.second
 
-    OutlinedButton(onClick = { expanded = true }, modifier = Modifier.fillMaxWidth()) {
-        Text(selectedLabel ?: "Repository wählen…")
-    }
-    DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-        if (repos.isEmpty()) {
-            DropdownMenuItem(text = { Text("Keine Repos – in Settings hinzufügen") }, onClick = { expanded = false })
-        }
-        repos.forEach { (id, label) ->
-            DropdownMenuItem(
-                text = { Text(label) },
-                onClick = {
-                    onSelect(id)
-                    expanded = false
-                },
+    Surface(
+        shape = MaterialTheme.shapes.large,
+        color = MaterialTheme.colorScheme.surfaceContainer,
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { expanded = true },
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(start = 16.dp, end = 8.dp, top = 6.dp, bottom = 6.dp),
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "Repository",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    text = selectedLabel ?: "Wähle ein Repository …",
+                    style = MaterialTheme.typography.titleSmall,
+                )
+            }
+            Icon(
+                Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
     }
+    DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+        if (repos.isEmpty()) {
+            DropdownMenuItem(
+                text = { Text("Noch keine Repos") },
+                enabled = false,
+                onClick = {},
+            )
+        }
+        repos.forEach { (id, label) ->
+            DropdownMenuItem(text = { Text(label) }, onClick = { onSelect(id); expanded = false })
+        }
+        DropdownMenuItem(
+            text = { Text("Repository hinzufügen …", color = MaterialTheme.colorScheme.primary) },
+            leadingIcon = { Icon(Icons.Filled.Add, contentDescription = null) },
+            onClick = { expanded = false; onAddRepo() },
+        )
+    }
 }
 
+/** Shared add-repository dialog. */
 @Composable
-private fun ModeCard(
+fun AddRepoDialog(
+    onDismiss: () -> Unit,
+    onSave: (fullName: String, defaultBranch: String) -> Unit,
+) {
+    var fullName by remember { mutableStateOf("") }
+    var branch by remember { mutableStateOf("") }
+    val valid = Regex("^[\\w.-]+/[\\w.-]+$").matches(fullName.trim())
+    val effectiveBranch = branch.trim().ifEmpty { "main" }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Repository hinzufügen") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                OutlinedTextField(
+                    value = fullName,
+                    onValueChange = { fullName = it },
+                    label = { Text("owner/repo") },
+                    placeholder = { Text("robinrehbein/remote-control") },
+                    singleLine = true,
+                    isError = fullName.isNotBlank() && !valid,
+                    supportingText = if (fullName.isNotBlank() && !valid) {
+                        { Text("Format: owner/repo") }
+                    } else {
+                        null
+                    },
+                )
+                OutlinedTextField(
+                    value = branch,
+                    onValueChange = { branch = it },
+                    label = { Text("Basis-Branch (optional)") },
+                    placeholder = { Text("main") },
+                    singleLine = true,
+                )
+                Text(
+                    "Für private Repos zusätzlich ein github-Secret in den Einstellungen hinterlegen.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onSave(fullName.trim(), effectiveBranch) }, enabled = valid) {
+                Text("Hinzufügen")
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Abbrechen") } },
+    )
+}
+
+/* ------------------------------------------------------------------ */
+/* Mode tiles                                                          */
+/* ------------------------------------------------------------------ */
+
+@Composable
+private fun ModeTile(
     title: String,
     subtitle: String,
     warning: Boolean = false,
     selected: Boolean,
     onClick: () -> Unit,
 ) {
-    Card(
-        onClick = onClick,
-        colors = if (selected) {
-            CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
+    Surface(
+        shape = MaterialTheme.shapes.large,
+        color = if (selected) {
+            MaterialTheme.colorScheme.secondaryContainer
         } else {
-            CardDefaults.cardColors()
+            MaterialTheme.colorScheme.surfaceContainer
         },
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick),
     ) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.padding(start = 4.dp, end = 14.dp, top = 4.dp, bottom = 4.dp),
+            modifier = Modifier.padding(start = 4.dp, end = 16.dp, top = 4.dp, bottom = 4.dp),
         ) {
             RadioButton(selected = selected, onClick = onClick)
-            Column(modifier = Modifier.padding(start = 4.dp, top = 8.dp, bottom = 8.dp)) {
-                Text(title, style = MaterialTheme.typography.titleMedium)
+            Column(modifier = Modifier.padding(start = 4.dp, top = 10.dp, bottom = 10.dp)) {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.titleSmall,
+                    color = if (warning && selected) {
+                        MaterialTheme.colorScheme.error
+                    } else {
+                        MaterialTheme.colorScheme.onSurface
+                    },
+                )
                 Text(
                     text = subtitle,
                     style = MaterialTheme.typography.bodySmall,
-                    color = if (warning) {
-                        MaterialTheme.colorScheme.error
-                    } else {
-                        MaterialTheme.colorScheme.onSurfaceVariant
-                    },
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
         }

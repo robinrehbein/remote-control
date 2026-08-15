@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -13,23 +14,21 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material3.Card
+import androidx.compose.material.icons.automirrored.filled.Refresh
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
@@ -38,6 +37,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.pocketagent.app.PocketAgentApp
 import com.pocketagent.app.data.AppRepository
 import com.pocketagent.app.data.DiffEntry
+import com.pocketagent.app.ui.theme.MonoMedium
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
@@ -95,7 +95,9 @@ fun DiffScreen(
                     }
                 },
                 actions = {
-                    TextButton(onClick = { vm.load() }) { Text("Aktualisieren") }
+                    IconButton(onClick = { vm.load() }) {
+                        Icon(Icons.AutoMirrored.Filled.Refresh, contentDescription = "Aktualisieren")
+                    }
                 },
             )
         },
@@ -128,14 +130,17 @@ fun DiffScreen(
                     .padding(padding),
                 contentAlignment = Alignment.Center,
             ) {
-                Text("Keine Änderungen im Working Tree.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(
+                    "Keine Änderungen im Working Tree.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
 
             else -> LazyColumn(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(padding),
-                contentPadding = PaddingValues(12.dp),
+                contentPadding = PaddingValues(16.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 items(state.entries, key = { it.path }) { entry ->
@@ -146,26 +151,67 @@ fun DiffScreen(
     }
 }
 
+private fun diffStats(patch: String): Pair<Int, Int> {
+    var added = 0
+    var removed = 0
+    patch.lines().forEach { line ->
+        when {
+            line.startsWith("+") && !line.startsWith("+++") -> added++
+            line.startsWith("-") && !line.startsWith("---") -> removed++
+        }
+    }
+    return added to removed
+}
+
 @Composable
 private fun DiffEntryCard(entry: DiffEntry) {
-    Card(modifier = Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(10.dp)) {
+    Surface(
+        shape = MaterialTheme.shapes.large,
+        color = MaterialTheme.colorScheme.surfaceContainer,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(Modifier.padding(vertical = 10.dp)) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp),
+            ) {
+                Text(
+                    text = entry.path.substringAfterLast('/'),
+                    style = MaterialTheme.typography.titleSmall,
+                    modifier = Modifier.weight(1f),
+                )
+                if (entry.binary != true) {
+                    val (added, removed) = diffStats(entry.patch)
+                    DiffStat(added = added, removed = removed)
+                }
+            }
             Text(
                 text = entry.path,
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.SemiBold,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 2.dp),
             )
             if (entry.binary == true) {
                 Text(
                     text = "Binäre Datei",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(top = 4.dp),
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
                 )
             } else {
-                Column(modifier = Modifier.padding(top = 6.dp)) {
-                    entry.patch.lines().forEach { line ->
-                        DiffColoredLine(line = line, monospace = MaterialTheme.typography.bodySmall)
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    shape = MaterialTheme.shapes.medium,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                ) {
+                    Column(Modifier.padding(vertical = 6.dp)) {
+                        entry.patch.lines().forEach { line ->
+                            DiffLine(line = line, style = MonoMedium)
+                        }
                     }
                 }
             }

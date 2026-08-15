@@ -2,33 +2,45 @@
 
 package com.pocketagent.app.ui.screens
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.Fingerprint
+import androidx.compose.material.icons.outlined.Folder
+import androidx.compose.material.icons.outlined.Key
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
-import androidx.compose.material3.Card
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.rememberSwipeToDismissBoxState
+import androidx.compose.material3.SwipeToDismissBox
+import androidx.compose.material3.SwipeToDismissBoxValue
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -38,6 +50,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -48,6 +61,8 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.pocketagent.app.PocketAgentApp
 import com.pocketagent.app.data.AppRepository
+import com.pocketagent.app.data.RepoInfo
+import com.pocketagent.app.data.SecretInfo
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
@@ -67,16 +82,6 @@ class SettingsViewModel : ViewModel() {
         }
     }
 
-    fun addRepo(fullName: String, defaultBranch: String, onDone: () -> Unit) {
-        viewModelScope.launch {
-            repository.addRepo(fullName, defaultBranch).fold(
-                onSuccess = { _error.value = null },
-                onFailure = { _error.value = it.message },
-            )
-            onDone()
-        }
-    }
-
     fun addSecret(kind: String, value: String, onDone: () -> Unit) {
         viewModelScope.launch {
             repository.addSecret(kind, value).fold(
@@ -91,6 +96,20 @@ class SettingsViewModel : ViewModel() {
         viewModelScope.launch { repository.deleteSecret(id) }
     }
 
+    fun addRepo(fullName: String, defaultBranch: String, onDone: () -> Unit) {
+        viewModelScope.launch {
+            repository.addRepo(fullName, defaultBranch).fold(
+                onSuccess = { _error.value = null },
+                onFailure = { _error.value = it.message },
+            )
+            onDone()
+        }
+    }
+
+    fun setBiometric(enabled: Boolean) {
+        viewModelScope.launch { repository.tokenStore.setBiometricEnabled(enabled) }
+    }
+
     fun logout(onDone: () -> Unit) {
         viewModelScope.launch {
             repository.tokenStore.clear()
@@ -99,7 +118,7 @@ class SettingsViewModel : ViewModel() {
     }
 }
 
-private val SECRET_KINDS = listOf("openai", "zai", "moonshot", "anthropic", "github", "claude_oauth", "junie")
+private val SECRET_KINDS = listOf("github", "zai", "openai", "moonshot", "anthropic", "claude_oauth", "junie", "kilo")
 
 @Composable
 fun SettingsScreen(onBack: () -> Unit) {
@@ -109,10 +128,11 @@ fun SettingsScreen(onBack: () -> Unit) {
     val stats by repository.stats.collectAsState()
     val secrets by repository.secrets.collectAsState()
     val repos by repository.repos.collectAsState()
+    val biometric by repository.tokenStore.biometricEnabled.collectAsState(initial = false)
     val error by vm.error.collectAsState()
 
-    var showAddDialog by remember { mutableStateOf(false) }
-    var showAddRepoDialog by remember { mutableStateOf(false) }
+    var showAddSecret by remember { mutableStateOf(false) }
+    var showAddRepo by remember { mutableStateOf(false) }
     var confirmLogout by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) { vm.refresh() }
@@ -134,135 +154,160 @@ fun SettingsScreen(onBack: () -> Unit) {
                 .fillMaxSize()
                 .padding(padding)
                 .verticalScroll(rememberScrollState())
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp),
+                .padding(bottom = 24.dp),
+            verticalArrangement = Arrangement.spacedBy(0.dp),
         ) {
-            Text("Server-Status", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-            Card(modifier = Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            /* ---------- Server ---------- */
+            SectionHeader("Server")
+            GroupCard {
+                Column(Modifier.padding(vertical = 8.dp)) {
                     val s = stats
-                    if (s == null) {
-                        Text("Keine Statistik verfügbar", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    } else {
-                        StatRow("Aktive Sessions", s.sessionsActive.toString())
-                        StatRow("Sessions total", s.sessionsTotal.toString())
-                        StatRow("Container läuft", s.containersRunning.toString())
-                        StatRow("Uptime", formatUptime(s.uptimeSec))
-                        if (s.versions.isNotEmpty()) {
-                            Text(
-                                text = s.versions.entries.joinToString("\n") { "${it.key}: ${it.value}" },
-                                style = MaterialTheme.typography.bodySmall,
-                                modifier = Modifier.padding(top = 4.dp),
-                            )
-                        }
-                    }
-                    TextButton(onClick = { vm.refresh() }) { Text("Aktualisieren") }
+                    SettingsRow(label = "Status", value = if (s != null) "verbunden" else "–")
+                    HorizontalDivider(modifier = Modifier.padding(start = 64.dp))
+                    SettingsRow(label = "Aktive Sessions", value = s?.sessionsActive?.toString() ?: "…")
+                    HorizontalDivider(modifier = Modifier.padding(start = 64.dp))
+                    SettingsRow(label = "Laufende Container", value = s?.containersRunning?.toString() ?: "…")
+                    HorizontalDivider(modifier = Modifier.padding(start = 64.dp))
+                    SettingsRow(label = "Uptime", value = s?.let { formatUptime(it.uptimeSec) } ?: "…")
                 }
             }
 
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text(
-                    text = "Repositories",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier.weight(1f),
-                )
-                IconButton(onClick = { showAddRepoDialog = true }) {
-                    Icon(Icons.Filled.Add, contentDescription = "Repository hinzufügen")
-                }
-            }
-            if (repos.isEmpty()) {
-                Text(
-                    "Noch keine Repos. Tippe auf + und gib den Namen im Format owner/repo ein.",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    style = MaterialTheme.typography.bodySmall,
-                )
-            } else {
-                repos.forEach { repo ->
-                    Card(modifier = Modifier.fillMaxWidth()) {
-                        Column(Modifier.padding(start = 12.dp, end = 12.dp, top = 10.dp, bottom = 10.dp)) {
-                            Text(repo.fullName, style = MaterialTheme.typography.titleMedium)
-                            Text(
-                                text = "Basis-Branch: ${repo.defaultBranch}",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
+            /* ---------- Sicherheit ---------- */
+            SectionHeader("Sicherheit")
+            GroupCard {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                ) {
+                    SettingsIcon(Icons.Outlined.Fingerprint)
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("App-Sperre", style = MaterialTheme.typography.bodyLarge)
+                        Text(
+                            text = "Biometrie oder Gerätesperre beim Start",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
                     }
+                    Switch(checked = biometric, onCheckedChange = { vm.setBiometric(it) })
                 }
             }
 
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text(
-                    text = "Secrets",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier.weight(1f),
-                )
-                IconButton(onClick = { showAddDialog = true }) {
-                    Icon(Icons.Filled.Add, contentDescription = "Secret hinzufügen")
-                }
-            }
-            if (secrets.isEmpty()) {
-                Text("Keine Secrets hinterlegt.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-            } else {
-                secrets.forEach { secret ->
-                    Card(modifier = Modifier.fillMaxWidth()) {
+            /* ---------- Repositories ---------- */
+            SectionHeader("Repositories")
+            GroupCard {
+                Column(Modifier.padding(vertical = 8.dp)) {
+                    if (repos.isEmpty()) {
+                        Text(
+                            text = "Noch keine Repos hinzugefügt",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                        )
+                    }
+                    repos.forEachIndexed { index, repo ->
+                        if (index > 0) HorizontalDivider(modifier = Modifier.padding(start = 64.dp))
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier.padding(start = 12.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 10.dp),
                         ) {
+                            SettingsIcon(Icons.Outlined.Folder)
                             Column(modifier = Modifier.weight(1f)) {
-                                Text(secret.kind, style = MaterialTheme.typography.titleMedium)
+                                Text(repo.fullName, style = MaterialTheme.typography.bodyLarge)
                                 Text(
-                                    text = "angelegt: ${relativeTime(secret.createdAt)}",
-                                    style = MaterialTheme.typography.labelSmall,
+                                    text = "Basis: ${repo.defaultBranch}",
+                                    style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
                             }
-                            IconButton(onClick = { vm.deleteSecret(secret.id) }) {
-                                Icon(Icons.Filled.Delete, contentDescription = "Löschen")
-                            }
                         }
                     }
+                    HorizontalDivider(modifier = Modifier.padding(start = 64.dp))
+                    AddRow(label = "Repository hinzufügen", onClick = { showAddRepo = true })
                 }
             }
 
-            error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+            /* ---------- Secrets ---------- */
+            SectionHeader("Secrets")
+            GroupCard {
+                Column(Modifier.padding(vertical = 8.dp)) {
+                    if (secrets.isEmpty()) {
+                        Text(
+                            text = "Keine Secrets – für private Repos und Provider nötig",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                        )
+                    }
+                    secrets.forEachIndexed { index, secret ->
+                        if (index > 0) HorizontalDivider(modifier = Modifier.padding(start = 64.dp))
+                        SwipeToDismissRow(onDismiss = { vm.deleteSecret(secret.id) }) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                            ) {
+                                SettingsIcon(Icons.Outlined.Key)
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(secret.kind, style = MaterialTheme.typography.bodyLarge)
+                                    Text(
+                                        text = "hinterlegt ${relativeTime(secret.createdAt)}",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    HorizontalDivider(modifier = Modifier.padding(start = 64.dp))
+                    AddRow(label = "Secret hinzufügen", onClick = { showAddSecret = true })
+                }
+            }
 
-            Button(
-                onClick = { confirmLogout = true },
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text("Abmelden (Token löschen)")
+            error?.let {
+                Text(
+                    it,
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(horizontal = 28.dp, vertical = 8.dp),
+                )
+            }
+
+            /* ---------- Abmelden ---------- */
+            SectionHeader("Gerät")
+            GroupCard {
+                Box(Modifier.padding(vertical = 4.dp)) {
+                    TextButton(
+                        onClick = { confirmLogout = true },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            "Von diesem Gerät abmelden",
+                            color = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.padding(vertical = 6.dp),
+                        )
+                    }
+                }
             }
         }
     }
 
-    if (showAddDialog) {
+    if (showAddSecret) {
         AddSecretDialog(
-            onDismiss = { showAddDialog = false },
-            onSave = { kind, value ->
-                vm.addSecret(kind, value) { showAddDialog = false }
-            },
+            onDismiss = { showAddSecret = false },
+            onSave = { kind, value -> vm.addSecret(kind, value) { showAddSecret = false } },
         )
     }
-
-    if (showAddRepoDialog) {
+    if (showAddRepo) {
         AddRepoDialog(
-            onDismiss = { showAddRepoDialog = false },
-            onSave = { fullName, branch ->
-                vm.addRepo(fullName, branch) { showAddRepoDialog = false }
-            },
+            onDismiss = { showAddRepo = false },
+            onSave = { fullName, branch -> vm.addRepo(fullName, branch) { showAddRepo = false } },
         )
     }
-
     if (confirmLogout) {
         AlertDialog(
             onDismissRequest = { confirmLogout = false },
@@ -278,73 +323,108 @@ fun SettingsScreen(onBack: () -> Unit) {
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Building blocks                                                     */
+/* ------------------------------------------------------------------ */
+
+@Composable
+private fun SettingsIcon(icon: ImageVector) {
+    Box(
+        modifier = Modifier
+            .size(36.dp)
+            .background(MaterialTheme.colorScheme.secondaryContainer, MaterialTheme.shapes.small),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            icon,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onSecondaryContainer,
+            modifier = Modifier.size(19.dp),
+        )
+    }
+    Spacer(modifier = Modifier.width(16.dp))
+}
+
+@Composable
+private fun SettingsRow(label: String, value: String) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 11.dp),
+    ) {
+        Text(label, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+        Text(
+            value,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+@Composable
+private fun AddRow(label: String, onClick: () -> Unit) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 13.dp),
+    ) {
+        Icon(
+            Icons.Filled.Add,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.size(20.dp),
+        )
+        Spacer(modifier = Modifier.width(12.dp))
+        Text(label, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.primary)
+    }
+}
+
+@Composable
+private fun SwipeToDismissRow(onDismiss: () -> Unit, content: @Composable () -> Unit) {
+    val state = rememberSwipeToDismissBoxState(
+        confirmValueChange = { value ->
+            if (value == SwipeToDismissBoxValue.EndToStart) {
+                onDismiss()
+                true
+            } else {
+                false
+            }
+        },
+    )
+    SwipeToDismissBox(
+        state = state,
+        enableDismissFromStartToEnd = false,
+        backgroundContent = {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 6.dp)
+                    .background(MaterialTheme.colorScheme.errorContainer, MaterialTheme.shapes.large),
+                contentAlignment = Alignment.CenterEnd,
+            ) {
+                Icon(
+                    Icons.Outlined.Delete,
+                    contentDescription = "Löschen",
+                    tint = MaterialTheme.colorScheme.onErrorContainer,
+                    modifier = Modifier.padding(end = 24.dp),
+                )
+            }
+        },
+        content = { content() },
+    )
+}
+
 private fun formatUptime(sec: Long): String {
     val h = sec / 3600
     val m = (sec % 3600) / 60
     return if (h > 0) "$h h $m min" else "$m min"
 }
 
-@Composable
-private fun StatRow(label: String, value: String) {
-    Row(modifier = Modifier.fillMaxWidth()) {
-        Text(label, modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
-        Text(value, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
-    }
-}
-
-@Composable
-private fun AddRepoDialog(
-    onDismiss: () -> Unit,
-    onSave: (fullName: String, defaultBranch: String) -> Unit,
-) {
-    var fullName by remember { mutableStateOf("") }
-    var branch by remember { mutableStateOf("") }
-    val valid = Regex("^[\\w.-]+/[\\w.-]+$").matches(fullName.trim())
-    val effectiveBranch = branch.trim().ifEmpty { "main" }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Repository hinzufügen") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                OutlinedTextField(
-                    value = fullName,
-                    onValueChange = { fullName = it },
-                    label = { Text("owner/repo") },
-                    placeholder = { Text("robinrehbein/remote-control") },
-                    singleLine = true,
-                    isError = fullName.isNotBlank() && !valid,
-                    supportingText = if (fullName.isNotBlank() && !valid) {
-                        { Text("Format: owner/repo") }
-                    } else {
-                        null
-                    },
-                )
-                OutlinedTextField(
-                    value = branch,
-                    onValueChange = { branch = it },
-                    label = { Text("Basis-Branch (optional)") },
-                    placeholder = { Text("main") },
-                    singleLine = true,
-                )
-                Text(
-                    "Für private Repos zusätzlich ein github-Secret in den Secrets hinterlegen.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-        },
-        confirmButton = {
-            TextButton(
-                onClick = { onSave(fullName.trim(), effectiveBranch) },
-                enabled = valid,
-            ) { Text("Hinzufügen") }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Abbrechen") }
-        },
-    )
-}
+/* ------------------------------------------------------------------ */
+/* Dialogs                                                             */
+/* ------------------------------------------------------------------ */
 
 @Composable
 private fun AddSecretDialog(
@@ -364,13 +444,19 @@ private fun AddSecretDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text("Art", style = MaterialTheme.typography.labelSmall)
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    TextButton(onClick = { kindDropdown = true }) { Text(kind) }
-                    DropdownMenu(expanded = kindDropdown, onDismissRequest = { kindDropdown = false }) {
-                        SECRET_KINDS.forEach { k ->
-                            DropdownMenuItem(text = { Text(k) }, onClick = { kind = k; kindDropdown = false })
-                        }
-                        DropdownMenuItem(text = { Text("custom …") }, onClick = { kind = "custom"; kindDropdown = false })
+                Surface(
+                    shape = MaterialTheme.shapes.small,
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Box {
+                        TextButton(onClick = { kindDropdown = true }) { Text(kind) }
+                        DropdownMenuKind(
+                            expanded = kindDropdown,
+                            onDismiss = { kindDropdown = false },
+                            current = kind,
+                            onSelect = { kind = it; kindDropdown = false },
+                        )
                     }
                 }
                 if (kind == "custom") {
@@ -401,4 +487,25 @@ private fun AddSecretDialog(
             TextButton(onClick = onDismiss) { Text("Abbrechen") }
         },
     )
+}
+
+@Composable
+private fun DropdownMenuKind(
+    expanded: Boolean,
+    onDismiss: () -> Unit,
+    current: String,
+    onSelect: (String) -> Unit,
+) {
+    androidx.compose.material3.DropdownMenu(expanded = expanded, onDismissRequest = onDismiss) {
+        SECRET_KINDS.forEach { k ->
+            androidx.compose.material3.DropdownMenuItem(
+                text = { Text(k, fontWeight = if (k == current) FontWeight.SemiBold else FontWeight.Normal) },
+                onClick = { onSelect(k) },
+            )
+        }
+        androidx.compose.material3.DropdownMenuItem(
+            text = { Text("custom …") },
+            onClick = { onSelect("custom") },
+        )
+    }
 }

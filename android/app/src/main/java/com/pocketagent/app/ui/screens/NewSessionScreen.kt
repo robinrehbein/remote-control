@@ -168,7 +168,12 @@ class NewSessionViewModel : ViewModel() {
 /* Provider display names                                              */
 /* ------------------------------------------------------------------ */
 
-private fun providerDisplayName(key: String): String = when (key) {
+/**
+ * Anzeigenamen kommen aus dem Adapter-Manifest (`providers`). Die Tabelle
+ * hier greift nur noch bei Adaptern ohne dieses Feld (ältere Server) und bei
+ * frei eingetippten Providern.
+ */
+private fun fallbackProviderName(key: String): String = when (key) {
     "openai" -> "OpenAI"
     "anthropic" -> "Anthropic"
     "zai" -> "Z.AI"
@@ -180,6 +185,9 @@ private fun providerDisplayName(key: String): String = when (key) {
     "xai" -> "xAI"
     else -> key
 }
+
+private fun providerDisplayName(key: String, descriptor: AdapterDescriptor?): String =
+    descriptor?.providers?.firstOrNull { it.id == key }?.name ?: fallbackProviderName(key)
 
 /** Provider keys in display order: default provider first, then the rest. */
 private fun orderedProviderKeys(descriptor: AdapterDescriptor): List<String> {
@@ -338,7 +346,7 @@ fun NewSessionScreen(
                         ) {
                             orderedProviderKeys(selectedDescriptor).forEach { key ->
                                 ProviderChip(
-                                    label = providerDisplayName(key),
+                                    label = providerDisplayName(key, selectedDescriptor),
                                     selected = !state.providerCustom && state.provider == key,
                                     keyMissing = key !in secretKinds,
                                     onClick = { vm.update { it.copy(provider = key, providerCustom = false) } },
@@ -377,7 +385,7 @@ fun NewSessionScreen(
                     if (descriptor.credentials.keys.none { it in secretKinds }) descriptor.name else null
                 } else {
                     val p = state.provider.trim()
-                    if (p.isNotEmpty() && p !in secretKinds) providerDisplayName(p) else null
+                    if (p.isNotEmpty() && p !in secretKinds) providerDisplayName(p, descriptor) else null
                 }
                 if (missingFor != null) {
                     Spacer(modifier = Modifier.height(SectionSpacing))

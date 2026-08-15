@@ -208,6 +208,70 @@ class ProtocolDecodeTest {
     }
 
     @Test
+    fun `decodes provider metadata and stays empty without it`() {
+        val msg = parseServerMessage(
+            """
+            {
+              "type": "adapter.list",
+              "requestId": "req-prov",
+              "adapters": [
+                {
+                  "id": "claude",
+                  "name": "Claude Code",
+                  "capabilities": {},
+                  "credentials": { "claude_oauth": ["CLAUDE_CODE_OAUTH_TOKEN"] },
+                  "providers": [
+                    { "id": "claude_oauth", "name": "Claude Abo (Setup-Token)", "hint": "claude setup-token" },
+                    { "id": "anthropic", "name": "Anthropic", "keyUrl": "https://console.anthropic.com/settings/keys" }
+                  ],
+                  "defaults": { "provider": "anthropic" }
+                },
+                {
+                  "id": "legacy",
+                  "name": "Alter Adapter",
+                  "capabilities": {},
+                  "defaults": { "provider": "openai" }
+                }
+              ]
+            }
+            """.trimIndent(),
+        )
+        val adapters = (msg as ServerMessage.AdapterListMsg).adapters
+        val claude = adapters.first()
+        assertEquals(2, claude.providers.size)
+        assertEquals("Claude Abo (Setup-Token)", claude.providers[0].name)
+        assertNull(claude.providers[0].keyUrl)
+        assertEquals("https://console.anthropic.com/settings/keys", claude.providers[1].keyUrl)
+        // Server ohne das Feld -> leere Liste, App faellt auf ihre Tabelle zurueck
+        assertTrue(adapters[1].providers.isEmpty())
+    }
+
+    @Test
+    fun `decodes secret validated results`() {
+        val ok = parseServerMessage(
+            """{"type":"secret.validated","requestId":"v1","kind":"openai","ok":true,"detail":"42 Modelle verfügbar"}""",
+        )
+        assertTrue(ok is ServerMessage.SecretValidatedMsg)
+        val okMsg = ok as ServerMessage.SecretValidatedMsg
+        assertTrue(okMsg.ok)
+        assertFalse(okMsg.unverified)
+        assertEquals("42 Modelle verfügbar", okMsg.detail)
+
+        val bad = parseServerMessage(
+            """{"type":"secret.validated","requestId":"v2","kind":"anthropic","ok":false,"detail":"Key ungültig oder abgelaufen"}""",
+        ) as ServerMessage.SecretValidatedMsg
+        assertFalse(bad.ok)
+
+        val unverified = parseServerMessage(
+            """{"type":"secret.validated","requestId":"v3","kind":"kilo","ok":true,"unverified":true}""",
+        ) as ServerMessage.SecretValidatedMsg
+        assertTrue(unverified.unverified)
+        assertNull(unverified.detail)
+
+        assertNull(parseServerMessage("""{"type":"secret.validated","kind":"openai","ok":true}"""))
+    }
+
+    @Test
     fun `returns null for garbage and unknown types`() {
         assertNull(parseServerMessage("not json"))
         assertNull(parseServerMessage("""{"type":"completely.unknown"}"""))

@@ -63,6 +63,18 @@ data class ModelInfo(
 @Serializable
 data class AdapterDefaults(val provider: String = "", val model: String? = null)
 
+/**
+ * Anzeige-Metadaten zu einem Zugang eines Adapters (id == Secret-Art).
+ * Rein kosmetisch; ältere Server liefern das Feld nicht.
+ */
+@Serializable
+data class ProviderDescriptor(
+    val id: String,
+    val name: String,
+    val keyUrl: String? = null,
+    val hint: String? = null,
+)
+
 @Serializable
 data class AdapterDescriptor(
     val id: String,
@@ -72,6 +84,7 @@ data class AdapterDescriptor(
     val capabilities: AdapterCapabilities = AdapterCapabilities(),
     val credentials: Map<String, List<String>> = emptyMap(),
     @SerialName("providerEnv") val providerEnv: Map<String, String> = emptyMap(),
+    val providers: List<ProviderDescriptor> = emptyList(),
     val defaults: AdapterDefaults = AdapterDefaults(),
 )
 
@@ -294,6 +307,21 @@ sealed interface ServerMessage {
         override val type: String get() = "secret.deleted"
     }
 
+    /**
+     * Ergebnis einer Live-Prüfung. Enthält nie den Wert.
+     * [unverified] = für diese Art gibt es keine Prüfung; [ok] ist dann true,
+     * die UI zeigt das aber neutral statt als Erfolg.
+     */
+    data class SecretValidatedMsg(
+        val requestId: String,
+        val kind: String,
+        val ok: Boolean,
+        val detail: String? = null,
+        val unverified: Boolean = false,
+    ) : ServerMessage {
+        override val type: String get() = "secret.validated"
+    }
+
     data class ServerStatsMsg(val requestId: String, val stats: ServerStats) : ServerMessage {
         override val type: String get() = "server.stats"
     }
@@ -312,6 +340,7 @@ fun requestIdOf(msg: ServerMessage): String? = when (msg) {
     is ServerMessage.SecretListMsg -> msg.requestId
     is ServerMessage.SecretSavedMsg -> msg.requestId
     is ServerMessage.SecretDeletedMsg -> msg.requestId
+    is ServerMessage.SecretValidatedMsg -> msg.requestId
     is ServerMessage.ServerStatsMsg -> msg.requestId
     else -> null
 }
@@ -524,6 +553,14 @@ fun parseServerMessage(raw: String): ServerMessage? {
                 id = root.optString("id") ?: return null,
             )
 
+            "secret.validated" -> ServerMessage.SecretValidatedMsg(
+                requestId = root.optString("requestId") ?: return null,
+                kind = root.optString("kind") ?: return null,
+                ok = root["ok"]?.jsonPrimitive?.booleanOrNullCompat() ?: false,
+                detail = root.optString("detail"),
+                unverified = root["unverified"]?.jsonPrimitive?.booleanOrNullCompat() ?: false,
+            )
+
             "server.stats" -> ServerMessage.ServerStatsMsg(
                 requestId = root.optString("requestId") ?: return null,
                 stats = (root["stats"] as? JsonObject)?.let { s ->
@@ -665,6 +702,17 @@ fun encodeRepoAdd(requestId: String, fullName: String, defaultBranch: String): S
 
 fun encodeSecretSet(requestId: String, kind: String, value: String): String = buildJsonObject {
     put("type", "secret.set")
+    put("requestId", requestId)
+    put("kind", kind)
+    put("value", value)
+}.toString()
+
+/**
+ * Key beim Anbieter prüfen lassen, ohne ihn zu speichern. Der Wert geht nur
+ * für die Prüfung an den Server und kommt nie zurück.
+ */
+fun encodeSecretValidate(requestId: String, kind: String, value: String): String = buildJsonObject {
+    put("type", "secret.validate")
     put("requestId", requestId)
     put("kind", kind)
     put("value", value)

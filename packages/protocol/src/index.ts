@@ -43,6 +43,22 @@ export interface AdapterCapabilities {
 }
 
 /**
+ * Human-facing metadata for one credential an adapter can use. Purely
+ * cosmetic: the app renders display names, "create key" links and setup
+ * hints from it instead of hard-coding a provider table.
+ */
+export interface ProviderDescriptor {
+  /** Secret kind == provider key, i.e. a key of `providerEnv` or `credentials`. */
+  id: string;
+  /** Display name, e.g. "Google Gemini". */
+  name: string;
+  /** Page where the user creates/copies the key. */
+  keyUrl?: string;
+  /** One-line setup hint shown in the secret dialog. */
+  hint?: string;
+}
+
+/**
  * Adapter plugin manifest. Each `shims/<id>/adapter.json` describes one
  * harness; the orchestrator registry loads them at boot and serves the list
  * to apps via `adapter.list`.
@@ -66,6 +82,12 @@ export interface AdapterDescriptor {
    * based on the session's chosen provider (e.g. openai -> OPENAI_API_KEY).
    */
   providerEnv?: Record<string, string>;
+  /**
+   * Optional display metadata for the credentials above (ids are the same
+   * secret kinds). Absent on older manifests — the app falls back to its own
+   * table then.
+   */
+  providers?: ProviderDescriptor[];
   defaults: { provider: string; model?: string };
 }
 
@@ -341,6 +363,12 @@ export type ClientMessage =
   | { type: 'repo.list'; requestId: string }
   | { type: 'repo.add'; requestId: string; fullName: string; defaultBranch: string }
   | { type: 'secret.set'; requestId: string; kind: SecretKind; value: string }
+  /**
+   * Live-check a key against its provider before/without storing it. The value
+   * is used for the outbound provider request only — it is never persisted,
+   * logged or echoed back.
+   */
+  | { type: 'secret.validate'; requestId: string; kind: SecretKind; value: string }
   | { type: 'secret.list'; requestId: string }
   | { type: 'secret.delete'; requestId: string; id: string }
   | { type: 'server.stats'; requestId: string };
@@ -373,6 +401,20 @@ export type ServerMessage =
   | { type: 'repo.added'; requestId: string; repo: RepoInfo }
   | { type: 'secret.list'; requestId: string; secrets: SecretInfo[] }
   | { type: 'secret.saved'; requestId: string; secret: SecretInfo }
+  /**
+   * Result of a `secret.validate`. Never carries the value.
+   * `unverified: true` means no live check exists for this kind — `ok` is
+   * true so the app keeps the flow going, but the UI must present it
+   * neutrally rather than as a confirmed key.
+   */
+  | {
+      type: 'secret.validated';
+      requestId: string;
+      kind: SecretKind;
+      ok: boolean;
+      detail?: string;
+      unverified?: boolean;
+    }
   | { type: 'secret.deleted'; requestId: string; id: string }
   | { type: 'server.stats'; requestId: string; stats: ServerStats };
 

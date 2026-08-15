@@ -102,6 +102,10 @@ Ohne Wert-Argument und ohne Pipe fragt die CLI interaktiv (Eingabe versteckt). `
 | pi | Provider API-Keys; ZAI/Kimi/Qwen-Subscription-OAuth post-MVP | |
 | junie | `junie` API-Key (usage-based) oder BYOK-Keys (openai/anthropic/...) | Headless one-shot; keine Remote-Approvals (App zeigt Banner) |
 
+Anzeigenamen, Key-Seiten und Einrichtungshinweise stehen im Manifest (`providers`-Feld in `shims/*/adapter.json`) — die App rendert daraus die Provider-Chips und im Zugang-Dialog einen „Key erstellen"-Link, statt eine eigene Tabelle zu pflegen.
+
+**Key prüfen:** Der Dialog hat neben „Speichern" ein „Prüfen", das den Key serverseitig gegen den Anbieter testet (ein billiger Read-Only-Call, 8 s Timeout, Wert wird nie geloggt oder gespeichert). Live-Prüfung gibt es für `openai`, `anthropic`, `groq`, `openrouter`, `moonshot`/`kimi`, `google`, `xai` und `github`; alle übrigen Arten (u. a. `zai`, `claude_oauth`, `junie`, `kilo`) melden neutral „keine Live-Prüfung" und lassen sich trotzdem speichern.
+
 **Neue Harnesses** (Codex CLI, Aider, eigener Agent, ...) ergänzt man als Plugin ohne Server-/App-Änderung — Anleitung in `ADAPTERS.md`.
 
 ## Lokale Entwicklung

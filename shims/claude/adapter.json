@@ -9,5 +9,18 @@
     "anthropic": ["ANTHROPIC_API_KEY"]
   },
   "providerEnv": {},
+  "providers": [
+    {
+      "id": "claude_oauth",
+      "name": "Claude Abo (Setup-Token)",
+      "hint": "Auf dem Laptop `claude setup-token` ausführen und den Token einfügen (Pro/Max, ~1 Jahr gültig) — oder direkt `pocketagent-secret claude`"
+    },
+    {
+      "id": "anthropic",
+      "name": "Anthropic",
+      "keyUrl": "https://console.anthropic.com/settings/keys",
+      "hint": "API-Key von console.anthropic.com (sk-ant-…), Abrechnung pro Token"
+    }
+  ],
   "defaults": { "provider": "anthropic", "model": "" }
 }

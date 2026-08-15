@@ -8,6 +8,7 @@ import type { Store } from './db.js';
 import { listAdapters } from './adapters.js';
 import type { SessionManager } from './sessions.js';
 import { encrypt } from './vault.js';
+import { validateSecret } from './secret-validate.js';
 
 export class Hub {
   private readonly sockets = new Set<WebSocket>();
@@ -322,6 +323,20 @@ export function registerWs(
               secret: { id: saved.id, kind: saved.kind, createdAt: saved.created_at },
             });
           }
+          return;
+        }
+        case 'secret.validate': {
+          // msg.value is passed straight to the provider check and never
+          // stored or logged; the answer carries kind/ok/detail only.
+          const result = await validateSecret(msg.kind, msg.value);
+          send({
+            type: 'secret.validated',
+            requestId: msg.requestId,
+            kind: msg.kind,
+            ok: result.ok,
+            ...(result.detail ? { detail: result.detail } : {}),
+            ...(result.unverified ? { unverified: true } : {}),
+          });
           return;
         }
         case 'secret.list': {

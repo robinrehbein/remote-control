@@ -1,7 +1,7 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { AdapterDescriptor } from '@pocketagent/protocol';
+import type { AdapterDescriptor, ProviderDescriptor } from '@pocketagent/protocol';
 import { config } from './config.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -13,6 +13,25 @@ function manifestDirs(): string[] {
     '/app/adapters',
   ].filter((d): d is string => typeof d === 'string' && d.length > 0);
   return [...new Set(candidates)].filter((d) => existsSync(d));
+}
+
+/** Display metadata is cosmetic: drop malformed entries, never fail the manifest. */
+function providerList(raw: unknown): ProviderDescriptor[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const out: ProviderDescriptor[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== 'object' || entry === null) continue;
+    const p = entry as Record<string, unknown>;
+    if (typeof p.id !== 'string' || p.id.length === 0) continue;
+    if (typeof p.name !== 'string' || p.name.length === 0) continue;
+    out.push({
+      id: p.id,
+      name: p.name,
+      ...(typeof p.keyUrl === 'string' && p.keyUrl.length > 0 ? { keyUrl: p.keyUrl } : {}),
+      ...(typeof p.hint === 'string' && p.hint.length > 0 ? { hint: p.hint } : {}),
+    });
+  }
+  return out.length > 0 ? out : undefined;
 }
 
 function validate(id: string, raw: unknown, source: string): AdapterDescriptor {
@@ -38,6 +57,10 @@ function validate(id: string, raw: unknown, source: string): AdapterDescriptor {
     },
     ...(typeof m.credentials === 'object' && m.credentials !== null ? { credentials: m.credentials as Record<string, string[]> } : {}),
     ...(typeof m.providerEnv === 'object' && m.providerEnv !== null ? { providerEnv: m.providerEnv as Record<string, string> } : {}),
+    ...((): { providers?: ProviderDescriptor[] } => {
+      const providers = providerList(m.providers);
+      return providers ? { providers } : {};
+    })(),
     defaults:
       typeof m.defaults === 'object' && m.defaults !== null
         ? (m.defaults as { provider: string; model?: string })

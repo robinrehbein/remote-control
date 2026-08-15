@@ -15,6 +15,16 @@ import java.util.concurrent.ConcurrentHashMap
 
 data class SessionEventEnvelope(val sessionId: String, val event: AgentEvent)
 
+/**
+ * Ergebnis einer Key-Prüfung. [unverified] heißt: für diese Art gibt es keine
+ * Live-Prüfung — [ok] ist dann true, wird aber neutral dargestellt.
+ */
+data class SecretValidation(
+    val ok: Boolean,
+    val detail: String? = null,
+    val unverified: Boolean = false,
+)
+
 class AppRepository(
     private val ws: WsClient,
     private val tokens: TokenStore,
@@ -115,6 +125,8 @@ class AppRepository(
                 scope.launch { refreshSecretsQuiet() }
                 completePending(msg.requestId, msg)
             }
+
+            is ServerMessage.SecretValidatedMsg -> completePending(msg.requestId, msg)
 
             is ServerMessage.ServerStatsMsg -> {
                 _stats.value = msg.stats
@@ -300,6 +312,27 @@ class AppRepository(
         val response = request { id -> encodeSecretSet(id, kind, value) }
         return when (response) {
             is ServerMessage.SecretSavedMsg -> Result.success(response.secret)
+            is ServerMessage.ErrorMsg -> Result.failure(IllegalStateException(response.message))
+            null -> Result.failure(IllegalStateException("Keine Verbindung"))
+            else -> Result.failure(IllegalStateException("Unerwartete Antwort"))
+        }
+    }
+
+    /**
+     * Live-Prüfung eines Keys beim Anbieter. Unabhängig vom Speichern; der
+     * Wert wird nur für die Prüfung übertragen und nie zurückgeliefert.
+     */
+    suspend fun validateSecret(kind: String, value: String): Result<SecretValidation> {
+        val response = request { id -> encodeSecretValidate(id, kind, value) }
+        return when (response) {
+            is ServerMessage.SecretValidatedMsg -> Result.success(
+                SecretValidation(
+                    ok = response.ok,
+                    detail = response.detail,
+                    unverified = response.unverified,
+                ),
+            )
+
             is ServerMessage.ErrorMsg -> Result.failure(IllegalStateException(response.message))
             null -> Result.failure(IllegalStateException("Keine Verbindung"))
             else -> Result.failure(IllegalStateException("Unerwartete Antwort"))

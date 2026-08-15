@@ -4,6 +4,7 @@ import com.pocketagent.app.data.AgentEvent
 import com.pocketagent.app.data.ServerMessage
 import com.pocketagent.app.data.parseServerMessage
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -128,6 +129,82 @@ class ProtocolDecodeTest {
         assertEquals(listOf("KILO_AUTH_CONTENT"), kilo.credentials["kilo"])
         assertEquals("ZAI_API_KEY", kilo.providerEnv["zai"])
         assertEquals("zai", kilo.defaults.provider)
+    }
+
+    @Test
+    fun `decodes session models and capability flags for switchers`() {
+        val models = parseServerMessage(
+            """
+            {
+              "type": "session.models",
+              "requestId": "req-mod",
+              "sessionId": "s1",
+              "models": [
+                { "id": "zai/glm-4.6", "name": "zai \u00b7 GLM 4.6" },
+                { "id": "claude-opus-5" },
+                { "noId": true }
+              ]
+            }
+            """.trimIndent(),
+        )
+        assertTrue(models is ServerMessage.SessionModelsMsg)
+        val list = (models as ServerMessage.SessionModelsMsg).models
+        assertEquals("s1", models.sessionId)
+        assertEquals(2, list.size)
+        assertEquals("zai/glm-4.6", list.first().id)
+        assertNull(list[1].name)
+
+        val adapters = parseServerMessage(
+            """
+            {
+              "type": "adapter.list",
+              "requestId": "req-caps",
+              "adapters": [
+                {
+                  "id": "claude",
+                  "name": "Claude Code",
+                  "capabilities": { "approvals": true, "reasoning": true, "modelSwitch": true },
+                  "defaults": { "provider": "anthropic" }
+                },
+                {
+                  "id": "junie",
+                  "name": "Junie",
+                  "capabilities": { "autoPush": true },
+                  "defaults": { "provider": "openai" }
+                }
+              ]
+            }
+            """.trimIndent(),
+        )
+        val caps = (adapters as ServerMessage.AdapterListMsg).adapters
+        assertTrue(caps[0].capabilities.reasoning)
+        assertTrue(caps[0].capabilities.modelSwitch)
+        // fehlende Flags bleiben false (abwaertskompatibel zu alten Servern)
+        assertFalse(caps[1].capabilities.reasoning)
+        assertFalse(caps[1].capabilities.modelSwitch)
+    }
+
+    @Test
+    fun `decodes session status with reasoning effort`() {
+        val msg = parseServerMessage(
+            """
+            {
+              "type": "session.status",
+              "sessionId": "s1",
+              "status": "idle",
+              "session": {
+                "id": "s1", "repoId": "r1", "adapter": "claude", "provider": "anthropic",
+                "model": "claude-opus-5", "mode": "auto", "status": "idle", "branch": "agent/s1",
+                "createdAt": "2026-01-01T10:00:00Z", "lastActiveAt": "2026-01-01T11:00:00Z",
+                "reasoningEffort": "high"
+              }
+            }
+            """.trimIndent(),
+        )
+        assertTrue(msg is ServerMessage.SessionStatusMsg)
+        val session = (msg as ServerMessage.SessionStatusMsg).session
+        assertEquals("high", session?.reasoningEffort)
+        assertEquals("claude-opus-5", session?.model)
     }
 
     @Test

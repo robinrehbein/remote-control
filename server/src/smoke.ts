@@ -185,6 +185,36 @@ async function main(): Promise<void> {
   );
   assert(errEvent.type === 'session.event', 'error event broadcast with message');
 
+  const badUpdate = await request(c2, {
+    type: 'session.update',
+    requestId: 'upd0',
+    sessionId,
+    reasoningEffort: 'extreme',
+  });
+  assert(badUpdate.type === 'error', 'session.update rejects unknown reasoningEffort');
+
+  const updated = await request(c2, {
+    type: 'session.update',
+    requestId: 'upd1',
+    sessionId,
+    mode: 'ask',
+    model: 'glm-4.6-air',
+    reasoningEffort: 'high',
+  });
+  assert(updated.type === 'request.ok', 'session.update -> request.ok');
+  const listAfter = await request(c2, { type: 'session.list', requestId: 'ses2' });
+  const row = listAfter.type === 'session.list' ? listAfter.sessions.find((s) => s.id === sessionId) : undefined;
+  assert(
+    row?.mode === 'ask' && row.model === 'glm-4.6-air' && row.reasoningEffort === 'high',
+    'session.update persists mode/model/reasoningEffort',
+  );
+
+  const models = await request(c2, { type: 'session.models.get', requestId: 'mod1', sessionId });
+  assert(
+    models.type === 'session.models' && Array.isArray(models.models),
+    'session.models.get -> session.models (empty for unprovisioned session)',
+  );
+
   const stats = await request(c2, { type: 'server.stats', requestId: 'stats1' });
   assert(
     stats.type === 'server.stats' && stats.stats.sessionsTotal >= 1 && stats.stats.uptimeSec >= 0,

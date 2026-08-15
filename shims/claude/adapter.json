@@ -3,7 +3,7 @@
   "id": "claude",
   "name": "Claude Code",
   "description": "Claude Code via Agent SDK; Pro/Max subscription through setup-token or Anthropic API key.",
-  "capabilities": { "approvals": true, "resume": true, "streaming": true, "autoPush": true },
+  "capabilities": { "approvals": true, "resume": true, "streaming": true, "autoPush": true, "reasoning": true, "modelSwitch": true },
   "credentials": {
     "claude_oauth": ["CLAUDE_CODE_OAUTH_TOKEN"],
     "anthropic": ["ANTHROPIC_API_KEY"]

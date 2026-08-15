@@ -46,6 +46,34 @@ function spawnOpenCode(env: ShimEnvConfig, onDead: (reason: string) => void): Ch
   return child;
 }
 
+/**
+ * Model selection for one prompt. opencode addresses models as
+ * {providerID, modelID}, so `model` may carry the `provider/model` form the
+ * shim's GET /models returns; an empty string falls back to opencode's default.
+ */
+export function selectModel(
+  current: { provider?: string; model?: string },
+  body: { provider?: unknown; model?: unknown },
+): { provider?: string; model?: string } {
+  const next = { ...current };
+  if (typeof body.provider === 'string' && body.provider.length > 0) next.provider = body.provider;
+  if (typeof body.model !== 'string') return next;
+  const raw = body.model.trim();
+  if (raw.length === 0) {
+    // explicit reset: let opencode pick its configured default again
+    next.model = undefined;
+    return next;
+  }
+  const slash = raw.indexOf('/');
+  if (slash > 0) {
+    next.provider = raw.slice(0, slash);
+    next.model = raw.slice(slash + 1);
+  } else {
+    next.model = raw;
+  }
+  return next;
+}
+
 function tokenOk(header: string | undefined, expected: string): boolean {
   if (header === undefined) return false;
   const a = Buffer.from(header);
@@ -148,8 +176,11 @@ async function main(): Promise<void> {
       // best effort: opencode may pick up config changes on new turns
       writeOpencodeConfig(env.workDir, permission, mode);
     }
-    if (typeof body?.provider === 'string') provider = body.provider;
-    if (typeof body?.model === 'string') model = body.model;
+    // reasoningEffort is intentionally ignored: opencode has no per-prompt
+    // effort knob, so the manifest reports capabilities.reasoning === false.
+    const selected = selectModel({ provider, model }, body ?? {});
+    provider = selected.provider;
+    model = selected.model;
     if (opencodeSessionId === undefined) {
       return await reply.code(409).send({ ok: false, error: 'no opencode session' });
     }
@@ -220,6 +251,8 @@ async function main(): Promise<void> {
     }
     return await reply.send({ ok: true });
   });
+
+  app.get('/models', async () => ({ models: await client.models() }));
 
   app.get('/diff', async () => (opencodeSessionId === undefined ? [] : await client.diff(opencodeSessionId)));
 

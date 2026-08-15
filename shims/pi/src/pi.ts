@@ -11,8 +11,10 @@ import {
 import type {
   AgentEvent,
   AgentMode,
+  ModelInfo,
   PermissionDecision,
   PermissionKind,
+  ReasoningEffort,
   TokenUsage,
 } from '@pocketagent/protocol';
 
@@ -25,6 +27,8 @@ export interface PromptOptions {
   provider?: string;
   model?: string;
   mode?: AgentMode;
+  /** Mapped onto the pi SDK's thinking level (same level names). */
+  reasoningEffort?: ReasoningEffort;
 }
 
 export interface PromptOutcome {
@@ -46,6 +50,8 @@ export interface PiRunner {
   readonly kind: 'pi' | 'fake';
   init(): Promise<void>;
   validateModel(provider?: string, model?: string): Promise<void>;
+  /** Optional model catalog for GET /models; absent -> empty list. */
+  listModels?(): ModelInfo[];
   prompt(text: string, options?: PromptOptions): Promise<PromptOutcome>;
   abort(): Promise<void>;
   resume(sessionRef: string): Promise<void>;
@@ -416,6 +422,20 @@ export class RealPiRunner implements PiRunner {
     };
   }
 
+  /** `<provider>/<modelId>` entries, matching what /prompt accepts. */
+  listModels(): ModelInfo[] {
+    const out: ModelInfo[] = [];
+    for (const model of this.requireRuntime().getModels()) {
+      const provider = typeof model.provider === 'string' ? model.provider : undefined;
+      if (provider === undefined || typeof model.id !== 'string') continue;
+      out.push({
+        id: `${provider}/${model.id}`,
+        name: `${provider} · ${typeof model.name === 'string' ? model.name : model.id}`,
+      });
+    }
+    return out;
+  }
+
   async validateModel(provider?: string, model?: string): Promise<void> {
     if (provider === undefined && model === undefined) return;
     if (!provider || !model) {
@@ -436,6 +456,11 @@ export class RealPiRunner implements PiRunner {
         const model = this.requireRuntime().getModel(options.provider, options.model);
         if (!model) throw new PromptError(`unknown model ${options.provider}/${options.model}`);
         await session.setModel(model);
+      }
+      if (options?.reasoningEffort) {
+        // pi thinking levels are a superset of the protocol's low|medium|high;
+        // the SDK clamps to what the active model supports.
+        if (session.supportsThinking()) session.setThinkingLevel(options.reasoningEffort);
       }
       await session.prompt(text);
     } finally {

@@ -30,6 +30,16 @@ export interface AdapterCapabilities {
   streaming: boolean;
   /** Shim performs auto-push + draft PR itself (yolo mode). */
   autoPush: boolean;
+  /**
+   * Shim maps `PromptRequest.reasoningEffort` onto a runtime option.
+   * Optional for backwards compatibility; treated as false when absent.
+   */
+  reasoning?: boolean;
+  /**
+   * Shim honours `PromptRequest.model` per prompt (live model switching).
+   * Optional for backwards compatibility; treated as false when absent.
+   */
+  modelSwitch?: boolean;
 }
 
 /**
@@ -60,6 +70,13 @@ export interface AdapterDescriptor {
 }
 
 export type AgentMode = 'yolo' | 'auto' | 'acceptEdits' | 'ask';
+
+/**
+ * Normalized reasoning/thinking budget. Adapters that expose an effort knob map
+ * these three levels onto their runtime option; all others ignore the field
+ * (and report `capabilities.reasoning === false`).
+ */
+export type ReasoningEffort = 'low' | 'medium' | 'high';
 
 /**
  * Per-session network isolation:
@@ -106,7 +123,28 @@ export interface PromptRequest {
   /** May override the mode the container was started with. */
   mode?: AgentMode;
   provider?: string;
+  /**
+   * May override the model for this and following turns. Adapters whose runtime
+   * addresses models as provider + model accept the `"<provider>/<model>"` form
+   * (the same ids their GET /models returns); an empty string means
+   * "adapter default".
+   */
   model?: string;
+  /** Ignored by adapters without `capabilities.reasoning`. */
+  reasoningEffort?: ReasoningEffort;
+}
+
+/** One entry of the shim's model catalog (GET /models). */
+export interface ModelInfo {
+  /** Id accepted by `PromptRequest.model` for this adapter. */
+  id: string;
+  /** Human-readable label; falls back to `id` in the UI. */
+  name?: string;
+}
+
+/** GET /models — an empty list is valid (adapter has no catalog). */
+export interface ModelsResponse {
+  models: ModelInfo[];
 }
 
 /** POST /resume */
@@ -232,6 +270,8 @@ export interface SessionInfo {
   lastActiveAt: string;
   prUrl?: string;
   networkPolicy?: NetworkPolicy;
+  /** Persisted reasoning budget; absent when the session never set one. */
+  reasoningEffort?: string;
 }
 
 export interface RepoInfo {
@@ -272,6 +312,22 @@ export type ClientMessage =
       networkPolicy?: NetworkPolicy;
     }
   | { type: 'session.prompt'; sessionId: string; text: string; mode?: AgentMode }
+  /**
+   * Change mode / model / reasoning effort of a live session. Every field is
+   * optional; the server persists what is set and answers with `session.status`
+   * (carrying the updated session) to all devices.
+   */
+  | {
+      type: 'session.update';
+      requestId: string;
+      sessionId: string;
+      mode?: AgentMode;
+      /** Empty string resets the session to the adapter default. */
+      model?: string;
+      reasoningEffort?: ReasoningEffort;
+    }
+  /** Ask the session's shim for its model catalog (proxied GET /models). */
+  | { type: 'session.models.get'; requestId: string; sessionId: string }
   | { type: 'session.permission'; sessionId: string; permissionId: string; decision: PermissionDecision }
   | { type: 'session.abort'; sessionId: string }
   | { type: 'session.stop'; sessionId: string }
@@ -310,6 +366,7 @@ export type ServerMessage =
   | { type: 'session.event'; sessionId: string; event: AgentEvent }
   | { type: 'session.diff'; requestId: string; sessionId: string; diff: DiffEntry[] }
   | { type: 'session.status'; sessionId: string; status: SessionStatus; session?: SessionInfo }
+  | { type: 'session.models'; requestId: string; sessionId: string; models: ModelInfo[] }
   | { type: 'session.deleted'; requestId: string; sessionId: string }
   | { type: 'adapter.list'; requestId: string; adapters: AdapterDescriptor[] }
   | { type: 'repo.list'; requestId: string; repos: RepoInfo[] }

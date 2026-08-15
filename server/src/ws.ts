@@ -220,6 +220,25 @@ export function registerWs(
             send({ type: 'error', sessionId: msg.sessionId, message: errText(e) }),
           );
           return;
+        case 'session.update': {
+          try {
+            const session = manager.updateSession(msg);
+            // session.status already went to every device; ack the requester
+            send({ type: 'request.ok', requestId: msg.requestId, payload: { session } });
+          } catch (e) {
+            send({ type: 'error', requestId: msg.requestId, sessionId: msg.sessionId, message: errText(e) });
+          }
+          return;
+        }
+        case 'session.models.get': {
+          try {
+            const models = await manager.models(msg.sessionId);
+            send({ type: 'session.models', requestId: msg.requestId, sessionId: msg.sessionId, models });
+          } catch (e) {
+            send({ type: 'error', requestId: msg.requestId, sessionId: msg.sessionId, message: errText(e) });
+          }
+          return;
+        }
         case 'session.permission':
           await manager.permission(msg.sessionId, msg.permissionId, msg.decision).catch((e) =>
             send({ type: 'error', sessionId: msg.sessionId, message: errText(e) }),

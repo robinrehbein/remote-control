@@ -24,6 +24,7 @@ export interface SessionRow {
   status: string; branch: string; session_ref: string | null; container_id: string | null;
   volume_name: string | null; shim_token: string | null; pr_url: string | null;
   shim_endpoint: string | null; link_id: string | null; network_policy: string | null;
+  reasoning_effort: string | null;
   created_at: string; last_active_at: string;
 }
 export interface PairingCodeRow { code: string; tenant_id: string; expires_at: string; used: number }
@@ -84,6 +85,9 @@ export class Store {
     }
     if (!cols.some((c) => c.name === 'network_policy')) {
       this.db.exec('ALTER TABLE sessions ADD COLUMN network_policy TEXT');
+    }
+    if (!cols.some((c) => c.name === 'reasoning_effort')) {
+      this.db.exec('ALTER TABLE sessions ADD COLUMN reasoning_effort TEXT');
     }
   }
 
@@ -189,14 +193,14 @@ export class Store {
       .prepare(
         `INSERT INTO sessions (id, tenant_id, repo_id, repo_full_name, adapter, provider, model, mode,
          status, branch, session_ref, container_id, volume_name, shim_token, pr_url, shim_endpoint, link_id,
-         network_policy, created_at, last_active_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         network_policy, reasoning_effort, created_at, last_active_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         row.id, row.tenant_id, row.repo_id, row.repo_full_name, row.adapter, row.provider,
         row.model, row.mode, row.status, row.branch, row.session_ref, row.container_id,
         row.volume_name, row.shim_token, row.pr_url, row.shim_endpoint, row.link_id,
-        row.network_policy, row.created_at, row.last_active_at,
+        row.network_policy, row.reasoning_effort, row.created_at, row.last_active_at,
       );
   }
 
@@ -216,6 +220,30 @@ export class Store {
 
   updateSessionMode(id: string, mode: string): void {
     this.db.prepare('UPDATE sessions SET mode = ? WHERE id = ?').run(mode, id);
+  }
+
+  /** Partial update of the switchable session settings (session.update). */
+  updateSessionSettings(
+    id: string,
+    patch: { mode?: string; model?: string; reasoningEffort?: string },
+  ): void {
+    const sets: string[] = [];
+    const values: (string | null)[] = [];
+    if (patch.mode !== undefined) {
+      sets.push('mode = ?');
+      values.push(patch.mode);
+    }
+    if (patch.model !== undefined) {
+      sets.push('model = ?');
+      values.push(patch.model);
+    }
+    if (patch.reasoningEffort !== undefined) {
+      sets.push('reasoning_effort = ?');
+      // empty string clears the stored effort
+      values.push(patch.reasoningEffort === '' ? null : patch.reasoningEffort);
+    }
+    if (sets.length === 0) return;
+    this.db.prepare(`UPDATE sessions SET ${sets.join(', ')} WHERE id = ?`).run(...values, id);
   }
 
   setProvisioned(id: string, containerId: string, volumeName: string, shimToken: string): void {

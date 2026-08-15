@@ -132,6 +132,12 @@ async function main(): Promise<void> {
     assert.equal(status0.mode, 'ask');
     assert.equal(status0.busy, false);
 
+    // model catalog (static core list)
+    const modelsRes = await fetch(`${base}/models`, { headers: auth });
+    assert.equal(modelsRes.status, 200);
+    const models = (await modelsRes.json()) as { models: Array<{ id: string }> };
+    assert.ok(models.models.some((m) => m.id === 'claude-opus-5'));
+
     // SSE
     sse = new SseClient(`${base}/events`, 'smoke-token');
     await sse.start();

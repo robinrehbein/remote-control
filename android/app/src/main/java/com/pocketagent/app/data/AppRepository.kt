@@ -123,6 +123,8 @@ class AppRepository(
 
             is ServerMessage.SessionDiffMsg -> completePending(msg.requestId, msg)
 
+            is ServerMessage.SessionModelsMsg -> completePending(msg.requestId, msg)
+
             is ServerMessage.SessionDeletedMsg -> {
                 _sessions.value = _sessions.value.filterNot { it.id == msg.sessionId }
                 completePending(msg.requestId, msg)
@@ -238,6 +240,38 @@ class AppRepository(
         val response = request { id -> encodeSessionDiffGet(id, sessionId) }
         return when (response) {
             is ServerMessage.SessionDiffMsg -> Result.success(response.diff)
+            is ServerMessage.ErrorMsg -> Result.failure(IllegalStateException(response.message))
+            null -> Result.failure(IllegalStateException("Keine Verbindung"))
+            else -> Result.success(emptyList())
+        }
+    }
+
+    /**
+     * Modus/Modell/Reasoning einer laufenden Session setzen. Der Server
+     * antwortet zusätzlich mit session.status an alle Geräte, die Liste
+     * aktualisiert sich also über das bestehende Handling.
+     */
+    suspend fun updateSession(
+        sessionId: String,
+        mode: AgentMode? = null,
+        model: String? = null,
+        reasoningEffort: ReasoningEffort? = null,
+    ): Result<Unit> {
+        val response = request { id ->
+            encodeSessionUpdate(id, sessionId, mode, model, reasoningEffort)
+        }
+        return when (response) {
+            is ServerMessage.ErrorMsg -> Result.failure(IllegalStateException(response.message))
+            null -> Result.failure(IllegalStateException("Keine Verbindung"))
+            else -> Result.success(Unit)
+        }
+    }
+
+    /** Modellkatalog des Session-Shims; leere Liste ist gültig. */
+    suspend fun loadModels(sessionId: String): Result<List<ModelInfo>> {
+        val response = request { id -> encodeSessionModelsGet(id, sessionId) }
+        return when (response) {
+            is ServerMessage.SessionModelsMsg -> Result.success(response.models)
             is ServerMessage.ErrorMsg -> Result.failure(IllegalStateException(response.message))
             null -> Result.failure(IllegalStateException("Keine Verbindung"))
             else -> Result.success(emptyList())

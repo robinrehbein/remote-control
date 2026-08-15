@@ -1,6 +1,8 @@
 import type {
   AgentEvent,
   DiffEntry,
+  ModelInfo,
+  ModelsResponse,
   PermissionDecision,
   PromptRequest,
   ShimApiResponse,
@@ -9,6 +11,24 @@ import type {
 
 const TIMEOUT_MS = 10_000;
 const RECONNECT_MS = 3_000;
+
+/** Tolerant reader for GET /models bodies (missing route, wrong shape -> []). */
+export function normalizeModels(body: unknown): ModelInfo[] {
+  const raw = Array.isArray(body) ? body : (body as ModelsResponse | null)?.models;
+  if (!Array.isArray(raw)) return [];
+  const out: ModelInfo[] = [];
+  for (const entry of raw) {
+    if (typeof entry === 'string') {
+      if (entry.length > 0) out.push({ id: entry });
+      continue;
+    }
+    if (typeof entry !== 'object' || entry === null) continue;
+    const { id, name } = entry as { id?: unknown; name?: unknown };
+    if (typeof id !== 'string' || id.length === 0) continue;
+    out.push({ id, ...(typeof name === 'string' && name.length > 0 ? { name } : {}) });
+  }
+  return out;
+}
 
 export class ShimClient {
   private readonly base: string;
@@ -62,6 +82,12 @@ export class ShimClient {
 
   diff(): Promise<DiffEntry[] | null> {
     return this.call<DiffEntry[]>('/diff', 'GET');
+  }
+
+  /** GET /models; older shims without the route answer 404 -> empty catalog. */
+  async models(): Promise<ModelInfo[]> {
+    const res = await this.call<ModelsResponse>('/models', 'GET');
+    return normalizeModels(res);
   }
 
   startEvents(onEvent: (e: AgentEvent) => void): void {

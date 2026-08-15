@@ -33,6 +33,8 @@ function validate(id: string, raw: unknown, source: string): AdapterDescriptor {
       resume: caps.resume === true,
       streaming: caps.streaming === true,
       autoPush: caps.autoPush === true,
+      reasoning: caps.reasoning === true,
+      modelSwitch: caps.modelSwitch === true,
     },
     ...(typeof m.credentials === 'object' && m.credentials !== null ? { credentials: m.credentials as Record<string, string[]> } : {}),
     ...(typeof m.providerEnv === 'object' && m.providerEnv !== null ? { providerEnv: m.providerEnv as Record<string, string> } : {}),

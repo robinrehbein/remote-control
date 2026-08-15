@@ -35,6 +35,29 @@ data class AdapterCapabilities(
     val resume: Boolean = false,
     val streaming: Boolean = false,
     val autoPush: Boolean = false,
+    /** Adapter maps reasoningEffort onto a runtime option. */
+    val reasoning: Boolean = false,
+    /** Adapter honours a per-prompt model override. */
+    val modelSwitch: Boolean = false,
+)
+
+/** Normalized reasoning budget accepted by session.update. */
+@Serializable
+enum class ReasoningEffort { @SerialName("low") LOW, @SerialName("medium") MEDIUM, @SerialName("high") HIGH;
+
+    companion object {
+        fun fromRaw(raw: String?): ReasoningEffort? =
+            raw?.let { value -> entries.firstOrNull { it.name.equals(value, ignoreCase = true) } }
+    }
+}
+
+fun ReasoningEffort.wireName(): String = name.lowercase()
+
+/** One entry of a shim's model catalog (session.models). */
+@Serializable
+data class ModelInfo(
+    val id: String,
+    val name: String? = null,
 )
 
 @Serializable
@@ -111,6 +134,7 @@ data class SessionInfo(
     val lastActiveAt: String,
     val prUrl: String? = null,
     val networkPolicy: String? = null,
+    val reasoningEffort: String? = null,
 )
 
 @Serializable
@@ -238,6 +262,14 @@ sealed interface ServerMessage {
         override val type: String get() = "session.deleted"
     }
 
+    data class SessionModelsMsg(
+        val requestId: String,
+        val sessionId: String,
+        val models: List<ModelInfo>,
+    ) : ServerMessage {
+        override val type: String get() = "session.models"
+    }
+
     data class AdapterListMsg(val requestId: String, val adapters: List<AdapterDescriptor>) : ServerMessage {
         override val type: String get() = "adapter.list"
     }
@@ -273,6 +305,7 @@ fun requestIdOf(msg: ServerMessage): String? = when (msg) {
     is ServerMessage.SessionListMsg -> msg.requestId
     is ServerMessage.SessionDiffMsg -> msg.requestId
     is ServerMessage.SessionDeletedMsg -> msg.requestId
+    is ServerMessage.SessionModelsMsg -> msg.requestId
     is ServerMessage.AdapterListMsg -> msg.requestId
     is ServerMessage.RepoListMsg -> msg.requestId
     is ServerMessage.RepoAddedMsg -> msg.requestId
@@ -442,6 +475,14 @@ fun parseServerMessage(raw: String): ServerMessage? {
                 },
             )
 
+            "session.models" -> ServerMessage.SessionModelsMsg(
+                requestId = root.optString("requestId") ?: return null,
+                sessionId = root.optString("sessionId") ?: return null,
+                models = root["models"]?.jsonArray?.mapNotNull { el ->
+                    runCatching { ProtocolJson.decodeFromJsonElement(ModelInfo.serializer(), el) }.getOrNull()
+                } ?: emptyList(),
+            )
+
             "session.deleted" -> ServerMessage.SessionDeletedMsg(
                 requestId = root.optString("requestId") ?: return null,
                 sessionId = root.optString("sessionId") ?: return null,
@@ -548,6 +589,31 @@ fun encodeSessionPrompt(sessionId: String, text: String, mode: AgentMode?): Stri
     put("sessionId", sessionId)
     put("text", text)
     mode?.let { put("mode", it.wireName()) }
+}.toString()
+
+/**
+ * Mode/Modell/Reasoning einer laufenden Session ändern. Alle Felder optional;
+ * leerer Modell-String setzt auf den Adapter-Default zurück.
+ */
+fun encodeSessionUpdate(
+    requestId: String,
+    sessionId: String,
+    mode: AgentMode? = null,
+    model: String? = null,
+    reasoningEffort: ReasoningEffort? = null,
+): String = buildJsonObject {
+    put("type", "session.update")
+    put("requestId", requestId)
+    put("sessionId", sessionId)
+    mode?.let { put("mode", it.wireName()) }
+    model?.let { put("model", it) }
+    reasoningEffort?.let { put("reasoningEffort", it.wireName()) }
+}.toString()
+
+fun encodeSessionModelsGet(requestId: String, sessionId: String): String = buildJsonObject {
+    put("type", "session.models.get")
+    put("requestId", requestId)
+    put("sessionId", sessionId)
 }.toString()
 
 fun encodeSessionPermission(sessionId: String, permissionId: String, decision: PermissionDecision): String = buildJsonObject {

@@ -5,8 +5,11 @@ import type {
   AgentMode,
   ClientMessage,
   DiffEntry,
+  ModelInfo,
   NetworkPolicy,
   PermissionDecision,
+  PromptRequest,
+  ReasoningEffort,
   ServerMessage,
   SessionInfo,
   SessionStatus,
@@ -16,12 +19,24 @@ import type { LinkRow, RepoRow, SessionRow, Store } from './db.js';
 import { decrypt } from './vault.js';
 import * as docker from './docker.js';
 import { getAdapter } from './adapters.js';
-import { ShimClient } from './shim-client.js';
+import { ShimClient, normalizeModels } from './shim-client.js';
 import { sendPush } from './fcm.js';
 
 const TENANT = 'default';
 
+const AGENT_MODES: readonly AgentMode[] = ['yolo', 'auto', 'acceptEdits', 'ask'];
+const REASONING_EFFORTS: readonly ReasoningEffort[] = ['low', 'medium', 'high'];
+
+export function isAgentMode(v: unknown): v is AgentMode {
+  return typeof v === 'string' && (AGENT_MODES as readonly string[]).includes(v);
+}
+
+export function isReasoningEffort(v: unknown): v is ReasoningEffort {
+  return typeof v === 'string' && (REASONING_EFFORTS as readonly string[]).includes(v);
+}
+
 type CreateMsg = Extract<ClientMessage, { type: 'session.create' }>;
+type UpdateMsg = Extract<ClientMessage, { type: 'session.update' }>;
 type LinkHello = Extract<ClientMessage, { type: 'agent.hello' }>;
 
 /** Transport for link-agent sessions (agent dialed in via outbound WS). */
@@ -77,6 +92,7 @@ export class SessionManager {
       shim_endpoint: null,
       link_id: null,
       network_policy: null,
+      reasoning_effort: null,
       created_at: now,
       last_active_at: now,
     };
@@ -126,6 +142,7 @@ export class SessionManager {
       shim_endpoint: null,
       link_id: null,
       network_policy: networkPolicy,
+      reasoning_effort: null,
       created_at: now,
       last_active_at: now,
     };
@@ -280,10 +297,27 @@ export class SessionManager {
     return { ok: true, body: res.body };
   }
 
+  /**
+   * Prompt body from the session row: mode/model/reasoningEffort are session
+   * state (switchable via `session.update`), so every turn carries them.
+   * Provider only rides along with a model, since runtimes that address models
+   * as provider+model need both.
+   */
+  private promptBody(row: SessionRow, text: string, mode?: AgentMode): PromptRequest {
+    const effectiveMode = mode ?? (isAgentMode(row.mode) ? row.mode : undefined);
+    return {
+      text,
+      ...(effectiveMode !== undefined ? { mode: effectiveMode } : {}),
+      ...(row.model ? { model: row.model, ...(row.provider ? { provider: row.provider } : {}) } : {}),
+      ...(isReasoningEffort(row.reasoning_effort) ? { reasoningEffort: row.reasoning_effort } : {}),
+    };
+  }
+
   async prompt(id: string, text: string, mode?: AgentMode): Promise<void> {
     const row = this.requireSession(id);
+    const body = this.promptBody(row, text, mode);
     if (row.link_id) {
-      const res = await this.linkCall(row, '/prompt', 'POST', { text, mode });
+      const res = await this.linkCall(row, '/prompt', 'POST', body);
       if (!res.ok) {
         this.emitEvent(id, { type: 'error', message: res.error, fatal: true });
         throw new Error(res.error);
@@ -293,12 +327,55 @@ export class SessionManager {
     }
     const client = this.client(id);
     this.setStatus(id, 'running');
-    const res = await client.prompt({ text, mode });
+    const res = await client.prompt(body);
     if (!res || !res.ok) {
       const message = res && !res.ok ? res.error : 'prompt request failed';
       this.setStatus(id, 'error');
       this.emitEvent(id, { type: 'error', message, fatal: true });
     }
+  }
+
+  /**
+   * Persist switchable session settings. The next prompt carries them to the
+   * shim; the updated session is broadcast to every device as `session.status`.
+   */
+  updateSession(msg: UpdateMsg): SessionInfo {
+    const row = this.requireSession(msg.sessionId);
+    if (msg.mode !== undefined && !isAgentMode(msg.mode)) {
+      throw new Error(`invalid mode "${String(msg.mode)}"`);
+    }
+    if (msg.model !== undefined && typeof msg.model !== 'string') {
+      throw new Error('model must be a string');
+    }
+    if (msg.reasoningEffort !== undefined && !isReasoningEffort(msg.reasoningEffort)) {
+      throw new Error(`invalid reasoningEffort "${String(msg.reasoningEffort)}"`);
+    }
+    this.store.updateSessionSettings(row.id, {
+      ...(msg.mode !== undefined ? { mode: msg.mode } : {}),
+      ...(msg.model !== undefined ? { model: msg.model.trim() } : {}),
+      ...(msg.reasoningEffort !== undefined ? { reasoningEffort: msg.reasoningEffort } : {}),
+    });
+    const updated = this.requireSession(row.id);
+    const info = this.toInfo(updated);
+    this.broadcast({
+      type: 'session.status',
+      sessionId: info.id,
+      status: info.status,
+      session: info,
+    });
+    return info;
+  }
+
+  /** Model catalog of the session's shim; unsupported/unreachable -> []. */
+  async models(id: string): Promise<ModelInfo[]> {
+    const row = this.requireSession(id);
+    if (row.link_id) {
+      const res = await this.linkCall(row, '/models', 'GET');
+      if (!res.ok) return [];
+      return normalizeModels(res.body);
+    }
+    if (!row.shim_token) return [];
+    return await this.client(id).models();
   }
 
   async permission(id: string, permissionId: string, decision: PermissionDecision): Promise<void> {
@@ -439,6 +516,7 @@ export class SessionManager {
       lastActiveAt: row.last_active_at,
       ...(row.pr_url ? { prUrl: row.pr_url } : {}),
       ...(isNetworkPolicy(row.network_policy) ? { networkPolicy: row.network_policy } : {}),
+      ...(row.reasoning_effort ? { reasoningEffort: row.reasoning_effort } : {}),
     };
   }
 

@@ -3,7 +3,7 @@
   "id": "kilo",
   "name": "Kilo Code",
   "description": "Kilo CLI (OpenCode-compatible fork); BYO provider keys or Kilo Gateway auth.json content.",
-  "capabilities": { "approvals": true, "resume": true, "streaming": true, "autoPush": true },
+  "capabilities": { "approvals": true, "resume": true, "streaming": true, "autoPush": true, "reasoning": false, "modelSwitch": true },
   "credentials": {
     "kilo": ["KILO_AUTH_CONTENT"]
   },

@@ -3,7 +3,7 @@
   "id": "junie",
   "name": "Junie",
   "description": "JetBrains Junie CLI headless one-shot; Junie API key or BYOK. No remote approvals (app shows banner).",
-  "capabilities": { "approvals": false, "resume": false, "streaming": false, "autoPush": true },
+  "capabilities": { "approvals": false, "resume": false, "streaming": false, "autoPush": true, "reasoning": false, "modelSwitch": true },
   "credentials": {
     "junie": ["JUNIE_API_KEY"]
   },

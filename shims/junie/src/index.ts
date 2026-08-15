@@ -1,7 +1,7 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
-import type { AgentEvent, AgentMode, PromptRequest, ShimStatus } from '@pocketagent/protocol';
+import type { AgentEvent, AgentMode, ModelsResponse, PromptRequest, ShimStatus } from '@pocketagent/protocol';
 import { EventBroadcaster } from './events';
 import { commitTurn, createDraftPr, ensureRepo, getDiff, pushBranch, type GitContext } from './gitops';
 import { RealJunieRunner, type JunieRunner } from './junie';
@@ -134,6 +134,10 @@ export function buildApp(deps: AppDeps): FastifyInstance {
     };
     return response;
   });
+
+  // junie has no queryable model catalog (models come from the CLI/BYOK
+  // config), so the list stays empty and the app falls back to free text.
+  app.get('/models', async (): Promise<ModelsResponse> => ({ models: [] }));
 
   app.get('/diff', async () => getDiff(gitCtx));
 

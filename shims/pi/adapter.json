@@ -3,7 +3,7 @@
   "id": "pi",
   "name": "pi",
   "description": "pi coding agent (badlogic) embedded via SDK; ZAI/Kimi/Qwen catalogs, remote approvals via tool_call hook.",
-  "capabilities": { "approvals": true, "resume": true, "streaming": true, "autoPush": true },
+  "capabilities": { "approvals": true, "resume": true, "streaming": true, "autoPush": true, "reasoning": true, "modelSwitch": true },
   "credentials": {},
   "providerEnv": {
     "openai": "OPENAI_API_KEY",

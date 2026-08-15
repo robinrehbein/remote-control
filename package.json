@@ -7,11 +7,13 @@
   "workspaces": [
     "packages/*",
     "server",
+    "link",
     "shims/*"
   ],
   "scripts": {
-    "typecheck": "tsc -p packages/protocol && tsc -p server && tsc -p shims/opencode && tsc -p shims/kilo && tsc -p shims/claude && tsc -p shims/pi && tsc -p shims/junie",
+    "typecheck": "tsc -p packages/protocol && tsc -p server && tsc -p link && tsc -p shims/opencode && tsc -p shims/kilo && tsc -p shims/claude && tsc -p shims/pi && tsc -p shims/junie",
     "smoke:server": "npm run smoke -w server --if-present",
+    "smoke:link": "npm run smoke -w link --if-present",
     "smoke:shims": "npm run smoke -w shims/opencode --if-present && npm run smoke -w shims/kilo --if-present && npm run smoke -w shims/claude --if-present && npm run smoke -w shims/pi --if-present && npm run smoke -w shims/junie --if-present",
     "smoke:real": "npm run smoke:real -w shims/opencode --if-present && npm run smoke:real -w shims/pi --if-present && npm run smoke:real -w shims/claude --if-present"
   },

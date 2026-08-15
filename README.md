@@ -28,6 +28,7 @@ Adapter-Shims in Session-Containern (einheitliches Protokoll)
 | `shims/pi/` | pi-Adapter (SDK-Embedding, Approvals via `tool_call`-Hook) |
 | `shims/junie/` | Junie-Adapter (CLI-Spawn pro Prompt, JSON-Output) |
 | `android/` | Native App (Kotlin, Jetpack Compose, Material3) — Adapterliste kommt dynamisch vom Server; CI baut das APK via GitHub Actions |
+| `link/` | **Link-Agent**: läuft in deinem Devcontainer/PC/VPS, verbindet sich per outbound-WebSocket mit dem Orchestrator und stellt deinen Live-Workspace als Session bereit (siehe `HOMEPC.md`) |
 | `ADAPTERS.md` | Plugin-Guide: Manifest-Schema + Harness in 5 Schritten hinzufügen |
 
 Jeder Shim implementiert dasselbe Protokoll: `POST /prompt`, `POST /abort`, `POST /resume`, `POST /permissions/:id`, `GET /status`, `GET /diff`, `GET /events` (SSE mit normierten `AgentEvent`s). Nach jedem Turn auto-committet der Shim auf `agent/<session-id>`; im Yolo-Modus wird automatisch gepusht + Draft-PR geöffnet, sonst per Tap in der App.

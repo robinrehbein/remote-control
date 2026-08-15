@@ -11,7 +11,7 @@ import type {
   SessionStatus,
 } from '@pocketagent/protocol';
 import { SERVER_VERSION, config } from './config.js';
-import type { RepoRow, SessionRow, Store } from './db.js';
+import type { LinkRow, RepoRow, SessionRow, Store } from './db.js';
 import { decrypt } from './vault.js';
 import * as docker from './docker.js';
 import { getAdapter } from './adapters.js';
@@ -21,16 +21,79 @@ import { sendPush } from './fcm.js';
 const TENANT = 'default';
 
 type CreateMsg = Extract<ClientMessage, { type: 'session.create' }>;
+type LinkHello = Extract<ClientMessage, { type: 'agent.hello' }>;
+
+/** Transport for link-agent sessions (agent dialed in via outbound WS). */
+export interface LinkTransport {
+  call(linkId: string, path: string, method: 'GET' | 'POST', body?: unknown): Promise<{ status: number; body?: unknown } | null>;
+  isConnected(linkId: string): boolean;
+  bye(linkId: string): void;
+}
 
 export class SessionManager {
   private readonly clients = new Map<string, ShimClient>();
   private readonly timers: NodeJS.Timeout[] = [];
+  private linkTransport: LinkTransport | null = null;
   readonly startedAt = Date.now();
 
   constructor(
     private readonly store: Store,
     private readonly broadcast: (m: ServerMessage) => void,
   ) {}
+
+  setLinkTransport(t: LinkTransport): void {
+    this.linkTransport = t;
+  }
+
+  /** Link agent (re)connected: bind or create its session row and mark idle. */
+  registerLinkSession(link: LinkRow, hello: LinkHello): string {
+    const now = new Date().toISOString();
+    const existing = this.store.getSessionByLink(link.id);
+    if (existing) {
+      if (hello.mode) this.store.updateSessionMode(existing.id, hello.mode);
+      if (hello.sessionRef) this.store.setSessionRef(existing.id, hello.sessionRef);
+      this.store.touchSession(existing.id);
+      this.setStatus(existing.id, 'idle');
+      return existing.id;
+    }
+    const id = randomUUID();
+    const row: SessionRow = {
+      id,
+      tenant_id: link.tenant_id,
+      repo_id: '',
+      repo_full_name: `link:${hello.name ?? link.name}${hello.workDir ? ` (${hello.workDir})` : ''}`,
+      adapter: hello.adapter,
+      provider: '',
+      model: '',
+      mode: hello.mode ?? 'ask',
+      status: 'idle',
+      branch: hello.branch ?? 'local',
+      session_ref: hello.sessionRef ?? null,
+      container_id: null,
+      volume_name: null,
+      shim_token: null,
+      pr_url: null,
+      shim_endpoint: null,
+      link_id: null,
+      created_at: now,
+      last_active_at: now,
+    };
+    this.store.insertSession(row);
+    this.store.setLinkId(id, link.id);
+    this.broadcastStatus(id, 'idle');
+    return id;
+  }
+
+  /** Link agent socket dropped: session becomes stopped (resumes on reconnect). */
+  linkDisconnected(linkId: string): void {
+    const row = this.store.getSessionByLink(linkId);
+    if (row && row.status !== 'stopped') this.setStatus(row.id, 'stopped');
+  }
+
+  /** Normalized event arriving from a link agent (same pipeline as shim SSE). */
+  handleLinkEvent(sessionId: string, ev: AgentEvent): void {
+    this.onEvent(sessionId, ev);
+  }
 
   createSession(msg: CreateMsg, tenant: string = TENANT): SessionRow {
     const repo = this.store.getRepo(msg.repoId);
@@ -55,6 +118,7 @@ export class SessionManager {
       shim_token: null,
       pr_url: null,
       shim_endpoint: null,
+      link_id: null,
       created_at: now,
       last_active_at: now,
     };
@@ -192,7 +256,34 @@ export class SessionManager {
     return this.clients.get(id) ?? new ShimClient(this.shimBase(id), row.shim_token);
   }
 
+  private async linkCall(
+    row: SessionRow,
+    path: string,
+    method: 'GET' | 'POST',
+    body?: unknown,
+  ): Promise<{ ok: true; body?: unknown } | { ok: false; error: string }> {
+    if (!this.linkTransport || !row.link_id) return { ok: false, error: 'link not connected' };
+    if (!this.linkTransport.isConnected(row.link_id)) return { ok: false, error: 'link agent disconnected' };
+    const res = await this.linkTransport.call(row.link_id, path, method, body);
+    if (!res) return { ok: false, error: 'link call timed out' };
+    if (res.status < 200 || res.status >= 300) {
+      const bodyErr = res.body as { error?: string } | undefined;
+      return { ok: false, error: bodyErr?.error ?? `link call failed (HTTP ${res.status})` };
+    }
+    return { ok: true, body: res.body };
+  }
+
   async prompt(id: string, text: string, mode?: AgentMode): Promise<void> {
+    const row = this.requireSession(id);
+    if (row.link_id) {
+      const res = await this.linkCall(row, '/prompt', 'POST', { text, mode });
+      if (!res.ok) {
+        this.emitEvent(id, { type: 'error', message: res.error, fatal: true });
+        throw new Error(res.error);
+      }
+      this.setStatus(id, 'running');
+      return;
+    }
     const client = this.client(id);
     this.setStatus(id, 'running');
     const res = await client.prompt({ text, mode });
@@ -204,16 +295,34 @@ export class SessionManager {
   }
 
   async permission(id: string, permissionId: string, decision: PermissionDecision): Promise<void> {
+    const row = this.requireSession(id);
+    if (row.link_id) {
+      const res = await this.linkCall(row, `/permissions/${encodeURIComponent(permissionId)}`, 'POST', { response: decision });
+      if (!res.ok) throw new Error(res.error);
+      return;
+    }
     const res = await this.client(id).permission(permissionId, decision);
     if (!res?.ok) throw new Error(res && !res.ok ? res.error : 'permission request failed');
   }
 
   async abort(id: string): Promise<void> {
+    const row = this.requireSession(id);
+    if (row.link_id) {
+      const res = await this.linkCall(row, '/abort', 'POST');
+      if (!res.ok) throw new Error(res.error);
+      return;
+    }
     const res = await this.client(id).abort();
     if (!res?.ok) throw new Error(res && !res.ok ? res.error : 'abort request failed');
   }
 
   async diff(id: string): Promise<DiffEntry[]> {
+    const row = this.requireSession(id);
+    if (row.link_id) {
+      const res = await this.linkCall(row, '/diff', 'GET');
+      if (!res.ok) throw new Error(res.error);
+      return Array.isArray(res.body) ? (res.body as DiffEntry[]) : [];
+    }
     const diff = await this.client(id).diff();
     if (!diff) throw new Error('diff request failed');
     return diff;
@@ -221,6 +330,11 @@ export class SessionManager {
 
   async stopSession(id: string): Promise<void> {
     const row = this.requireSession(id);
+    if (row.link_id) {
+      this.linkTransport?.bye(row.link_id);
+      this.setStatus(id, 'stopped');
+      return;
+    }
     this.clients.get(id)?.stop();
     this.clients.delete(id);
     if (row.container_id) await docker.stopContainer(row.container_id);
@@ -229,6 +343,13 @@ export class SessionManager {
 
   async resumeSession(id: string): Promise<void> {
     const row = this.requireSession(id);
+    if (row.link_id) {
+      if (!this.linkTransport?.isConnected(row.link_id)) {
+        throw new Error('link agent not connected - restart it on the agent host');
+      }
+      this.setStatus(id, 'idle');
+      return;
+    }
     if (!row.shim_token || !row.volume_name) throw new Error('session not provisioned');
     if (!config.dockerEnabled) throw new Error('docker is disabled on this server');
     await docker.ensureNetwork();
@@ -261,6 +382,9 @@ export class SessionManager {
 
   async push(id: string): Promise<void> {
     const row = this.requireSession(id);
+    if (row.link_id) {
+      throw new Error('tap-push is not supported for linked sessions (yolo mode auto-pushes from the agent host)');
+    }
     if (!row.volume_name) throw new Error('session not provisioned');
     const repo = this.store.getRepo(row.repo_id);
     if (!repo) throw new Error('repo missing');
@@ -273,6 +397,11 @@ export class SessionManager {
     const row = this.store.getSession(id);
     this.clients.get(id)?.stop();
     this.clients.delete(id);
+    if (row?.link_id) {
+      this.linkTransport?.bye(row.link_id);
+      this.store.deleteSession(id);
+      return;
+    }
     if (row) {
       if (row.container_id) {
         await docker.stopContainer(row.container_id);
@@ -333,6 +462,7 @@ export class SessionManager {
   private async reapIdle(): Promise<void> {
     const cutoff = Date.now() - config.idleStopSec * 1000;
     for (const row of this.store.listSessions(TENANT)) {
+      if (row.link_id) continue; // linked agents are long-lived, no container cost
       if (
         (row.status === 'running' || row.status === 'idle') &&
         Date.parse(row.last_active_at) < cutoff

@@ -19,6 +19,11 @@ export async function buildApp(): Promise<App> {
   const store = new Store();
   const hub = new Hub();
   const manager = new SessionManager(store, (m) => hub.broadcast(m));
+  manager.setLinkTransport({
+    call: (linkId, path, method, body) => hub.callLink(linkId, path, method, body),
+    isConnected: (linkId) => hub.hasLink(linkId),
+    bye: (linkId) => hub.byeLink(linkId),
+  });
 
   app.get('/api/health', async () => ({
     ok: true,

@@ -23,10 +23,11 @@ export interface SessionRow {
   adapter: string; provider: string; model: string; mode: string;
   status: string; branch: string; session_ref: string | null; container_id: string | null;
   volume_name: string | null; shim_token: string | null; pr_url: string | null;
-  shim_endpoint: string | null;
+  shim_endpoint: string | null; link_id: string | null;
   created_at: string; last_active_at: string;
 }
 export interface PairingCodeRow { code: string; tenant_id: string; expires_at: string; used: number }
+export interface LinkRow { id: string; tenant_id: string; name: string; token_hash: string; created_at: string }
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS devices (
@@ -56,6 +57,10 @@ CREATE TABLE IF NOT EXISTS session_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
   type TEXT NOT NULL, payload TEXT NOT NULL, ts TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS links (
+  id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, name TEXT NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL
+);
 `;
 
 export class Store {
@@ -73,6 +78,9 @@ export class Store {
     const cols = this.db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>;
     if (!cols.some((c) => c.name === 'shim_endpoint')) {
       this.db.exec('ALTER TABLE sessions ADD COLUMN shim_endpoint TEXT');
+    }
+    if (!cols.some((c) => c.name === 'link_id')) {
+      this.db.exec('ALTER TABLE sessions ADD COLUMN link_id TEXT');
     }
   }
 
@@ -114,6 +122,24 @@ export class Store {
     if (!row || row.used !== 0 || Date.parse(row.expires_at) < Date.now()) return false;
     this.db.prepare('UPDATE pairing_codes SET used = 1 WHERE code = ?').run(code);
     return true;
+  }
+
+  createLink(id: string, tenant: string, name: string, tokenHash: string): void {
+    this.db
+      .prepare('INSERT INTO links (id, tenant_id, name, token_hash, created_at) VALUES (?, ?, ?, ?, ?)')
+      .run(id, tenant, name, tokenHash, new Date().toISOString());
+  }
+
+  getLinkByTokenHash(tokenHash: string): LinkRow | undefined {
+    return this.db.prepare('SELECT * FROM links WHERE token_hash = ?').get(tokenHash) as
+      | LinkRow
+      | undefined;
+  }
+
+  getSessionByLink(linkId: string): SessionRow | undefined {
+    return this.db.prepare('SELECT * FROM sessions WHERE link_id = ?').get(linkId) as
+      | SessionRow
+      | undefined;
   }
 
   saveSecret(id: string, tenant: string, kind: string, ciphertext: string, nonce: string): void {
@@ -183,6 +209,10 @@ export class Store {
     this.db.prepare('UPDATE sessions SET status = ? WHERE id = ?').run(status, id);
   }
 
+  updateSessionMode(id: string, mode: string): void {
+    this.db.prepare('UPDATE sessions SET mode = ? WHERE id = ?').run(mode, id);
+  }
+
   setProvisioned(id: string, containerId: string, volumeName: string, shimToken: string): void {
     this.db
       .prepare('UPDATE sessions SET container_id = ?, volume_name = ?, shim_token = ? WHERE id = ?')
@@ -195,6 +225,10 @@ export class Store {
 
   setShimEndpoint(id: string, endpoint: string | null): void {
     this.db.prepare('UPDATE sessions SET shim_endpoint = ? WHERE id = ?').run(endpoint, id);
+  }
+
+  setLinkId(id: string, linkId: string | null): void {
+    this.db.prepare('UPDATE sessions SET link_id = ? WHERE id = ?').run(linkId, id);
   }
 
   setSessionRef(id: string, ref: string): void {

@@ -11,6 +11,11 @@ import { encrypt } from './vault.js';
 
 export class Hub {
   private readonly sockets = new Set<WebSocket>();
+  private readonly linkSockets = new Map<string, WebSocket>();
+  private readonly pendingLinkCalls = new Map<
+    string,
+    { resolve: (v: { status: number; body?: unknown } | null) => void; timer: NodeJS.Timeout }
+  >();
 
   add(s: WebSocket): void {
     this.sockets.add(s);
@@ -30,10 +35,72 @@ export class Hub {
       }
     }
   }
+
+  registerLink(linkId: string, socket: WebSocket): void {
+    this.linkSockets.get(linkId)?.close(4000, 'replaced');
+    this.linkSockets.set(linkId, socket);
+  }
+
+  dropLink(linkId: string, socket: WebSocket): void {
+    if (this.linkSockets.get(linkId) === socket) this.linkSockets.delete(linkId);
+  }
+
+  hasLink(linkId: string): boolean {
+    return this.linkSockets.has(linkId);
+  }
+
+  callLink(
+    linkId: string,
+    path: string,
+    method: 'GET' | 'POST',
+    body?: unknown,
+  ): Promise<{ status: number; body?: unknown } | null> {
+    const socket = this.linkSockets.get(linkId);
+    if (!socket) return Promise.resolve(null);
+    const callId = randomUUID();
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.pendingLinkCalls.delete(callId);
+        resolve(null);
+      }, 20_000);
+      this.pendingLinkCalls.set(callId, { resolve, timer });
+      try {
+        socket.send(JSON.stringify({ type: 'agent.command', sessionId: linkId, callId, path, method, body }));
+      } catch {
+        clearTimeout(timer);
+        this.pendingLinkCalls.delete(callId);
+        resolve(null);
+      }
+    });
+  }
+
+  resolveLinkCall(callId: string, status: number, body?: unknown): void {
+    const pending = this.pendingLinkCalls.get(callId);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    this.pendingLinkCalls.delete(callId);
+    pending.resolve({ status, body });
+  }
+
+  byeLink(linkId: string): void {
+    const socket = this.linkSockets.get(linkId);
+    if (!socket) return;
+    try {
+      socket.send(JSON.stringify({ type: 'agent.bye', sessionId: linkId }));
+    } catch {
+      /* closed */
+    }
+  }
 }
 
 type FcmRegisterMessage = { type: 'fcm.register'; token: string };
 type AppClientMessage = ClientMessage | FcmRegisterMessage;
+/** Incoming frames on a link socket (link -> server uses ServerMessage variants). */
+type LinkInMessage = Extract<
+  ServerMessage,
+  { type: 'agent.response' | 'agent.event' | 'agent.ping' | 'agent.pong' }
+>;
+type SocketInMessage = AppClientMessage | LinkInMessage;
 
 export function registerWs(
   app: FastifyInstance,
@@ -43,7 +110,9 @@ export function registerWs(
 ): void {
   app.get('/ws', { websocket: true }, (socket: WebSocket) => {
     let authed = false;
+    let role: 'device' | 'link' = 'device';
     let deviceId: string | null = null;
+    let linkId: string | null = null;
 
     const send = (m: ServerMessage): void => {
       try {
@@ -55,13 +124,27 @@ export function registerWs(
     const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
     socket.on('message', (data: RawData) => {
-      let msg: AppClientMessage;
+      let msg: SocketInMessage;
       try {
-        msg = JSON.parse(String(data)) as AppClientMessage;
+        msg = JSON.parse(String(data)) as SocketInMessage;
       } catch {
         return;
       }
       if (!authed) {
+        if (msg.type === 'agent.hello') {
+          const link = store.getLinkByTokenHash(sha256(msg.token));
+          if (!link) {
+            socket.close(4001, 'unauthorized');
+            return;
+          }
+          authed = true;
+          role = 'link';
+          linkId = link.id;
+          hub.registerLink(link.id, socket);
+          const sessionId = manager.registerLinkSession(link, msg);
+          send({ type: 'agent.ready', sessionId });
+          return;
+        }
         if (msg.type !== 'hello') {
           socket.close(4001, 'unauthorized');
           return;
@@ -77,11 +160,47 @@ export function registerWs(
         send({ type: 'welcome', ok: true, serverVersion: SERVER_VERSION });
         return;
       }
+      if (role === 'link') {
+        if (msg.type === 'agent.response') {
+          hub.resolveLinkCall(msg.callId, msg.status, msg.body);
+          return;
+        }
+        if (msg.type === 'agent.event') {
+          manager.handleLinkEvent(msg.sessionId, msg.event);
+          return;
+        }
+        if (msg.type === 'agent.ping') {
+          send({ type: 'agent.pong', ts: msg.ts });
+          return;
+        }
+        return;
+      }
+      if (
+        msg.type === 'agent.response' ||
+        msg.type === 'agent.event' ||
+        msg.type === 'agent.ping' ||
+        msg.type === 'agent.pong' ||
+        msg.type === 'agent.hello'
+      ) {
+        return;
+      }
       void handle(msg).catch((e) => send({ type: 'error', message: errText(e) }));
     });
 
-    socket.on('close', () => hub.remove(socket));
-    socket.on('error', () => hub.remove(socket));
+    socket.on('close', () => {
+      hub.remove(socket);
+      if (role === 'link' && linkId) {
+        hub.dropLink(linkId, socket);
+        manager.linkDisconnected(linkId);
+      }
+    });
+    socket.on('error', () => {
+      hub.remove(socket);
+      if (role === 'link' && linkId) {
+        hub.dropLink(linkId, socket);
+        manager.linkDisconnected(linkId);
+      }
+    });
 
     async function handle(msg: AppClientMessage): Promise<void> {
       switch (msg.type) {

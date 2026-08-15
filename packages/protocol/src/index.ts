@@ -240,6 +240,17 @@ export interface SecretInfo {
 export type ClientMessage =
   | { type: 'hello'; deviceId: string; token: string }
   | {
+      /** Link-agent (devcontainer/VPS/bare metal) registration; outbound WS, no inbound ports needed. */
+      type: 'agent.hello';
+      token: string;
+      name?: string;
+      adapter: AdapterId;
+      mode?: AgentMode;
+      branch?: string;
+      workDir?: string;
+      sessionRef?: string;
+    }
+  | {
       type: 'session.create';
       requestId: string;
       repoId: string;
@@ -269,6 +280,19 @@ export type ClientMessage =
 
 export type ServerMessage =
   | { type: 'welcome'; ok: true; serverVersion: string }
+  /** server -> link agent: registration accepted, session bound */
+  | { type: 'agent.ready'; sessionId: string }
+  /** server -> link agent: proxy a shim HTTP call over the outbound WS */
+  | { type: 'agent.command'; sessionId: string; callId: string; path: string; method: 'GET' | 'POST'; body?: unknown }
+  /** link agent -> server: response to an agent.command */
+  | { type: 'agent.response'; callId: string; status: number; body?: unknown }
+  /** link agent -> server: normalized shim event */
+  | { type: 'agent.event'; sessionId: string; event: AgentEvent }
+  /** link agent -> server / server -> link agent keepalive */
+  | { type: 'agent.ping'; ts: number }
+  | { type: 'agent.pong'; ts: number }
+  /** server -> link agent: session stopped from the app; link agent should shut down */
+  | { type: 'agent.bye'; sessionId: string }
   | { type: 'error'; requestId?: string; sessionId?: string; message: string }
   | { type: 'request.ok'; requestId: string; payload?: unknown }
   | { type: 'session.list'; requestId: string; sessions: SessionInfo[] }

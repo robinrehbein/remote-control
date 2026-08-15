@@ -1,0 +1,25 @@
+{
+  "name": "@pocketagent/link",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "PocketAgent link agent: runs next to your code (devcontainer, VPS, PC), spawns an adapter shim and exposes it to the orchestrator via outbound WebSocket - no inbound ports needed",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "smoke": "tsx smoke.ts",
+    "typecheck": "tsc -p . --noEmit"
+  },
+  "dependencies": {
+    "@pocketagent/protocol": "file:../packages/protocol",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.0",
+    "typescript": "^5.9.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

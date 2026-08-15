@@ -47,6 +47,7 @@ fun PocketAgentNavHost(
                     }
                 },
                 onBack = { navController.popBackStack() },
+                onOpenSettings = { navController.navigate(Routes.SETTINGS) },
             )
         }
         composable(Routes.SESSION) { backStack ->

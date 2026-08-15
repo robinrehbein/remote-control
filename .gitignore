@@ -25,3 +25,7 @@ google-services.json
 .kilo/
 .tools/
 dist/
+
+# Kotlin compiler session data
+.kotlin/
+android/.kotlin/

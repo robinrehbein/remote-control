@@ -8,8 +8,10 @@
 import type {
   AgentEvent,
   AgentMode,
+  ModelInfo,
   PermissionDecision,
   PermissionKind,
+  ReasoningEffort,
   ShimStatus,
   TokenUsage,
 } from '@pocketagent/protocol';
@@ -58,8 +60,22 @@ export interface RunnerConfig {
   cwd: string;
   permissionMode: PermissionMode;
   model?: string;
+  /** Maps onto the SDK's `Options.effort` (EffortLevel). */
+  effort?: ReasoningEffort;
   resumeSessionId?: string;
 }
+
+/**
+ * Core model catalog served by GET /models. The Agent SDK resolves model ids
+ * itself (Query.supportedModels() needs a live query), so the shim ships a
+ * static list of the ids the CLI accepts.
+ */
+export const CLAUDE_MODELS: readonly ModelInfo[] = [
+  { id: 'claude-fable-5', name: 'Claude Fable 5' },
+  { id: 'claude-opus-5', name: 'Claude Opus 5' },
+  { id: 'claude-sonnet-5', name: 'Claude Sonnet 5' },
+  { id: 'claude-haiku-4-5-20251001', name: 'Claude Haiku 4.5' },
+];
 
 export interface RunnerCallbacks {
   onRunnerMessage(msg: RunnerMessage): void;
@@ -151,6 +167,10 @@ class SdkRunner implements ClaudeRunner {
       canUseTool: this.canUseTool,
     };
     if (this.config.model) options.model = this.config.model;
+    // Options.effort ('low' | 'medium' | 'high' | 'xhigh' | 'max') is the SDK's
+    // reasoning knob; there is no control request for it, so it is applied when
+    // the query starts (ClaudeSession restarts the runner when it changes).
+    if (this.config.effort) options.effort = this.config.effort;
     if (this.config.resumeSessionId) options.resume = this.config.resumeSessionId;
     if (this.config.permissionMode === 'bypassPermissions') {
       options.allowDangerouslySkipPermissions = true;
@@ -366,15 +386,29 @@ const PERMISSION_TIMEOUT_MS = 10 * 60 * 1000;
 export class ClaudeSession {
   private mode: AgentMode;
   private model?: string;
+  private effort?: ReasoningEffort;
   private sessionId?: string;
   private busy = false;
   private runner: ClaudeRunner | null = null;
+  /**
+   * Auto-push follows the mode of the current turn: `session.update` switches
+   * yolo<->ask mid-session and the orchestrator carries the effective mode on
+   * every prompt, while AUTO_PUSH is frozen at container start. Prompts without
+   * a mode (older orchestrators) keep the env default.
+   */
+  private autoPush: boolean;
+  /** Values the live runner was last configured with (control requests are skipped when unchanged). */
+  private appliedPermissionMode: PermissionMode;
+  private appliedModel?: string;
   private readonly pendingPermissions = new Map<string, PendingPermission>();
   private readonly toolNames = new Map<string, string>();
 
   constructor(private readonly deps: ClaudeSessionDeps) {
     this.mode = deps.mode;
     this.model = deps.model;
+    this.autoPush = deps.autoPush;
+    this.appliedPermissionMode = mapMode(deps.mode);
+    this.appliedModel = deps.model;
   }
 
   status(): ShimStatus {
@@ -419,19 +453,36 @@ export class ClaudeSession {
         cwd: this.deps.cwd,
         permissionMode: mapMode(this.mode),
         model: this.model,
+        effort: this.effort,
         resumeSessionId: this.sessionId,
       },
       this.runnerCallbacks,
     );
     await runner.start();
     this.runner = runner;
+    // a fresh query starts with mode/model baked into its options
+    this.appliedPermissionMode = mapMode(this.mode);
+    this.appliedModel = this.model;
     return { runner, reused: false };
   }
 
-  async prompt(text: string, opts?: { mode?: AgentMode; model?: string }): Promise<void> {
+  async prompt(
+    text: string,
+    opts?: { mode?: AgentMode; model?: string; reasoningEffort?: ReasoningEffort },
+  ): Promise<void> {
     if (this.busy) throw new Error('busy');
-    if (opts?.mode) this.mode = opts.mode;
-    if (opts?.model) this.model = opts.model;
+    if (opts?.mode) {
+      this.mode = opts.mode;
+      this.autoPush = opts.mode === 'yolo';
+    }
+    if (opts?.model !== undefined) this.model = opts.model.length > 0 ? opts.model : undefined;
+    if (opts?.reasoningEffort && opts.reasoningEffort !== this.effort) {
+      this.effort = opts.reasoningEffort;
+      // effort has no control request in the SDK: drop the runner so the next
+      // turn starts a query with the new option (resuming the same session).
+      this.runner?.close();
+      this.runner = null;
+    }
     // Mark busy before booting the runner so boot failures (e.g. missing CLI
     // binary, spawn errors) surface as turn.failed via SSE instead of a bare
     // HTTP 500 with no event.
@@ -440,16 +491,21 @@ export class ClaudeSession {
     try {
       const { runner, reused } = await this.ensureRunner();
       if (reused) {
-        if (opts?.mode) {
+        // only send control requests for values that actually changed
+        const permissionMode = mapMode(this.mode);
+        if (permissionMode !== this.appliedPermissionMode) {
           try {
-            await runner.setPermissionMode(mapMode(opts.mode));
+            await runner.setPermissionMode(permissionMode);
+            this.appliedPermissionMode = permissionMode;
           } catch {
             /* control request unsupported */
           }
         }
-        if (opts?.model) {
+        if (this.model !== this.appliedModel) {
           try {
-            await runner.setModel(opts.model);
+            // undefined resets the runner to the CLI default
+            await runner.setModel(this.model);
+            this.appliedModel = this.model;
           } catch {
             /* control request unsupported */
           }
@@ -537,7 +593,7 @@ export class ClaudeSession {
           usage,
           ...(commitSha !== undefined ? { commitSha } : {}),
         });
-        if (this.deps.autoPush) {
+        if (this.autoPush) {
           try {
             const pushed = await this.deps.pushBranch();
             if (pushed) {

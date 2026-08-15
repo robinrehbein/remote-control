@@ -36,6 +36,12 @@ function dockerHost(): string | null {
   return raw && raw.length > 0 ? raw : null;
 }
 
+/** Marks a set DOCKER_HOST as the *local* daemon reached through a socket proxy. */
+function dockerHostIsLocal(): boolean {
+  const raw = process.env.DOCKER_HOST_IS_LOCAL?.trim();
+  return raw === '1' || raw === 'true';
+}
+
 function dockerAddr(fallbackHost: string | null): string | null {
   const raw = process.env.DOCKER_ADDR?.trim();
   if (raw && raw.length > 0) return raw;
@@ -82,10 +88,21 @@ function loadNetworkPolicyDefault(): NetworkPolicy {
 function loadNetworkAllowlist(): string[] {
   const raw = process.env.NETWORK_ALLOWLIST?.trim();
   if (!raw) return DEFAULT_NETWORK_ALLOWLIST;
+  return parseAllowlist(raw);
+}
+
+/** Comma separated host list -> normalized allowlist entries. */
+export function parseAllowlist(raw: string): string[] {
   return raw
     .split(',')
     .map((h) => h.trim().toLowerCase())
     .filter((h) => h.length > 0);
+}
+
+/** Shared secret between orchestrator and the remote gateway container. */
+function gatewayToken(): string | null {
+  const raw = process.env.GATEWAY_TOKEN?.trim();
+  return raw && raw.length > 0 ? raw : null;
 }
 
 export const config = {
@@ -95,6 +112,13 @@ export const config = {
   dockerEnabled: loadDockerEnabled(),
   /** null => local /var/run/docker.sock; tcp://host:port => remote daemon (session containers run elsewhere, e.g. orchestrator on Fly.io + Docker host at home) */
   dockerHost: dockerHost(),
+  /**
+   * Marks a set DOCKER_HOST as the same local daemon, only reached through a
+   * docker socket proxy (hardening stage 2, e.g. http://socket-proxy:2375).
+   * Session networks and the egress proxy stay active and no shim ports are
+   * published - i.e. everything behaves exactly like plain socket mode.
+   */
+  dockerHostIsLocal: dockerHostIsLocal(),
   /** Hostname/IP the orchestrator uses to reach published shim ports on the docker host (defaults to DOCKER_HOST's hostname) */
   dockerAddr: dockerAddr(dockerHost()),
   dockerTls: {
@@ -111,4 +135,30 @@ export const config = {
   networkAllowlist: loadNetworkAllowlist(),
   egressProxyPort: Number(process.env.EGRESS_PROXY_PORT ?? 3128),
   sessionPidsLimit: Number(process.env.SESSION_PIDS_LIMIT ?? 512),
+  /**
+   * Remote-runner gateway (see server/src/gateway.ts). Only relevant when the
+   * daemon is truly remote (DOCKER_HOST set, DOCKER_HOST_IS_LOCAL unset):
+   * a single container on the runner that reverse-proxies shim traffic in
+   * (`/s/<sessionId>/...`) and enforces the egress allowlist out, so session
+   * containers can stay on internal per-session networks.
+   *
+   * Without GATEWAY_TOKEN the server keeps the previous remote behaviour
+   * (policy forced to 'open', shim ports published on the docker host).
+   */
+  gatewayToken: gatewayToken(),
+  /** Host port the gateway's ingress listener is published on (fixed, not random). */
+  gatewayPort: Number(process.env.GATEWAY_PORT ?? 8443),
+  /** Image the gateway container runs; must exist on the *runner*. */
+  gatewayImage: process.env.GATEWAY_IMAGE ?? `${process.env.ADAPTER_IMAGE_PREFIX ?? 'pocketagent'}/orchestrator:latest`,
 } as const;
+
+/** Port the gateway listens on inside its container (ingress). */
+export const GATEWAY_INGRESS_PORT = 8443;
+/** Port the gateway's egress proxy listens on inside the session networks. */
+export const GATEWAY_EGRESS_PORT = 3128;
+/** Header carrying the gateway shared secret. */
+export const GATEWAY_AUTH_HEADER = 'x-pocketagent-gateway';
+/** Container name of the managed gateway on the runner. */
+export const GATEWAY_CONTAINER_NAME = 'pocketagent-gateway';
+/** DNS alias the gateway gets inside every session network. */
+export const GATEWAY_ALIAS = 'gateway';

@@ -1,0 +1,22 @@
+{
+  "name": "pocketagent-cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Push provider secrets (Claude setup-token, Kilo auth.json, API keys, ...) from your laptop straight into the PocketAgent server vault via POST /api/secrets - no typing on the phone",
+  "bin": {
+    "pocketagent-secret": "./src/index.ts"
+  },
+  "scripts": {
+    "start": "node src/index.ts",
+    "smoke": "node smoke.ts",
+    "typecheck": "tsc -p . --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "typescript": "^5.9.0"
+  },
+  "engines": {
+    "node": ">=22.18.0"
+  }
+}

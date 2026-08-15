@@ -3,7 +3,7 @@
   "id": "pi",
   "name": "pi",
   "description": "pi coding agent (badlogic) embedded via SDK; ZAI/Kimi/Qwen catalogs, remote approvals via tool_call hook.",
-  "capabilities": { "approvals": true, "resume": true, "streaming": true, "autoPush": true },
+  "capabilities": { "approvals": true, "resume": true, "streaming": true, "autoPush": true, "reasoning": true, "modelSwitch": true },
   "credentials": {},
   "providerEnv": {
     "openai": "OPENAI_API_KEY",
@@ -13,5 +13,13 @@
     "anthropic": "ANTHROPIC_API_KEY",
     "google": "GEMINI_API_KEY"
   },
+  "providers": [
+    { "id": "openai", "name": "OpenAI", "keyUrl": "https://platform.openai.com/api-keys", "hint": "API-Key von platform.openai.com (sk-…)" },
+    { "id": "zai", "name": "Z.AI", "keyUrl": "https://z.ai/manage-apikey/apikey-list", "hint": "API-Key aus dem Z.AI-Dashboard" },
+    { "id": "moonshot", "name": "Moonshot", "keyUrl": "https://platform.moonshot.ai/console/api-keys", "hint": "API-Key von platform.moonshot.ai" },
+    { "id": "kimi", "name": "Kimi", "keyUrl": "https://platform.moonshot.ai/console/api-keys", "hint": "API-Key von platform.moonshot.ai (gleicher Key wie Moonshot)" },
+    { "id": "anthropic", "name": "Anthropic", "keyUrl": "https://console.anthropic.com/settings/keys", "hint": "API-Key von console.anthropic.com (sk-ant-…)" },
+    { "id": "google", "name": "Google Gemini", "keyUrl": "https://aistudio.google.com/apikey", "hint": "API-Key aus Google AI Studio" }
+  ],
   "defaults": { "provider": "openai", "model": "" }
 }

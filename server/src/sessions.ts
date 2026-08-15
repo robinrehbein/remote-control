@@ -5,8 +5,11 @@ import type {
   AgentMode,
   ClientMessage,
   DiffEntry,
+  ModelInfo,
   NetworkPolicy,
   PermissionDecision,
+  PromptRequest,
+  ReasoningEffort,
   ServerMessage,
   SessionInfo,
   SessionStatus,
@@ -16,12 +19,46 @@ import type { LinkRow, RepoRow, SessionRow, Store } from './db.js';
 import { decrypt } from './vault.js';
 import * as docker from './docker.js';
 import { getAdapter } from './adapters.js';
-import { ShimClient } from './shim-client.js';
+import { ShimClient, normalizeModels } from './shim-client.js';
 import { sendPush } from './fcm.js';
 
 const TENANT = 'default';
 
+const AGENT_MODES: readonly AgentMode[] = ['yolo', 'auto', 'acceptEdits', 'ask'];
+const REASONING_EFFORTS: readonly ReasoningEffort[] = ['low', 'medium', 'high'];
+
+export function isAgentMode(v: unknown): v is AgentMode {
+  return typeof v === 'string' && (AGENT_MODES as readonly string[]).includes(v);
+}
+
+export function isReasoningEffort(v: unknown): v is ReasoningEffort {
+  return typeof v === 'string' && (REASONING_EFFORTS as readonly string[]).includes(v);
+}
+
+/**
+ * Prompt body from the session row: mode/model/reasoningEffort are session
+ * state (switchable via `session.update`), so every turn carries them.
+ * Provider only rides along with a model, since runtimes that address models
+ * as provider+model need both.
+ *
+ * `model` is sent whenever the column holds a string - including the empty
+ * string, which is the documented "adapter default" reset every shim
+ * implements (and a no-op for sessions that never picked a model).
+ */
+export function buildPromptBody(row: SessionRow, text: string, mode?: AgentMode): PromptRequest {
+  const effectiveMode = mode ?? (isAgentMode(row.mode) ? row.mode : undefined);
+  return {
+    text,
+    ...(effectiveMode !== undefined ? { mode: effectiveMode } : {}),
+    ...(typeof row.model === 'string'
+      ? { model: row.model, ...(row.provider ? { provider: row.provider } : {}) }
+      : {}),
+    ...(isReasoningEffort(row.reasoning_effort) ? { reasoningEffort: row.reasoning_effort } : {}),
+  };
+}
+
 type CreateMsg = Extract<ClientMessage, { type: 'session.create' }>;
+type UpdateMsg = Extract<ClientMessage, { type: 'session.update' }>;
 type LinkHello = Extract<ClientMessage, { type: 'agent.hello' }>;
 
 /** Transport for link-agent sessions (agent dialed in via outbound WS). */
@@ -77,6 +114,7 @@ export class SessionManager {
       shim_endpoint: null,
       link_id: null,
       network_policy: null,
+      reasoning_effort: null,
       created_at: now,
       last_active_at: now,
     };
@@ -126,6 +164,7 @@ export class SessionManager {
       shim_endpoint: null,
       link_id: null,
       network_policy: networkPolicy,
+      reasoning_effort: null,
       created_at: now,
       last_active_at: now,
     };
@@ -144,7 +183,7 @@ export class SessionManager {
       const cid = await docker.createSessionContainer(staged, env);
       if (!cid) throw new Error('failed to create session container');
       if (!(await docker.startContainer(cid))) throw new Error('failed to start session container');
-      const endpoint = await docker.shimEndpoint(cid);
+      const endpoint = await docker.shimEndpoint(cid, row.id);
       this.store.setProvisioned(row.id, cid, staged.volume_name as string, shimToken);
       this.store.setShimEndpoint(row.id, endpoint);
       const base = this.shimBase(row.id, endpoint);
@@ -161,6 +200,15 @@ export class SessionManager {
 
   private shimBase(id: string, endpoint?: string | null): string {
     return endpoint ?? this.store.getSession(id)?.shim_endpoint ?? `http://${id}:8080`;
+  }
+
+  /**
+   * Shim client for a session base URL. In remote-gateway mode the base URL
+   * points at the gateway (`.../s/<id>`), which requires the shared-secret
+   * header; all local modes add no extra headers.
+   */
+  private shimClient(base: string, token: string): ShimClient {
+    return new ShimClient(base, token, docker.gatewayHeaders());
   }
 
   private buildEnv(
@@ -197,7 +245,7 @@ export class SessionManager {
   }
 
   private async waitForShim(base: string, token: string, timeoutMs: number): Promise<void> {
-    const client = new ShimClient(base, token);
+    const client = this.shimClient(base, token);
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       if (await client.status()) return;
@@ -208,7 +256,7 @@ export class SessionManager {
 
   private connectEvents(id: string, base: string, token: string): void {
     this.clients.get(id)?.stop();
-    const client = new ShimClient(base, token);
+    const client = this.shimClient(base, token);
     this.clients.set(id, client);
     client.startEvents((ev) => this.onEvent(id, ev));
   }
@@ -260,7 +308,7 @@ export class SessionManager {
   private client(id: string): ShimClient {
     const row = this.requireSession(id);
     if (!row.shim_token) throw new Error('session not provisioned');
-    return this.clients.get(id) ?? new ShimClient(this.shimBase(id), row.shim_token);
+    return this.clients.get(id) ?? this.shimClient(this.shimBase(id), row.shim_token);
   }
 
   private async linkCall(
@@ -282,8 +330,9 @@ export class SessionManager {
 
   async prompt(id: string, text: string, mode?: AgentMode): Promise<void> {
     const row = this.requireSession(id);
+    const body = buildPromptBody(row, text, mode);
     if (row.link_id) {
-      const res = await this.linkCall(row, '/prompt', 'POST', { text, mode });
+      const res = await this.linkCall(row, '/prompt', 'POST', body);
       if (!res.ok) {
         this.emitEvent(id, { type: 'error', message: res.error, fatal: true });
         throw new Error(res.error);
@@ -293,12 +342,55 @@ export class SessionManager {
     }
     const client = this.client(id);
     this.setStatus(id, 'running');
-    const res = await client.prompt({ text, mode });
+    const res = await client.prompt(body);
     if (!res || !res.ok) {
       const message = res && !res.ok ? res.error : 'prompt request failed';
       this.setStatus(id, 'error');
       this.emitEvent(id, { type: 'error', message, fatal: true });
     }
+  }
+
+  /**
+   * Persist switchable session settings. The next prompt carries them to the
+   * shim; the updated session is broadcast to every device as `session.status`.
+   */
+  updateSession(msg: UpdateMsg): SessionInfo {
+    const row = this.requireSession(msg.sessionId);
+    if (msg.mode !== undefined && !isAgentMode(msg.mode)) {
+      throw new Error(`invalid mode "${String(msg.mode)}"`);
+    }
+    if (msg.model !== undefined && typeof msg.model !== 'string') {
+      throw new Error('model must be a string');
+    }
+    if (msg.reasoningEffort !== undefined && !isReasoningEffort(msg.reasoningEffort)) {
+      throw new Error(`invalid reasoningEffort "${String(msg.reasoningEffort)}"`);
+    }
+    this.store.updateSessionSettings(row.id, {
+      ...(msg.mode !== undefined ? { mode: msg.mode } : {}),
+      ...(msg.model !== undefined ? { model: msg.model.trim() } : {}),
+      ...(msg.reasoningEffort !== undefined ? { reasoningEffort: msg.reasoningEffort } : {}),
+    });
+    const updated = this.requireSession(row.id);
+    const info = this.toInfo(updated);
+    this.broadcast({
+      type: 'session.status',
+      sessionId: info.id,
+      status: info.status,
+      session: info,
+    });
+    return info;
+  }
+
+  /** Model catalog of the session's shim; unsupported/unreachable -> []. */
+  async models(id: string): Promise<ModelInfo[]> {
+    const row = this.requireSession(id);
+    if (row.link_id) {
+      const res = await this.linkCall(row, '/models', 'GET');
+      if (!res.ok) return [];
+      return normalizeModels(res.body);
+    }
+    if (!row.shim_token) return [];
+    return await this.client(id).models();
   }
 
   async permission(id: string, permissionId: string, decision: PermissionDecision): Promise<void> {
@@ -375,12 +467,12 @@ export class SessionManager {
     }
     if (cid && cid !== row.container_id) this.store.setContainer(id, cid);
     // remote mode assigns a new published port per (re)created container
-    const endpoint = cid ? await docker.shimEndpoint(cid) : row.shim_endpoint;
+    const endpoint = cid ? await docker.shimEndpoint(cid, id) : row.shim_endpoint;
     this.store.setShimEndpoint(id, endpoint);
     const base = this.shimBase(id, endpoint);
     await this.waitForShim(base, row.shim_token, 60_000);
     if (row.session_ref) {
-      const res = await new ShimClient(base, row.shim_token).resume(row.session_ref);
+      const res = await this.shimClient(base, row.shim_token).resume(row.session_ref);
       if (!res?.ok) throw new Error(res && !res.ok ? res.error : 'resume failed');
     }
     this.connectEvents(id, base, row.shim_token);
@@ -439,6 +531,7 @@ export class SessionManager {
       lastActiveAt: row.last_active_at,
       ...(row.pr_url ? { prUrl: row.pr_url } : {}),
       ...(isNetworkPolicy(row.network_policy) ? { networkPolicy: row.network_policy } : {}),
+      ...(row.reasoning_effort ? { reasoningEffort: row.reasoning_effort } : {}),
     };
   }
 

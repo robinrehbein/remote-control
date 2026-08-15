@@ -35,10 +35,45 @@ data class AdapterCapabilities(
     val resume: Boolean = false,
     val streaming: Boolean = false,
     val autoPush: Boolean = false,
+    /** Adapter maps reasoningEffort onto a runtime option. */
+    val reasoning: Boolean = false,
+    /** Adapter honours a per-prompt model override. */
+    val modelSwitch: Boolean = false,
+)
+
+/** Normalized reasoning budget accepted by session.update. */
+@Serializable
+enum class ReasoningEffort { @SerialName("low") LOW, @SerialName("medium") MEDIUM, @SerialName("high") HIGH;
+
+    companion object {
+        fun fromRaw(raw: String?): ReasoningEffort? =
+            raw?.let { value -> entries.firstOrNull { it.name.equals(value, ignoreCase = true) } }
+    }
+}
+
+fun ReasoningEffort.wireName(): String = name.lowercase()
+
+/** One entry of a shim's model catalog (session.models). */
+@Serializable
+data class ModelInfo(
+    val id: String,
+    val name: String? = null,
 )
 
 @Serializable
 data class AdapterDefaults(val provider: String = "", val model: String? = null)
+
+/**
+ * Anzeige-Metadaten zu einem Zugang eines Adapters (id == Secret-Art).
+ * Rein kosmetisch; ältere Server liefern das Feld nicht.
+ */
+@Serializable
+data class ProviderDescriptor(
+    val id: String,
+    val name: String,
+    val keyUrl: String? = null,
+    val hint: String? = null,
+)
 
 @Serializable
 data class AdapterDescriptor(
@@ -49,6 +84,7 @@ data class AdapterDescriptor(
     val capabilities: AdapterCapabilities = AdapterCapabilities(),
     val credentials: Map<String, List<String>> = emptyMap(),
     @SerialName("providerEnv") val providerEnv: Map<String, String> = emptyMap(),
+    val providers: List<ProviderDescriptor> = emptyList(),
     val defaults: AdapterDefaults = AdapterDefaults(),
 )
 
@@ -111,6 +147,7 @@ data class SessionInfo(
     val lastActiveAt: String,
     val prUrl: String? = null,
     val networkPolicy: String? = null,
+    val reasoningEffort: String? = null,
 )
 
 @Serializable
@@ -238,6 +275,14 @@ sealed interface ServerMessage {
         override val type: String get() = "session.deleted"
     }
 
+    data class SessionModelsMsg(
+        val requestId: String,
+        val sessionId: String,
+        val models: List<ModelInfo>,
+    ) : ServerMessage {
+        override val type: String get() = "session.models"
+    }
+
     data class AdapterListMsg(val requestId: String, val adapters: List<AdapterDescriptor>) : ServerMessage {
         override val type: String get() = "adapter.list"
     }
@@ -262,6 +307,21 @@ sealed interface ServerMessage {
         override val type: String get() = "secret.deleted"
     }
 
+    /**
+     * Ergebnis einer Live-Prüfung. Enthält nie den Wert.
+     * [unverified] = für diese Art gibt es keine Prüfung; [ok] ist dann true,
+     * die UI zeigt das aber neutral statt als Erfolg.
+     */
+    data class SecretValidatedMsg(
+        val requestId: String,
+        val kind: String,
+        val ok: Boolean,
+        val detail: String? = null,
+        val unverified: Boolean = false,
+    ) : ServerMessage {
+        override val type: String get() = "secret.validated"
+    }
+
     data class ServerStatsMsg(val requestId: String, val stats: ServerStats) : ServerMessage {
         override val type: String get() = "server.stats"
     }
@@ -273,12 +333,14 @@ fun requestIdOf(msg: ServerMessage): String? = when (msg) {
     is ServerMessage.SessionListMsg -> msg.requestId
     is ServerMessage.SessionDiffMsg -> msg.requestId
     is ServerMessage.SessionDeletedMsg -> msg.requestId
+    is ServerMessage.SessionModelsMsg -> msg.requestId
     is ServerMessage.AdapterListMsg -> msg.requestId
     is ServerMessage.RepoListMsg -> msg.requestId
     is ServerMessage.RepoAddedMsg -> msg.requestId
     is ServerMessage.SecretListMsg -> msg.requestId
     is ServerMessage.SecretSavedMsg -> msg.requestId
     is ServerMessage.SecretDeletedMsg -> msg.requestId
+    is ServerMessage.SecretValidatedMsg -> msg.requestId
     is ServerMessage.ServerStatsMsg -> msg.requestId
     else -> null
 }
@@ -442,6 +504,14 @@ fun parseServerMessage(raw: String): ServerMessage? {
                 },
             )
 
+            "session.models" -> ServerMessage.SessionModelsMsg(
+                requestId = root.optString("requestId") ?: return null,
+                sessionId = root.optString("sessionId") ?: return null,
+                models = root["models"]?.jsonArray?.mapNotNull { el ->
+                    runCatching { ProtocolJson.decodeFromJsonElement(ModelInfo.serializer(), el) }.getOrNull()
+                } ?: emptyList(),
+            )
+
             "session.deleted" -> ServerMessage.SessionDeletedMsg(
                 requestId = root.optString("requestId") ?: return null,
                 sessionId = root.optString("sessionId") ?: return null,
@@ -481,6 +551,14 @@ fun parseServerMessage(raw: String): ServerMessage? {
             "secret.deleted" -> ServerMessage.SecretDeletedMsg(
                 requestId = root.optString("requestId") ?: return null,
                 id = root.optString("id") ?: return null,
+            )
+
+            "secret.validated" -> ServerMessage.SecretValidatedMsg(
+                requestId = root.optString("requestId") ?: return null,
+                kind = root.optString("kind") ?: return null,
+                ok = root["ok"]?.jsonPrimitive?.booleanOrNullCompat() ?: false,
+                detail = root.optString("detail"),
+                unverified = root["unverified"]?.jsonPrimitive?.booleanOrNullCompat() ?: false,
             )
 
             "server.stats" -> ServerMessage.ServerStatsMsg(
@@ -550,6 +628,31 @@ fun encodeSessionPrompt(sessionId: String, text: String, mode: AgentMode?): Stri
     mode?.let { put("mode", it.wireName()) }
 }.toString()
 
+/**
+ * Mode/Modell/Reasoning einer laufenden Session ändern. Alle Felder optional;
+ * leerer Modell-String setzt auf den Adapter-Default zurück.
+ */
+fun encodeSessionUpdate(
+    requestId: String,
+    sessionId: String,
+    mode: AgentMode? = null,
+    model: String? = null,
+    reasoningEffort: ReasoningEffort? = null,
+): String = buildJsonObject {
+    put("type", "session.update")
+    put("requestId", requestId)
+    put("sessionId", sessionId)
+    mode?.let { put("mode", it.wireName()) }
+    model?.let { put("model", it) }
+    reasoningEffort?.let { put("reasoningEffort", it.wireName()) }
+}.toString()
+
+fun encodeSessionModelsGet(requestId: String, sessionId: String): String = buildJsonObject {
+    put("type", "session.models.get")
+    put("requestId", requestId)
+    put("sessionId", sessionId)
+}.toString()
+
 fun encodeSessionPermission(sessionId: String, permissionId: String, decision: PermissionDecision): String = buildJsonObject {
     put("type", "session.permission")
     put("sessionId", sessionId)
@@ -599,6 +702,17 @@ fun encodeRepoAdd(requestId: String, fullName: String, defaultBranch: String): S
 
 fun encodeSecretSet(requestId: String, kind: String, value: String): String = buildJsonObject {
     put("type", "secret.set")
+    put("requestId", requestId)
+    put("kind", kind)
+    put("value", value)
+}.toString()
+
+/**
+ * Key beim Anbieter prüfen lassen, ohne ihn zu speichern. Der Wert geht nur
+ * für die Prüfung an den Server und kommt nie zurück.
+ */
+fun encodeSecretValidate(requestId: String, kind: String, value: String): String = buildJsonObject {
+    put("type", "secret.validate")
     put("requestId", requestId)
     put("kind", kind)
     put("value", value)

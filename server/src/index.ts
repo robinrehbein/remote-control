@@ -7,6 +7,7 @@ import { Store } from './db.js';
 import { SessionManager } from './sessions.js';
 import { Hub, registerWs } from './ws.js';
 import { confirmPairing, generatePairingCode, adminTokenOk } from './pairing.js';
+import { registerSecretsApi } from './secrets-api.js';
 import { startEgressProxy } from './egress-proxy.js';
 
 export interface App {
@@ -47,6 +48,8 @@ export async function buildApp(): Promise<App> {
     const code = generatePairingCode(store);
     return { ok: true, code, expiresAt: new Date(Date.now() + ttlMs).toISOString() };
   });
+
+  registerSecretsApi(app, store);
 
   await app.register(websocket);
   registerWs(app, store, manager, hub);

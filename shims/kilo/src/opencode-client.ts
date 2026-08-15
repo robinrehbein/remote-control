@@ -1,4 +1,5 @@
-import type { DiffEntry, PermissionDecision } from '@pocketagent/protocol';
+import { parseProviderCatalog } from '@pocketagent/protocol';
+import type { DiffEntry, ModelInfo, PermissionDecision } from '@pocketagent/protocol';
 
 export type PermissionForward = 'ok' | 'unavailable' | 'error';
 
@@ -106,6 +107,13 @@ export class OpenCodeClient {
       return Object.values(raw).map(idOf).filter((v): v is string => v !== undefined);
     }
     return [];
+  }
+
+  /** Provider/model catalog; unavailable route or odd shape -> empty list. */
+  async models(): Promise<ModelInfo[]> {
+    const res = await this.json<unknown>('GET', `/config/providers?${this.directoryQuery()}`);
+    if (res.status < 200 || res.status >= 300) return [];
+    return parseProviderCatalog(res.data);
   }
 
   async promptMessage(sessionId: string, body: PromptMessageBody): Promise<number> {

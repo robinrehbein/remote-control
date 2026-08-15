@@ -77,6 +77,21 @@ docker exec -it pocketagent-orchestrator npx tsx src/pair.ts
 
 App installieren (APK aus GitHub Actions Artifact), Server-URL + Code + Gerätename eingeben → Device-Token wird im Keystore verschlüsselt gespeichert. Provider-Keys landen danach NIE auf dem Handy, nur im Server-Vault (Einstellungen → Secrets: `github` PAT mit repo-Scope, `openai`, `zai`, `moonshot`, `anthropic`, `claude_oauth` (setup-token), `junie`).
 
+### Keys vom Laptop hinterlegen
+
+Statt Provider-Keys aufs Handy zu tippen, gehen sie direkt vom Laptop in den Server-Vault: `POST /api/secrets` (Auth: `Authorization: Bearer <PAIRING_ADMIN_TOKEN>`, gleicher Token wie bei `/api/pairing/create` — in `.env` setzen) landet auf demselben Vault-Codepfad wie das `secret.set` der App. Das CLI-Paket `cli/` (`pocketagent-secret`, Node-Builtins only, kein `npm install -g` nötig) macht daraus einen einzeiler:
+
+```bash
+export POCKETAGENT_URL=https://orch.example.com
+export POCKETAGENT_ADMIN_TOKEN=...   # = PAIRING_ADMIN_TOKEN aus .env
+
+node cli/src/index.ts claude                    # führt `claude setup-token` aus, speichert als claude_oauth
+echo sk-... | node cli/src/index.ts openai       # Wert per stdin (pipe)
+cat kilo-auth.json | node cli/src/index.ts kilo  # Datei-Inhalt per stdin (Gateway auth.json)
+```
+
+Ohne Wert-Argument und ohne Pipe fragt die CLI interaktiv (Eingabe versteckt). `http://` wird nur zu `localhost` akzeptiert, sonst `https://` oder explizit `--insecure-http`.
+
 ### 4. Auth-Quellen je Adapter
 
 | Adapter | Secret | Hinweis |
@@ -86,6 +101,10 @@ App installieren (APK aus GitHub Actions Artifact), Server-URL + Code + Geräten
 | claude | `claude_oauth` = `claude setup-token` (Pro/Max, ~1 Jahr gültig) oder `anthropic` API-Key | Token-Erneuerung auf dem Laptop, dann Secret updaten |
 | pi | Provider API-Keys; ZAI/Kimi/Qwen-Subscription-OAuth post-MVP | |
 | junie | `junie` API-Key (usage-based) oder BYOK-Keys (openai/anthropic/...) | Headless one-shot; keine Remote-Approvals (App zeigt Banner) |
+
+Anzeigenamen, Key-Seiten und Einrichtungshinweise stehen im Manifest (`providers`-Feld in `shims/*/adapter.json`) — die App rendert daraus die Provider-Chips und im Zugang-Dialog einen „Key erstellen"-Link, statt eine eigene Tabelle zu pflegen.
+
+**Key prüfen:** Der Dialog hat neben „Speichern" ein „Prüfen", das den Key serverseitig gegen den Anbieter testet (ein billiger Read-Only-Call, 8 s Timeout, Wert wird nie geloggt oder gespeichert). Live-Prüfung gibt es für `openai`, `anthropic`, `groq`, `openrouter`, `moonshot`/`kimi`, `google`, `xai` und `github`; alle übrigen Arten (u. a. `zai`, `claude_oauth`, `junie`, `kilo`) melden neutral „keine Live-Prüfung" und lassen sich trotzdem speichern.
 
 **Neue Harnesses** (Codex CLI, Aider, eigener Agent, ...) ergänzt man als Plugin ohne Server-/App-Änderung — Anleitung in `ADAPTERS.md`.
 
@@ -107,7 +126,7 @@ Android: siehe `android/README.md` (lokal + CI; CI-Workflow liegt in `.github/wo
 - Device-Token: nur SHA-256-Hash in der DB; Token im Android Keystore (AES-GCM)
 - Provider-Secrets: AES-256-GCM im Vault, MASTER_KEY aus Env; pro Session-Container wird nur das Credential des gewählten Adapters/Providers injiziert
 - Session-Container: eigenes Volume, Memory-Limit, per-Session Random-Token für die Shim-API; Yolo-Deny-Liste blockt `git push`/`rm -rf` im Agenten-Kontext (Push läuft nur über den Shim)
-- Bekannte Grenze (Single-User akzeptiert): `docker.sock` im Orchestrator = Root-äquivalent; für Multi-Tenant später rootless Runner (siehe Plan)
+- Bekannte Grenze (Single-User akzeptiert): `docker.sock` im Orchestrator = Root-äquivalent; für Multi-Tenant später rootless Runner (siehe Plan). Auf Shared-Hosts (z. B. Coolify mit weiteren Apps) Blast-Radius beachten → RUNBOOK-Sektion Coolify sowie geplante Alternativen (Socket-Proxy, Remote-Runner)
 
 ## Status / Verifikation
 

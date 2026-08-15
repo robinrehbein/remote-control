@@ -7,7 +7,9 @@ import fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest }
 import type {
   AgentEvent,
   AgentMode,
+  ModelsResponse,
   PromptRequest,
+  ReasoningEffort,
   ShimStatus,
 } from '@pocketagent/protocol';
 import { EventBroadcaster } from './events';
@@ -15,6 +17,33 @@ import { commitTurn, createDraftPr, ensureRepo, getDiff, pushBranch, type GitCon
 import { PromptError, RealPiRunner, type PiRunner, type PromptOutcome } from './pi';
 
 const AGENT_MODES: readonly AgentMode[] = ['yolo', 'auto', 'acceptEdits', 'ask'];
+const REASONING_EFFORTS: readonly ReasoningEffort[] = ['low', 'medium', 'high'];
+
+/**
+ * Auto-push is a property of the *mode of the current turn*, not of the mode
+ * the container booted with: `session.update` switches yolo<->ask mid-session
+ * and the orchestrator carries the effective mode on every prompt, while
+ * AUTO_PUSH is frozen at container start. Prompts without a mode (older
+ * orchestrators) keep the env default.
+ */
+export function autoPushForMode(mode: AgentMode | undefined, envDefault: boolean): boolean {
+  return mode === undefined ? envDefault : mode === 'yolo';
+}
+
+/**
+ * pi addresses models as provider + id, so `model` may carry the
+ * `<provider>/<modelId>` form that GET /models returns; the leading segment
+ * then overrides the request's `provider`.
+ */
+export function splitModelRef(
+  provider: string | undefined,
+  model: string | undefined,
+): { provider?: string; model?: string } {
+  if (model === undefined) return { provider, model };
+  const slash = model.indexOf('/');
+  if (slash > 0) return { provider: model.slice(0, slash), model: model.slice(slash + 1) };
+  return { provider, model };
+}
 
 export interface ShimConfig {
   port: number;
@@ -157,6 +186,8 @@ export function buildApp(deps: AppDeps): FastifyInstance {
     return response;
   });
 
+  app.get('/models', async (): Promise<ModelsResponse> => ({ models: runner.listModels?.() ?? [] }));
+
   app.get('/diff', async () => getDiff(gitCtx));
 
   app.post('/prompt', async (request, reply) => {
@@ -169,8 +200,16 @@ export function buildApp(deps: AppDeps): FastifyInstance {
     if (mode !== undefined && !AGENT_MODES.includes(mode)) {
       return reply.code(400).send({ ok: false, error: `mode must be one of ${AGENT_MODES.join('|')}` });
     }
-    const provider = readString(body, 'provider');
-    const model = readString(body, 'model');
+    const { provider, model } = splitModelRef(
+      readString(body, 'provider'),
+      readString(body, 'model'),
+    );
+    const reasoningEffort = readString(body, 'reasoningEffort') as ReasoningEffort | undefined;
+    if (reasoningEffort !== undefined && !REASONING_EFFORTS.includes(reasoningEffort)) {
+      return reply
+        .code(400)
+        .send({ ok: false, error: `reasoningEffort must be one of ${REASONING_EFFORTS.join('|')}` });
+    }
     try {
       await runner.validateModel(provider, model);
     } catch (error) {
@@ -179,7 +218,7 @@ export function buildApp(deps: AppDeps): FastifyInstance {
     if (runner.status().busy) {
       return reply.code(409).send({ ok: false, error: 'prompt already running' });
     }
-    void runTurn({ text, mode, provider, model });
+    void runTurn({ text, mode, provider, model, reasoningEffort });
     return { ok: true as const };
   });
 
@@ -286,7 +325,7 @@ export function buildApp(deps: AppDeps): FastifyInstance {
         usage: outcome.usage,
         commitSha,
       });
-      if (config.autoPush) await autoPush();
+      if (autoPushForMode(request.mode, config.autoPush)) await autoPush();
     }
     if (commitError) bus.publish({ type: 'error', message: commitError });
     publishStatus();

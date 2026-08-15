@@ -43,10 +43,12 @@ function forbidden(socket: net.Socket): void {
   socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
 }
 
-export function startEgressProxy(opts: EgressProxyOptions = {}): http.Server {
-  const port = opts.port ?? config.egressProxyPort;
-  const allowlist = opts.allowlist ?? config.networkAllowlist;
-
+/**
+ * Build the proxy server without binding it. Used in-process by the
+ * orchestrator (local mode) and standalone by the remote gateway container
+ * (server/src/gateway.ts) — identical filtering logic in both.
+ */
+export function createEgressProxyServer(allowlist: string[]): http.Server {
   const server = http.createServer((req, res) => {
     let target: URL;
     try {
@@ -97,6 +99,13 @@ export function startEgressProxy(opts: EgressProxyOptions = {}): http.Server {
     socket.on('error', () => upstream.destroy());
   });
 
+  return server;
+}
+
+export function startEgressProxy(opts: EgressProxyOptions = {}): http.Server {
+  const port = opts.port ?? config.egressProxyPort;
+  const allowlist = opts.allowlist ?? config.networkAllowlist;
+  const server = createEgressProxyServer(allowlist);
   server.listen(port, '0.0.0.0');
   return server;
 }

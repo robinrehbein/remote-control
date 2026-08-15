@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import Fastify, { type FastifyReply } from 'fastify';
+import { selectModel } from '@pocketagent/protocol';
 import type { AgentMode, PermissionDecision, PromptRequest, ResumeRequest, ShimStatus } from '@pocketagent/protocol';
 import { readEnv, type ShimEnvConfig } from './env';
 import { parsePermissionJson, permissionForMode, writeOpencodeConfig, type PermissionMap } from './modes';
@@ -58,6 +59,16 @@ function spawnOpenCode(env: ShimEnvConfig, onDead: (reason: string) => void): Ch
   return child;
 }
 
+/**
+ * Auto-push is a property of the *mode of the current turn*, not of the mode
+ * the container happened to boot with: `session.update` switches yolo<->ask
+ * mid-session and the orchestrator carries the effective mode on every prompt.
+ * Prompts without a mode (older orchestrators) keep the AUTO_PUSH env default.
+ */
+function autoPushForMode(mode: AgentMode | undefined, envDefault: boolean): boolean {
+  return mode === undefined ? envDefault : mode === 'yolo';
+}
+
 function tokenOk(header: string | undefined, expected: string): boolean {
   if (header === undefined) return false;
   const a = Buffer.from(header);
@@ -100,6 +111,10 @@ async function main(): Promise<void> {
   let provider: string | undefined;
   let model: string | undefined;
   let opencodeSessionId: string | undefined;
+  let autoPush = env.autoPush;
+  // last mode written to opencode.json - re-writing it on every prompt is
+  // pointless work, so the config is only rewritten when the mode changed
+  let appliedMode: AgentMode = mode;
 
   const branch = await gitops.ensureRepo(env);
   writeOpencodeConfig(env.workDir, permission, mode);
@@ -139,7 +154,7 @@ async function main(): Promise<void> {
     getBranch: () => branch,
     getMode: () => mode,
     getProviderModel: () => ({ provider, model }),
-    isAutoPush: () => env.autoPush,
+    isAutoPush: () => autoPush,
     commitTurn: () => gitops.commitTurn(env.workDir),
     pushTurn: () => gitops.pushAndDraftPR(env),
   });
@@ -178,14 +193,22 @@ async function main(): Promise<void> {
     if (typeof text !== 'string' || text.length === 0) {
       return await reply.code(400).send({ ok: false, error: 'text is required' });
     }
-    if (body?.mode !== undefined && MODES.includes(body.mode)) {
-      mode = body.mode;
-      permission = permissionForMode(mode);
-      // best effort: opencode may pick up config changes on new turns
-      writeOpencodeConfig(env.workDir, permission, mode);
+    const promptMode = body?.mode !== undefined && MODES.includes(body.mode) ? body.mode : undefined;
+    if (promptMode !== undefined) {
+      mode = promptMode;
+      if (mode !== appliedMode) {
+        permission = permissionForMode(mode);
+        // best effort: opencode may pick up config changes on new turns
+        writeOpencodeConfig(env.workDir, permission, mode);
+        appliedMode = mode;
+      }
     }
-    if (typeof body?.provider === 'string') provider = body.provider;
-    if (typeof body?.model === 'string') model = body.model;
+    autoPush = autoPushForMode(promptMode, env.autoPush);
+    // reasoningEffort is intentionally ignored: kilo has no per-prompt effort
+    // knob, so the manifest reports capabilities.reasoning === false.
+    const selected = selectModel({ provider, model }, body ?? {});
+    provider = selected.provider;
+    model = selected.model;
     if (opencodeSessionId === undefined) {
       return await reply.code(409).send({ ok: false, error: 'no opencode session' });
     }
@@ -251,6 +274,8 @@ async function main(): Promise<void> {
     }
     return await reply.send({ ok: true });
   });
+
+  app.get('/models', async () => ({ models: await client.models() }));
 
   app.get('/diff', async () => (opencodeSessionId === undefined ? [] : await client.diff(opencodeSessionId)));
 

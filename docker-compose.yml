@@ -6,8 +6,11 @@ services:
     image: pocketagent/orchestrator:latest
     container_name: pocketagent-orchestrator
     restart: unless-stopped
+    # Hinter Reverse-Proxy betreiben (Coolify/Traefik mit TLS); nur zum lokalen
+    # Testen direkt erreichbar. Wer Coolify die Domain routen lässt, kann das
+    # ports-Mapping ganz entfernen.
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
       # Generate once: openssl rand -hex 32
       MASTER_KEY: ${MASTER_KEY:?set MASTER_KEY in .env}
@@ -19,14 +22,68 @@ services:
       ADAPTER_IMAGE_PREFIX: pocketagent
       # Optional: FCM service account JSON (single line) for push notifications
       FCM_SERVICE_ACCOUNT_JSON: ${FCM_SERVICE_ACCOUNT_JSON:-}
+      # ---- Härtung Stufe 2 (Socket-Proxy), siehe RUNBOOK ------------------
+      # Statt des rohen Socket-Mounts unten den Proxy ansprechen. Der Proxy
+      # redet mit DEMSELBEN lokalen Daemon, deshalb DOCKER_HOST_IS_LOCAL=1:
+      # Session-Netze + Egress-Proxy bleiben aktiv, keine Port-Publishes.
+      # DOCKER_HOST: http://socket-proxy:2375
+      # DOCKER_HOST_IS_LOCAL: "1"
+      # ---- Remote-Runner (echter fremder Daemon), siehe FLY.md/RUNBOOK ----
+      # Hier ist DOCKER_HOST_IS_LOCAL bewusst NICHT gesetzt. Ohne GATEWAY_TOKEN
+      # gilt dann Policy 'open' + veröffentlichte Shim-Ports. Mit Token startet
+      # der Orchestrator auf dem Runner den Container 'pocketagent-gateway'
+      # (Ingress :8443 published, Egress :3128 nur in den Session-Netzen) und
+      # Session-Netze/Allowlist funktionieren auch remote.
+      # DOCKER_HOST: tcp://runner.example.com:2376
+      # DOCKER_ADDR: runner.example.com
+      # DOCKER_CLIENT_CA_B64: ${DOCKER_CLIENT_CA_B64:-}
+      # DOCKER_CLIENT_CERT_B64: ${DOCKER_CLIENT_CERT_B64:-}
+      # DOCKER_CLIENT_KEY_B64: ${DOCKER_CLIENT_KEY_B64:-}
+      # GATEWAY_TOKEN: ${GATEWAY_TOKEN:-}        # openssl rand -hex 32, stabil halten
+      # GATEWAY_PORT: "8443"                     # Host-Port des Gateways am Runner
+      # GATEWAY_IMAGE: pocketagent/orchestrator:latest  # muss AUF DEM RUNNER liegen
     volumes:
       - orchestrator-data:/data
+      # Härtung: diesen Mount entfernen und stattdessen DOCKER_HOST=http://socket-proxy:2375
+      # + DOCKER_HOST_IS_LOCAL=1 setzen; Start mit --profile socketproxy
+      # (dann zusätzlich den networks-Block unten aktivieren).
       - /var/run/docker.sock:/var/run/docker.sock
+    # networks:
+    #   - default
+    #   - socketproxy
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://localhost:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 30s
       timeout: 5s
       retries: 3
+
+  # ---- Docker-Socket-Proxy (Härtung Stufe 2, optional) ----------------
+  # Start:  docker compose --profile socketproxy up -d
+  # Reduziert die dem Orchestrator sichtbare Docker-API-Oberfläche; der rohe
+  # Socket liegt dann nur noch im Proxy (read-only gemountet). Freigeschaltet
+  # ist genau das, was server/src/docker.ts braucht: Container create/start/
+  # stop/remove/inspect/wait, Netzwerke inkl. connect/disconnect, Volumes,
+  # Image-Pull. Kein EXEC, kein BUILD, kein SWARM, kein SYSTEM.
+  socket-proxy:
+    profiles: ["socketproxy"]
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: pocketagent-socket-proxy
+    restart: unless-stopped
+    environment:
+      CONTAINERS: "1"
+      IMAGES: "1"
+      NETWORKS: "1"
+      VOLUMES: "1"
+      POST: "1"
+      EXEC: "0"
+      BUILD: "0"
+      SWARM: "0"
+      SYSTEM: "0"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    # Bewusst kein ports-Mapping: nur über das interne Netz erreichbar.
+    networks:
+      - socketproxy
 
   # ---- adapter shim images (build-only, never run) --------------------
   # Build all:  docker compose --profile shims build
@@ -61,3 +118,8 @@ services:
 
 volumes:
   orchestrator-data:
+
+networks:
+  # Internes Netz nur für orchestrator <-> socket-proxy (kein Egress).
+  socketproxy:
+    internal: true

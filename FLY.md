@@ -20,9 +20,10 @@ DEIN DOCKER-HOST (Coolify-Server zuhause)
 ```
 
 Der Orchestrator verbindet sich per `DOCKER_HOST` mit dem Docker-Daemon deines
-Servers, erstellt Container/Volumes dort und erreicht die Shims über
-veröffentlichte Ports (`DOCKER_ADDR`). Ab Fly ist alles identisch zur
-Selfhost-Variante.
+Servers, erstellt Container/Volumes dort und erreicht die Shims entweder über
+veröffentlichte Ports (`DOCKER_ADDR`, Standard) oder — empfohlen — über einen
+**Gateway-Container** auf dem Docker-Host (`GATEWAY_TOKEN`, siehe unten). Ab Fly
+ist alles identisch zur Selfhost-Variante.
 
 ## Voraussetzungen
 
@@ -49,12 +50,13 @@ Selfhost-Variante.
        -CAcreateserial -out client-cert.pem -extfile extfile-client.cnf
      ```
    - Daemon neustarten; Firewall: Port 2376 **nur** für Fly-Egress offenhalten
-     (idealerweise auf Fly-IPs einschränken).
+     (idealerweise auf Fly-IPs einschränken). Mit Gateway zusätzlich
+     `GATEWAY_PORT` (Default 8443) für dieselben IPs freigeben.
 
 3. **Adapter-Images auf dem Docker-Host bauen** (nicht auf Fly — die Container
    laufen dort!). Auf dem Coolify-Server, im Repo:
    ```bash
-   docker build -f server/Dockerfile         -t pocketagent/orchestrator:latest .   # nur falls auch lokal betrieben
+   docker build -f server/Dockerfile         -t pocketagent/orchestrator:latest .   # Pflicht für den Gateway-Modus (siehe unten)
    docker build -f shims/opencode/Dockerfile -t pocketagent/opencode-shim:latest .
    docker build -f shims/kilo/Dockerfile     -t pocketagent/kilo-shim:latest .
    docker build -f shims/claude/Dockerfile   -t pocketagent/claude-shim:latest .
@@ -79,13 +81,43 @@ fly secrets set \
   DOCKER_CLIENT_KEY_B64="$(B64 client-key.pem)" \
   SESSION_MEM_LIMIT="2g" \
   IDLE_STOP_SEC="900" \
-  GC_DAYS="14"
+  GC_DAYS="14" \
+  GATEWAY_TOKEN="$(openssl rand -hex 32)"
+  # optional: GATEWAY_PORT=8443, GATEWAY_IMAGE=..., NETWORK_ALLOWLIST=...
   # optional: FCM_SERVICE_ACCOUNT_JSON='{...single line...}'
 
 fly deploy
 ```
 
 Danach: `fly status`, Health-Check grün unter `https://<app>.fly.dev/api/health`.
+
+## Netzwerk-Policies im Remote-Modus (Gateway)
+
+Ohne Zusatz erzwingt der Remote-Modus Policy `open` und veröffentlicht je
+Session einen Shim-Port auf dem Docker-Host — der Orchestrator läuft dort ja
+nicht als Container und kann sich weder in ein Session-Netz hängen noch einen
+internen Egress-Proxy anbieten.
+
+Mit gesetztem `GATEWAY_TOKEN` startet der Orchestrator auf dem Docker-Host
+einen einzelnen Container `pocketagent-gateway` (aus dem Orchestrator-Image,
+`GATEWAY_IMAGE`, Kommando `npx tsx src/gateway.ts`). Der Gateway hängt am
+Default-Bridge-Netz *und* in jedem Session-Netz (Alias `gateway`):
+
+- **Ingress** `:8443` (einziger veröffentlichter Host-Port, Auth per Header
+  `x-pocketagent-gateway`): `/s/<sessionId>/<pfad>` → `http://<sessionId>:8080/<pfad>`,
+  SSE inklusive.
+- **Egress** `:3128` (nicht veröffentlicht): Allowlist-Forward-Proxy, exakt die
+  Filterlogik des lokalen In-Process-Proxys. Sessions mit Policy `allowlist`
+  bekommen `HTTP(S)_PROXY=http://gateway:3128`.
+
+Session-Container liegen damit in `Internal: true`-Netzen: kein eigener
+Host-Port, kein direkter Internetzugang. Details, Firewall-Regeln und
+Prüfschritte: `RUNBOOK.md` → „Remote-Runner mit Netzwerk-Policies".
+
+**Ohne `GATEWAY_TOKEN`** bleibt es beim alten Verhalten (`open` + veröffentlichte
+Ports); beim ersten Session-Start warnt der Log entsprechend. Voraussetzung für
+den Gateway-Modus: Das Orchestrator-Image muss **auf dem Docker-Host** vorhanden
+sein (siehe Build-Schritt oben).
 
 ## App koppeln & Secrets
 

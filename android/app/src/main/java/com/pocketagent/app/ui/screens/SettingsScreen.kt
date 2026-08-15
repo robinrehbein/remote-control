@@ -7,6 +7,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -22,15 +23,20 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.Logout
+import androidx.compose.material.icons.automirrored.outlined.OpenInNew
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.outlined.CheckCircleOutline
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Edit
+import androidx.compose.material.icons.outlined.ErrorOutline
 import androidx.compose.material.icons.outlined.Fingerprint
 import androidx.compose.material.icons.outlined.Folder
+import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Key
 import androidx.compose.material.icons.outlined.Visibility
 import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
@@ -58,6 +64,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -72,7 +79,9 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.pocketagent.app.PocketAgentApp
 import com.pocketagent.app.data.AdapterDescriptor
 import com.pocketagent.app.data.AppRepository
+import com.pocketagent.app.data.ProviderDescriptor
 import com.pocketagent.app.data.SecretInfo
+import com.pocketagent.app.data.SecretValidation
 import com.pocketagent.app.data.WsClient
 import com.pocketagent.app.ui.theme.CardInset
 import com.pocketagent.app.ui.theme.SectionSpacing
@@ -106,6 +115,11 @@ class SettingsViewModel : ViewModel() {
             )
             onDone()
         }
+    }
+
+    /** Live-Prüfung beim Anbieter; unabhängig vom Speichern. */
+    fun validateSecret(kind: String, value: String, onResult: (Result<SecretValidation>) -> Unit) {
+        viewModelScope.launch { onResult(repository.validateSecret(kind, value)) }
     }
 
     fun deleteSecret(id: String) {
@@ -143,6 +157,8 @@ private data class SecretMeta(
     val displayName: String,
     val description: String,
     val multiline: Boolean = false,
+    /** Seite zum Erstellen des Keys — kommt aus dem Adapter-Manifest. */
+    val keyUrl: String? = null,
 )
 
 private val SECRET_CATALOG = listOf(
@@ -169,16 +185,46 @@ private val KIND_PREFIXES = mapOf(
     "openrouter" to listOf("sk-or-"),
 )
 
-/** Static catalog + fallback entries for kinds only known from adapter descriptors. */
+/**
+ * Der statische Katalog bleibt die Grundlage (er kennt auch Arten, die kein
+ * installierter Adapter meldet), wird aber pro Art mit den Manifest-Angaben
+ * des Servers überschrieben — der Server weiß besser, wie sein Adapter den
+ * Zugang nennt und wo man den Key holt.
+ */
 private fun buildCatalog(adapters: List<AdapterDescriptor>): List<SecretMeta> {
+    val manifest = LinkedHashMap<String, ProviderDescriptor>()
+    adapters.forEach { adapter ->
+        adapter.providers.forEach { provider ->
+            if (provider.id !in manifest) manifest[provider.id] = provider
+        }
+    }
+
+    val enriched = SECRET_CATALOG.map { meta ->
+        val provider = manifest[meta.kind] ?: return@map meta
+        meta.copy(
+            displayName = provider.name.ifBlank { meta.displayName },
+            description = provider.hint?.takeIf { it.isNotBlank() } ?: meta.description,
+            keyUrl = provider.keyUrl,
+        )
+    }
+
     val known = SECRET_CATALOG.map { it.kind }.toSet()
     val dynamic = adapters
         .flatMap { it.credentials.keys + it.providerEnv.keys }
         .distinct()
         .filter { it !in known }
         .sorted()
-        .map { SecretMeta(it, it, "Wird von einem installierten Adapter genutzt") }
-    return SECRET_CATALOG + dynamic
+        .map { kind ->
+            val provider = manifest[kind]
+            SecretMeta(
+                kind = kind,
+                displayName = provider?.name?.takeIf { it.isNotBlank() } ?: kind,
+                description = provider?.hint?.takeIf { it.isNotBlank() }
+                    ?: "Wird von einem installierten Adapter genutzt",
+                keyUrl = provider?.keyUrl,
+            )
+        }
+    return enriched + dynamic
 }
 
 private fun metaFor(kind: String, catalog: List<SecretMeta>): SecretMeta =
@@ -421,6 +467,7 @@ fun SettingsScreen(onBack: () -> Unit) {
             initialKind = secretDialogKind,
             onDismiss = { showSecretDialog = false },
             onSave = { kind, value -> vm.addSecret(kind, value) { showSecretDialog = false } },
+            onValidate = { kind, value, onResult -> vm.validateSecret(kind, value, onResult) },
         )
     }
     manageSecret?.let { secret ->
@@ -678,12 +725,23 @@ private fun SecretDialog(
     initialKind: String?,
     onDismiss: () -> Unit,
     onSave: (kind: String, value: String) -> Unit,
+    onValidate: (kind: String, value: String, onResult: (Result<SecretValidation>) -> Unit) -> Unit,
 ) {
     var selectedKind by remember(initialKind) { mutableStateOf(initialKind) }
     var customKind by remember { mutableStateOf("") }
     var value by remember { mutableStateOf("") }
     var showValue by remember { mutableStateOf(false) }
     var expanded by remember { mutableStateOf(false) }
+    var checking by remember { mutableStateOf(false) }
+    var check by remember { mutableStateOf<SecretValidation?>(null) }
+    var checkError by remember { mutableStateOf<String?>(null) }
+    val uriHandler = LocalUriHandler.current
+
+    // Ein Ergebnis gilt immer nur für genau den Wert, der geprüft wurde.
+    fun resetCheck() {
+        check = null
+        checkError = null
+    }
 
     val customMode = selectedKind == CUSTOM_KIND
     val selectedMeta = selectedKind?.takeIf { it != CUSTOM_KIND }?.let { metaFor(it, catalog) }
@@ -741,6 +799,7 @@ private fun SecretDialog(
                                 },
                                 onClick = {
                                     selectedKind = meta.kind
+                                    resetCheck()
                                     expanded = false
                                 },
                             )
@@ -749,6 +808,7 @@ private fun SecretDialog(
                             text = { Text("Eigene Art …") },
                             onClick = {
                                 selectedKind = CUSTOM_KIND
+                                resetCheck()
                                 expanded = false
                             },
                         )
@@ -758,7 +818,7 @@ private fun SecretDialog(
                 if (customMode) {
                     OutlinedTextField(
                         value = customKind,
-                        onValueChange = { customKind = it },
+                        onValueChange = { customKind = it; resetCheck() },
                         label = { Text("Eigene Art") },
                         supportingText = { Text("Kleinbuchstaben und Unterstriche, z. B. mein_provider") },
                         singleLine = true,
@@ -780,10 +840,26 @@ private fun SecretDialog(
                     )
                 }
 
+                // Der Weg zum Key gehört dorthin, wo er gebraucht wird.
+                selectedMeta?.keyUrl?.takeIf { it.isNotBlank() }?.let { url ->
+                    TextButton(
+                        onClick = { runCatching { uriHandler.openUri(url) } },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                    ) {
+                        Icon(
+                            Icons.AutoMirrored.Outlined.OpenInNew,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp),
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Key erstellen")
+                    }
+                }
+
                 if (multiline) {
                     OutlinedTextField(
                         value = value,
-                        onValueChange = { value = it },
+                        onValueChange = { value = it; resetCheck() },
                         label = { Text("Wert") },
                         minLines = 3,
                         maxLines = 6,
@@ -794,7 +870,7 @@ private fun SecretDialog(
                 } else {
                     OutlinedTextField(
                         value = value,
-                        onValueChange = { value = it },
+                        onValueChange = { value = it; resetCheck() },
                         label = { Text("Wert") },
                         singleLine = true,
                         shape = MaterialTheme.shapes.small,
@@ -825,16 +901,82 @@ private fun SecretDialog(
                         modifier = Modifier.fillMaxWidth(),
                     )
                 }
+
+                CheckResultRow(checking = checking, result = check, error = checkError)
             }
         },
         confirmButton = {
-            TextButton(
-                onClick = { onSave(effectiveKind, value.trim()) },
-                enabled = effectiveKind.isNotBlank() && value.isNotBlank(),
-            ) { Text("Speichern") }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                // Prüfen ist optional: Speichern bleibt jederzeit möglich,
+                // auch wenn die Prüfung fehlschlägt oder gar nicht existiert.
+                TextButton(
+                    onClick = {
+                        checking = true
+                        resetCheck()
+                        onValidate(effectiveKind, value.trim()) { result ->
+                            checking = false
+                            result.fold(
+                                onSuccess = { check = it },
+                                onFailure = { checkError = it.message ?: "Prüfung fehlgeschlagen" },
+                            )
+                        }
+                    },
+                    enabled = !checking && effectiveKind.isNotBlank() && value.isNotBlank(),
+                ) { Text("Prüfen") }
+                Spacer(modifier = Modifier.width(4.dp))
+                TextButton(
+                    onClick = { onSave(effectiveKind, value.trim()) },
+                    enabled = effectiveKind.isNotBlank() && value.isNotBlank(),
+                ) { Text("Speichern") }
+            }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("Abbrechen") }
         },
     )
+}
+
+/**
+ * Ergebniszeile der Live-Prüfung. Grün nur bei bestätigtem Key; Arten ohne
+ * Prüfung bleiben bewusst neutral, damit „ungeprüft" nicht wie „geprüft" aussieht.
+ */
+@Composable
+private fun CheckResultRow(
+    checking: Boolean,
+    result: SecretValidation?,
+    error: String?,
+) {
+    if (!checking && result == null && error == null) return
+
+    val (icon, tint, text) = when {
+        checking -> Triple(null, MaterialTheme.colorScheme.onSurfaceVariant, "Key wird geprüft …")
+        error != null -> Triple(Icons.Outlined.ErrorOutline, MaterialTheme.colorScheme.error, error)
+        result != null && result.unverified -> Triple(
+            Icons.Outlined.Info,
+            MaterialTheme.colorScheme.onSurfaceVariant,
+            result.detail ?: "Keine Live-Prüfung verfügbar — gespeichert wird trotzdem",
+        )
+
+        result != null && result.ok -> Triple(
+            Icons.Outlined.CheckCircleOutline,
+            semantic().success,
+            result.detail ?: "Key funktioniert",
+        )
+
+        else -> Triple(
+            Icons.Outlined.ErrorOutline,
+            MaterialTheme.colorScheme.error,
+            result?.detail ?: "Key konnte nicht bestätigt werden",
+        )
+    }
+
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+        if (icon == null) {
+            CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.size(16.dp))
+        } else {
+            Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(16.dp))
+        }
+        Spacer(modifier = Modifier.width(8.dp))
+        Text(text, style = MaterialTheme.typography.bodySmall, color = tint)
+    }
 }

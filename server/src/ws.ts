@@ -8,6 +8,7 @@ import type { Store } from './db.js';
 import { listAdapters } from './adapters.js';
 import type { SessionManager } from './sessions.js';
 import { encrypt } from './vault.js';
+import { validateSecret } from './secret-validate.js';
 
 export class Hub {
   private readonly sockets = new Set<WebSocket>();
@@ -220,6 +221,25 @@ export function registerWs(
             send({ type: 'error', sessionId: msg.sessionId, message: errText(e) }),
           );
           return;
+        case 'session.update': {
+          try {
+            const session = manager.updateSession(msg);
+            // session.status already went to every device; ack the requester
+            send({ type: 'request.ok', requestId: msg.requestId, payload: { session } });
+          } catch (e) {
+            send({ type: 'error', requestId: msg.requestId, sessionId: msg.sessionId, message: errText(e) });
+          }
+          return;
+        }
+        case 'session.models.get': {
+          try {
+            const models = await manager.models(msg.sessionId);
+            send({ type: 'session.models', requestId: msg.requestId, sessionId: msg.sessionId, models });
+          } catch (e) {
+            send({ type: 'error', requestId: msg.requestId, sessionId: msg.sessionId, message: errText(e) });
+          }
+          return;
+        }
         case 'session.permission':
           await manager.permission(msg.sessionId, msg.permissionId, msg.decision).catch((e) =>
             send({ type: 'error', sessionId: msg.sessionId, message: errText(e) }),
@@ -303,6 +323,20 @@ export function registerWs(
               secret: { id: saved.id, kind: saved.kind, createdAt: saved.created_at },
             });
           }
+          return;
+        }
+        case 'secret.validate': {
+          // msg.value is passed straight to the provider check and never
+          // stored or logged; the answer carries kind/ok/detail only.
+          const result = await validateSecret(msg.kind, msg.value);
+          send({
+            type: 'secret.validated',
+            requestId: msg.requestId,
+            kind: msg.kind,
+            ok: result.ok,
+            ...(result.detail ? { detail: result.detail } : {}),
+            ...(result.unverified ? { unverified: true } : {}),
+          });
           return;
         }
         case 'secret.list': {

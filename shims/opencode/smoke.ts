@@ -255,9 +255,21 @@ async function main(): Promise<void> {
     await startEventCollector();
     await sleep(300);
 
-    const prompt = await api<{ ok: boolean }>('POST', '/prompt', { text: 'say hi' });
+    // catalog route: the fake has no /config/providers -> empty list, no error
+    const models = await api<{ models: unknown[] }>('GET', '/models');
+    assert(models.status === 200 && Array.isArray(models.data?.models), 'GET /models -> {models:[...]}');
+
+    const prompt = await api<{ ok: boolean }>('POST', '/prompt', {
+      text: 'say hi',
+      model: 'zai/glm-4.6',
+      reasoningEffort: 'high',
+    });
     assert(prompt.status === 200 && prompt.data?.ok === true, 'POST /prompt -> {ok:true}');
     assert(prompts.length === 1 && prompts[0] !== undefined && prompts[0].includes('say hi'), 'prompt forwarded to opencode');
+    assert(
+      (prompts[0] ?? '').includes('"providerID":"zai"') && (prompts[0] ?? '').includes('"modelID":"glm-4.6"'),
+      'provider/model split from the "provider/model" form',
+    );
 
     await waitFor((e) => e.type === 'permission.request', 'permission.request');
     const permReq = collected.find((e): e is Extract<AgentEvent, { type: 'permission.request' }> => e.type === 'permission.request');

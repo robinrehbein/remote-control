@@ -6,7 +6,9 @@ import type {
   AgentMode,
   AgentEvent,
   DiffEntry,
+  ModelsResponse,
   PromptRequest,
+  ReasoningEffort,
   ResumeRequest,
   ShimStatus,
 } from '@pocketagent/protocol';
@@ -15,6 +17,7 @@ import type { FastifyInstance } from 'fastify';
 import path from 'node:path';
 import { realpathSync } from 'node:fs';
 import {
+  CLAUDE_MODELS,
   ClaudeSession,
   hasCredentials,
   sdkRunnerFactory,
@@ -23,6 +26,8 @@ import {
 import type { RunnerFactory } from './claude.ts';
 import { EventBroadcaster } from './events.ts';
 import { commitTurn, ensureRepo, getDiff, pushAndCreatePr } from './gitops.ts';
+
+const REASONING_EFFORTS: readonly ReasoningEffort[] = ['low', 'medium', 'high'];
 
 export interface ShimConfig {
   token: string;
@@ -95,8 +100,15 @@ export function buildServer(cfg: ShimConfig, runnerFactory?: RunnerFactory): Fas
     if (typeof body?.text !== 'string' || body.text.trim().length === 0) {
       return reply.code(400).send({ ok: false, error: 'text required' });
     }
+    if (body.reasoningEffort !== undefined && !REASONING_EFFORTS.includes(body.reasoningEffort)) {
+      return reply.code(400).send({ ok: false, error: 'reasoningEffort must be low|medium|high' });
+    }
     try {
-      await session.prompt(body.text, { mode: body.mode, model: body.model });
+      await session.prompt(body.text, {
+        mode: body.mode,
+        model: body.model,
+        reasoningEffort: body.reasoningEffort,
+      });
       return { ok: true };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -138,6 +150,8 @@ export function buildServer(cfg: ShimConfig, runnerFactory?: RunnerFactory): Fas
       return { ok: true };
     },
   );
+
+  app.get('/models', async (): Promise<ModelsResponse> => ({ models: [...CLAUDE_MODELS] }));
 
   app.get('/diff', async (): Promise<DiffEntry[]> => {
     try {

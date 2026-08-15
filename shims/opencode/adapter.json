@@ -3,7 +3,7 @@
   "id": "opencode",
   "name": "OpenCode",
   "description": "OpenCode headless server; 75+ providers via Models.dev, custom OpenAI-compatible endpoints. Kilo-CLI-compatible API.",
-  "capabilities": { "approvals": true, "resume": true, "streaming": true, "autoPush": true },
+  "capabilities": { "approvals": true, "resume": true, "streaming": true, "autoPush": true, "reasoning": false, "modelSwitch": true },
   "credentials": {},
   "providerEnv": {
     "openai": "OPENAI_API_KEY",
@@ -14,5 +14,14 @@
     "groq": "GROQ_API_KEY",
     "openrouter": "OPENROUTER_API_KEY"
   },
+  "providers": [
+    { "id": "openai", "name": "OpenAI", "keyUrl": "https://platform.openai.com/api-keys", "hint": "API-Key von platform.openai.com (sk-…)" },
+    { "id": "zai", "name": "Z.AI", "keyUrl": "https://z.ai/manage-apikey/apikey-list", "hint": "API-Key aus dem Z.AI-Dashboard" },
+    { "id": "moonshot", "name": "Moonshot", "keyUrl": "https://platform.moonshot.ai/console/api-keys", "hint": "API-Key von platform.moonshot.ai" },
+    { "id": "anthropic", "name": "Anthropic", "keyUrl": "https://console.anthropic.com/settings/keys", "hint": "API-Key von console.anthropic.com (sk-ant-…)" },
+    { "id": "google", "name": "Google Gemini", "keyUrl": "https://aistudio.google.com/apikey", "hint": "API-Key aus Google AI Studio" },
+    { "id": "groq", "name": "Groq", "keyUrl": "https://console.groq.com/keys", "hint": "API-Key von console.groq.com" },
+    { "id": "openrouter", "name": "OpenRouter", "keyUrl": "https://openrouter.ai/settings/keys", "hint": "API-Key von openrouter.ai (sk-or-…)" }
+  ],
   "defaults": { "provider": "zai", "model": "" }
 }

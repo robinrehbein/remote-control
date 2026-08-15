@@ -9,6 +9,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -21,8 +22,10 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -52,6 +55,7 @@ import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
@@ -81,9 +85,14 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.pocketagent.app.PocketAgentApp
+import com.pocketagent.app.data.AdapterCapabilities
+import com.pocketagent.app.data.AdapterDescriptor
 import com.pocketagent.app.data.AgentEvent
+import com.pocketagent.app.data.AgentMode
 import com.pocketagent.app.data.AppRepository
+import com.pocketagent.app.data.ModelInfo
 import com.pocketagent.app.data.PermissionDecision
+import com.pocketagent.app.data.ReasoningEffort
 import com.pocketagent.app.data.SessionInfo
 import com.pocketagent.app.data.SessionStatus
 import com.pocketagent.app.data.wireName
@@ -93,10 +102,14 @@ import com.pocketagent.app.ui.theme.ContentInset
 import com.pocketagent.app.ui.theme.MinTouchTarget
 import com.pocketagent.app.ui.theme.MonoMedium
 import com.pocketagent.app.ui.theme.PillShape
+import com.pocketagent.app.ui.theme.RadioRowDividerInset
 import com.pocketagent.app.ui.theme.ScreenGutter
 import com.pocketagent.app.ui.theme.semantic
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 /* ------------------------------------------------------------------ */
@@ -140,6 +153,14 @@ sealed interface TimelineItem {
     data class Error(val message: String) : TimelineItem
 }
 
+/** Ladezustand des Modellkatalogs (session.models.get). */
+sealed interface ModelsState {
+    data object Idle : ModelsState
+    data object Loading : ModelsState
+    data class Loaded(val models: List<ModelInfo>) : ModelsState
+    data class Failed(val message: String) : ModelsState
+}
+
 class SessionViewModel : ViewModel() {
     lateinit var repository: AppRepository
     var sessionId: String = ""
@@ -159,6 +180,17 @@ class SessionViewModel : ViewModel() {
     private val _deleted = MutableStateFlow(false)
     val deleted: StateFlow<Boolean> = _deleted
 
+    private val _adapters = MutableStateFlow<List<AdapterDescriptor>>(emptyList())
+
+    private val _models = MutableStateFlow<ModelsState>(ModelsState.Idle)
+    val models: StateFlow<ModelsState> = _models
+
+    /** Capabilities des Adapters dieser Session (leer, solange nichts geladen ist). */
+    val capabilities: StateFlow<AdapterCapabilities> =
+        combine(_session, _adapters) { session, adapters ->
+            adapters.firstOrNull { it.id == session?.adapter }?.capabilities ?: AdapterCapabilities()
+        }.stateIn(viewModelScope, SharingStarted.Eagerly, AdapterCapabilities())
+
     fun bind(id: String, repo: AppRepository) {
         if (sessionId == id) return
         sessionId = id
@@ -173,7 +205,11 @@ class SessionViewModel : ViewModel() {
                 if (envelope.sessionId == id) applyEvent(envelope.event)
             }
         }
+        viewModelScope.launch {
+            repository.adapters.collect { list -> _adapters.value = list }
+        }
         viewModelScope.launch { repository.refreshSessions() }
+        viewModelScope.launch { if (repository.adapters.value.isEmpty()) repository.refreshAdapters() }
     }
 
     private fun applyEvent(event: AgentEvent) {
@@ -251,6 +287,38 @@ class SessionViewModel : ViewModel() {
         }
     }
 
+    /* ---------------- Modus / Modell / Reasoning ---------------- */
+
+    private fun update(
+        mode: AgentMode? = null,
+        model: String? = null,
+        reasoningEffort: ReasoningEffort? = null,
+    ) {
+        viewModelScope.launch {
+            // Erfolgsfall aktualisiert die UI über das session.status-Handling
+            repository.updateSession(sessionId, mode, model, reasoningEffort)
+                .onFailure { append(TimelineItem.Error("Änderung fehlgeschlagen: ${it.message}")) }
+        }
+    }
+
+    fun setMode(mode: AgentMode) = update(mode = mode)
+
+    /** Leerer String setzt auf den Adapter-Default zurück. */
+    fun setModel(model: String) = update(model = model.trim())
+
+    fun setReasoning(effort: ReasoningEffort) = update(reasoningEffort = effort)
+
+    fun loadModels() {
+        if (_models.value is ModelsState.Loading) return
+        _models.value = ModelsState.Loading
+        viewModelScope.launch {
+            _models.value = repository.loadModels(sessionId).fold(
+                onSuccess = { ModelsState.Loaded(it) },
+                onFailure = { ModelsState.Failed(it.message ?: "Unbekannter Fehler") },
+            )
+        }
+    }
+
     fun abort() = repository.sendAbort(sessionId)
     fun stop() = repository.sendStop(sessionId)
     fun resume() = repository.sendResume(sessionId)
@@ -283,8 +351,12 @@ fun SessionScreen(
     val input by vm.input.collectAsState()
     val busy by vm.busy.collectAsState()
     val deleted by vm.deleted.collectAsState()
+    val capabilities by vm.capabilities.collectAsState()
+    val models by vm.models.collectAsState()
 
     LaunchedEffect(deleted) { if (deleted) onBack() }
+
+    var sheet by remember { mutableStateOf<SessionSheet?>(null) }
 
     val listState = androidx.compose.foundation.lazy.rememberLazyListState()
     LaunchedEffect(items.size) {
@@ -394,6 +466,41 @@ fun SessionScreen(
                             )
                         }
                     }
+                    // Kompakte Chip-Reihe: aktiver Modus immer, Modell und
+                    // Reasoning nur, wenn der Adapter sie wirklich unterstützt.
+                    session?.let { s ->
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState())
+                                .padding(start = ScreenGutter, end = ScreenGutter, top = 2.dp, bottom = 4.dp),
+                        ) {
+                            SettingChip(
+                                label = "Modus",
+                                value = modeLabel(s.mode),
+                                onClick = { sheet = SessionSheet.MODE },
+                            )
+                            if (capabilities.modelSwitch) {
+                                SettingChip(
+                                    label = "Modell",
+                                    value = s.model.ifBlank { "Standard" },
+                                    onClick = {
+                                        sheet = SessionSheet.MODEL
+                                        vm.loadModels()
+                                    },
+                                )
+                            }
+                            if (capabilities.reasoning) {
+                                SettingChip(
+                                    label = "Reasoning",
+                                    value = reasoningLabel(ReasoningEffort.fromRaw(s.reasoningEffort)),
+                                    onClick = { sheet = SessionSheet.REASONING },
+                                )
+                            }
+                        }
+                    }
                     Row(
                         verticalAlignment = Alignment.Bottom,
                         modifier = Modifier
@@ -482,6 +589,30 @@ fun SessionScreen(
         }
     }
 
+    when (sheet) {
+        SessionSheet.MODE -> ModeSheet(
+            current = session?.mode,
+            onDismiss = { sheet = null },
+            onPick = { mode -> sheet = null; vm.setMode(mode) },
+        )
+
+        SessionSheet.MODEL -> ModelSheet(
+            current = session?.model.orEmpty(),
+            state = models,
+            onDismiss = { sheet = null },
+            onRetry = { vm.loadModels() },
+            onPick = { model -> sheet = null; vm.setModel(model) },
+        )
+
+        SessionSheet.REASONING -> ReasoningSheet(
+            current = ReasoningEffort.fromRaw(session?.reasoningEffort),
+            onDismiss = { sheet = null },
+            onPick = { effort -> sheet = null; vm.setReasoning(effort) },
+        )
+
+        null -> Unit
+    }
+
     if (confirmDelete) {
         AlertDialog(
             onDismissRequest = { confirmDelete = false },
@@ -494,6 +625,242 @@ fun SessionScreen(
                 TextButton(onClick = { confirmDelete = false }) { Text("Abbrechen") }
             },
         )
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Modus / Modell / Reasoning — Chips + Bottom Sheets                  */
+/* ------------------------------------------------------------------ */
+
+enum class SessionSheet { MODE, MODEL, REASONING }
+
+fun modeLabel(mode: AgentMode): String = when (mode) {
+    AgentMode.ASK -> "Ask"
+    AgentMode.ACCEPT_EDITS -> "Accept Edits"
+    AgentMode.AUTO -> "Auto"
+    AgentMode.YOLO -> "Yolo"
+}
+
+fun reasoningLabel(effort: ReasoningEffort?): String = when (effort) {
+    ReasoningEffort.LOW -> "Niedrig"
+    ReasoningEffort.MEDIUM -> "Mittel"
+    ReasoningEffort.HIGH -> "Hoch"
+    null -> "Standard"
+}
+
+/** Kompakter Pill-Chip: Label klein und grau, aktiver Wert darunter/daneben. */
+@Composable
+private fun SettingChip(label: String, value: String, onClick: () -> Unit) {
+    Surface(
+        shape = PillShape,
+        color = MaterialTheme.colorScheme.surfaceContainerHighest,
+        onClick = onClick,
+        modifier = Modifier.heightIn(min = 34.dp),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(start = 12.dp, end = 8.dp, top = 6.dp, bottom = 6.dp),
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(modifier = Modifier.width(6.dp))
+            Text(
+                text = value,
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.widthIn(max = 160.dp),
+            )
+            Icon(
+                Icons.Filled.ExpandMore,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(16.dp),
+            )
+        }
+    }
+}
+
+/** Gemeinsame Hülle der drei Sheets: Titel + One-UI-Gruppenkarte. */
+@Composable
+private fun SettingSheet(
+    title: String,
+    onDismiss: () -> Unit,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        containerColor = MaterialTheme.colorScheme.background,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .navigationBarsPadding()
+                .padding(bottom = 12.dp),
+        ) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.padding(start = ContentInset, end = ContentInset, bottom = 12.dp),
+            )
+            content()
+        }
+    }
+}
+
+@Composable
+private fun ModeSheet(
+    current: AgentMode?,
+    onDismiss: () -> Unit,
+    onPick: (AgentMode) -> Unit,
+) {
+    SettingSheet(title = "Modus", onDismiss = onDismiss) {
+        GroupCard {
+            Column {
+                val entries = listOf(
+                    Triple(AgentMode.ASK, "Ask", "Jede Aktion wird vorher bestätigt"),
+                    Triple(AgentMode.ACCEPT_EDITS, "Accept Edits", "Datei-Änderungen laufen durch, alles andere wird gefragt"),
+                    Triple(AgentMode.AUTO, "Auto", "Agent entscheidet selbst, Push nur manuell"),
+                    Triple(AgentMode.YOLO, "Yolo", "Vollautomatisch inklusive Push und Draft-PR"),
+                )
+                entries.forEachIndexed { index, (mode, title, subtitle) ->
+                    if (index > 0) ListDivider(RadioRowDividerInset)
+                    SelectableTile(
+                        title = title,
+                        subtitle = subtitle,
+                        selected = current == mode,
+                        titleColor = if (mode == AgentMode.YOLO && current == mode) {
+                            MaterialTheme.colorScheme.error
+                        } else {
+                            Color.Unspecified
+                        },
+                        onClick = { onPick(mode) },
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ReasoningSheet(
+    current: ReasoningEffort?,
+    onDismiss: () -> Unit,
+    onPick: (ReasoningEffort) -> Unit,
+) {
+    SettingSheet(title = "Reasoning", onDismiss = onDismiss) {
+        GroupCard {
+            Column {
+                val entries = listOf(
+                    Triple(ReasoningEffort.LOW, "Niedrig", "Schnelle Antworten, wenig Nachdenken"),
+                    Triple(ReasoningEffort.MEDIUM, "Mittel", "Ausgewogen zwischen Tempo und Tiefe"),
+                    Triple(ReasoningEffort.HIGH, "Hoch", "Gründliches Nachdenken, langsamer und teurer"),
+                )
+                entries.forEachIndexed { index, (effort, title, subtitle) ->
+                    if (index > 0) ListDivider(RadioRowDividerInset)
+                    SelectableTile(
+                        title = title,
+                        subtitle = subtitle,
+                        selected = current == effort,
+                        onClick = { onPick(effort) },
+                    )
+                }
+            }
+        }
+        SectionNote("Gilt ab dem nächsten Prompt dieser Session.")
+    }
+}
+
+@Composable
+private fun ModelSheet(
+    current: String,
+    state: ModelsState,
+    onDismiss: () -> Unit,
+    onRetry: () -> Unit,
+    onPick: (String) -> Unit,
+) {
+    var custom by remember(current) { mutableStateOf(current) }
+    SettingSheet(title = "Modell", onDismiss = onDismiss) {
+        when (state) {
+            is ModelsState.Loading, ModelsState.Idle -> Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.padding(horizontal = ContentInset, vertical = 12.dp),
+            ) {
+                CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.size(16.dp))
+                Spacer(modifier = Modifier.width(10.dp))
+                Text(
+                    text = "Modelle werden geladen …",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            is ModelsState.Failed -> Column {
+                SectionError(state.message)
+                TextButton(
+                    onClick = onRetry,
+                    shape = PillShape,
+                    modifier = Modifier
+                        .padding(start = ScreenGutter, top = 4.dp)
+                        .heightIn(min = MinTouchTarget),
+                ) {
+                    Text("Erneut versuchen")
+                }
+            }
+
+            is ModelsState.Loaded -> if (state.models.isEmpty()) {
+                SectionNote("Dieser Adapter liefert keine Modellliste – Modell unten frei eintragen.")
+            } else {
+                GroupCard {
+                    Column(modifier = Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState())) {
+                        SelectableTile(
+                            title = "Adapter-Standard",
+                            subtitle = "Modellwahl dem Adapter überlassen",
+                            selected = current.isBlank(),
+                            onClick = { onPick("") },
+                        )
+                        state.models.forEach { model ->
+                            ListDivider(RadioRowDividerInset)
+                            SelectableTile(
+                                title = model.name ?: model.id,
+                                subtitle = model.id,
+                                selected = current == model.id,
+                                onClick = { onPick(model.id) },
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        SectionHeader("Eigenes Modell")
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = ScreenGutter),
+        ) {
+            OutlinedTextField(
+                value = custom,
+                onValueChange = { custom = it },
+                placeholder = { Text("z. B. anbieter/modell") },
+                singleLine = true,
+                shape = PillShape,
+                modifier = Modifier.weight(1f),
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Button(
+                onClick = { onPick(custom) },
+                shape = PillShape,
+                enabled = custom.trim() != current,
+                modifier = Modifier.heightIn(min = MinTouchTarget),
+            ) {
+                Text("Setzen")
+            }
+        }
     }
 }
 

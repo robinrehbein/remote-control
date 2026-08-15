@@ -1,6 +1,8 @@
 import type {
   AgentEvent,
   DiffEntry,
+  ModelInfo,
+  ModelsResponse,
   PermissionDecision,
   PromptRequest,
   ShimApiResponse,
@@ -10,15 +12,39 @@ import type {
 const TIMEOUT_MS = 10_000;
 const RECONNECT_MS = 3_000;
 
+/** Tolerant reader for GET /models bodies (missing route, wrong shape -> []). */
+export function normalizeModels(body: unknown): ModelInfo[] {
+  const raw = Array.isArray(body) ? body : (body as ModelsResponse | null)?.models;
+  if (!Array.isArray(raw)) return [];
+  const out: ModelInfo[] = [];
+  for (const entry of raw) {
+    if (typeof entry === 'string') {
+      if (entry.length > 0) out.push({ id: entry });
+      continue;
+    }
+    if (typeof entry !== 'object' || entry === null) continue;
+    const { id, name } = entry as { id?: unknown; name?: unknown };
+    if (typeof id !== 'string' || id.length === 0) continue;
+    out.push({ id, ...(typeof name === 'string' && name.length > 0 ? { name } : {}) });
+  }
+  return out;
+}
+
 export class ShimClient {
   private readonly base: string;
   private readonly token: string;
+  private readonly extraHeaders: Record<string, string>;
   private ac: AbortController | null = null;
   private stopped = false;
 
-  constructor(base: string, token: string) {
+  /**
+   * `extraHeaders` ride along on every request; used for the remote-runner
+   * gateway's shared-secret header (empty in all local modes).
+   */
+  constructor(base: string, token: string, extraHeaders: Record<string, string> = {}) {
     this.base = base.replace(/\/+$/, '');
     this.token = token;
+    this.extraHeaders = extraHeaders;
   }
 
   private async call<T>(path: string, method: string, body?: unknown): Promise<T | null> {
@@ -26,6 +52,7 @@ export class ShimClient {
       const res = await fetch(`${this.base}${path}`, {
         method,
         headers: {
+          ...this.extraHeaders,
           authorization: `Bearer ${this.token}`,
           ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
         },
@@ -64,6 +91,12 @@ export class ShimClient {
     return this.call<DiffEntry[]>('/diff', 'GET');
   }
 
+  /** GET /models; older shims without the route answer 404 -> empty catalog. */
+  async models(): Promise<ModelInfo[]> {
+    const res = await this.call<ModelsResponse>('/models', 'GET');
+    return normalizeModels(res);
+  }
+
   startEvents(onEvent: (e: AgentEvent) => void): void {
     void this.eventLoop(onEvent);
   }
@@ -73,7 +106,11 @@ export class ShimClient {
       this.ac = new AbortController();
       try {
         const res = await fetch(`${this.base}/events`, {
-          headers: { authorization: `Bearer ${this.token}`, accept: 'text/event-stream' },
+          headers: {
+            ...this.extraHeaders,
+            authorization: `Bearer ${this.token}`,
+            accept: 'text/event-stream',
+          },
           signal: this.ac.signal,
         });
         if (!res.ok || !res.body) throw new Error(`sse status ${res.status}`);

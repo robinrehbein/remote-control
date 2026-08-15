@@ -7,8 +7,12 @@
  *  - App <-> Orchestrator WebSocket messages
  *  - Pairing REST types
  *
- * Pure TypeScript types, zero runtime dependencies.
+ * Pure TypeScript types, zero runtime dependencies. The single exception is
+ * `./opencode-catalog.ts` (re-exported below): pure, dependency-free helpers
+ * shared verbatim by the opencode and kilo shims.
  */
+
+export { parseProviderCatalog, selectModel } from './opencode-catalog.js';
 
 /* ------------------------------------------------------------------ */
 /* Common enums                                                        */
@@ -30,6 +34,32 @@ export interface AdapterCapabilities {
   streaming: boolean;
   /** Shim performs auto-push + draft PR itself (yolo mode). */
   autoPush: boolean;
+  /**
+   * Shim maps `PromptRequest.reasoningEffort` onto a runtime option.
+   * Optional for backwards compatibility; treated as false when absent.
+   */
+  reasoning?: boolean;
+  /**
+   * Shim honours `PromptRequest.model` per prompt (live model switching).
+   * Optional for backwards compatibility; treated as false when absent.
+   */
+  modelSwitch?: boolean;
+}
+
+/**
+ * Human-facing metadata for one credential an adapter can use. Purely
+ * cosmetic: the app renders display names, "create key" links and setup
+ * hints from it instead of hard-coding a provider table.
+ */
+export interface ProviderDescriptor {
+  /** Secret kind == provider key, i.e. a key of `providerEnv` or `credentials`. */
+  id: string;
+  /** Display name, e.g. "Google Gemini". */
+  name: string;
+  /** Page where the user creates/copies the key. */
+  keyUrl?: string;
+  /** One-line setup hint shown in the secret dialog. */
+  hint?: string;
 }
 
 /**
@@ -56,10 +86,23 @@ export interface AdapterDescriptor {
    * based on the session's chosen provider (e.g. openai -> OPENAI_API_KEY).
    */
   providerEnv?: Record<string, string>;
+  /**
+   * Optional display metadata for the credentials above (ids are the same
+   * secret kinds). Absent on older manifests — the app falls back to its own
+   * table then.
+   */
+  providers?: ProviderDescriptor[];
   defaults: { provider: string; model?: string };
 }
 
 export type AgentMode = 'yolo' | 'auto' | 'acceptEdits' | 'ask';
+
+/**
+ * Normalized reasoning/thinking budget. Adapters that expose an effort knob map
+ * these three levels onto their runtime option; all others ignore the field
+ * (and report `capabilities.reasoning === false`).
+ */
+export type ReasoningEffort = 'low' | 'medium' | 'high';
 
 /**
  * Per-session network isolation:
@@ -106,7 +149,28 @@ export interface PromptRequest {
   /** May override the mode the container was started with. */
   mode?: AgentMode;
   provider?: string;
+  /**
+   * May override the model for this and following turns. Adapters whose runtime
+   * addresses models as provider + model accept the `"<provider>/<model>"` form
+   * (the same ids their GET /models returns); an empty string means
+   * "adapter default".
+   */
   model?: string;
+  /** Ignored by adapters without `capabilities.reasoning`. */
+  reasoningEffort?: ReasoningEffort;
+}
+
+/** One entry of the shim's model catalog (GET /models). */
+export interface ModelInfo {
+  /** Id accepted by `PromptRequest.model` for this adapter. */
+  id: string;
+  /** Human-readable label; falls back to `id` in the UI. */
+  name?: string;
+}
+
+/** GET /models — an empty list is valid (adapter has no catalog). */
+export interface ModelsResponse {
+  models: ModelInfo[];
 }
 
 /** POST /resume */
@@ -158,7 +222,12 @@ export interface ShimEnv {
   REPO_BRANCH?: string;          // base branch to start from (default: repo default branch)
   GITHUB_PAT?: string;           // injected when push is allowed
   REPO_FULL_NAME: string;        // owner/name for PR API calls
-  AUTO_PUSH: '1' | '0';          // yolo => 1 (auto push + draft PR after each completed turn)
+  /**
+   * Start value only (yolo => 1): auto push + draft PR after each completed
+   * turn. Since mode is switchable mid-session, shims derive the decision per
+   * turn from `PromptRequest.mode` and fall back to this env when it is absent.
+   */
+  AUTO_PUSH: '1' | '0';
   /** Only provider credential relevant for this session, e.g. OPENAI_API_KEY / ZAI_API_KEY / CLAUDE_CODE_OAUTH_TOKEN. */
   [key: string]: string | undefined;
 }
@@ -232,6 +301,8 @@ export interface SessionInfo {
   lastActiveAt: string;
   prUrl?: string;
   networkPolicy?: NetworkPolicy;
+  /** Persisted reasoning budget; absent when the session never set one. */
+  reasoningEffort?: string;
 }
 
 export interface RepoInfo {
@@ -272,6 +343,22 @@ export type ClientMessage =
       networkPolicy?: NetworkPolicy;
     }
   | { type: 'session.prompt'; sessionId: string; text: string; mode?: AgentMode }
+  /**
+   * Change mode / model / reasoning effort of a live session. Every field is
+   * optional; the server persists what is set and answers with `session.status`
+   * (carrying the updated session) to all devices.
+   */
+  | {
+      type: 'session.update';
+      requestId: string;
+      sessionId: string;
+      mode?: AgentMode;
+      /** Empty string resets the session to the adapter default. */
+      model?: string;
+      reasoningEffort?: ReasoningEffort;
+    }
+  /** Ask the session's shim for its model catalog (proxied GET /models). */
+  | { type: 'session.models.get'; requestId: string; sessionId: string }
   | { type: 'session.permission'; sessionId: string; permissionId: string; decision: PermissionDecision }
   | { type: 'session.abort'; sessionId: string }
   | { type: 'session.stop'; sessionId: string }
@@ -285,6 +372,12 @@ export type ClientMessage =
   | { type: 'repo.list'; requestId: string }
   | { type: 'repo.add'; requestId: string; fullName: string; defaultBranch: string }
   | { type: 'secret.set'; requestId: string; kind: SecretKind; value: string }
+  /**
+   * Live-check a key against its provider before/without storing it. The value
+   * is used for the outbound provider request only — it is never persisted,
+   * logged or echoed back.
+   */
+  | { type: 'secret.validate'; requestId: string; kind: SecretKind; value: string }
   | { type: 'secret.list'; requestId: string }
   | { type: 'secret.delete'; requestId: string; id: string }
   | { type: 'server.stats'; requestId: string };
@@ -310,12 +403,27 @@ export type ServerMessage =
   | { type: 'session.event'; sessionId: string; event: AgentEvent }
   | { type: 'session.diff'; requestId: string; sessionId: string; diff: DiffEntry[] }
   | { type: 'session.status'; sessionId: string; status: SessionStatus; session?: SessionInfo }
+  | { type: 'session.models'; requestId: string; sessionId: string; models: ModelInfo[] }
   | { type: 'session.deleted'; requestId: string; sessionId: string }
   | { type: 'adapter.list'; requestId: string; adapters: AdapterDescriptor[] }
   | { type: 'repo.list'; requestId: string; repos: RepoInfo[] }
   | { type: 'repo.added'; requestId: string; repo: RepoInfo }
   | { type: 'secret.list'; requestId: string; secrets: SecretInfo[] }
   | { type: 'secret.saved'; requestId: string; secret: SecretInfo }
+  /**
+   * Result of a `secret.validate`. Never carries the value.
+   * `unverified: true` means no live check exists for this kind — `ok` is
+   * true so the app keeps the flow going, but the UI must present it
+   * neutrally rather than as a confirmed key.
+   */
+  | {
+      type: 'secret.validated';
+      requestId: string;
+      kind: SecretKind;
+      ok: boolean;
+      detail?: string;
+      unverified?: boolean;
+    }
   | { type: 'secret.deleted'; requestId: string; id: string }
   | { type: 'server.stats'; requestId: string; stats: ServerStats };
 

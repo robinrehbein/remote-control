@@ -89,6 +89,14 @@ async function git(cwd: string, args: string[]): Promise<string> {
   return stdout;
 }
 
+async function waitUntil(pred: () => boolean, label: string, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!pred()) {
+    if (Date.now() > deadline) throw new Error(`timeout waiting for ${label}`);
+    await new Promise((r) => setTimeout(r, 25));
+  }
+}
+
 async function main(): Promise<void> {
   const workDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-shim-smoke-'));
   await git(workDir, ['init', '-b', 'main']);
@@ -117,6 +125,31 @@ async function main(): Promise<void> {
   const authJson: Record<string, string> = { ...auth, 'content-type': 'application/json' };
   let sse: SseClient | undefined;
 
+  /** One full fake turn in `mode`, including the permission gate the fake runner opens. */
+  async function runTurn(mode: string): Promise<void> {
+    const client = sse;
+    if (client === undefined) throw new Error('sse not started');
+    const count = (type: string): number => client.events.filter((e) => e.type === type).length;
+    const permsBefore = count('permission.request');
+    const doneBefore = count('turn.completed');
+    const res = await fetch(`${base}/prompt`, {
+      method: 'POST',
+      headers: authJson,
+      body: JSON.stringify({ text: 'again', mode }),
+    });
+    assert.equal(res.status, 200, `prompt (${mode}) accepted`);
+    await waitUntil(() => count('permission.request') > permsBefore, `permission.request (${mode})`);
+    const perms = client.events.filter((e) => e.type === 'permission.request');
+    const pending = perms[perms.length - 1];
+    if (pending === undefined || pending.type !== 'permission.request') throw new Error('unreachable');
+    await fetch(`${base}/permissions/${pending.permissionId}`, {
+      method: 'POST',
+      headers: authJson,
+      body: JSON.stringify({ response: 'once' }),
+    });
+    await waitUntil(() => count('turn.completed') > doneBefore, `turn.completed (${mode})`);
+  }
+
   try {
     // auth
     const health = await fetch(`${base}/health`);
@@ -131,6 +164,12 @@ async function main(): Promise<void> {
     assert.equal(status0.provider, 'anthropic');
     assert.equal(status0.mode, 'ask');
     assert.equal(status0.busy, false);
+
+    // model catalog (static core list)
+    const modelsRes = await fetch(`${base}/models`, { headers: auth });
+    assert.equal(modelsRes.status, 200);
+    const models = (await modelsRes.json()) as { models: Array<{ id: string }> };
+    assert.ok(models.models.some((m) => m.id === 'claude-opus-5'));
 
     // SSE
     sse = new SseClient(`${base}/events`, 'smoke-token');
@@ -219,6 +258,17 @@ async function main(): Promise<void> {
     assert.equal((await resumeRes.json() as { ok: boolean }).ok, true);
     const status2 = (await (await fetch(`${base}/status`, { headers: auth })).json()) as Record<string, unknown>;
     assert.equal(status2.sessionRef, 'fake-2');
+
+    // auto-push follows the mode of the *current* turn, not the AUTO_PUSH the
+    // container booted with (cfg.autoPush === false above). The smoke repo has
+    // no origin, so an attempted push surfaces as a "push failed" error event.
+    const pushAttempts = (): number =>
+      (sse?.events ?? []).filter((e) => e.type === 'error' && e.message.startsWith('push failed')).length;
+    assert.equal(pushAttempts(), 0, 'no push attempt for the ask turns so far');
+    await runTurn('yolo');
+    await waitUntil(() => pushAttempts() === 1, 'push attempt after switching to yolo');
+    await runTurn('ask');
+    assert.equal(pushAttempts(), 1, 'no further push after switching back to ask');
 
     // validation
     const badPrompt = await fetch(`${base}/prompt`, {

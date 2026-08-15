@@ -34,14 +34,21 @@ RUN npm ci --omit=dev
 
 COPY --from=builder /app/dist /app/dist
 
+# Shim build contexts for the on-demand self build (server/src/image-build.ts):
+# without a registry the orchestrator builds a missing <prefix>/<id>-shim image
+# itself over the docker API, so the layout here MUST match what every
+# shims/<id>/Dockerfile COPYs from its (repo-root) context.
+# node_modules stay out via the root .dockerignore.
+COPY tsconfig.base.json /app/build-context/tsconfig.base.json
+COPY packages/protocol /app/build-context/packages/protocol
+COPY shims /app/build-context/shims
+
 # Adapter plugin manifests (shims/*/adapter.json -> /app/adapters/<id>.json)
-COPY shims /tmp/shims-manifests
 RUN mkdir -p /app/adapters \
-  && cd /tmp/shims-manifests \
+  && cd /app/build-context/shims \
   && for d in */; do \
        if [ -f "${d}adapter.json" ]; then cp "${d}adapter.json" "/app/adapters/${d%/}.json"; fi; \
-     done \
-  && rm -rf /tmp/shims-manifests
+     done
 
 EXPOSE 3000
 

@@ -1,0 +1,20 @@
+# Build-context exclusions for every image built from the repo root
+# (server/Dockerfile and shims/*/Dockerfile all use context ".").
+# The orchestrator image bundles the shim sources for the self build
+# (server/src/image-build.ts) - dependencies and build output must NOT ride
+# along: every Dockerfile runs its own `npm ci`.
+**/node_modules
+**/dist
+**/*.tsbuildinfo
+**/.smoke-work
+
+.git
+.github
+.kilo
+android
+data
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.*

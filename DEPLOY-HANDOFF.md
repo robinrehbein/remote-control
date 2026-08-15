@@ -76,14 +76,15 @@ cp .env.example .env
 # MASTER_KEY eintragen:
 sed -i "s|^MASTER_KEY=.*|MASTER_KEY=$(openssl rand -hex 32)|" .env
 
-docker compose --profile shims build          # baut alle 5 Shim-Images + Pull-Basis
-docker compose build orchestrator             # Orchestrator-Image
-docker images | grep pocketagent              # Erwartung: 6 Images pocketagent/*
+docker compose build orchestrator             # Orchestrator-Image (Pflicht)
+# Optional: docker compose --profile shims build  # Shims vorbauen (beschleunigt Erst-Start)
 ```
 
-Wichtig: Build-Kontext ist der Repo-Root (steht so in den Compose-Build-Definitionen).
-Die Image-Tags müssen exakt `pocketagent/<id>-shim:latest` + `pocketagent/orchestrator:latest`
-heißen (das ist der Default von `ADAPTER_IMAGE_PREFIX=pocketagent`).
+Die 5 Shim-Images sind seit dem Selfbuild OPTIONAL vorzubauen: Fehlende Images
+baut der Orchestrator beim ersten Session-Start eines Agenten selbst aus den im
+Orchestrator-Image gebündelten Quellen (Content-Hash-Tags, `ADAPTER_IMAGE_TAG`
+dafür NICHT setzen). Wichtig: Build-Kontext ist der Repo-Root (steht so in den
+Compose-Build-Definitionen).
 
 Erwartete Build-Fallen (falls sie zuschlagen, beheben und im Report dokumentieren):
 - `npm ci`-Fehler in `shims/claude` → Dockerfile hat bereits `npm ci || npm install`-Fallback

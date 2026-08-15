@@ -295,9 +295,12 @@ export function registerWs(
           return;
         case 'session.update': {
           try {
-            const session = manager.updateSession(msg);
+            const { session, reprovision } = manager.updateSession(msg);
             // session.status already went to every device; ack the requester
             send({ type: 'request.ok', requestId: msg.requestId, payload: { session } });
+            // A harness switch recreates the container (possibly building its
+            // image first, minutes): ack first, report progress/errors as events.
+            if (reprovision) void reprovision();
           } catch (e) {
             send({ type: 'error', requestId: msg.requestId, sessionId: msg.sessionId, message: errText(e) });
           }

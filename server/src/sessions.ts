@@ -16,7 +16,6 @@ import type {
 } from '@pocketagent/protocol';
 import { SERVER_VERSION, config, isNetworkPolicy } from './config.js';
 import type { LinkRow, RepoRow, SessionRow, Store } from './db.js';
-import { decrypt } from './vault.js';
 import * as docker from './docker.js';
 
 import { getAdapter } from './adapters.js';
@@ -34,6 +33,17 @@ export function isAgentMode(v: unknown): v is AgentMode {
 
 export function isReasoningEffort(v: unknown): v is ReasoningEffort {
   return typeof v === 'string' && (REASONING_EFFORTS as readonly string[]).includes(v);
+}
+
+/**
+ * Provider a session falls back to when it switches to another harness: the
+ * manifest default, else its first provider key, else none (adapters whose
+ * credentials are fixed, e.g. claude).
+ */
+export function defaultProviderFor(adapter: string): string {
+  const desc = getAdapter(adapter);
+  const fallback = Object.keys(desc?.providerEnv ?? {})[0] ?? '';
+  return desc?.defaults.provider || fallback;
 }
 
 /**
@@ -196,6 +206,11 @@ export class SessionManager {
     return row;
   }
 
+  /** Progress channel of a provisioning run (image build takes minutes). */
+  private noticeFor(sessionId: string): (message: string) => void {
+    return (message) => this.emitEvent(sessionId, { type: 'notice', message });
+  }
+
   private async provision(row: SessionRow, repo: RepoRow, baseBranch: string): Promise<void> {
     try {
       if (!config.dockerEnabled) throw new Error('docker is disabled on this server');
@@ -203,8 +218,7 @@ export class SessionManager {
       const shimToken = randomBytes(24).toString('hex');
       const staged: SessionRow = { ...row, volume_name: `pocketagent-sess-${row.id}`, shim_token: shimToken };
       const env = this.buildEnv(staged, repo, shimToken, baseBranch);
-      const cid = await docker.createSessionContainer(staged, env);
-      if (!cid) throw new Error('failed to create session container');
+      const cid = await docker.createSessionContainer(staged, env, this.noticeFor(row.id));
       const pat = this.githubPatFor(row);
       if (pat) await docker.injectCredsFile(cid, { githubPat: pat });
       if (!(await docker.startContainer(cid))) throw new Error('failed to start session container');
@@ -265,9 +279,12 @@ export class SessionManager {
       // creds file injected via putArchive before container start (see githubPatFor)
       PA_CREDS_FILE: '/run/secrets/pa/creds.json',
     };
+    // getSecretValue (not a raw decrypt): secrets are AAD-bound since the
+    // vault migration, and only this path knows both the AAD and the legacy
+    // fallback - decrypting the row directly throws on every current key.
     const setKey = (kind: string, key: string): void => {
-      const s = this.store.getSecretByKind(kind, row.tenant_id);
-      if (s) env[key] = decrypt({ ciphertext: s.ciphertext, nonce: s.nonce });
+      const value = this.store.getSecretValue(kind, row.tenant_id);
+      if (value !== null) env[key] = value;
     };
     for (const [kind, vars] of Object.entries(desc.credentials ?? {})) {
       for (const v of vars) setKey(kind, v);
@@ -386,8 +403,13 @@ export class SessionManager {
   /**
    * Persist switchable session settings. The next prompt carries them to the
    * shim; the updated session is broadcast to every device as `session.status`.
+   *
+   * A harness switch (`adapter`) is validated and persisted synchronously too,
+   * but its container work is handed back as `reprovision`: the caller acks the
+   * request first, because the new agent's image may still have to be built
+   * (minutes on first use).
    */
-  updateSession(msg: UpdateMsg): SessionInfo {
+  updateSession(msg: UpdateMsg): { session: SessionInfo; reprovision: (() => Promise<void>) | null } {
     const row = this.requireSession(msg.sessionId);
     if (msg.mode !== undefined && !isAgentMode(msg.mode)) {
       throw new Error(`invalid mode "${String(msg.mode)}"`);
@@ -398,11 +420,31 @@ export class SessionManager {
     if (msg.reasoningEffort !== undefined && !isReasoningEffort(msg.reasoningEffort)) {
       throw new Error(`invalid reasoningEffort "${String(msg.reasoningEffort)}"`);
     }
+    // null => no harness change (also for an update that names the current one)
+    const nextAdapter = msg.adapter !== undefined && msg.adapter !== row.adapter ? msg.adapter : null;
+    if (nextAdapter !== null) this.assertAdapterSwitchable(row, nextAdapter);
     this.store.updateSessionSettings(row.id, {
       ...(msg.mode !== undefined ? { mode: msg.mode } : {}),
       ...(msg.model !== undefined ? { model: msg.model.trim() } : {}),
       ...(msg.reasoningEffort !== undefined ? { reasoningEffort: msg.reasoningEffort } : {}),
+      ...(nextAdapter !== null
+        ? {
+            adapter: nextAdapter,
+            provider: defaultProviderFor(nextAdapter),
+            clearSessionRef: true,
+            // harness-bound settings reset unless this very update replaces them
+            ...(msg.model === undefined ? { model: '' } : {}),
+            ...(msg.reasoningEffort === undefined ? { reasoningEffort: '' } : {}),
+          }
+        : {}),
     });
+    if (nextAdapter !== null) {
+      this.store.updateSessionStatus(row.id, 'creating');
+      this.emitEvent(row.id, {
+        type: 'notice',
+        message: `Agent gewechselt: ${row.adapter} → ${nextAdapter}. Der neue Agent startet frisch auf dem aktuellen Code-Stand.`,
+      });
+    }
     const updated = this.requireSession(row.id);
     const info = this.toInfo(updated);
     this.broadcast({
@@ -411,7 +453,65 @@ export class SessionManager {
       status: info.status,
       session: info,
     });
-    return info;
+    return {
+      session: info,
+      reprovision: nextAdapter !== null ? () => this.reprovisionAdapter(row.id) : null,
+    };
+  }
+
+  /** Preconditions of a harness switch; throws with the reason for the app. */
+  private assertAdapterSwitchable(row: SessionRow, adapter: string): void {
+    if (!getAdapter(adapter)) throw new Error(`unbekannter Adapter "${adapter}"`);
+    if (row.link_id) {
+      throw new Error('Agent-Wechsel ist für Link-Sessions nicht möglich – den Agenten auf dem Host neu starten.');
+    }
+    if (!config.dockerEnabled) {
+      throw new Error('Agent-Wechsel benötigt Docker – auf diesem Server ist Docker deaktiviert.');
+    }
+    if (!row.volume_name || !row.shim_token) {
+      throw new Error('Agent-Wechsel benötigt eine provisionierte Session.');
+    }
+    if (row.status !== 'idle' && row.status !== 'stopped' && row.status !== 'error') {
+      throw new Error(`Agent-Wechsel im Status "${row.status}" nicht möglich – bitte warten oder Turn abbrechen.`);
+    }
+  }
+
+  /**
+   * Recreate the session container for the newly selected adapter on the
+   * existing volume: the repo checkout and the session branch stay, only the
+   * harness is exchanged (the shims clone only into an empty /work).
+   */
+  private async reprovisionAdapter(id: string): Promise<void> {
+    try {
+      const row = this.requireSession(id);
+      if (!row.shim_token || !row.volume_name) throw new Error('Session ist nicht provisioniert.');
+      const repo = this.store.getRepo(row.repo_id);
+      if (!repo) throw new Error('repo missing');
+      this.clients.get(id)?.stop();
+      this.clients.delete(id);
+      if (row.container_id) {
+        await docker.stopContainer(row.container_id);
+        await docker.removeContainer(row.container_id); // volume survives on purpose
+      }
+      await docker.ensureNetwork();
+      const env = this.buildEnv(row, repo, row.shim_token, repo.default_branch);
+      const cid = await docker.createSessionContainer(row, env, this.noticeFor(id));
+      const pat = this.githubPatFor(row);
+      if (pat) await docker.injectCredsFile(cid, { githubPat: pat });
+      if (!(await docker.startContainer(cid))) throw new Error('failed to start session container');
+      this.store.setContainer(id, cid);
+      const endpoint = await docker.shimEndpoint(cid, id);
+      this.store.setShimEndpoint(id, endpoint);
+      const base = this.shimBase(id, endpoint);
+      await this.waitForShim(base, row.shim_token, 60_000);
+      this.connectEvents(id, base, row.shim_token);
+      this.setStatus(id, 'idle');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.store.updateSessionStatus(id, 'error');
+      this.emitEvent(id, { type: 'error', message, fatal: true });
+      this.broadcastStatus(id, 'error');
+    }
   }
 
   /** Model catalog of the session's shim; unsupported/unreachable -> []. */
@@ -493,8 +593,8 @@ export class SessionManager {
       cid = await docker.createSessionContainer(
         row,
         this.buildEnv(row, repo, row.shim_token, repo.default_branch),
+        this.noticeFor(id),
       );
-      if (!cid) throw new Error('failed to recreate session container');
       const pat = this.githubPatFor(row);
       if (pat) await docker.injectCredsFile(cid, { githubPat: pat });
       started = await docker.startContainer(cid);
@@ -524,7 +624,7 @@ export class SessionManager {
     if (!repo) throw new Error('repo missing');
     const env = this.buildEnv(row, repo, row.shim_token ?? '', repo.default_branch);
     const pat = this.githubPatFor(row);
-    if (!(await docker.oneShotPush(row, env, pat ? { githubPat: pat } : undefined))) {
+    if (!(await docker.oneShotPush(row, env, pat ? { githubPat: pat } : undefined, this.noticeFor(id)))) {
       throw new Error('push failed');
     }
     this.emitEvent(id, { type: 'pushed', branch: row.branch, auto: false });

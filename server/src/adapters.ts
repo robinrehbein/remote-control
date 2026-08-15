@@ -3,6 +3,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AdapterDescriptor, ProviderDescriptor } from '@pocketagent/protocol';
 import { config } from './config.js';
+import { shimContextHash } from './image-build.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -104,7 +105,18 @@ export function getAdapter(id: string): AdapterDescriptor | undefined {
   return listAdapters().find((a) => a.id === id);
 }
 
+/**
+ * Image a session container of this adapter runs.
+ *
+ * An explicit manifest "image" always wins (operator-controlled artifact, never
+ * self-built). Otherwise the tag is either the pinned ADAPTER_IMAGE_TAG or -
+ * the default - `c<content hash>` over the bundled shim build context, so the
+ * self build in docker.ts rebuilds exactly when the shim sources changed.
+ */
 export function adapterImage(id: string): string {
   const desc = getAdapter(id);
-  return desc?.image ?? `${config.adapterImagePrefix}/${id}-shim:${config.adapterImageTag}`;
+  if (desc?.image) return desc.image;
+  const hash = config.adapterImageTagPinned ? null : shimContextHash(id);
+  const tag = hash === null ? config.adapterImageTag : `c${hash}`;
+  return `${config.adapterImagePrefix}/${id}-shim:${tag}`;
 }

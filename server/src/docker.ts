@@ -10,7 +10,11 @@ import {
   isNetworkPolicy,
 } from './config.js';
 import { adapterImage, getAdapter } from './adapters.js';
+import { buildShimImage, shimContextFiles } from './image-build.js';
 import type { SessionRow } from './db.js';
+
+/** Progress line handed to the app while a session is being provisioned. */
+export type NoticeFn = (message: string) => void;
 
 let client: Docker | null = null;
 
@@ -368,6 +372,53 @@ export async function pullImage(image: string): Promise<void> {
   });
 }
 
+async function imageExists(d: Docker, image: string): Promise<boolean> {
+  try {
+    await d.getImage(image).inspect();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Make the adapter image available on the daemon that runs the session:
+ * (a) already present locally, (b) pullable from a registry, (c) built from the
+ * build context bundled into the orchestrator image (see image-build.ts).
+ *
+ * (c) is skipped for adapters that pin an explicit "image" in their manifest -
+ * those are operator-controlled artifacts and must never be shadowed by a
+ * locally built one. Throws with an actionable German message otherwise.
+ */
+async function ensureAdapterImage(adapter: string, onNotice?: NoticeFn): Promise<string> {
+  const d = docker();
+  const image = adapterImage(adapter);
+  if (!d) return image;
+  if (await imageExists(d, image)) return image;
+  await pullImage(image);
+  if (await imageExists(d, image)) return image;
+  if (getAdapter(adapter)?.image) {
+    throw new Error(
+      `Shim-Image ${image} ist im Adapter-Manifest fest eingetragen, liegt aber weder lokal vor noch ` +
+        `konnte es aus der Registry geladen werden. Image pushen/verfügbar machen oder das Feld "image" ` +
+        `in shims/${adapter}/adapter.json entfernen, damit der Server es selbst baut.`,
+    );
+  }
+  if (shimContextFiles(adapter) === null) {
+    throw new Error(
+      `Shim-Image ${image} fehlt und konnte nicht gebaut werden: im Orchestrator-Image liegt kein ` +
+        `Build-Kontext für Adapter "${adapter}" (erwartet shims/${adapter}/Dockerfile).`,
+    );
+  }
+  try {
+    await buildShimImage(d, adapter, image, onNotice);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`Shim-Image ${image} fehlt und konnte nicht gebaut werden: ${msg}`);
+  }
+  return image;
+}
+
 /** One ustar header (512 bytes) + data padded to a 512-byte block. uid/gid 1000 = 'node' in the shim images. */
 function tarEntry(name: string, mode: number, typeflag: '0' | '5', data: Buffer): Buffer {
   const h = Buffer.alloc(512);
@@ -414,25 +465,30 @@ export async function injectCredsFile(containerId: string, creds: Record<string,
   }
 }
 
+/**
+ * Create the session container. Every failure throws with its real cause
+ * (docker message, missing image, failed build): provision()/resumeSession()
+ * forward it verbatim to the app, which would otherwise only ever see a
+ * generic "failed to create session container".
+ */
 export async function createSessionContainer(
   session: SessionRow,
   env: Record<string, string | undefined>,
-): Promise<string | null> {
+  onNotice?: NoticeFn,
+): Promise<string> {
   const d = docker();
-  if (!d || !session.volume_name) return null;
-  // Networking is resolved before the try block on purpose: a broken gateway
-  // must fail the session with its own cause instead of being flattened into
-  // the generic "failed to create session container" of the null return below.
+  if (!d) throw new Error('Docker ist auf diesem Server deaktiviert.');
+  if (!session.volume_name) throw new Error('Session hat kein Volume – nicht provisioniert.');
   const containerEnv = { ...env };
   const networking = await sessionNetworking(session, containerEnv);
+  const image = await ensureAdapterImage(session.adapter, onNotice);
   try {
     await ensureVolume(session.volume_name);
-    await pullImage(adapterImage(session.adapter));
     // With a gateway the shim is reached through it, so no host port is published
     // (an internal per-session network could not serve one anyway).
     const remote = isRemote() && !gatewayEnabled();
     const c = await d.createContainer({
-      Image: adapterImage(session.adapter),
+      Image: image,
       Env: envArr(containerEnv),
       Labels: { 'pocketagent.session': session.id },
       ...(remote ? { ExposedPorts: { '8080/tcp': {} } } : {}),
@@ -452,8 +508,9 @@ export async function createSessionContainer(
     });
     return c.id;
   } catch (e) {
-    console.error(`[docker] create failed for session ${session.id.slice(0, 8)}: ${String(e)}`);
-    return null;
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error(`[docker] create failed for session ${session.id.slice(0, 8)}: ${msg}`);
+    throw new Error(`Session-Container konnte nicht erstellt werden: ${msg}`);
   }
 }
 
@@ -539,19 +596,21 @@ export function pushScriptFor(adapter: string): string {
   return getAdapter(adapter)?.pushScript ?? `/app/shims/${adapter}/scripts/push.js`;
 }
 
+/** Tap-push in a throwaway container. Boolean result; the real cause is logged. */
 export async function oneShotPush(
   session: SessionRow,
   env: Record<string, string | undefined>,
   creds?: Record<string, string>,
+  onNotice?: NoticeFn,
 ): Promise<boolean> {
   const d = docker();
   if (!d || !session.volume_name) return false;
   try {
-    await pullImage(adapterImage(session.adapter));
+    const image = await ensureAdapterImage(session.adapter, onNotice);
     const containerEnv = { ...env };
     const networking = await sessionNetworking(session, containerEnv);
     const c = await d.createContainer({
-      Image: adapterImage(session.adapter),
+      Image: image,
       Env: envArr(containerEnv),
       Cmd: ['node', pushScriptFor(session.adapter)],
       Labels: { 'pocketagent.session': session.id },
@@ -574,7 +633,8 @@ export async function oneShotPush(
     await c.remove().catch(() => {});
     return res.StatusCode === 0;
   } catch (e) {
-    console.error(`[docker] push failed for session ${session.id.slice(0, 8)}: ${String(e)}`);
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error(`[docker] push failed for session ${session.id.slice(0, 8)}: ${msg}`);
     return false;
   }
 }

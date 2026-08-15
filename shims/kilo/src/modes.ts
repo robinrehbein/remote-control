@@ -8,6 +8,12 @@ export type PermissionMap = PermissionTree;
 
 const readAllow: PermissionMap = { read: 'allow', glob: 'allow', grep: 'allow', list: 'allow' };
 
+/**
+ * NOTE: the yolo/auto deny-list below (git push, rm -rf, ...) is ADVISORY only
+ * and trivially bypassable (e.g. `sh -c`, scripts, indirect tool invocations).
+ * It is NOT a security boundary — actual isolation comes from the session
+ * container. See the README security section.
+ */
 export function permissionForMode(mode: AgentMode): PermissionMap {
   switch (mode) {
     case 'yolo':

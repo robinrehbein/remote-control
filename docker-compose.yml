@@ -7,7 +7,9 @@ services:
     container_name: pocketagent-orchestrator
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      # Loopback-only by default; remove the 127.0.0.1 prefix only for
+      # direct LAN exposure or when a reverse proxy terminates TLS for you.
+      - "127.0.0.1:3000:3000"
     environment:
       # Generate once: openssl rand -hex 32
       MASTER_KEY: ${MASTER_KEY:?set MASTER_KEY in .env}
@@ -17,6 +19,17 @@ services:
       IDLE_STOP_SEC: ${IDLE_STOP_SEC:-900}
       GC_DAYS: ${GC_DAYS:-14}
       ADAPTER_IMAGE_PREFIX: pocketagent
+      # Shim image tag (default latest; pin a build tag or use digest pinning
+      # via shims/<id>/adapter.json "image" for reproducible deploys)
+      ADAPTER_IMAGE_TAG: ${ADAPTER_IMAGE_TAG:-latest}
+      # Optional per-session CPU limit in docker NanoCPUs (e.g. 1000000000 = 1 CPU)
+      SESSION_CPU_QUOTA: ${SESSION_CPU_QUOTA:-}
+      # Remote-docker mode only (DOCKER_HOST=tcp://...): explicit consent that
+      # remote sessions run with networkPolicy 'open' over plaintext shim ports
+      # REMOTE_NETWORK_OPEN: "1"
+      # Remote-docker mode only: host IP shim ports are published on
+      # (default 127.0.0.1 = reachable only via tunnel from the orchestrator)
+      # DOCKER_PUBLISH_IP: 127.0.0.1
       # Optional: FCM service account JSON (single line) for push notifications
       FCM_SERVICE_ACCOUNT_JSON: ${FCM_SERVICE_ACCOUNT_JSON:-}
     volumes:

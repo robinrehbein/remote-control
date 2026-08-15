@@ -5,12 +5,13 @@
  */
 import { spawn, execFile as execFileCb, type ChildProcess } from 'node:child_process';
 import { createServer, type ServerResponse } from 'node:http';
-import { existsSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import type { AgentEvent, DiffEntry, ShimStatus } from '@pocketagent/protocol';
+import { askpassEnv, ensureRepo, git as gitRun, readGithubPat } from './src/gitops';
 
 const exec = promisify(execFileCb);
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -225,11 +226,103 @@ async function waitFor(predicate: (event: AgentEvent) => boolean, label: string,
   throw new Error(`timeout waiting for "${label}"; events so far: ${collected.map((e) => e.type).join(', ')}`);
 }
 
+/** PAT resolution contract: PA_CREDS_FILE JSON .githubPat with GITHUB_PAT fallback. */
+async function credentialChecks(): Promise<void> {
+  const credsDir = mkdtempSync(join(tmpdir(), 'pa-creds-'));
+  const credsFile = join(credsDir, 'creds.json');
+  writeFileSync(credsFile, JSON.stringify({ githubPat: 'pat-from-creds-file' }));
+  const savedFile = process.env.PA_CREDS_FILE;
+  const savedPat = process.env.GITHUB_PAT;
+  try {
+    delete process.env.GITHUB_PAT;
+    process.env.PA_CREDS_FILE = credsFile;
+    assert(readGithubPat() === 'pat-from-creds-file', 'readGithubPat reads githubPat from PA_CREDS_FILE');
+    writeFileSync(credsFile, '{ this is not json');
+    assert(readGithubPat() === undefined, 'readGithubPat tolerant of malformed creds file (no env fallback set)');
+    process.env.GITHUB_PAT = 'pat-from-env';
+    assert(readGithubPat() === 'pat-from-env', 'readGithubPat falls back to GITHUB_PAT on bad creds file');
+    delete process.env.PA_CREDS_FILE;
+    assert(readGithubPat() === 'pat-from-env', 'readGithubPat uses GITHUB_PAT when no creds file is set');
+    delete process.env.GITHUB_PAT;
+    assert(readGithubPat() === undefined, 'readGithubPat returns undefined when nothing is configured');
+  } finally {
+    if (savedFile === undefined) delete process.env.PA_CREDS_FILE;
+    else process.env.PA_CREDS_FILE = savedFile;
+    if (savedPat === undefined) delete process.env.GITHUB_PAT;
+    else process.env.GITHUB_PAT = savedPat;
+    rmSync(credsDir, { recursive: true, force: true });
+  }
+
+  const pat = 'ghp_smoke_askpass_secret_literal';
+  const env = askpassEnv(pat);
+  if (env === undefined) throw new Error('assert failed: askpassEnv returns env for a pat');
+  const scriptPath = env.GIT_ASKPASS;
+  if (typeof scriptPath !== 'string' || scriptPath.length === 0) throw new Error('assert failed: askpassEnv sets GIT_ASKPASS');
+  const script = readFileSync(scriptPath, 'utf8');
+  assert(!script.includes(pat), 'askpass script must not contain the PAT literal');
+  assert(script.includes('x-access-token'), 'askpass script answers Username prompts with x-access-token');
+  assert(script.includes('PA_GIT_PAT'), 'askpass script reads the PAT from PA_GIT_PAT env, not inline');
+  assert((statSync(scriptPath).mode & 0o777) === 0o700, 'askpass script has mode 0700');
+  assert(env.PA_GIT_PAT === pat, 'askpassEnv passes the PAT via PA_GIT_PAT');
+  assert(env.GIT_TERMINAL_PROMPT === '0', 'askpassEnv disables git terminal prompts');
+  rmSync(scriptPath, { force: true });
+  assert(askpassEnv(undefined) === undefined, 'askpassEnv returns undefined without a pat');
+  console.log('[smoke] credential checks ok');
+}
+
+/** Local git end-to-end: bare repo + clone, push via plain URL + askpass; no PAT in .git/config. */
+async function gitEndToEnd(): Promise<void> {
+  try {
+    await exec('git', ['--version']);
+  } catch {
+    console.log('SKIP git end-to-end: git binary not available');
+    return;
+  }
+  const base = mkdtempSync(join(tmpdir(), 'pa-git-e2e-'));
+  const pat = 'ghp_smoke_e2e_secret';
+  try {
+    const bare = join(base, 'remote.git');
+    const remote = `file://${bare}`;
+    const seed = join(base, 'seed');
+    await exec('git', ['init', '--bare', '-b', 'main', bare]);
+    await exec('git', ['init', '-b', 'main', seed]);
+    await exec('git', ['-C', seed, 'config', 'user.name', 'SmokeTest']);
+    await exec('git', ['-C', seed, 'config', 'user.email', 'smoke@test.local']);
+    writeFileSync(join(seed, 'README.md'), '# seed\n');
+    await exec('git', ['-C', seed, 'add', '-A']);
+    await exec('git', ['-C', seed, 'commit', '-m', 'init']);
+    await exec('git', ['-C', seed, 'push', remote, 'HEAD:refs/heads/main']);
+
+    // clone through the shim code path: plain URL + askpass env, PAT supplied
+    const work = join(base, 'clone');
+    await ensureRepo({ workDir: work, repoUrl: remote, sessionId: 'smoke-git', githubPat: pat });
+    writeFileSync(join(work, 'change.txt'), 'change\n');
+    await exec('git', ['-C', work, 'add', '-A']);
+    await exec('git', ['-C', work, 'commit', '-m', 'change']);
+    const askpass = askpassEnv(pat);
+    if (askpass === undefined) throw new Error('assert failed: askpass env for e2e push');
+    await gitRun(work, ['push', remote, 'HEAD:refs/heads/agent/smoke-git'], askpass);
+
+    const cfg = readFileSync(join(work, '.git', 'config'), 'utf8');
+    assert(!cfg.includes(pat), 'no PAT in .git/config after clone+push');
+    assert(!cfg.includes('x-access-token'), 'no embedded credentials in .git/config');
+    const head = await exec('git', ['-C', bare, 'rev-parse', '--verify', 'refs/heads/agent/smoke-git']);
+    assert(head.stdout.trim().length > 0, 'pushed branch exists on the bare remote');
+    rmSync(askpass.GIT_ASKPASS ?? '', { force: true });
+    console.log('[smoke] git end-to-end (plain URL + askpass) ok');
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+}
+
 async function main(): Promise<void> {
   const workDir = await mkdtempSync(join(tmpdir(), 'pa-smoke-'));
   let shim: ChildProcess | undefined;
 
   try {
+    await credentialChecks();
+    await gitEndToEnd();
+
     await exec('git', ['-C', workDir, 'init', '-b', 'main']);
     await exec('git', ['-C', workDir, 'config', 'user.name', 'SmokeTest']);
     await exec('git', ['-C', workDir, 'config', 'user.email', 'smoke@test.local']);

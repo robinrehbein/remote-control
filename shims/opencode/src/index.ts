@@ -5,11 +5,11 @@ import { createRequire } from 'node:module';
 import { dirname, resolve } from 'node:path';
 import Fastify, { type FastifyReply } from 'fastify';
 import type { AgentMode, PermissionDecision, PromptRequest, ResumeRequest, ShimStatus } from '@pocketagent/protocol';
-import { readEnv, type ShimEnvConfig } from './env';
-import { parsePermissionJson, permissionForMode, writeOpencodeConfig, type PermissionMap } from './modes';
-import * as gitops from './gitops';
-import { OpenCodeClient, type PromptMessageBody } from './opencode-client';
-import { Broadcaster, EventNormalizer } from './events';
+import { readEnv, type ShimEnvConfig } from './env.ts';
+import { parsePermissionJson, permissionForMode, writeOpencodeConfig, type PermissionMap } from './modes.ts';
+import * as gitops from './gitops.ts';
+import { OpenCodeClient, type PromptMessageBody } from './opencode-client.ts';
+import { Broadcaster, EventNormalizer } from './events.ts';
 
 const MODES: readonly AgentMode[] = ['yolo', 'auto', 'acceptEdits', 'ask'];
 const DECISIONS: readonly PermissionDecision[] = ['once', 'always', 'reject'];

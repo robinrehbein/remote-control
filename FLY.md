@@ -62,6 +62,30 @@ Selfhost-Variante.
    docker build -f shims/junie/Dockerfile    -t pocketagent/junie-shim:latest .
    ```
 
+## Transport-Sicherheit (Pflicht-Lektüre vor dem ersten Session-Start)
+
+Remote-Modus heißt: Shim-Ports werden **auf dem Docker-Host veröffentlicht** und
+der Orchestrator (auf Fly) spricht sie per Plaintext-HTTP an. Drei Regeln:
+
+1. **`DOCKER_PUBLISH_IP`** (Standard `127.0.0.1`): Shim-Ports lauschen nur auf
+   Loopback des Docker-Hosts — aus dem Internet unerreichbar, aber Fly kommt
+   auch nicht direkt ran. Zwei Wege:
+   - **SSH-Reverse-Tunnel**: Auf dem Docker-Host pro Session-Port einen Tunnel
+     zur Fly-VM aufbauen, Muster: `ssh -R 18080:127.0.0.1:<port> ...` — der
+     Orchestrator verbindet sich dann via `DOCKER_ADDR`+Tunnelport.
+   - **WireGuard**: Ein privates Netz zwischen Fly-VM (Fly unterstützt
+     WireGuard-Peering via `fly wireguard`) und Docker-Host; dann
+     `DOCKER_PUBLISH_IP` auf die Tunnel-Interface-IP des Docker-Hosts setzen,
+     sodass die Ports nur im WireGuard-Netz lauschen.
+2. **Port 2376 firewallen**: Docker-Remote-API nur für Fly-Egress offenhalten
+   (siehe Voraussetzungen) — daran ändert auch ein Tunnel nichts.
+3. **`REMOTE_NETWORK_OPEN=1`**: Remote-Sessions laufen zwingend mit
+   `networkPolicy 'open'` (interne Docker-Netzwerke + Egress-Proxy brauchen den
+   lokalen Socket). Der Orchestrator verweigert Remote-Sessions ohne dieses
+   explizite Consent-Flag. Klarstellung: **auch mit Flag bleibt der
+   Shim-Traffic Plaintext** über `DOCKER_ADDR`, solange nicht getunnelt wird —
+   das Flag ersetzt keine Verschlüsselung, es dokumentiert dein Einverständnis.
+
 ## Deployment
 
 ```bash
@@ -77,10 +101,12 @@ fly secrets set \
   DOCKER_CLIENT_CA_B64="$(B64 ca.pem)" \
   DOCKER_CLIENT_CERT_B64="$(B64 client-cert.pem)" \
   DOCKER_CLIENT_KEY_B64="$(B64 client-key.pem)" \
+  REMOTE_NETWORK_OPEN="1" \
   SESSION_MEM_LIMIT="2g" \
   IDLE_STOP_SEC="900" \
   GC_DAYS="14"
-  # optional: FCM_SERVICE_ACCOUNT_JSON='{...single line...}'
+  # optional: DOCKER_PUBLISH_IP (Standard 127.0.0.1, siehe Transport-Sicherheit),
+  #           FCM_SERVICE_ACCOUNT_JSON='{...single line...}'
 
 fly deploy
 ```
@@ -90,7 +116,7 @@ Danach: `fly status`, Health-Check grün unter `https://<app>.fly.dev/api/health
 ## App koppeln & Secrets
 
 ```bash
-fly ssh console -C "npx tsx src/pair.ts"   # Pairing-Code erzeugen (10 min gültig)
+fly ssh console -C "node dist/pair.js"   # Pairing-Code erzeugen (10 min gültig)
 ```
 
 App: Server-URL `https://<app>.fly.dev` + Code + Gerätename. Danach in

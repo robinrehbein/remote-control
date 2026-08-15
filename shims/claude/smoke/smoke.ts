@@ -1,18 +1,23 @@
 /**
  * Smoke test for the claude shim. Runs the real fastify server + session
- * orchestration against a FakeRunner (no SDK, no credentials) and a temp
- * git repo. Verifies: SSE event normalization, permission flow over
- * /permissions/:id, auto-commit per turn, /diff, /status, auth.
+ * orchestration against a FakeRunner (no SDK, no credentials, no docker)
+ * and a temp git repo. Verifies: SSE event normalization, permission flow
+ * over /permissions/:id, auto-commit per turn, /diff, /status, auth
+ * (constant-time bearer check), PAT credential handling (creds file,
+ * askpass helper without embedded PAT) and the credential-free clone/push
+ * path against a local file:// remote.
  */
 import type { AgentEvent } from '@pocketagent/protocol';
 import { execFile } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import assert from 'node:assert/strict';
 import { buildServer } from '../src/index.ts';
 import { fakeRunnerFactory } from './fakerunner.ts';
+import { askpassEnv, commitTurn, ensureRepo, pushAndCreatePr, readGithubPat } from '../src/gitops.ts';
 
 const exec = promisify(execFile);
 
@@ -90,6 +95,13 @@ async function git(cwd: string, args: string[]): Promise<string> {
 }
 
 async function main(): Promise<void> {
+  try {
+    await exec('git', ['--version']);
+  } catch {
+    console.log('SKIP: git binary not available, smoke test skipped');
+    process.exit(0);
+  }
+
   const workDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-shim-smoke-'));
   await git(workDir, ['init', '-b', 'main']);
   await git(workDir, ['config', 'user.name', 'Smoke Tester']);
@@ -125,6 +137,14 @@ async function main(): Promise<void> {
 
     const noAuth = await fetch(`${base}/status`);
     assert.equal(noAuth.status, 401);
+
+    const wrongAuth = await fetch(`${base}/status`, {
+      headers: { authorization: 'Bearer smoke-token-with-wrong-suffix' },
+    });
+    assert.equal(wrongAuth.status, 401);
+
+    const rightAuth = await fetch(`${base}/status`, { headers: auth });
+    assert.equal(rightAuth.status, 200);
 
     const status0 = (await (await fetch(`${base}/status`, { headers: auth })).json()) as Record<string, unknown>;
     assert.equal(status0.adapter, 'claude');
@@ -233,6 +253,131 @@ async function main(): Promise<void> {
       body: JSON.stringify({ response: 'maybe' }),
     });
     assert.equal(badPermBody.status, 400);
+
+    // --- credential handling: readGithubPat (creds file + env fallback) ---
+    const prevCredsFile = process.env.PA_CREDS_FILE;
+    const prevGithubPat = process.env.GITHUB_PAT;
+    const credsDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-shim-creds-'));
+    try {
+      const credsFile = path.join(credsDir, 'creds.json');
+      await fs.writeFile(credsFile, JSON.stringify({ githubPat: 'file-pat-123' }));
+      delete process.env.GITHUB_PAT;
+      process.env.PA_CREDS_FILE = credsFile;
+      assert.equal(readGithubPat(), 'file-pat-123');
+
+      const badCredsFile = path.join(credsDir, 'bad.json');
+      await fs.writeFile(badCredsFile, '{not valid json');
+      process.env.PA_CREDS_FILE = badCredsFile;
+      process.env.GITHUB_PAT = 'env-pat-456';
+      assert.equal(readGithubPat(), 'env-pat-456');
+
+      process.env.PA_CREDS_FILE = path.join(credsDir, 'missing.json');
+      assert.equal(readGithubPat(), 'env-pat-456');
+
+      delete process.env.GITHUB_PAT;
+      assert.equal(readGithubPat(), undefined);
+
+      delete process.env.PA_CREDS_FILE;
+      process.env.GITHUB_PAT = 'env-only-789';
+      assert.equal(readGithubPat(), 'env-only-789');
+    } finally {
+      if (prevCredsFile === undefined) delete process.env.PA_CREDS_FILE;
+      else process.env.PA_CREDS_FILE = prevCredsFile;
+      if (prevGithubPat === undefined) delete process.env.GITHUB_PAT;
+      else process.env.GITHUB_PAT = prevGithubPat;
+      await fs.rm(credsDir, { recursive: true, force: true });
+    }
+
+    // --- askpass helper: no PAT literal inside the script file ---
+    const askpass = askpassEnv('super-secret-pat-987');
+    assert.ok(askpass !== undefined, 'askpassEnv returns env for a pat');
+    assert.equal(askpass.PA_GIT_PAT, 'super-secret-pat-987');
+    assert.equal(askpass.GIT_TERMINAL_PROMPT, '0');
+    assert.ok(typeof askpass.GIT_ASKPASS === 'string' && askpass.GIT_ASKPASS.length > 0);
+    const askpassScript = await fs.readFile(askpass.GIT_ASKPASS!, 'utf8');
+    assert.ok(!askpassScript.includes('super-secret-pat-987'), 'askpass script must not embed PAT');
+    assert.ok(askpassScript.includes('x-access-token'), 'askpass answers the username prompt');
+    assert.equal((await fs.stat(askpass.GIT_ASKPASS!)).mode & 0o777, 0o700, 'askpass is 0700');
+    assert.equal(askpassEnv(undefined), undefined, 'no pat -> no askpass env');
+    await fs.rm(askpass.GIT_ASKPASS!, { force: true });
+
+    // --- git end-to-end: plain-URL clone + askpass push against file:// remote ---
+    const seedDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-shim-seed-'));
+    const bareDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-shim-bare-'));
+    const cloneDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-shim-clone-'));
+    const pushJsCreds = path.join(os.tmpdir(), `claude-shim-pushjs-${process.pid}.json`);
+    const gitSessionId = 'git-e2e';
+    const gitPat = 'e2e-pat-do-not-leak';
+    try {
+      await git(seedDir, ['init', '-b', 'main']);
+      await git(seedDir, ['config', 'user.name', 'Seed']);
+      await git(seedDir, ['config', 'user.email', 'seed@test.local']);
+      await fs.writeFile(path.join(seedDir, 'README.md'), '# seed\n');
+      await git(seedDir, ['add', '-A']);
+      await git(seedDir, ['commit', '-m', 'init', '--no-verify']);
+      await exec('git', ['clone', '--bare', seedDir, bareDir]);
+      const bareUrl = `file://${bareDir}`;
+
+      const bootstrap = await ensureRepo({
+        workDir: cloneDir,
+        repoUrl: bareUrl,
+        repoBranch: 'main',
+        pat: gitPat,
+        sessionId: gitSessionId,
+      });
+      assert.equal(bootstrap, 'cloned');
+      const cloneConfig = await fs.readFile(path.join(cloneDir, '.git/config'), 'utf8');
+      assert.ok(!cloneConfig.includes(gitPat), 'no PAT in .git/config after clone');
+      assert.ok(!cloneConfig.includes('x-access-token'), 'no injected username in remote URL');
+      assert.ok(cloneConfig.includes(bareUrl), 'remote origin is the plain file:// URL');
+
+      const sha = await commitTurn(cloneDir);
+      assert.match(sha, /^[0-9a-f]{40}$/);
+
+      const pushed = await pushAndCreatePr({
+        workDir: cloneDir,
+        sessionId: gitSessionId,
+        pat: gitPat,
+      });
+      assert.equal(pushed.branch, `agent/${gitSessionId}`);
+      assert.equal(pushed.prUrl, undefined);
+      await git(bareDir, ['rev-parse', '--verify', `refs/heads/agent/${gitSessionId}`]);
+      const pushedConfig = await fs.readFile(path.join(cloneDir, '.git/config'), 'utf8');
+      assert.ok(!pushedConfig.includes(gitPat), 'no PAT in .git/config after push');
+
+      // scripts/push.js through the same credential path (creds file, file:// remote)
+      await fs.writeFile(pushJsCreds, JSON.stringify({ githubPat: 'pushjs-pat-321' }));
+      const pushJs = await exec(process.execPath, [
+        fileURLToPath(new URL('../scripts/push.js', import.meta.url)),
+      ], {
+        env: {
+          ...process.env,
+          WORK_DIR: cloneDir,
+          SESSION_ID: gitSessionId,
+          PA_CREDS_FILE: pushJsCreds,
+          GITHUB_PAT: '',
+          REPO_FULL_NAME: '',
+        },
+        maxBuffer: 16 * 1024 * 1024,
+      });
+      const jsonLine = pushJs.stdout
+        .trim()
+        .split('\n')
+        .filter((l) => l.startsWith('{'))
+        .pop();
+      assert.ok(jsonLine, 'push.js printed its JSON outcome');
+      const outcome = JSON.parse(jsonLine ?? '{}') as { ok: boolean; branch: string };
+      assert.equal(outcome.ok, true);
+      assert.equal(outcome.branch, `agent/${gitSessionId}`);
+      const finalConfig = await fs.readFile(path.join(cloneDir, '.git/config'), 'utf8');
+      assert.ok(!finalConfig.includes('pushjs-pat-321'), 'no PAT in .git/config after push.js');
+      assert.ok(!finalConfig.includes(gitPat), 'still no gitops PAT after push.js');
+    } finally {
+      await fs.rm(seedDir, { recursive: true, force: true });
+      await fs.rm(bareDir, { recursive: true, force: true });
+      await fs.rm(cloneDir, { recursive: true, force: true });
+      await fs.rm(pushJsCreds, { force: true });
+    }
 
     sse.close();
     console.log('SMOKE OK');

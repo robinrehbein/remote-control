@@ -12,6 +12,7 @@ import type {
 } from '@pocketagent/protocol';
 import { fastify } from 'fastify';
 import type { FastifyInstance } from 'fastify';
+import { timingSafeEqual } from 'node:crypto';
 import path from 'node:path';
 import { realpathSync } from 'node:fs';
 import {
@@ -22,7 +23,7 @@ import {
 } from './claude.ts';
 import type { RunnerFactory } from './claude.ts';
 import { EventBroadcaster } from './events.ts';
-import { commitTurn, ensureRepo, getDiff, pushAndCreatePr } from './gitops.ts';
+import { commitTurn, ensureRepo, getDiff, pushAndCreatePr, readGithubPat } from './gitops.ts';
 
 export interface ShimConfig {
   token: string;
@@ -32,6 +33,14 @@ export interface ShimConfig {
   model?: string;
   autoPush: boolean;
   github: { pat?: string; repoFullName?: string; base?: string };
+}
+
+/** Constant-time bearer-token comparison (same approach as shims/opencode). */
+function tokenOk(header: string | undefined, expected: string): boolean {
+  if (header === undefined) return false;
+  const a = Buffer.from(header);
+  const b = Buffer.from(`Bearer ${expected}`);
+  return a.length === b.length && timingSafeEqual(a, b);
 }
 
 export function loadConfigFromEnv(): ShimConfig {
@@ -48,7 +57,7 @@ export function loadConfigFromEnv(): ShimConfig {
     model: process.env.CLAUDE_MODEL,
     autoPush: process.env.AUTO_PUSH === '1',
     github: {
-      pat: process.env.GITHUB_PAT,
+      pat: readGithubPat(),
       repoFullName: process.env.REPO_FULL_NAME,
       base: process.env.REPO_BRANCH,
     },
@@ -80,8 +89,7 @@ export function buildServer(cfg: ShimConfig, runnerFactory?: RunnerFactory): Fas
 
   app.addHook('onRequest', async (req, reply) => {
     if (req.url === '/health' || req.url.startsWith('/health')) return;
-    const expected = `Bearer ${cfg.token}`;
-    if (!cfg.token || req.headers.authorization !== expected) {
+    if (!cfg.token || !tokenOk(req.headers.authorization, cfg.token)) {
       return reply.code(401).send({ ok: false, error: 'unauthorized' });
     }
   });
@@ -188,7 +196,10 @@ export async function main(): Promise<void> {
 
   let runnerFactory: RunnerFactory | undefined;
   if (process.env.SMOKE_FAKE === '1') {
-    const mod = await import('../smoke/fakerunner.ts');
+    // Non-literal specifier keeps smoke/ out of the tsc emit graph
+    // (tsconfig.build.json uses rootDir=src); reachable via tsx from source.
+    const fakeModulePath = '../smoke/fakerunner.ts';
+    const mod = (await import(fakeModulePath)) as { fakeRunnerFactory: RunnerFactory };
     runnerFactory = mod.fakeRunnerFactory;
   }
 
@@ -202,7 +213,7 @@ export async function main(): Promise<void> {
       workDir: cfg.workDir,
       repoUrl: process.env.REPO_URL,
       repoBranch: process.env.REPO_BRANCH,
-      pat: process.env.GITHUB_PAT,
+      pat: cfg.github.pat,
       sessionId: cfg.sessionId,
     });
     console.log(`repo bootstrap: ${result}`);

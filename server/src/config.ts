@@ -88,6 +88,14 @@ function loadNetworkAllowlist(): string[] {
     .filter((h) => h.length > 0);
 }
 
+/** Optional per-session CPU limit in docker NanoCPUs (e.g. 1000000000 = 1 CPU); undefined when unset/invalid. */
+function loadSessionCpuQuota(): number | undefined {
+  const raw = process.env.SESSION_CPU_QUOTA?.trim();
+  if (!raw) return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.round(n) : undefined;
+}
+
 export const config = {
   port: Number(process.env.PORT ?? 3000),
   dataDir: resolve(process.env.DATA_DIR ?? './data'),
@@ -107,8 +115,23 @@ export const config = {
   idleStopSec: Number(process.env.IDLE_STOP_SEC ?? 900),
   gcDays: Number(process.env.GC_DAYS ?? 14),
   adapterImagePrefix: process.env.ADAPTER_IMAGE_PREFIX ?? 'pocketagent',
+  /** Tag used for adapter shim images (pin a specific build instead of 'latest'). */
+  adapterImageTag: process.env.ADAPTER_IMAGE_TAG?.trim() || 'latest',
   networkPolicyDefault: loadNetworkPolicyDefault(),
   networkAllowlist: loadNetworkAllowlist(),
   egressProxyPort: Number(process.env.EGRESS_PROXY_PORT ?? 3128),
   sessionPidsLimit: Number(process.env.SESSION_PIDS_LIMIT ?? 512),
+  /**
+   * Explicit consent for networkPolicy 'open' in remote-daemon mode (DOCKER_HOST=tcp://...).
+   * Remote mode publishes shim ports as plaintext HTTP on the docker host unless tunneled;
+   * creating remote sessions without this flag is rejected.
+   */
+  remoteNetworkOpen: process.env.REMOTE_NETWORK_OPEN === '1',
+  /**
+   * Host IP shim ports are published on in remote-daemon mode. Default 127.0.0.1 keeps
+   * them off the LAN; reach them via SSH tunnel or set to a WireGuard interface IP.
+   */
+  dockerPublishIp: process.env.DOCKER_PUBLISH_IP?.trim() || '127.0.0.1',
+  /** Optional per-session CPU limit in docker NanoCPUs (undefined = unlimited). */
+  sessionCpuQuota: loadSessionCpuQuota(),
 } as const;

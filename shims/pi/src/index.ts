@@ -10,9 +10,17 @@ import type {
   PromptRequest,
   ShimStatus,
 } from '@pocketagent/protocol';
-import { EventBroadcaster } from './events';
-import { commitTurn, createDraftPr, ensureRepo, getDiff, pushBranch, type GitContext } from './gitops';
-import { PromptError, RealPiRunner, type PiRunner, type PromptOutcome } from './pi';
+import { EventBroadcaster } from './events.js';
+import {
+  commitTurn,
+  createDraftPr,
+  ensureRepo,
+  getDiff,
+  readGithubPat,
+  pushBranch,
+  type GitContext,
+} from './gitops.js';
+import { PromptError, RealPiRunner, type PiRunner, type PromptOutcome } from './pi.js';
 
 const AGENT_MODES: readonly AgentMode[] = ['yolo', 'auto', 'acceptEdits', 'ask'];
 
@@ -64,7 +72,8 @@ export function loadConfig(env: NodeJS.ProcessEnv): ShimConfig {
     mode: mode ?? 'ask',
     repoUrl: env.REPO_URL,
     repoBranch: env.REPO_BRANCH,
-    githubPat: env.GITHUB_PAT,
+    // PA_CREDS_FILE ({githubPat}) with GITHUB_PAT env fallback; see readGithubPat.
+    githubPat: readGithubPat() ?? env.GITHUB_PAT,
     repoFullName: env.REPO_FULL_NAME,
     autoPush: env.AUTO_PUSH === '1',
     agentDir: env.PI_AGENT_DIR ?? join(homedir(), '.pi', 'agent'),

@@ -64,6 +64,40 @@ docker compose up -d
 docker exec -it pocketagent-orchestrator npx tsx src/pair.ts   # Pairing-Code (10 min gültig)
 ```
 
+## 4a. Pairing-Härtung & Revocation (aktuell)
+
+- Pairing-Codes sind jetzt **12 Hex-Zeichen** (`randomBytes(6)`), TTL weiterhin 10 Minuten.
+  Der `pair`-Befehl (`npm run pair -w server` bzw. `npx tsx src/pair.ts`) ist **unverändert**.
+- **Lockout**: pro Code werden fehlgeschlagene Confirm-Versuche gezählt (`attempts`-Spalte,
+  per Migration hinzugefügt); nach **5 Fehlversuchen** ist der Code dauerhaft ungültig —
+  auch wenn er noch nicht abgelaufen ist. Ungültige/unbekannte Codes verbrauchen keine Attempts.
+- **Rate-Limit** auf allen `/api/pairing/*`-Routes: **10 req/min pro IP** und **60 req/min global**
+  (Sliding Window, in-memory). Verstoß → HTTP 429 `{"ok":false,"error":"rate limited"}`.
+  Beim Betrieb hinter einem Reverse-Proxy zählen alle Clients als eine IP, sofern `trustProxy`
+  nicht konfiguriert ist — das globale Limit greift trotzdem.
+- Auth-Failures (Pairing-Confirm, WS-Unauthorized 4001, Verbindungsversuche widerufener
+  Devices) werden als `console.warn`-Audit-Zeilen geloggt: `{"ts":...,"ev":"auth.fail",...}`.
+  Pairing-Codes werden darin nur als 4-Zeichen-Präfix protokolliert.
+
+### Admin-CLI (Devices & Links verwalten)
+
+```bash
+# Entwicklung (Repo-Root):
+npx tsx src/admin.ts list-devices        # im server/-Workspace: npm exec -- tsx src/admin.ts ...
+npx tsx src/admin.ts revoke-device <id>
+npx tsx src/admin.ts list-links
+npx tsx src/admin.ts revoke-link <id>
+
+# Produktion (im Container, gebaute dist/):
+node dist/admin.js list-devices
+node dist/admin.js revoke-device <id>
+```
+
+Hinweis: Die CLI läuft als eigener Prozess direkt auf der DB und kann daher **lebende
+WS-Verbindungen nicht sofort schließen** — gesperrte Devices/Links fallen beim nächsten
+Reconnect bzw. Restart des Orchestrators heraus (wird beim Revoke-Befehl mit ausgegeben).
+Revocation über die App (`device.revoke`/`link.revoke` via WS) schließt lebende Sockets sofort.
+
 App installieren (CI-Artifact), koppeln (URL + Code + Gerätename), dann in
 Settings → Secrets hinterlegen: `github` (fine-grained PAT, Contents R/W +
 Pull requests R/W je Repo), danach pro Adapter siehe README-Tabelle

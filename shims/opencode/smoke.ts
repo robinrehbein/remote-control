@@ -5,12 +5,13 @@
  */
 import { spawn, execFile as execFileCb, type ChildProcess } from 'node:child_process';
 import { createServer, type ServerResponse } from 'node:http';
-import { existsSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import type { AgentEvent, DiffEntry, ShimStatus } from '@pocketagent/protocol';
+import { askpassEnv, pushAndDraftPR, readGithubPat } from './src/gitops.ts';
 
 const exec = promisify(execFileCb);
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -176,7 +177,112 @@ async function waitFor(predicate: (event: AgentEvent) => boolean, label: string,
   throw new Error(`timeout waiting for "${label}"; events so far: ${collected.map((e) => e.type).join(', ')}`);
 }
 
+async function hasGit(): Promise<boolean> {
+  try {
+    await exec('git', ['--version']);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Credential-handling checks (no docker, no real credentials):
+ *  - readGithubPat resolves the PAT from a temp PA_CREDS_FILE and falls back
+ *    to GITHUB_PAT on missing/malformed creds files
+ *  - askpassEnv writes an askpass script that contains no PAT literal
+ *  - the new push path pushes to a file:// remote without ever embedding the
+ *    PAT in a remote URL or .git/config
+ */
+async function credentialChecks(): Promise<void> {
+  const prevCredsFile = process.env.PA_CREDS_FILE;
+  const prevPat = process.env.GITHUB_PAT;
+
+  // (a) readGithubPat: creds file, then env fallbacks
+  const credsDir = mkdtempSync(join(tmpdir(), 'pa-creds-'));
+  try {
+    const credsFile = join(credsDir, 'creds.json');
+    writeFileSync(credsFile, JSON.stringify({ githubPat: 'pat-from-creds-file' }));
+    process.env.PA_CREDS_FILE = credsFile;
+    delete process.env.GITHUB_PAT;
+    assert(readGithubPat() === 'pat-from-creds-file', 'readGithubPat reads PA_CREDS_FILE');
+
+    process.env.GITHUB_PAT = 'pat-from-env';
+    writeFileSync(credsFile, '{ not json');
+    assert(readGithubPat() === 'pat-from-env', 'readGithubPat falls back to GITHUB_PAT on bad JSON');
+    process.env.PA_CREDS_FILE = join(credsDir, 'missing.json');
+    assert(readGithubPat() === 'pat-from-env', 'readGithubPat falls back to GITHUB_PAT on missing file');
+    delete process.env.GITHUB_PAT;
+    assert(readGithubPat() === undefined, 'readGithubPat undefined without any source');
+  } finally {
+    if (prevCredsFile === undefined) delete process.env.PA_CREDS_FILE;
+    else process.env.PA_CREDS_FILE = prevCredsFile;
+    if (prevPat === undefined) delete process.env.GITHUB_PAT;
+    else process.env.GITHUB_PAT = prevPat;
+    rmSync(credsDir, { recursive: true, force: true });
+  }
+
+  // (b) askpassEnv: script must not contain the PAT, must echo $PA_GIT_PAT
+  assert(askpassEnv(undefined) === undefined, 'askpassEnv(undefined) -> undefined');
+  const pat = 'smoke-pat-never-leak';
+  const env = askpassEnv(pat);
+  assert(env !== undefined, 'askpassEnv(pat) returns env');
+  const scriptPath = env?.GIT_ASKPASS;
+  assert(typeof scriptPath === 'string' && scriptPath.length > 0, 'GIT_ASKPASS path set');
+  const script = readFileSync(scriptPath as string, 'utf8');
+  assert(!script.includes(pat), 'askpass script contains no PAT literal');
+  assert(script.includes('"$PA_GIT_PAT"'), 'askpass script echoes $PA_GIT_PAT');
+  assert(script.includes('x-access-token'), 'askpass script answers username');
+  assert((statSync(scriptPath as string).mode & 0o777) === 0o700, 'askpass script mode 0700');
+  assert(env?.PA_GIT_PAT === pat, 'PA_GIT_PAT env carries the PAT');
+  assert(env?.GIT_TERMINAL_PROMPT === '0', 'GIT_TERMINAL_PROMPT=0');
+
+  // (c) end-to-end push path against a local file:// remote
+  if (!(await hasGit())) {
+    console.log('SKIP: git binary not available for push-path check');
+    return;
+  }
+  const gitDir = mkdtempSync(join(tmpdir(), 'pa-git-'));
+  try {
+    const bare = join(gitDir, 'remote.git');
+    const clone = join(gitDir, 'clone');
+    await exec('git', ['init', '--bare', '-b', 'main', bare]);
+    await exec('git', ['clone', `file://${bare}`, clone]);
+    await exec('git', ['-C', clone, 'config', 'user.name', 'SmokeTest']);
+    await exec('git', ['-C', clone, 'config', 'user.email', 'smoke@test.local']);
+    writeFileSync(join(clone, 'change.txt'), 'push me\n');
+    await exec('git', ['-C', clone, 'add', '-A']);
+    await exec('git', ['-C', clone, 'commit', '-m', 'init']);
+
+    process.env.PA_CREDS_FILE = join(gitDir, 'missing-creds.json');
+    process.env.GITHUB_PAT = pat;
+    try {
+      const outcome = await pushAndDraftPR({
+        workDir: clone,
+        repoUrl: `file://${bare}`,
+        sessionId: 'push-check',
+        repoFullName: '', // no GitHub API call from smoke
+      });
+      assert(outcome.ok, `push path ok (${outcome.ok ? '' : outcome.error})`);
+      await exec('git', ['-C', bare, 'rev-parse', '--verify', 'refs/heads/agent/push-check']);
+      const remoteUrl = await exec('git', ['-C', clone, 'config', '--get', 'remote.origin.url']);
+      assert(!remoteUrl.stdout.includes(pat), 'remote.origin.url contains no PAT');
+      const gitConfig = readFileSync(join(clone, '.git', 'config'), 'utf8');
+      assert(!gitConfig.includes(pat), '.git/config contains no PAT');
+    } finally {
+      if (prevCredsFile === undefined) delete process.env.PA_CREDS_FILE;
+      else process.env.PA_CREDS_FILE = prevCredsFile;
+      if (prevPat === undefined) delete process.env.GITHUB_PAT;
+      else process.env.GITHUB_PAT = prevPat;
+    }
+    console.log('[smoke] push-path check ok (file:// remote, no PAT in URLs/config)');
+  } finally {
+    rmSync(gitDir, { recursive: true, force: true });
+  }
+}
+
 async function main(): Promise<void> {
+  await credentialChecks();
   const workDir = await mkdtempSync(join(tmpdir(), 'pa-smoke-'));
   let shim: ChildProcess | undefined;
 

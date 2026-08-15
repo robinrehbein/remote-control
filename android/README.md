@@ -79,3 +79,11 @@ Ohne Firebase-Konfiguration läuft die App normal (kein Push). Für echtes FCM:
 - `ProtocolDecodeTest`: ServerMessage-Decode (session.event/tool.call, request.ok,
   session.list) inkl. unbekannter Felder
 - `PairingDecodeTest`: Pairing-Response, URL/WS-Normalisierung
+
+## Sicherheit
+
+Siehe [../SECURITY.md](../SECURITY.md) für die vollständige Security-Policy und
+Known Limitations. Wichtig: der committete Keystore
+(`android/keystore/pocketagent.keystore`) ist debug-gradig und wird über alle
+CI-Builds geteilt – er muss vor jeder öffentlichen Verteilung rotiert werden
+(„Rotate before launch“ in SECURITY.md).

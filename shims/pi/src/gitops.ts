@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
 import type { DiffEntry } from '@pocketagent/protocol';
@@ -21,6 +22,53 @@ const GIT_USER_EMAIL = 'agent@pocketagent.local';
 const SESSION_DIR_IGNORE = '.pi-sessions/';
 const MAX_PATCH_BYTES = 64 * 1024;
 const MAX_DIFF_FILES = 500;
+const DEFAULT_CREDS_FILE = '/run/secrets/pa/creds.json';
+
+/**
+ * Resolve the GitHub PAT: PA_CREDS_FILE JSON ({githubPat}) first, then the
+ * GITHUB_PAT env var (link-agent mode). Tolerates a missing or malformed file.
+ */
+export function readGithubPat(): string | undefined {
+  const credsFile = process.env.PA_CREDS_FILE || DEFAULT_CREDS_FILE;
+  try {
+    const data: unknown = JSON.parse(readFileSync(credsFile, 'utf8'));
+    if (typeof data === 'object' && data !== null) {
+      const pat = (data as { githubPat?: unknown }).githubPat;
+      if (typeof pat === 'string' && pat.length > 0) return pat;
+    }
+  } catch {
+    /* missing or malformed creds file: fall through to env */
+  }
+  const envPat = process.env.GITHUB_PAT;
+  return typeof envPat === 'string' && envPat.length > 0 ? envPat : undefined;
+}
+
+const ASKPASS_SCRIPT = [
+  '#!/bin/sh',
+  'case "$1" in',
+  '  Username*) echo "x-access-token" ;;',
+  '  *) printf \'%s\' "$PA_GIT_PAT" ;;',
+  'esac',
+  '',
+].join('\n');
+
+/**
+ * Env for authenticated git child processes: a tiny GIT_ASKPASS helper hands
+ * the PAT to git via the PA_GIT_PAT env var, so the PAT never appears in
+ * remote URLs, .git/config, argv or logs (the script itself holds no secret).
+ * Returns undefined when no PAT is configured (public or local remotes).
+ */
+export function askpassEnv(pat: string | undefined): NodeJS.ProcessEnv | undefined {
+  if (!pat) return undefined;
+  const helper = join(tmpdir(), `pocketagent-askpass-${process.pid}.sh`);
+  writeFileSync(helper, ASKPASS_SCRIPT, { mode: 0o700 });
+  return {
+    ...process.env,
+    GIT_ASKPASS: helper,
+    GIT_TERMINAL_PROMPT: '0',
+    PA_GIT_PAT: pat,
+  };
+}
 
 export function redact(text: string, secret?: string): string {
   if (!secret) return text;
@@ -31,11 +79,7 @@ export function agentBranch(sessionId: string): string {
   return `agent/${sessionId}`;
 }
 
-export function withCredentials(url: string, pat?: string): string {
-  if (!pat) return url;
-  return url.replace(/^(https:\/\/)(?:[^/@]+@)?([^/]+)/, `$1x-access-token:${pat}@$2`);
-}
-
+/** Defensive: drop userinfo from a URL (e.g. legacy configs written by older versions). */
 export function stripCredentials(url: string): string {
   return url.replace(/^(https:\/\/)[^/@]+@/, '$1');
 }
@@ -46,6 +90,7 @@ async function git(cwd: string, args: string[], ctx: GitContext, timeoutMs = 120
       cwd,
       timeout: timeoutMs,
       maxBuffer: 32 * 1024 * 1024,
+      env: askpassEnv(ctx.githubPat),
     });
     return stdout;
   } catch (error) {
@@ -79,7 +124,8 @@ export async function ensureRepo(ctx: GitContext): Promise<string> {
       await mkdir(dirname(ctx.workDir), { recursive: true });
       const args = ['clone'];
       if (ctx.repoBranch) args.push('--branch', ctx.repoBranch);
-      args.push(withCredentials(ctx.repoUrl, ctx.githubPat), ctx.workDir);
+      // Plain URL: auth (if any) flows through GIT_ASKPASS, never the URL.
+      args.push(ctx.repoUrl, ctx.workDir);
       await git(dirname(ctx.workDir), args, ctx, 300_000);
     } else {
       await mkdir(ctx.workDir, { recursive: true });
@@ -117,9 +163,9 @@ export async function pushBranch(ctx: GitContext, branch: string): Promise<void>
   } catch {
     remoteUrl = ctx.repoUrl ?? '';
   }
-  const url = withCredentials(remoteUrl, ctx.githubPat);
-  if (!url) throw new Error('no remote configured for push');
-  await git(ctx.workDir, ['push', url, `HEAD:refs/heads/${branch}`], ctx, 300_000);
+  if (!remoteUrl) throw new Error('no remote configured for push');
+  // Plain URL push: credentials, when needed, are supplied by GIT_ASKPASS.
+  await git(ctx.workDir, ['push', remoteUrl, `HEAD:refs/heads/${branch}`], ctx, 300_000);
 }
 
 interface PullRequestResponse {

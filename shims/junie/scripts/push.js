@@ -4,19 +4,63 @@
  * Commits dirty state, pushes the agent branch and opens a draft PR.
  * Best-effort: always exits 0, failures are logged to stderr (secrets redacted).
  *
- * Env: WORK_DIR, SESSION_ID, GITHUB_PAT, REPO_FULL_NAME, REPO_BRANCH (base, default main)
+ * The PAT is never embedded in remote URLs / git argv: authentication goes
+ * through a GIT_ASKPASS helper that reads the secret from PA_GIT_PAT env.
+ *
+ * Env: WORK_DIR, SESSION_ID, PA_CREDS_FILE (default /run/secrets/pa/creds.json,
+ * JSON {"githubPat":"..."}) with GITHUB_PAT fallback, REPO_FULL_NAME,
+ * REPO_BRANCH (base, default main)
  */
 import { spawnSync } from 'node:child_process';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const workDir = process.env.WORK_DIR || process.cwd();
 const sessionId = process.env.SESSION_ID || 'unknown-session';
-const pat = process.env.GITHUB_PAT || '';
 const fullName = process.env.REPO_FULL_NAME || '';
 const base = process.env.REPO_BRANCH || 'main';
 const branch = `agent/${sessionId}`;
 
-function git(args) {
-  const result = spawnSync('git', args, { cwd: workDir, encoding: 'utf8' });
+const ASKPASS_SCRIPT = [
+  '#!/bin/sh',
+  'case "$1" in',
+  '  Username*) echo "x-access-token" ;;',
+  `  *) printf '%s' "$PA_GIT_PAT" ;;`,
+  'esac',
+  '',
+].join('\n');
+
+function readGithubPat() {
+  const credsFile = process.env.PA_CREDS_FILE || '/run/secrets/pa/creds.json';
+  try {
+    const parsed = JSON.parse(readFileSync(credsFile, 'utf8'));
+    if (typeof parsed === 'object' && parsed !== null && typeof parsed.githubPat === 'string' && parsed.githubPat) {
+      return parsed.githubPat;
+    }
+  } catch {
+    /* missing or malformed creds file -> fall back to GITHUB_PAT */
+  }
+  const pat = process.env.GITHUB_PAT;
+  return typeof pat === 'string' && pat ? pat : undefined;
+}
+
+const pat = readGithubPat();
+
+function askpassEnv() {
+  if (!pat) return undefined;
+  const script = join(tmpdir(), `pocketagent-askpass-${process.pid}.sh`);
+  writeFileSync(script, ASKPASS_SCRIPT, { mode: 0o700 });
+  return {
+    ...process.env,
+    GIT_ASKPASS: script,
+    GIT_TERMINAL_PROMPT: '0',
+    PA_GIT_PAT: pat,
+  };
+}
+
+function git(args, env) {
+  const result = spawnSync('git', args, { cwd: workDir, encoding: 'utf8', env: env ?? process.env });
   return {
     ok: result.status === 0,
     out: `${result.stdout || ''}${result.stderr || ''}`.trim(),
@@ -29,11 +73,6 @@ function redact(text) {
 
 function log(message) {
   process.stderr.write(`[push] ${redact(message)}\n`);
-}
-
-function injectPat(url) {
-  if (!pat) return url;
-  return url.replace(/^(https:\/\/)(?:[^/@]+@)?([^/]+)/, `$1x-access-token:${pat}@$2`);
 }
 
 function stripPat(url) {
@@ -64,7 +103,7 @@ async function main() {
     log('no origin remote configured; skipping push');
     return;
   }
-  const push = git(['push', injectPat(stripPat(remote.out)), `HEAD:refs/heads/${branch}`]);
+  const push = git(['push', stripPat(remote.out), `HEAD:refs/heads/${branch}`], askpassEnv());
   if (!push.ok) {
     log(`push failed: ${push.out}`);
     return;
@@ -72,7 +111,7 @@ async function main() {
   log(`pushed ${branch}`);
 
   if (!pat || !fullName) {
-    log('GITHUB_PAT/REPO_FULL_NAME not set; skipping draft PR');
+    log('no GitHub PAT/REPO_FULL_NAME; skipping draft PR');
     return;
   }
   try {
@@ -98,10 +137,10 @@ async function main() {
       log('draft PR already exists');
     } else {
       const text = await response.text();
-      log(`draft PR failed: HTTP ${response.status} ${text.slice(0, 300)}`);
+      log(`draft PR failed: HTTP ${response.status} ${redact(text).slice(0, 300)}`);
     }
   } catch (error) {
-    log(`draft PR failed: ${error instanceof Error ? error.message : String(error)}`);
+    log(`draft PR failed: ${redact(error instanceof Error ? error.message : String(error))}`);
   }
 }
 

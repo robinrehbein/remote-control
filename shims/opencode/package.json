@@ -6,6 +6,7 @@
   "description": "PocketAgent adapter shim wrapping `opencode serve` behind the unified PocketAgent HTTP protocol",
   "scripts": {
     "typecheck": "tsc -p . --noEmit",
+    "build": "tsc -p tsconfig.build.json",
     "smoke": "tsx smoke.ts",
     "smoke:real": "tsx real-check.ts",
     "dev": "tsx watch src/index.ts",
@@ -14,11 +15,11 @@
   "dependencies": {
     "@pocketagent/protocol": "file:../../packages/protocol",
     "fastify": "^5.2.0",
-    "opencode-ai": "1.18.18",
-    "tsx": "^4.20.0"
+    "opencode-ai": "1.18.18"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "tsx": "^4.20.0",
     "typescript": "^5.9.0"
   },
   "engines": {

@@ -43,11 +43,54 @@ function forbidden(socket: net.Socket): void {
   socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
 }
 
+type TokenValidator = (token: string) => boolean;
+
+let tokenValidator: TokenValidator | null = null;
+
+/**
+ * Register the per-session token validator used to gate proxy access (the
+ * SessionManager passes any live session's shim_token). While unset (smoke /
+ * dev) the proxy keeps accepting unauthenticated requests.
+ */
+export function setEgressTokenValidator(fn: ((token: string) => boolean) | null): void {
+  tokenValidator = fn;
+}
+
+/**
+ * Extract the proxy-auth token from a Proxy-Authorization header value:
+ * 'Bearer <t>' or 'Basic <base64 of "pa:<t>">'. Malformed values -> null.
+ */
+export function parseProxyAuth(header: string | undefined): string | null {
+  if (!header) return null;
+  const m = /^(\w+)\s+(\S+)\s*$/.exec(header.trim());
+  if (!m) return null;
+  const [, scheme, value] = m as unknown as [string, string, string];
+  if (scheme.toLowerCase() === 'bearer') return value;
+  if (scheme.toLowerCase() === 'basic') {
+    const decoded = Buffer.from(value, 'base64').toString('utf8');
+    const i = decoded.indexOf(':');
+    if (i === -1) return null;
+    return decoded.slice(i + 1);
+  }
+  return null;
+}
+
+function proxyAuthorized(req: http.IncomingMessage): boolean {
+  if (!tokenValidator) return true;
+  const header = req.headers['proxy-authorization'];
+  const token = parseProxyAuth(Array.isArray(header) ? header[0] : header);
+  return token !== null && tokenValidator(token);
+}
+
 export function startEgressProxy(opts: EgressProxyOptions = {}): http.Server {
   const port = opts.port ?? config.egressProxyPort;
   const allowlist = opts.allowlist ?? config.networkAllowlist;
 
   const server = http.createServer((req, res) => {
+    if (!proxyAuthorized(req)) {
+      res.writeHead(403).end('forbidden');
+      return;
+    }
     let target: URL;
     try {
       target = new URL(req.url ?? '/');
@@ -81,7 +124,11 @@ export function startEgressProxy(opts: EgressProxyOptions = {}): http.Server {
     const idx = url.lastIndexOf(':');
     const host = idx === -1 ? url : url.slice(0, idx);
     const portNum = idx === -1 ? 443 : Number(url.slice(idx + 1));
-    if ((portNum !== 443 && portNum !== 80) || !hostAllowed(host, allowlist)) {
+    if (
+      !proxyAuthorized(req) ||
+      (portNum !== 443 && portNum !== 80) ||
+      !hostAllowed(host, allowlist)
+    ) {
       forbidden(socket);
       return;
     }

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
 import type { RawData, WebSocket } from 'ws';
 import type { ClientMessage, ServerMessage } from '@pocketagent/protocol';
 import { SERVER_VERSION } from './config.js';
@@ -9,20 +9,64 @@ import { listAdapters } from './adapters.js';
 import type { SessionManager } from './sessions.js';
 import { encrypt } from './vault.js';
 
+/** Security audit line (stdout-warn JSON; never log tokens). */
+function auditWarn(kind: string, fields: Record<string, unknown>): void {
+  console.warn(JSON.stringify({ ts: new Date().toISOString(), ev: 'auth.fail', kind, ...fields }));
+}
+
+/** Per remote-address live WS connection counter (module level, one process). */
+const wsConnCounts = new Map<string, number>();
+const MAX_CONNS_PER_ADDRESS = 10;
+
 export class Hub {
   private readonly sockets = new Set<WebSocket>();
+  private readonly deviceIds = new Map<WebSocket, string>();
   private readonly linkSockets = new Map<string, WebSocket>();
   private readonly pendingLinkCalls = new Map<
     string,
     { resolve: (v: { status: number; body?: unknown } | null) => void; timer: NodeJS.Timeout }
   >();
 
-  add(s: WebSocket): void {
+  add(s: WebSocket, deviceId: string): void {
     this.sockets.add(s);
+    this.deviceIds.set(s, deviceId);
   }
 
   remove(s: WebSocket): void {
     this.sockets.delete(s);
+    this.deviceIds.delete(s);
+  }
+
+  isDeviceOnline(deviceId: string): boolean {
+    for (const id of this.deviceIds.values()) {
+      if (id === deviceId) return true;
+    }
+    return false;
+  }
+
+  /** Close all live sockets of a device (called on device revocation; safe to call again). */
+  closeDevice(deviceId: string): void {
+    for (const [s, id] of [...this.deviceIds]) {
+      if (id !== deviceId) continue;
+      this.remove(s);
+      try {
+        s.close(4001, 'revoked');
+      } catch {
+        /* already closed */
+      }
+    }
+  }
+
+  /** Close a link agent's live socket (called on link revocation; safe to call again). */
+  closeLink(linkId: string): void {
+    const s = this.linkSockets.get(linkId);
+    if (!s) return;
+    this.linkSockets.delete(linkId);
+    try {
+      s.close(4001, 'revoked');
+    } catch {
+      /* already closed */
+    }
   }
 
   broadcast(m: ServerMessage): void {
@@ -102,13 +146,33 @@ type LinkInMessage = Extract<
 >;
 type SocketInMessage = AppClientMessage | LinkInMessage;
 
+const REPO_FULL_NAME_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
+const REPO_BRANCH_RE = /^[A-Za-z0-9._/-]+$/;
+
 export function registerWs(
   app: FastifyInstance,
   store: Store,
   manager: SessionManager,
   hub: Hub,
 ): void {
-  app.get('/ws', { websocket: true }, (socket: WebSocket) => {
+  // maxPayload (1 MiB) is enforced at the websocket plugin registration in index.ts.
+  app.get('/ws', { websocket: true }, (socket: WebSocket, request: FastifyRequest) => {
+    // NOTE: reverse proxies may collapse many distinct clients into a single
+    // remote address; this cap is a coarse DoS guard, not an identity bound.
+    const addr = request.socket.remoteAddress ?? 'unknown';
+    const conns = (wsConnCounts.get(addr) ?? 0) + 1;
+    wsConnCounts.set(addr, conns);
+    socket.once('close', () => {
+      const n = (wsConnCounts.get(addr) ?? 1) - 1;
+      if (n <= 0) wsConnCounts.delete(addr);
+      else wsConnCounts.set(addr, n);
+    });
+    if (conns > MAX_CONNS_PER_ADDRESS) {
+      auditWarn('ws.conn-limit', { ip: addr });
+      socket.close(4001, 'too many connections');
+      return;
+    }
+
     let authed = false;
     let role: 'device' | 'link' = 'device';
     let deviceId: string | null = null;
@@ -134,6 +198,7 @@ export function registerWs(
         if (msg.type === 'agent.hello') {
           const link = store.getLinkByTokenHash(sha256(msg.token));
           if (!link) {
+            auditWarn('ws.link-unauthorized', { ip: addr });
             socket.close(4001, 'unauthorized');
             return;
           }
@@ -150,13 +215,20 @@ export function registerWs(
           return;
         }
         const dev = store.getDevice(msg.deviceId);
-        if (!dev || dev.token_hash !== sha256(msg.token)) {
+        if (!dev) {
+          // Row gone => device was revoked (or never enrolled).
+          auditWarn('ws.revoked-device', { ip: addr, deviceId: msg.deviceId });
+          socket.close(4001, 'unauthorized');
+          return;
+        }
+        if (dev.token_hash !== sha256(msg.token)) {
+          auditWarn('ws.unauthorized', { ip: addr, deviceId: msg.deviceId });
           socket.close(4001, 'unauthorized');
           return;
         }
         authed = true;
         deviceId = dev.id;
-        hub.add(socket);
+        hub.add(socket, dev.id);
         send({ type: 'welcome', ok: true, serverVersion: SERVER_VERSION });
         return;
       }
@@ -279,6 +351,10 @@ export function registerWs(
           return;
         }
         case 'repo.add': {
+          if (!REPO_FULL_NAME_RE.test(msg.fullName) || !REPO_BRANCH_RE.test(msg.defaultBranch)) {
+            send({ type: 'error', requestId: msg.requestId, message: 'invalid fullName or defaultBranch' });
+            return;
+          }
           try {
             const repo = store.addRepo(randomUUID(), 'default', msg.fullName, msg.defaultBranch);
             send({
@@ -293,7 +369,7 @@ export function registerWs(
         }
         case 'secret.set': {
           const id = randomUUID();
-          const { ciphertext, nonce } = encrypt(msg.value);
+          const { ciphertext, nonce } = encrypt(msg.value, `secret:default:${msg.kind}`);
           store.saveSecret(id, 'default', msg.kind, ciphertext, nonce);
           const saved = store.getSecret(id);
           if (saved) {
@@ -318,6 +394,39 @@ export function registerWs(
           store.deleteSecret(msg.id, 'default');
           send({ type: 'secret.deleted', requestId: msg.requestId, id: msg.id });
           return;
+        case 'device.list': {
+          // Single-tenant trust model: any authenticated device may list/revoke.
+          const devices = store.listDevices('default').map((d) => ({
+            id: d.id,
+            name: d.name,
+            enrolledAt: d.enrolled_at,
+            online: hub.isDeviceOnline(d.id),
+          }));
+          send({ type: 'device.list', requestId: msg.requestId, devices });
+          return;
+        }
+        case 'device.revoke': {
+          // Single-tenant trust model: any authenticated device may revoke another device.
+          store.deleteDevice(msg.deviceId);
+          hub.closeDevice(msg.deviceId);
+          send({ type: 'device.revoked', requestId: msg.requestId, deviceId: msg.deviceId });
+          return;
+        }
+        case 'link.list': {
+          const links = store.listLinks('default').map((l) => ({
+            id: l.id,
+            name: l.name,
+            createdAt: l.created_at,
+          }));
+          send({ type: 'link.list', requestId: msg.requestId, links });
+          return;
+        }
+        case 'link.revoke': {
+          store.deleteLink(msg.linkId);
+          hub.closeLink(msg.linkId);
+          send({ type: 'link.revoked', requestId: msg.requestId, linkId: msg.linkId });
+          return;
+        }
         case 'server.stats':
           send({ type: 'server.stats', requestId: msg.requestId, stats: await manager.stats() });
           return;

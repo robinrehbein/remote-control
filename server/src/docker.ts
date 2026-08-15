@@ -11,14 +11,18 @@ function docker(): Docker | null {
   if (client === null) {
     if (config.dockerHost) {
       const url = new URL(config.dockerHost);
-      client = new Docker({
-        protocol: url.protocol === 'https:' ? 'https' : 'http',
-        host: url.hostname,
-        port: url.port ? Number(url.port) : 2375,
-        ...(config.dockerTls.ca && config.dockerTls.cert && config.dockerTls.key
-          ? { ca: config.dockerTls.ca, cert: config.dockerTls.cert, key: config.dockerTls.key }
-          : {}),
-      });
+      if (url.protocol === 'unix:') {
+        client = new Docker({ socketPath: url.pathname || '/var/run/docker.sock' });
+      } else {
+        client = new Docker({
+          protocol: url.protocol === 'https:' ? 'https' : 'http',
+          host: url.hostname,
+          port: url.port ? Number(url.port) : 2375,
+          ...(config.dockerTls.ca && config.dockerTls.cert && config.dockerTls.key
+            ? { ca: config.dockerTls.ca, cert: config.dockerTls.cert, key: config.dockerTls.key }
+            : {}),
+        });
+      }
     } else {
       client = new Docker({ socketPath: '/var/run/docker.sock' });
     }
@@ -26,9 +30,19 @@ function docker(): Docker | null {
   return client;
 }
 
-/** true when session containers run on a remote daemon; shim ports are then published on the docker host. */
+/**
+ * true when session containers run on a remote daemon (tcp/http/https DOCKER_HOST);
+ * shim ports are then published on the docker host. A unix:// DOCKER_HOST is a
+ * local socket and NOT remote.
+ */
 export function isRemote(): boolean {
-  return config.dockerHost !== null;
+  if (!config.dockerHost) return false;
+  try {
+    const proto = new URL(config.dockerHost).protocol.replace(/:$/, '');
+    return proto !== 'unix';
+  } catch {
+    return true; // unparseable, non-unix host string: assume remote daemon
+  }
 }
 
 export function parseMem(spec: string): number {
@@ -129,9 +143,8 @@ export async function removeSessionNetwork(sessionId: string): Promise<void> {
   }
 }
 
-/** Remote daemons publish shim ports; session networks only work in socket mode. */
+/** Validate the session row's network policy (fallback: config default). Remote-mode gating lives in createSession. */
 function policyFor(session: SessionRow): NetworkPolicy {
-  if (isRemote()) return 'open';
   const raw = session.network_policy;
   return isNetworkPolicy(raw) ? raw : config.networkPolicyDefault;
 }
@@ -152,8 +165,10 @@ async function sessionNetworking(
   const netName = await ensureSessionNetwork(session.id);
   await ensureSelfAttached(netName);
   if (policyFor(session) === 'allowlist') {
-    env.HTTP_PROXY = `http://${ORCHESTRATOR_ALIAS}:${config.egressProxyPort}`;
-    env.HTTPS_PROXY = `http://${ORCHESTRATOR_ALIAS}:${config.egressProxyPort}`;
+    // Proxy auth: the egress proxy only accepts requests carrying a valid per-session shim token.
+    const auth = session.shim_token ? `pa:${session.shim_token}@` : '';
+    env.HTTP_PROXY = `http://${auth}${ORCHESTRATOR_ALIAS}:${config.egressProxyPort}`;
+    env.HTTPS_PROXY = `http://${auth}${ORCHESTRATOR_ALIAS}:${config.egressProxyPort}`;
     env.NO_PROXY = 'localhost,127.0.0.1';
   }
   return { EndpointsConfig: { [netName]: { Aliases: [session.id] } } };
@@ -188,6 +203,52 @@ export async function pullImage(image: string): Promise<void> {
   });
 }
 
+/** One ustar header (512 bytes) + data padded to a 512-byte block. uid/gid 1000 = 'node' in the shim images. */
+function tarEntry(name: string, mode: number, typeflag: '0' | '5', data: Buffer): Buffer {
+  const h = Buffer.alloc(512);
+  h.write(name.slice(0, 99), 0, 100, 'utf8');
+  h.write(mode.toString(8).padStart(7, '0') + '\0', 100, 8, 'ascii');
+  h.write('1750\0', 108, 8, 'ascii'); // uid 1000
+  h.write('1750\0', 116, 8, 'ascii'); // gid 1000
+  h.write(data.length.toString(8).padStart(11, '0') + '\0', 124, 12, 'ascii');
+  h.write('00000000000\0', 136, 12, 'ascii'); // mtime 0
+  h.write('        ', 148, 8, 'ascii'); // checksum placeholder (spaces)
+  h.write(typeflag, 156, 1, 'ascii');
+  h.write('ustar\0', 257, 6, 'ascii');
+  h.write('00', 263, 2, 'ascii');
+  let sum = 0;
+  for (const b of h) sum += b;
+  h.write(sum.toString(8).padStart(6, '0') + '\0 ', 148, 8, 'ascii');
+  const pad = (512 - (data.length % 512)) % 512;
+  return Buffer.concat([h, data, Buffer.alloc(pad)]);
+}
+
+/**
+ * Inject `creds` into a NOT-YET-STARTED container as /run/secrets/pa/creds.json
+ * (uid/gid 1000, dir 0700, file 0400) via a minimal in-memory tar. Replaces
+ * GITHUB_PAT container env (K2 contract): shims read PA_CREDS_FILE at runtime.
+ * putArchive writes are daemon-side and work on a not-yet-started
+ * readonly-rootfs container; if a daemon ever rejects it, creds injection
+ * failing is logged here and sessions continue without push credentials.
+ */
+export async function injectCredsFile(containerId: string, creds: Record<string, string>): Promise<boolean> {
+  const d = docker();
+  if (!d) return false;
+  try {
+    const body = Buffer.from(JSON.stringify(creds), 'utf8');
+    const tar = Buffer.concat([
+      tarEntry('pa/', 0o700, '5', Buffer.alloc(0)),
+      tarEntry('pa/creds.json', 0o400, '0', body),
+      Buffer.alloc(1024), // end-of-archive marker
+    ]);
+    await d.getContainer(containerId).putArchive(tar, { path: '/run/secrets' });
+    return true;
+  } catch (e) {
+    console.error(`[docker] creds injection failed for ${containerId.slice(0, 8)}: ${String(e)}`);
+    return false;
+  }
+}
+
 export async function createSessionContainer(
   session: SessionRow,
   env: Record<string, string | undefined>,
@@ -211,8 +272,11 @@ export async function createSessionContainer(
         CapDrop: ['ALL'],
         SecurityOpt: ['no-new-privileges'],
         PidsLimit: config.sessionPidsLimit,
+        ReadonlyRootfs: true,
+        // executable /tmp: shims run their GIT_ASKPASS helper script from /tmp
         Tmpfs: { '/tmp': 'rw,size=1g' },
-        ...(remote ? { PortBindings: { '8080/tcp': [{ HostPort: '' }] } } : {}),
+        ...(config.sessionCpuQuota ? { NanoCpus: config.sessionCpuQuota } : {}),
+        ...(remote ? { PortBindings: { '8080/tcp': [{ HostPort: '', HostIp: config.dockerPublishIp }] } } : {}),
       },
       NetworkingConfig: networking,
     });
@@ -303,6 +367,7 @@ export function pushScriptFor(adapter: string): string {
 export async function oneShotPush(
   session: SessionRow,
   env: Record<string, string | undefined>,
+  creds?: Record<string, string>,
 ): Promise<boolean> {
   const d = docker();
   if (!d || !session.volume_name) return false;
@@ -321,10 +386,14 @@ export async function oneShotPush(
         CapDrop: ['ALL'],
         SecurityOpt: ['no-new-privileges'],
         PidsLimit: config.sessionPidsLimit,
+        ReadonlyRootfs: true,
+        // executable /tmp: shims run their GIT_ASKPASS helper script from /tmp
         Tmpfs: { '/tmp': 'rw,size=1g' },
+        ...(config.sessionCpuQuota ? { NanoCpus: config.sessionCpuQuota } : {}),
       },
       NetworkingConfig: networking,
     });
+    if (creds && Object.keys(creds).length > 0) await injectCredsFile(c.id, creds);
     await c.start();
     const res = await c.wait();
     await c.remove().catch(() => {});

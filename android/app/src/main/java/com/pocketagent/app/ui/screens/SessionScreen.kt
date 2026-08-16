@@ -3,8 +3,12 @@
 package com.pocketagent.app.ui.screens
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -55,14 +59,12 @@ import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.DoneAll
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledIconButton
-import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -75,6 +77,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -82,6 +85,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -112,16 +116,19 @@ import com.pocketagent.app.data.SessionInfo
 import com.pocketagent.app.data.SessionStatus
 import com.pocketagent.app.data.StartPhase
 import com.pocketagent.app.data.WsClient
-import com.pocketagent.app.data.wireName
 import com.pocketagent.app.ui.components.MarkdownText
 import com.pocketagent.app.ui.theme.CardInset
 import com.pocketagent.app.ui.theme.ChipHeight
+import com.pocketagent.app.ui.theme.ChipSpacing
 import com.pocketagent.app.ui.theme.ChipValueMaxWidth
 import com.pocketagent.app.ui.theme.ComposerHeight
 import com.pocketagent.app.ui.theme.ContentInset
 import com.pocketagent.app.ui.theme.MinTouchTarget
 import com.pocketagent.app.ui.theme.MonoMedium
 import com.pocketagent.app.ui.theme.MonoSmall
+import com.pocketagent.app.ui.theme.MotionMedium
+import com.pocketagent.app.ui.theme.MotionShort
+import com.pocketagent.app.ui.theme.OneUiEasing
 import com.pocketagent.app.ui.theme.PillShape
 import com.pocketagent.app.ui.theme.PrimaryButtonHeight
 import com.pocketagent.app.ui.theme.RadioRowDividerInset
@@ -380,7 +387,12 @@ class SessionViewModel : ViewModel() {
         viewModelScope.launch {
             // Erfolgsfall aktualisiert die UI über das session.status-Handling
             repository.updateSession(sessionId, mode, model, reasoningEffort, adapter)
-                .onFailure { append(TimelineItem.Error("Änderung fehlgeschlagen: ${it.message}")) }
+                .onFailure {
+                    // Kopfzeile bleibt handlungsleitend; der Servertext – falls
+                    // vorhanden – steht nur als Nebensatz dahinter.
+                    val cause = it.message?.takeIf { m -> m.isNotBlank() }?.let { m -> " ($m)" }.orEmpty()
+                    append(TimelineItem.Error("Änderung konnte nicht übernommen werden – bitte erneut versuchen.$cause"))
+                }
         }
     }
 
@@ -409,7 +421,9 @@ class SessionViewModel : ViewModel() {
         viewModelScope.launch {
             _models.value = repository.loadModels(sessionId).fold(
                 onSuccess = { ModelsState.Loaded(it) },
-                onFailure = { ModelsState.Failed(it.message ?: "Unbekannter Fehler") },
+                // Keine Server-/Exception-Interna vor dem Nutzer — die Karte
+                // bietet ohnehin "Erneut versuchen" als Weg nach vorn.
+                onFailure = { ModelsState.Failed("Die Modellliste konnte nicht geladen werden.") },
             )
         }
     }
@@ -459,7 +473,9 @@ fun SessionScreen(
 
     LaunchedEffect(deleted) { if (deleted) onBack() }
 
-    var sheet by remember { mutableStateOf<SessionSheet?>(null) }
+    // SessionSheet ist ein Enum und damit Serializable — der Standard-Saver
+    // trägt es unverändert über Fold/Rotation hinweg.
+    var sheet by rememberSaveable { mutableStateOf<SessionSheet?>(null) }
 
     // Nach dem Laden ans Ende — aber ohne Animation, damit der Verlauf
     // fertig unten steht statt sichtbar durchzurauschen. Erst danach wird
@@ -478,8 +494,8 @@ fun SessionScreen(
         }
     }
 
-    var menuOpen by remember { mutableStateOf(false) }
-    var confirmDelete by remember { mutableStateOf(false) }
+    var menuOpen by rememberSaveable { mutableStateOf(false) }
+    var confirmDelete by rememberSaveable { mutableStateOf(false) }
 
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
@@ -506,7 +522,7 @@ fun SessionScreen(
                                 details = listOfNotNull(
                                     sessionSubtitle(s),
                                     adapterLabel(adapters, s.adapter),
-                                    s.mode.wireName(),
+                                    modeLabel(s.mode),
                                     s.networkPolicy?.takeIf { it != "allowlist" }?.let(::networkPolicyLabel),
                                 ),
                                 modifier = Modifier.padding(top = 2.dp),
@@ -522,7 +538,10 @@ fun SessionScreen(
                 actions = {
                     if (busy || session?.status == SessionStatus.RUNNING) {
                         IconButton(onClick = { vm.abort() }) {
-                            Icon(Icons.Filled.Stop, contentDescription = "Agent anhalten")
+                            // vm.abort() bricht nur den laufenden Zug ab — die
+                            // Beschreibung darf nicht nach "Container anhalten"
+                            // klingen, das ist eine andere Aktion im Menü.
+                            Icon(Icons.Filled.Stop, contentDescription = "Aktuellen Auftrag abbrechen")
                         }
                     }
                     IconButton(onClick = { onOpenDiff(sessionId) }) {
@@ -542,18 +561,24 @@ fun SessionScreen(
                             }
                             if (session?.status == SessionStatus.STOPPED) {
                                 DropdownMenuItem(
-                                    text = { Text("Fortsetzen") },
+                                    text = { Text(sessionActionLabel(SessionAction.RESUME)) },
                                     leadingIcon = { Icon(Icons.Outlined.Check, contentDescription = null) },
                                     onClick = { menuOpen = false; vm.resume() },
                                 )
                             } else {
                                 DropdownMenuItem(
-                                    text = { Text("Container anhalten") },
+                                    // Beschriftung aus SessionActions statt hier
+                                    // noch einmal getippt: dieselbe Aktion hieß
+                                    // in der Liste und hier sonst verschieden.
+                                    text = { Text(sessionActionLabel(SessionAction.STOP)) },
                                     leadingIcon = { Icon(Icons.Outlined.Close, contentDescription = null) },
                                     onClick = { menuOpen = false; vm.stop() },
                                 )
                             }
                             DropdownMenuItem(
+                                // Bewusst nicht sessionActionLabel(DELETE): das
+                                // sagt nur „Löschen“. Im Menü einer offenen
+                                // Session muss dastehen, was gelöscht wird.
                                 text = { Text("Session löschen") },
                                 leadingIcon = { Icon(Icons.Filled.Delete, contentDescription = null) },
                                 onClick = { menuOpen = false; confirmDelete = true },
@@ -588,7 +613,11 @@ fun SessionScreen(
                     // Der Start braucht Minuten — er steht ruhig über dem
                     // Composer statt in der Timeline, wo er wegscrollen würde.
                     startProgressOf(session?.status, progress)?.let { StartProgressCard(it) }
-                    AnimatedVisibility(visible = busy, enter = fadeIn(), exit = fadeOut()) {
+                    AnimatedVisibility(
+                        visible = busy,
+                        enter = fadeIn(tween(MotionShort, easing = LinearEasing)),
+                        exit = fadeOut(tween(MotionShort, easing = LinearEasing)),
+                    ) {
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
                             modifier = Modifier.padding(start = ContentInset, top = 6.dp, bottom = 2.dp),
@@ -612,7 +641,7 @@ fun SessionScreen(
                     session?.let { s ->
                         val chipsEnabled = s.status != SessionStatus.CREATING
                         Row(
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            horizontalArrangement = Arrangement.spacedBy(ChipSpacing),
                             verticalAlignment = Alignment.CenterVertically,
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -806,9 +835,9 @@ fun SessionScreen(
     }
 
     if (confirmDelete) {
-        AlertDialog(
+        OneUiDialog(
             onDismissRequest = { confirmDelete = false },
-            title = { Text("Session löschen?") },
+            title = "Session löschen?",
             // Dieselbe Warnung wie in der Liste: es geht mehr verloren als der Container.
             text = {
                 Text(
@@ -901,7 +930,13 @@ private fun StartProgressCard(progress: StartProgress) {
                         modifier = Modifier.padding(top = 8.dp),
                     )
                 }
-                AnimatedVisibility(visible = expanded) {
+                AnimatedVisibility(
+                    visible = expanded,
+                    enter = expandVertically(tween(MotionMedium, easing = OneUiEasing)) +
+                        fadeIn(tween(MotionShort, easing = LinearEasing)),
+                    exit = shrinkVertically(tween(MotionMedium, easing = OneUiEasing)) +
+                        fadeOut(tween(MotionShort, easing = LinearEasing)),
+                ) {
                     Text(
                         text = detail,
                         style = MonoSmall,
@@ -966,7 +1001,12 @@ fun SettingChip(
         color = MaterialTheme.colorScheme.surfaceContainerHighest,
         onClick = onClick,
         enabled = enabled,
+        // Gezeichnet bleibt die Pille bei ChipHeight (34 dp) — die Tippfläche
+        // wächst per minimumInteractiveComponentSize() zentriert auf 48 dp,
+        // ohne dass die Surface selbst größer gezeichnet wird. Ein Material3-
+        // Surface bringt das für einen klickbaren Chip sonst nicht mit.
         modifier = Modifier
+            .minimumInteractiveComponentSize()
             .heightIn(min = ChipHeight)
             .alpha(if (enabled) 1f else 0.4f),
     ) {
@@ -1039,7 +1079,10 @@ fun SettingIconChip(
         color = MaterialTheme.colorScheme.surfaceContainerHighest,
         onClick = onClick,
         enabled = enabled,
+        // minimumInteractiveComponentSize() deckt hier auch die Breite ab —
+        // ein reiner Icon-Chip ist von Natur aus schmaler als 48 dp.
         modifier = Modifier
+            .minimumInteractiveComponentSize()
             .heightIn(min = ChipHeight)
             .alpha(if (enabled) 1f else 0.4f),
     ) {
@@ -1124,7 +1167,7 @@ private fun AgentSheet(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = ScreenGutter, vertical = 10.dp)
-                .height(PrimaryButtonHeight),
+                .heightIn(min = PrimaryButtonHeight),
         ) {
             Text("Agent wechseln")
         }
@@ -1351,9 +1394,9 @@ private fun ModelSearchField(
         },
         singleLine = true,
         shape = PillShape,
+        // One UI: jedes Suchfeld behält Autokorrektur und Vorschläge — anders
+        // als das freie Modellfeld weiter unten ist das hier echte Textsuche.
         keyboardOptions = KeyboardOptions(
-            autoCorrectEnabled = false,
-            keyboardType = KeyboardType.Ascii,
             imeAction = ImeAction.Search,
         ),
         colors = OutlinedTextFieldDefaults.colors(
@@ -1378,8 +1421,9 @@ private fun ModelSheet(
 ) {
     var custom by remember(current) { mutableStateOf(current) }
     // Der Suchtext gehört dem geöffneten Sheet: Schließen und erneutes
-    // Öffnen beginnt wieder bei der vollen Liste.
-    var query by remember { mutableStateOf("") }
+    // Öffnen beginnt wieder bei der vollen Liste. rememberSaveable, damit
+    // ein Fold/Rotation während der Suche sie nicht verwirft.
+    var query by rememberSaveable { mutableStateOf("") }
     SettingSheet(title = "Modell", onDismiss = onDismiss) {
         when (state) {
             is ModelsState.Loading, ModelsState.Idle -> Row(
@@ -1409,7 +1453,7 @@ private fun ModelSheet(
             }
 
             is ModelsState.Loaded -> if (state.models.isEmpty()) {
-                SectionNote("Dieser Adapter liefert keine Modellliste – Modell unten frei eintragen.")
+                SectionNote("Dieser Agent liefert keine Modellliste – trag dein Modell unten ein.")
             } else {
                 val searchable = state.models.size > ModelSearchThreshold
                 if (searchable) ModelSearchField(query = query, onQueryChange = { query = it })
@@ -1436,8 +1480,8 @@ private fun ModelSheet(
                             // Treffer – der Standard ist keiner davon.
                             if (!searching) {
                                 SelectableTile(
-                                    title = "Adapter-Standard",
-                                    subtitle = "Modellwahl dem Adapter überlassen",
+                                    title = "Standard des Agenten",
+                                    subtitle = "Modellwahl dem Agenten überlassen",
                                     selected = current.isBlank(),
                                     onClick = { onPick("") },
                                 )
@@ -1612,7 +1656,13 @@ private fun ToolCard(item: TimelineItem.Tool) {
                     )
                 }
             }
-            AnimatedVisibility(visible = expanded) {
+            AnimatedVisibility(
+                visible = expanded,
+                enter = expandVertically(tween(MotionMedium, easing = OneUiEasing)) +
+                    fadeIn(tween(MotionShort, easing = LinearEasing)),
+                exit = shrinkVertically(tween(MotionMedium, easing = OneUiEasing)) +
+                    fadeOut(tween(MotionShort, easing = LinearEasing)),
+            ) {
                 Column(
                     Modifier
                         .padding(horizontal = 14.dp, vertical = 4.dp)
@@ -1702,9 +1752,9 @@ private fun ApprovalCard(item: TimelineItem.Approval, vm: SessionViewModel) {
                 }
             }
             when (item.resolved) {
-                // Same button heights, same pill shape, one accent: the
-                // safe default is filled, the wider grant is tonal, the
-                // refusal is quiet text.
+                // Ein Button-Stil pro Karte: nur "Erlauben" ist gefüllt, alles
+                // andere flacher TextButton. Die Rangfolge kommt aus Position
+                // und Farbe, nicht mehr aus drei verschiedenen Hintergründen.
                 null -> Column(modifier = Modifier.padding(top = 14.dp)) {
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(
@@ -1712,16 +1762,16 @@ private fun ApprovalCard(item: TimelineItem.Approval, vm: SessionViewModel) {
                             onClick = { vm.decide(item.permissionId, PermissionDecision.ONCE) },
                             modifier = Modifier
                                 .weight(1f)
-                                .height(MinTouchTarget),
+                                .heightIn(min = MinTouchTarget),
                         ) {
                             Text("Erlauben")
                         }
-                        FilledTonalButton(
+                        TextButton(
                             shape = PillShape,
                             onClick = { vm.decide(item.permissionId, PermissionDecision.ALWAYS) },
                             modifier = Modifier
                                 .weight(1f)
-                                .height(MinTouchTarget),
+                                .heightIn(min = MinTouchTarget),
                         ) {
                             Text("Immer")
                         }

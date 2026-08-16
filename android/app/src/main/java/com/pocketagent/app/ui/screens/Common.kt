@@ -4,6 +4,7 @@ import android.Manifest
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
@@ -15,22 +16,27 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material3.BasicAlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -52,18 +58,23 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.DialogProperties
 import com.pocketagent.app.data.SessionStatus
 import com.pocketagent.app.data.WsClient
 import com.pocketagent.app.ui.theme.CardInset
 import com.pocketagent.app.ui.theme.ContentInset
 import com.pocketagent.app.ui.theme.IconRowDividerInset
 import com.pocketagent.app.ui.theme.ListItemTitle
+import com.pocketagent.app.ui.theme.MinTouchTarget
 import com.pocketagent.app.ui.theme.PillShape
 import com.pocketagent.app.ui.theme.RowVerticalPadding
 import com.pocketagent.app.ui.theme.ScreenGutter
@@ -121,10 +132,19 @@ fun PulsingDot(color: Color, pulse: Boolean, size: Dp = 8.dp) {
         return
     }
     val transition = rememberInfiniteTransition(label = "pulse")
+    // Linear, weil One UI genau diese Kurve dem Auf- und Abblenden von
+    // Transparenz zuordnet. Die 850 ms bleiben absichtlich über der
+    // 500-ms-Grenze aus motion/basic: die ist mit „to avoid interfering with
+    // subsequent tasks" begründet und zielt auf Übergänge, die den Nutzer
+    // aufhalten. Auf 500 ms halbiert würde aus einer Liste laufender Sessions
+    // ein Stroboskop.
     val alpha by transition.animateFloat(
         initialValue = 1f,
-        targetValue = 0.25f,
-        animationSpec = infiniteRepeatable(tween(850), RepeatMode.Reverse),
+        targetValue = 0.4f,
+        animationSpec = infiniteRepeatable(
+            tween(850, easing = LinearEasing),
+            RepeatMode.Reverse,
+        ),
         label = "pulseAlpha",
     )
     Box(modifier = Modifier.size(size).alpha(alpha).background(color, CircleShape))
@@ -238,8 +258,21 @@ fun ConnectionLine(
         horizontalArrangement = Arrangement.Center,
         modifier = modifier
             .fillMaxWidth()
-            .then(if (connecting) Modifier else Modifier.clickable(onClick = onReconnect))
-            .heightIn(min = 36.dp)
+            // Der einzige Weg zurück aus einer abgerissenen Verbindung. Er war
+            // 36 dp hoch und ohne Rolle — für einen Screenreader also kein
+            // Knopf, und für den Daumen zu knapp.
+            .then(
+                if (connecting) {
+                    Modifier
+                } else {
+                    Modifier.clickable(
+                        onClickLabel = "Jetzt verbinden",
+                        role = Role.Button,
+                        onClick = onReconnect,
+                    )
+                },
+            )
+            .heightIn(min = MinTouchTarget)
             .padding(horizontal = ScreenGutter, vertical = 4.dp),
     ) {
         DotLabel(
@@ -287,6 +320,10 @@ fun OneUiScaffold(
     Scaffold(
         modifier = Modifier.nestedScroll(scrollBehavior.nestedScrollConnection),
         containerColor = MaterialTheme.colorScheme.background,
+        // Der Scaffold-Standard sind `systemBars` — die lassen die Kamera-
+        // Aussparung aus. One UI verlangt, Inhalte um sie herum zu legen; quer
+        // und auf einem aufgeklappten Foldable überlappt sie sonst den Text.
+        contentWindowInsets = WindowInsets.safeDrawing,
         floatingActionButton = floatingActionButton,
         bottomBar = bottomBar,
         snackbarHost = snackbarHost,
@@ -388,14 +425,22 @@ fun SectionNote(text: String, modifier: Modifier = Modifier) {
     )
 }
 
-/** Inline error under a section — same inset, error color. */
+/**
+ * Inline error under a section — same inset, error color.
+ *
+ * Als Live-Region ausgezeichnet: der Text erscheint als Ergebnis einer
+ * Aktion, und One UI verlangt „audible feedback for … results of actions".
+ * Ohne die Auszeichnung erfährt ein Screenreader-Nutzer nichts davon.
+ */
 @Composable
 fun SectionError(text: String, modifier: Modifier = Modifier) {
     Text(
         text = text,
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.error,
-        modifier = modifier.padding(start = ContentInset, end = ContentInset, top = 8.dp),
+        modifier = modifier
+            .semantics { liveRegion = LiveRegionMode.Assertive }
+            .padding(start = ContentInset, end = ContentInset, top = 8.dp),
     )
 }
 
@@ -409,37 +454,67 @@ fun ListDivider(startInset: Dp = IconRowDividerInset) {
 }
 
 /**
- * The one warning surface in the app: something is missing or will behave
- * unexpectedly. Semantic warning colors, never the accent.
+ * Dialoghülle für Auswahl und Bestätigung, unten verankert.
+ *
+ * One UI ist an dieser Stelle eindeutig: „Choice and confirmation dialogs
+ * appear at the bottom of the screen. Information dialogs, such as progress
+ * popups, appear in the center of the screen" (one-ui/comp/dialog). Ein
+ * zentrierter AlertDialog ist damit die falsche Form für jedes „Wirklich
+ * löschen?" — er gehört in Daumennähe, nicht in die Bildmitte.
+ *
+ * Ansonsten verhält sie sich wie ein AlertDialog: Titel, Text, bestätigende
+ * und abweisende Aktion, Schließen per Rückwärtstaste oder Tippen daneben.
  */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun NoticeCard(
-    text: String,
-    actionLabel: String? = null,
-    onAction: (() -> Unit)? = null,
+fun OneUiDialog(
+    onDismissRequest: () -> Unit,
+    title: String,
+    confirmButton: @Composable () -> Unit,
+    modifier: Modifier = Modifier,
+    dismissButton: (@Composable () -> Unit)? = null,
+    text: (@Composable () -> Unit)? = null,
 ) {
-    val s = semantic()
-    ScreenCard(color = s.warningContainer) {
-        Column(
-            modifier = Modifier.padding(
-                start = CardInset,
-                end = CardInset,
-                top = 14.dp,
-                bottom = if (actionLabel != null) 8.dp else 14.dp,
-            ),
+    BasicAlertDialog(
+        onDismissRequest = onDismissRequest,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+        modifier = Modifier.fillMaxSize(),
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .windowInsetsPadding(WindowInsets.safeDrawing),
+            contentAlignment = Alignment.BottomCenter,
         ) {
-            Text(
-                text = text,
-                style = MaterialTheme.typography.bodyMedium,
-                color = s.warning,
-            )
-            if (actionLabel != null && onAction != null) {
-                TextButton(
-                    onClick = onAction,
-                    shape = PillShape,
-                    modifier = Modifier.padding(top = 4.dp).heightIn(min = 44.dp),
-                ) {
-                    Text(actionLabel, color = s.warning, fontWeight = FontWeight.SemiBold)
+            Surface(
+                modifier = modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = ScreenGutter, vertical = ScreenGutter),
+                shape = MaterialTheme.shapes.large,
+                color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                tonalElevation = 0.dp,
+            ) {
+                Column(modifier = Modifier.padding(CardInset)) {
+                    Text(
+                        text = title,
+                        style = MaterialTheme.typography.titleMedium,
+                        modifier = Modifier.padding(bottom = if (text != null) 8.dp else 12.dp),
+                    )
+                    text?.let {
+                        it()
+                        Spacer(modifier = Modifier.height(12.dp))
+                    }
+                    Row(
+                        horizontalArrangement = Arrangement.End,
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        dismissButton?.let {
+                            it()
+                            Spacer(modifier = Modifier.width(8.dp))
+                        }
+                        confirmButton()
+                    }
                 }
             }
         }
@@ -481,6 +556,11 @@ fun SelectableTile(
                 text = title,
                 style = ListItemTitle,
                 color = if (titleColor == Color.Unspecified) MaterialTheme.colorScheme.onSurface else titleColor,
+                // One UI hält Listentitel „within 31 characters to avoid
+                // spilling over to a second line". Lange Modell-Ids tun das
+                // sonst und schieben den Untertitel nach unten.
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
             )
             if (!subtitle.isNullOrBlank()) {
                 Text(

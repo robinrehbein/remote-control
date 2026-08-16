@@ -8,7 +8,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
@@ -74,8 +74,16 @@ class PairingViewModel : ViewModel() {
         val s = _state.value
         val container = app.container
         if (s.busy) return
-        if (s.serverUrl.isBlank() || s.code.isBlank() || s.deviceName.isBlank()) {
-            _state.value = s.copy(error = "Bitte alle Felder ausfüllen")
+        // Nennt das leere Feld statt pauschal "alle Felder" zu verlangen —
+        // nur eines fehlt normalerweise.
+        val fieldError = when {
+            s.serverUrl.isBlank() -> "Trag die Server-URL ein."
+            s.code.isBlank() -> "Trag den Pairing-Code ein."
+            s.deviceName.isBlank() -> "Trag einen Gerätenamen ein."
+            else -> null
+        }
+        if (fieldError != null) {
+            _state.value = s.copy(error = fieldError)
             return
         }
         _state.value = s.copy(busy = true, error = null)
@@ -212,7 +220,10 @@ fun PairingScreen(onPaired: () -> Unit) {
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(top = 28.dp)
-                .height(PrimaryButtonHeight),
+                // heightIn statt height: bei 200% Schriftgröße muss das
+                // Label wachsen dürfen, statt am Button-Rand abgeschnitten
+                // zu werden — der einzige Button auf dem Login-Screen.
+                .heightIn(min = PrimaryButtonHeight),
         ) {
             if (state.busy) {
                 CircularProgressIndicator(
@@ -226,7 +237,7 @@ fun PairingScreen(onPaired: () -> Unit) {
         }
 
         Text(
-            text = "Den Pairing-Code erzeugst du auf deinem Server.",
+            text = stringResource(R.string.pairing_hint_code),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center,

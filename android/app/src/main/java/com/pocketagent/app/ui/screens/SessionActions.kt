@@ -50,11 +50,11 @@ fun archiveSwipeArchives(archived: Boolean): Boolean = !archived
 
 /** Beschriftung des Wisch-Hintergrunds auf der Archiv-Seite. */
 fun archiveSwipeLabel(archived: Boolean): String =
-    if (archiveSwipeArchives(archived)) "Archivieren" else "Wiederherstellen"
+    if (archiveSwipeArchives(archived)) "Archivieren" else "Aus Archiv holen"
 
 /** Bestätigung nach dem Wisch — dieselbe Sprache wie im Kontextmenü. */
 fun archiveDoneLabel(archived: Boolean): String =
-    if (archived) "Session archiviert" else "Session wiederhergestellt"
+    if (archived) "Session archiviert" else "Aus Archiv geholt"
 
 /* ------------------------------------------------------------------ */
 /* Kontextmenü                                                         */
@@ -100,7 +100,7 @@ fun sessionActionLabel(action: SessionAction): String = when (action) {
     SessionAction.RENAME -> "Umbenennen"
     SessionAction.ARCHIVE -> "Archivieren"
     SessionAction.UNARCHIVE -> "Aus Archiv holen"
-    SessionAction.STOP -> "Container anhalten"
+    SessionAction.STOP -> "Session pausieren"
     SessionAction.RESUME -> "Fortsetzen"
     SessionAction.PUSH -> "Änderungen pushen"
     SessionAction.OPEN_PR -> "Pull Request öffnen"
@@ -114,6 +114,7 @@ fun sessionActionLabel(action: SessionAction): String = when (action) {
 fun sessionActionNote(action: SessionAction): String? = when (action) {
     SessionAction.ARCHIVE -> "Container wird gestoppt, der Arbeitsstand bleibt erhalten"
     SessionAction.UNARCHIVE -> "Zurück in die Liste; Fortsetzen startet den Container neu"
+    SessionAction.STOP -> "Der Container wird beendet; Fortsetzen startet ihn neu"
     SessionAction.DELETE -> "Endgültig – mit Verlauf und Arbeitsstand"
     else -> null
 }
@@ -121,5 +122,4 @@ fun sessionActionNote(action: SessionAction): String? = when (action) {
 /** Text der Löschbestätigung; benennt, was tatsächlich verloren geht. */
 fun deleteConfirmText(session: SessionInfo): String =
     "„${sessionDisplayName(session)}“ wird endgültig gelöscht, inklusive Verlauf und " +
-        "Arbeitsstand. Container, Volume und Netz werden entfernt. Das lässt sich nicht " +
-        "rückgängig machen."
+        "Arbeitsstand. Das lässt sich nicht rückgängig machen."

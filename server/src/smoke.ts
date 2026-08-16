@@ -1224,6 +1224,28 @@ async function main(): Promise<void> {
   );
   assert(errEvent.type === 'session.event', 'error event broadcast with message');
 
+  /* ---- session.prompt ack: requestId gets an error echoed back, none stays silent ---- */
+  // The session never got a shim_token (docker disabled), so manager.prompt()
+  // deterministically rejects with 'session not provisioned' - this exercises
+  // the same error-ack path a real client hits while its container is booting.
+  const promptAck = await request(c2, {
+    type: 'session.prompt',
+    requestId: 'prm1',
+    sessionId,
+    text: 'hallo',
+  });
+  assert(
+    promptAck.type === 'error' && promptAck.requestId === 'prm1' && promptAck.sessionId === sessionId,
+    'session.prompt with a requestId is acked with error + the same requestId',
+  );
+  c2.send({ type: 'session.prompt', sessionId, text: 'ohne requestId' });
+  const silentPrompt = await c2.wait(
+    (m) => m.type === 'error' && m.sessionId === sessionId && !('requestId' in m),
+    5_000,
+  );
+  assert(silentPrompt.type === 'error', 'session.prompt without a requestId still reports the failure');
+  assert(!('requestId' in silentPrompt), 'session.prompt without a requestId gets no requestId back (fire-and-forget)');
+
   const badUpdate = await request(c2, {
     type: 'session.update',
     requestId: 'upd0',

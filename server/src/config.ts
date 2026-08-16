@@ -113,6 +113,16 @@ function loadSessionCpuQuota(): number | undefined {
   return Number.isFinite(n) && n > 0 ? Math.round(n) : undefined;
 }
 
+/**
+ * Whether the process sits behind a reverse proxy (Coolify/Traefik) that sets
+ * X-Forwarded-For. Only then may that header be trusted for req.ip - directly
+ * exposed, it is client-spoofable.
+ */
+function loadTrustProxy(): boolean {
+  const raw = process.env.TRUST_PROXY;
+  return raw === '1' || raw === 'true';
+}
+
 export const config = {
   port: Number(process.env.PORT ?? 3000),
   dataDir: resolve(process.env.DATA_DIR ?? './data'),
@@ -182,6 +192,8 @@ export const config = {
   dockerPublishIp: process.env.DOCKER_PUBLISH_IP?.trim() || '127.0.0.1',
   /** Optional per-session CPU limit in docker NanoCPUs (undefined = unlimited). */
   sessionCpuQuota: loadSessionCpuQuota(),
+  /** Trust X-Forwarded-For from a reverse proxy in front of the server (see TRUST_PROXY). */
+  trustProxy: loadTrustProxy(),
 } as const;
 
 /** Port the gateway listens on inside its container (ingress). */

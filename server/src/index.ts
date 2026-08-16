@@ -25,7 +25,10 @@ export function auditWarn(kind: string, fields: Record<string, unknown>): void {
 }
 
 export async function buildApp(): Promise<App> {
-  const app = Fastify({ logger: false, bodyLimit: 1024 * 1024 });
+  // trustProxy: only honour X-Forwarded-For when TRUST_PROXY=1 (behind
+  // Coolify/Traefik) - it makes req.ip (WS conn cap, pairing rate limiter)
+  // resolve the real client instead of the proxy's single shared address.
+  const app = Fastify({ logger: false, bodyLimit: 1024 * 1024, trustProxy: config.trustProxy });
   const store = new Store();
   const hub = new Hub();
   const heartbeat = new Heartbeat();

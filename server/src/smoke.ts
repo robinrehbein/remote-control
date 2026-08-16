@@ -106,10 +106,20 @@ function proxyGet(
   http: typeof import('node:http'),
   proxyPort: number,
   absoluteUrl: string,
+  token?: string,
 ): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
     const req = http.request(
-      { host: '127.0.0.1', port: proxyPort, method: 'GET', path: absoluteUrl },
+      {
+        host: '127.0.0.1',
+        port: proxyPort,
+        method: 'GET',
+        path: absoluteUrl,
+        // same shape git/curl send from the proxy URL's userinfo
+        headers: token
+          ? { 'proxy-authorization': `Basic ${Buffer.from(`pa:${token}`).toString('base64')}` }
+          : {},
+      },
       (res) => {
         let body = '';
         res.on('data', (c) => (body += String(c)));
@@ -211,6 +221,27 @@ async function gatewaySmoke(): Promise<void> {
   assert(allowed.status === 200 && allowed.body === 'pong', 'egress proxy forwards allowlisted hosts');
   const blocked = await proxyGet(http, egressPort, 'http://blocked.example/x');
   assert(blocked.status === 403, 'egress proxy blocks hosts outside the allowlist');
+
+  // Denial reasons must stay distinguishable: an unauthenticated caller gets
+  // 407 (so it can authenticate), everything else 403.
+  const { denyReason } = await import('./egress-proxy.js');
+  assert(denyReason(false, '127.0.0.1', 443, ['127.0.0.1']) === 'auth', 'missing auth is reported as auth');
+  assert(denyReason(true, '127.0.0.1', 8443, ['127.0.0.1']) === 'port', 'CONNECT to a foreign port is refused');
+  assert(denyReason(true, '127.0.0.1', null, ['127.0.0.1']) === null, 'forwarded HTTP is not port-gated');
+  assert(denyReason(true, 'evil.example', 443, ['127.0.0.1']) === 'host', 'unlisted host is reported as host');
+
+  // A session token that the validator knows must tunnel; the same request
+  // without credentials must not - this is the exact path a shim's git clone
+  // takes, which previously failed with an opaque 403.
+  const gated = createEgressProxyServer(['127.0.0.1'], (t) => t === 'live-session-token');
+  const gatedPort = await listen(gated);
+  const authed = await proxyGet(http, gatedPort, `http://127.0.0.1:${upstreamPort}/ping`, 'live-session-token');
+  assert(authed.status === 200, 'egress proxy accepts a live session token');
+  const unauthed = await proxyGet(http, gatedPort, `http://127.0.0.1:${upstreamPort}/ping`);
+  assert(unauthed.status === 407, 'egress proxy answers 407 (not 403) without credentials');
+  const staleToken = await proxyGet(http, gatedPort, `http://127.0.0.1:${upstreamPort}/ping`, 'not-a-session');
+  assert(staleToken.status === 407, 'egress proxy rejects an unknown token');
+  gated.close();
 
   for (const s of [shim, ingress, upstream, egress]) s.close();
 }

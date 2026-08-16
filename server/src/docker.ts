@@ -220,18 +220,23 @@ async function attachGateway(networkName: string): Promise<void> {
   }
 }
 
-export async function ensureNetwork(): Promise<void> {
+/** Create a network unless the daemon already knows it (idempotent). */
+async function ensureNetworkExists(name: string, internal: boolean): Promise<void> {
   const d = docker();
   if (!d) return;
   try {
-    await d.getNetwork(config.networkName).inspect();
+    await d.getNetwork(name).inspect();
   } catch {
     try {
-      await d.createNetwork({ Name: config.networkName, CheckDuplicate: true });
+      await d.createNetwork({ Name: name, CheckDuplicate: true, ...(internal ? { Internal: true } : {}) });
     } catch {
       /* already created concurrently */
     }
   }
+}
+
+export async function ensureNetwork(): Promise<void> {
+  await ensureNetworkExists(config.networkName, false);
   await ensureSelfAttached(config.networkName);
 }
 
@@ -275,39 +280,23 @@ export async function ensureSelfAttached(networkName: string): Promise<string | 
 }
 
 /**
- * Local mode reaches the shim only through the shared docker network, and an
+ * Local mode reaches the shim only through the session's docker network, and an
  * 'allowlist' session reaches the egress proxy only the same way. A failed
  * attach therefore has to fail the session immediately with its real cause
  * instead of running into the shim-readiness timeout.
  */
-async function requireSelfAttached(networkName: string): Promise<void> {
-  const failure = await ensureSelfAttached(networkName);
-  if (failure) {
-    throw new Error(
-      `${failure} Ohne diese Anbindung ist der Agent-Container nicht erreichbar. ` +
-        'Prüfe, ob der Orchestrator selbst als Docker-Container mit gesetztem HOSTNAME läuft.',
-    );
-  }
+async function requireAttached(session: SessionRow): Promise<void> {
+  const failure = await attachOrchestratorTo(session);
+  if (failure === null) return;
+  const hint =
+    sessionNetworkFor(session).relay === 'gateway'
+      ? 'Prüfe den Gateway-Container auf dem Docker-Host.'
+      : 'Prüfe, ob der Orchestrator selbst als Docker-Container mit gesetztem HOSTNAME läuft.';
+  throw new Error(`${failure} Ohne diese Anbindung ist der Agent-Container nicht erreichbar. ${hint}`);
 }
 
 export function sessionNetworkName(sessionId: string): string {
   return `pocketagent-s-${sessionId.slice(0, 12)}`;
-}
-
-async function ensureSessionNetwork(sessionId: string): Promise<string> {
-  const d = docker();
-  const name = sessionNetworkName(sessionId);
-  if (!d) return name;
-  try {
-    await d.getNetwork(name).inspect();
-  } catch {
-    try {
-      await d.createNetwork({ Name: name, Internal: true, CheckDuplicate: true });
-    } catch {
-      /* already created concurrently */
-    }
-  }
-  return name;
 }
 
 /** Delete a session's internal network together with any containers left on it. */
@@ -346,29 +335,66 @@ function policyFor(session: SessionRow): NetworkPolicy {
   return isNetworkPolicy(raw) ? raw : config.networkPolicyDefault;
 }
 
+/** Who relays orchestrator traffic into a session's network. */
+export type SessionRelay =
+  /** local daemon: the orchestrator container itself (alias 'orchestrator') */
+  | 'orchestrator'
+  /** remote daemon + GATEWAY_TOKEN: the gateway container (alias 'gateway') */
+  | 'gateway'
+  /** remote daemon without gateway: the shim is reached via a published port */
+  | 'none';
+
+export interface SessionNetwork {
+  /** docker network the session container lives on */
+  name: string;
+  relay: SessionRelay;
+}
+
 /**
- * Resolve the container network for a session. 'open' shares the main
- * network; 'allowlist'/'isolated' get a dedicated internal network with a
- * reachable relay attached: locally the orchestrator itself (alias
- * 'orchestrator'), remotely the gateway container (alias 'gateway'). For
- * 'allowlist' the proxy env vars are injected into `env`.
+ * Network a session's container lives on and who has to be attached to it so
+ * the orchestrator can reach the shim: 'open' shares the main network,
+ * 'allowlist'/'isolated' get a dedicated internal one. Pure by contract - the
+ * single source of truth for both session creation and the startup reconcile.
+ */
+export function sessionNetworkFor(session: SessionRow): SessionNetwork {
+  const name = policyFor(session) === 'open' ? config.networkName : sessionNetworkName(session.id);
+  const relay: SessionRelay = gatewayEnabled() ? 'gateway' : isRemote() ? 'none' : 'orchestrator';
+  return { name, relay };
+}
+
+/**
+ * (Re)establish the link between the orchestrator and a session's network,
+ * creating the network when it is missing. Idempotent; returns null when the
+ * link stands, otherwise its German cause. Needed on every path that has to
+ * talk to a shim - including a freshly deployed orchestrator container, which
+ * starts out attached to no session network at all.
+ */
+export async function attachOrchestratorTo(session: SessionRow): Promise<string | null> {
+  const { name, relay } = sessionNetworkFor(session);
+  if (relay === 'none') return null; // published shim port, no shared network
+  await ensureNetworkExists(name, name !== config.networkName);
+  if (relay === 'orchestrator') return ensureSelfAttached(name);
+  try {
+    await attachGateway(name);
+    return null;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return `Gateway-Container konnte nicht ans Netz ${name} angebunden werden: ${msg}`;
+  }
+}
+
+/**
+ * Container networking for a session (see sessionNetworkFor). For 'allowlist'
+ * the proxy env vars are injected into `env`.
  */
 async function sessionNetworking(
   session: SessionRow,
   env: Record<string, string | undefined>,
 ): Promise<{ EndpointsConfig: Record<string, { Aliases: string[] }> }> {
   const policy = policyFor(session);
-  if (policy === 'open') {
-    // With a gateway even 'open' sessions are reached through it (no published
-    // port), so it has to sit on the shared network too.
-    if (gatewayEnabled()) await attachGateway(config.networkName);
-    else await requireSelfAttached(config.networkName);
-    return { EndpointsConfig: { [config.networkName]: { Aliases: [session.id] } } };
-  }
-  const netName = await ensureSessionNetwork(session.id);
-  const viaGateway = gatewayEnabled();
-  if (viaGateway) await attachGateway(netName);
-  else await requireSelfAttached(netName);
+  const { name: netName, relay } = sessionNetworkFor(session);
+  await requireAttached(session);
+  const viaGateway = relay === 'gateway';
   if (policy === 'allowlist') {
     // Proxy auth: egress proxies accept requests carrying a valid per-session
     // shim token (Basic "pa:<token>"); instances without a validator ignore it.
@@ -605,6 +631,24 @@ export async function containerLogTail(id: string, lines = LOG_TAIL_LINES): Prom
     return stripLogFraming(Buffer.isBuffer(raw) ? raw : Buffer.from(String(raw)));
   } catch {
     return ''; // container removed / daemon unreachable
+  }
+}
+
+/**
+ * Liveness of a session container. 'unknown' means the daemon did not answer:
+ * only a daemon that *did* answer proves a container is gone, so a caller must
+ * never turn a transport failure into a dead session.
+ */
+export type ContainerState = 'running' | 'stopped' | 'missing' | 'unknown';
+
+export async function containerState(id: string): Promise<ContainerState> {
+  const d = docker();
+  if (!d) return 'unknown';
+  try {
+    const info = await d.getContainer(id).inspect();
+    return info.State?.Running === true ? 'running' : 'stopped';
+  } catch (e) {
+    return /no such container|404/i.test(String(e)) ? 'missing' : 'unknown';
   }
 }
 

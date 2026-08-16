@@ -433,6 +433,39 @@ export class SessionManager {
     return this.clients.get(id) ?? this.shimClient(this.shimBase(id), row.shim_token);
   }
 
+  /**
+   * Every shim request goes through here: `null` means the shim never answered,
+   * which after a redeploy simply means the new orchestrator container hangs on
+   * no session network any more. Re-attach it (and the event stream that died
+   * with the old attachment) once and retry before reporting a failure.
+   */
+  private async withShim<T>(id: string, call: (c: ShimClient) => Promise<T | null>): Promise<T | null> {
+    const first = await call(this.client(id));
+    if (first !== null) return first;
+    const row = this.store.getSession(id);
+    if (!row || !row.shim_token) return null;
+    const failure = await docker.attachOrchestratorTo(row);
+    if (failure !== null) {
+      console.warn(`[sessions] re-attach failed for ${id.slice(0, 8)}: ${failure}`);
+      return null;
+    }
+    this.connectEvents(id, this.shimBase(id, row.shim_endpoint), row.shim_token);
+    return await call(this.client(id));
+  }
+
+  /**
+   * Message for a shim that stayed unreachable even after the re-attach. The
+   * container's own state and log say what a bare "request failed" never could;
+   * containerDiagnostics masks token-shaped words in that log.
+   */
+  private async unreachableMessage(id: string): Promise<string> {
+    const row = this.store.getSession(id);
+    const diag = row?.container_id ? await docker.containerDiagnostics(row.container_id) : '';
+    return diag
+      ? `Der Agent-Container ist nicht erreichbar.\n${diag}`
+      : 'Der Agent-Container ist nicht erreichbar und liefert keine Diagnose – Session neu starten.';
+  }
+
   private async linkCall(
     row: SessionRow,
     path: string,
@@ -462,11 +495,11 @@ export class SessionManager {
       this.setStatus(id, 'running');
       return;
     }
-    const client = this.client(id);
+    if (!row.shim_token) throw new Error('session not provisioned'); // before any status change
     this.setStatus(id, 'running');
-    const res = await client.prompt(body);
+    const res = await this.withShim(id, (c) => c.prompt(body));
     if (!res || !res.ok) {
-      const message = res && !res.ok ? res.error : 'prompt request failed';
+      const message = res && !res.ok ? res.error : await this.unreachableMessage(id);
       this.setStatus(id, 'error');
       this.emitEvent(id, { type: 'error', message, fatal: true });
     }
@@ -602,7 +635,7 @@ export class SessionManager {
       return normalizeModels(res.body);
     }
     if (!row.shim_token) return [];
-    return await this.client(id).models();
+    return (await this.withShim(id, (c) => c.models())) ?? [];
   }
 
   async permission(id: string, permissionId: string, decision: PermissionDecision): Promise<void> {
@@ -612,8 +645,8 @@ export class SessionManager {
       if (!res.ok) throw new Error(res.error);
       return;
     }
-    const res = await this.client(id).permission(permissionId, decision);
-    if (!res?.ok) throw new Error(res && !res.ok ? res.error : 'permission request failed');
+    const res = await this.withShim(id, (c) => c.permission(permissionId, decision));
+    if (!res?.ok) throw new Error(res && !res.ok ? res.error : await this.unreachableMessage(id));
   }
 
   async abort(id: string): Promise<void> {
@@ -623,8 +656,8 @@ export class SessionManager {
       if (!res.ok) throw new Error(res.error);
       return;
     }
-    const res = await this.client(id).abort();
-    if (!res?.ok) throw new Error(res && !res.ok ? res.error : 'abort request failed');
+    const res = await this.withShim(id, (c) => c.abort());
+    if (!res?.ok) throw new Error(res && !res.ok ? res.error : await this.unreachableMessage(id));
   }
 
   async diff(id: string): Promise<DiffEntry[]> {
@@ -634,8 +667,8 @@ export class SessionManager {
       if (!res.ok) throw new Error(res.error);
       return Array.isArray(res.body) ? (res.body as DiffEntry[]) : [];
     }
-    const diff = await this.client(id).diff();
-    if (!diff) throw new Error('diff request failed');
+    const diff = await this.withShim(id, (c) => c.diff());
+    if (!diff) throw new Error(await this.unreachableMessage(id));
     return diff;
   }
 
@@ -664,7 +697,11 @@ export class SessionManager {
     if (!row.shim_token || !row.volume_name) throw new Error('session not provisioned');
     if (!config.dockerEnabled) throw new Error('docker is disabled on this server');
     const notice = this.noticeFor(id);
-    await docker.ensureNetwork();
+    // The session's own network, not just the shared one: an 'allowlist'/
+    // 'isolated' container is reachable only through pocketagent-s-<id>, and a
+    // resume after a redeploy starts out attached to neither.
+    const attachFailure = await docker.attachOrchestratorTo(row);
+    if (attachFailure !== null) throw new Error(attachFailure);
     let cid = row.container_id;
     notice('Container startet', { phase: 'container-start' });
     let started = cid ? await docker.startContainer(cid) : false;
@@ -774,6 +811,71 @@ export class SessionManager {
       uptimeSec: Math.floor((Date.now() - this.startedAt) / 1000),
       versions: { server: SERVER_VERSION },
     };
+  }
+
+  /**
+   * A redeploy replaces the orchestrator container while the session
+   * containers keep running: the new one is attached to no session network and
+   * holds no event stream, so every request to a live session fails. Rebuild
+   * that state once at startup and bring the rows in line with what the daemon
+   * actually still has. Never blocks or fails the server start - each session
+   * is guarded on its own.
+   */
+  async reconcile(tenant: string = TENANT): Promise<void> {
+    if (!config.dockerEnabled) return;
+    for (const row of this.store.listSessions(tenant)) {
+      // link agents redial by themselves; rows without a container have nothing
+      // to reconnect to, and stopped/error sessions are resumed explicitly.
+      if (row.link_id || !row.container_id) continue;
+      if (row.status === 'stopped' || row.status === 'error') continue;
+      try {
+        await this.reconcileSession(row);
+      } catch (e) {
+        console.error(`[sessions] reconcile failed for ${row.id.slice(0, 8)}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+  }
+
+  private async reconcileSession(row: SessionRow): Promise<void> {
+    const state = await docker.containerState(row.container_id as string);
+    if (state === 'unknown') {
+      console.warn(`[sessions] reconcile: docker did not answer for ${row.id.slice(0, 8)} - session left as is`);
+      return;
+    }
+    if (state === 'missing') {
+      this.emitEvent(row.id, {
+        type: 'error',
+        message:
+          'Der Agent-Container existiert nicht mehr (nach einem Server-Neustart nicht wiedergefunden). ' +
+          'Die Session kann mit ihrem Arbeitsstand neu gestartet werden.',
+        fatal: true,
+      });
+      this.setStatus(row.id, 'error');
+      return;
+    }
+    if (state === 'stopped') {
+      this.emitEvent(row.id, {
+        type: 'notice',
+        message: 'Der Agent-Container läuft nicht mehr – die Session wurde als gestoppt markiert und kann fortgesetzt werden.',
+      });
+      this.setStatus(row.id, 'stopped');
+      return;
+    }
+    const failure = await docker.attachOrchestratorTo(row);
+    if (failure !== null) throw new Error(failure);
+    if (!row.shim_token) return;
+    this.connectEvents(row.id, this.shimBase(row.id, row.shim_endpoint), row.shim_token);
+    // A turn (or a start) that was in flight during the restart is lost: its
+    // shim events went nowhere, so the session would stay 'running' forever.
+    const interrupted = row.status === 'running' || row.status === 'creating';
+    this.emitEvent(row.id, {
+      type: 'notice',
+      message: interrupted
+        ? 'Server wurde neu gestartet – die Verbindung zu diesem Agenten wurde wiederhergestellt. Der laufende Turn wurde dabei abgebrochen.'
+        : 'Server wurde neu gestartet – die Verbindung zu diesem Agenten wurde wiederhergestellt.',
+    });
+    if (interrupted) this.setStatus(row.id, 'idle');
+    console.log(`[sessions] reconciled ${row.id.slice(0, 8)} (${row.status} -> ${interrupted ? 'idle' : row.status})`);
   }
 
   start(): void {

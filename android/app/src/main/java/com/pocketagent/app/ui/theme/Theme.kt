@@ -285,6 +285,17 @@ val ChipSpacing = 8.dp
  */
 val ChipValueMaxWidth = 160.dp
 
+/**
+ * Breiteste Lesespalte. One UI: „Stretched-out apps are harder to read and
+ * waste the extra space of the large screen." Auf einem Tablet liefe eine
+ * Zeile sonst über die volle Gerätebreite, und „Session starten" wäre ein
+ * tausend dp breiter Knopf.
+ *
+ * Der Wert ist nicht dokumentiert — die Guideline nennt für Inhaltsbreiten
+ * keine Zahl. Er ist gewählt, nicht zitiert.
+ */
+val ContentMaxWidth = 640.dp
+
 /** Vertical air between one section's card and the next section header. */
 val SectionSpacing = 20.dp
 

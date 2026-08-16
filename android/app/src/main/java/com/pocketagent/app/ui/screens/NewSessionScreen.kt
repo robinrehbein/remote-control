@@ -63,8 +63,11 @@ import com.pocketagent.app.data.AgentMode
 import com.pocketagent.app.data.AppRepository
 import com.pocketagent.app.data.RepoInfo
 import com.pocketagent.app.ui.theme.CardInset
+import com.pocketagent.app.ui.theme.ContentInset
+import com.pocketagent.app.ui.theme.ListItemTitle
 import com.pocketagent.app.ui.theme.PillShape
 import com.pocketagent.app.ui.theme.PrimaryButtonHeight
+import com.pocketagent.app.ui.theme.PrimaryButtonTextSize
 import com.pocketagent.app.ui.theme.RadioRowDividerInset
 import com.pocketagent.app.ui.theme.ScreenGutter
 import com.pocketagent.app.ui.theme.SectionSpacing
@@ -258,6 +261,14 @@ fun NewSessionScreen(
             // at the end of a long scroll.
             Surface(color = MaterialTheme.colorScheme.background, tonalElevation = 0.dp) {
                 Column(modifier = Modifier.navigationBarsPadding()) {
+                    // What will actually start, spelled out where the decision is
+                    // made. Everything above this bar is a control; this line is
+                    // the result of all of them together.
+                    StartSummary(
+                        state = state,
+                        repos = repos,
+                        descriptor = selectedDescriptor,
+                    )
                     state.error?.let { SectionError(it) }
                     Button(
                         onClick = { vm.create() },
@@ -276,7 +287,10 @@ fun NewSessionScreen(
                             )
                             Spacer(modifier = Modifier.width(8.dp))
                         }
-                        Text(if (state.busy) "Session startet …" else "Session starten")
+                        Text(
+                            text = if (state.busy) "Session startet …" else "Session starten",
+                            fontSize = PrimaryButtonTextSize,
+                        )
                     }
                 }
             }
@@ -451,7 +465,7 @@ fun NewSessionScreen(
                     ) {
                         Text(
                             text = "Erweitert",
-                            style = MaterialTheme.typography.titleSmall,
+                            style = ListItemTitle,
                             modifier = Modifier.weight(1f),
                         )
                         Icon(
@@ -518,6 +532,56 @@ fun NewSessionScreen(
 }
 
 /* ------------------------------------------------------------------ */
+/* Was tatsächlich startet                                             */
+/* ------------------------------------------------------------------ */
+
+private fun modeLabel(mode: AgentMode): String = when (mode) {
+    AgentMode.ASK -> "Ask"
+    AgentMode.ACCEPT_EDITS -> "Accept Edits"
+    AgentMode.AUTO -> "Auto"
+    AgentMode.YOLO -> "Yolo"
+}
+
+private fun networkLabel(policy: String): String = when (policy) {
+    "isolated" -> "Isoliert"
+    "open" -> "Offen"
+    else -> "Allowlist"
+}
+
+/**
+ * One line above the primary button naming the resolved configuration —
+ * including what "Standardmodell" and an empty branch field actually mean.
+ * Every control on this screen is a fragment of a decision; this is the
+ * only place the whole decision is readable at once.
+ */
+@Composable
+private fun StartSummary(
+    state: NewSessionViewModel.UiState,
+    repos: List<RepoInfo>,
+    descriptor: AdapterDescriptor?,
+) {
+    val repo = repos.firstOrNull { it.id == state.repoId } ?: return
+    val branch = state.branch.trim().ifBlank { repo.defaultBranch }
+    val model = state.model.trim().ifBlank { "Standardmodell" }
+    val parts = listOfNotNull(
+        repo.fullName,
+        branch,
+        descriptor?.name,
+        model,
+        modeLabel(state.mode),
+        networkLabel(state.networkPolicy),
+    )
+    Text(
+        text = parts.joinToString(" · "),
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        maxLines = 2,
+        overflow = TextOverflow.Ellipsis,
+        modifier = Modifier.padding(start = ContentInset, end = ContentInset, top = 10.dp),
+    )
+}
+
+/* ------------------------------------------------------------------ */
 /* Modell + Zugang — eine Zeile, ein Sheet                             */
 /* ------------------------------------------------------------------ */
 
@@ -548,7 +612,7 @@ private fun ModelRow(title: String, keyMissing: Boolean, onClick: () -> Unit) {
             Column(modifier = Modifier.weight(1f).padding(vertical = 10.dp)) {
                 Text(
                     text = title,
-                    style = MaterialTheme.typography.titleSmall,
+                    style = ListItemTitle,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
@@ -763,7 +827,7 @@ private fun RepoSelector(
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
                         text = selected?.fullName ?: "Repository wählen",
-                        style = MaterialTheme.typography.titleSmall,
+                        style = ListItemTitle,
                         color = if (selected == null) {
                             MaterialTheme.colorScheme.onSurfaceVariant
                         } else {

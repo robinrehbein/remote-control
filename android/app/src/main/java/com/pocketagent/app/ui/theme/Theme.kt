@@ -123,7 +123,14 @@ val DarkSemantic = Semantic(
     removedBg = Color(0xFF4A1611),
 )
 
-/* Type: One UI leans on medium/semibold titles and roomy body text. */
+/*
+ * Type: One UI leans on medium/semibold titles and roomy body text.
+ *
+ * Sizes that map onto a documented One UI role carry it in a comment. The
+ * list-row title is deliberately NOT one of them — titleSmall also carries
+ * chat and markdown headings, where 17sp Regular would collide with body
+ * text. That role has its own token, [ListItemTitle], below.
+ */
 private val AppTypography = Typography(
     headlineLarge = TextStyle(fontWeight = FontWeight.SemiBold, fontSize = 30.sp, letterSpacing = 0.sp),
     headlineMedium = TextStyle(fontWeight = FontWeight.SemiBold, fontSize = 26.sp, letterSpacing = 0.sp),
@@ -133,10 +140,28 @@ private val AppTypography = Typography(
     titleSmall = TextStyle(fontWeight = FontWeight.Medium, fontSize = 14.5.sp),
     bodyLarge = TextStyle(fontSize = 16.sp, lineHeight = 23.sp, letterSpacing = 0.2.sp),
     bodyMedium = TextStyle(fontSize = 14.sp, lineHeight = 20.sp, letterSpacing = 0.1.sp),
-    bodySmall = TextStyle(fontSize = 12.5.sp, lineHeight = 17.sp, letterSpacing = 0.1.sp),
-    labelLarge = TextStyle(fontWeight = FontWeight.Medium, fontSize = 14.sp),
-    labelMedium = TextStyle(fontWeight = FontWeight.Medium, fontSize = 12.sp),
+    /** One UI secondary text: textAppearanceSmall, 13sp. */
+    bodySmall = TextStyle(fontSize = 13.sp, lineHeight = 18.sp, letterSpacing = 0.1.sp),
+    /** One UI button label: 15sp Bold, never all-caps. */
+    labelLarge = TextStyle(fontWeight = FontWeight.Bold, fontSize = 15.sp),
+    /** One UI section header: ListSeparator, 13sp Bold. */
+    labelMedium = TextStyle(fontWeight = FontWeight.Bold, fontSize = 13.sp),
     labelSmall = TextStyle(fontWeight = FontWeight.Medium, fontSize = 11.sp, letterSpacing = 0.2.sp),
+)
+
+/**
+ * Title of a row in a grouped list — the One UI `textAppearanceListItem`:
+ * 17sp Regular, not a smaller semibold. Small half-bold text surrounded by
+ * generous whitespace reads as cramped and vague at once; the roomier
+ * regular is what makes a One UI list scan.
+ *
+ * Every grouped-list row uses this, so agents, autonomy modes, repositories
+ * and settings rows all read identically. Chat and markdown keep titleSmall.
+ */
+val ListItemTitle = TextStyle(
+    fontWeight = FontWeight.Normal,
+    fontSize = 17.sp,
+    lineHeight = 22.sp,
 )
 
 val MonoSmall = TextStyle(
@@ -165,25 +190,36 @@ val PillShape = RoundedCornerShape(50)
 
 /* ------------------------------------------------------------------ */
 /* Spacing tokens — one grid for every screen.                         */
+/*                                                                     */
+/* Measured against the SESL8 resources (One UI 8). Samsung publishes  */
+/* no complete dp specification, so these mirror the values Samsung's  */
+/* own components carry rather than a documented grid. One UI does not */
+/* follow an 8pt rhythm — odd values like 13 and 5 are deliberate.     */
 /* ------------------------------------------------------------------ */
 
 /** Outer gutter of every card, list and full-width button. */
-val ScreenGutter = 12.dp
+val ScreenGutter = 10.dp
 
 /** Inner padding of a card — text inside a card starts at Gutter+Card. */
-val CardInset = 16.dp
+val CardInset = 12.dp
 
-/** Where free-standing text (section headers, notes) starts: 12+16. */
+/** Where free-standing text (section headers, notes) starts: 10+12. */
 val ContentInset = ScreenGutter + CardInset
 
-/** Minimum height of a tappable list row (One UI is generous). */
+/** Minimum height of a tappable list row (listPreferredItemHeightSmall). */
 val TileMinHeight = 56.dp
+
+/** Vertical padding inside a list row, above and below its text block. */
+val RowVerticalPadding = 14.dp
 
 /** Android's minimum comfortable touch target. */
 val MinTouchTarget = 48.dp
 
-/** Height of the primary full-width action button. */
-val PrimaryButtonHeight = 52.dp
+/** Height of the primary full-width action button (Button.Custom). */
+val PrimaryButtonHeight = 44.dp
+
+/** Label size of that button — noticeably larger than a Material button. */
+val PrimaryButtonTextSize = 18.sp
 
 /**
  * Height of one composer line: the input pill and the round send button
@@ -195,11 +231,23 @@ val ComposerHeight = 56.dp
 /** Vertical air between one section's card and the next section header. */
 val SectionSpacing = 20.dp
 
-/** Divider inset for rows with a leading 36dp icon (16 + 36 + 16). */
-val IconRowDividerInset = 68.dp
+/** Air above a section header (sesl_list_subheader_padding_top). */
+val SectionHeaderTop = 13.dp
 
-/** Divider inset for rows with a leading radio button (4 + 48 + 4). */
-val RadioRowDividerInset = 56.dp
+/** Air below a section header, before its card. */
+val SectionHeaderBottom = 5.dp
+
+/*
+ * Divider insets are measured from the card's edge, and the card already
+ * sits at ScreenGutter. One UI insets its dividers slightly rather than
+ * aligning them to the text, so both values stay small.
+ */
+
+/** Divider inset for rows with a leading 36dp icon (12 + 36 + 12). */
+val IconRowDividerInset = 60.dp
+
+/** Divider inset for a plain or radio row: 12 from the card, 22 from the screen. */
+val RadioRowDividerInset = 12.dp
 
 private val LocalSemantic = staticCompositionLocalOf { LightSemantic }
 

@@ -90,6 +90,7 @@ import com.pocketagent.app.data.wireName
 import com.pocketagent.app.ui.theme.CardInset
 import com.pocketagent.app.ui.theme.PillShape
 import com.pocketagent.app.ui.theme.PrimaryButtonHeight
+import com.pocketagent.app.ui.theme.PrimaryButtonTextSize
 import com.pocketagent.app.ui.theme.ScreenGutter
 import com.pocketagent.app.ui.theme.TileMinHeight
 import kotlinx.coroutines.launch
@@ -488,7 +489,7 @@ private fun EmptySessions(onNewSession: () -> Unit) {
         ) {
             Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(18.dp))
             Spacer(modifier = Modifier.width(8.dp))
-            Text("Erste Session starten")
+            Text("Erste Session starten", fontSize = PrimaryButtonTextSize)
         }
     }
 }

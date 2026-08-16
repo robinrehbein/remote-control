@@ -137,10 +137,6 @@ Android: siehe `android/README.md` (lokal + CI; CI-Workflow liegt in `.github/wo
 
 - Device-Token: nur SHA-256-Hash in der DB; Token im Android Keystore (AES-GCM)
 - Provider-Secrets: AES-256-GCM im Vault, MASTER_KEY aus Env; pro Session-Container wird nur das Credential des gewählten Adapters/Providers injiziert
-<<<<<<< HEAD
-- Session-Container: eigenes Volume, Memory-Limit, per-Session Random-Token für die Shim-API; Yolo-Deny-Liste blockt `git push`/`rm -rf` im Agenten-Kontext (Push läuft nur über den Shim)
-- Bekannte Grenze (Single-User akzeptiert): `docker.sock` im Orchestrator = Root-äquivalent; für Multi-Tenant später rootless Runner (siehe Plan). Auf Shared-Hosts (z. B. Coolify mit weiteren Apps) Blast-Radius beachten → RUNBOOK-Sektion Coolify sowie geplante Alternativen (Socket-Proxy, Remote-Runner)
-=======
 - **Egress-Proxy** (networkPolicy `allowlist`): verlangt jetzt Proxy-Auth — nur Requests mit dem Per-Session-Shim-Token (`Proxy-Authorization: Bearer/Basic`) passieren; alles andere → 403
 - Session-Container: eigenes Volume, Memory-/CPU-Limit, readonly Rootfs, per-Session Random-Token für die Shim-API
 - **Ehrlich über die Grenzen** (Details: `SECURITY.md`):
@@ -165,7 +161,6 @@ for v in $(docker volume ls -q --filter name=pocketagent-sess-); do
   docker run --rm -v "$v:/w" alpine chown -R 1000:1000 /w
 done
 ```
->>>>>>> 55a7f2f
 
 ## Status / Verifikation
 

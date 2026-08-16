@@ -106,16 +106,11 @@ fly secrets set \
   REMOTE_NETWORK_OPEN="1" \
   SESSION_MEM_LIMIT="2g" \
   IDLE_STOP_SEC="900" \
-<<<<<<< HEAD
   GC_DAYS="14" \
   GATEWAY_TOKEN="$(openssl rand -hex 32)"
   # optional: GATEWAY_PORT=8443, GATEWAY_IMAGE=..., NETWORK_ALLOWLIST=...
+  # optional: DOCKER_PUBLISH_IP (Standard 127.0.0.1, siehe Transport-Sicherheit)
   # optional: FCM_SERVICE_ACCOUNT_JSON='{...single line...}'
-=======
-  GC_DAYS="14"
-  # optional: DOCKER_PUBLISH_IP (Standard 127.0.0.1, siehe Transport-Sicherheit),
-  #           FCM_SERVICE_ACCOUNT_JSON='{...single line...}'
->>>>>>> 55a7f2f
 
 fly deploy
 ```

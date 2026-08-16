@@ -475,16 +475,19 @@ fun SessionScreen(
                 title = {
                     Column {
                         Text(
-                            text = session?.repoFullName ?: "Session",
+                            text = session?.let(::sessionDisplayName) ?: "Session",
                             style = MaterialTheme.typography.titleMedium,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
                         // One quiet line instead of a badge plus four chips.
+                        // Trägt die Session einen Titel, rutscht das Repository
+                        // hier hinein — sonst stünde es nirgends mehr.
                         session?.let { s ->
                             StatusLine(
                                 status = s.status,
                                 details = listOfNotNull(
+                                    sessionSubtitle(s),
                                     adapterLabel(adapters, s.adapter),
                                     s.mode.wireName(),
                                     s.networkPolicy?.takeIf { it != "allowlist" }?.let(::networkPolicyLabel),
@@ -779,9 +782,18 @@ fun SessionScreen(
         AlertDialog(
             onDismissRequest = { confirmDelete = false },
             title = { Text("Session löschen?") },
-            text = { Text("Container und Volume werden entfernt. Das kann nicht rückgängig gemacht werden.") },
+            // Dieselbe Warnung wie in der Liste: es geht mehr verloren als der Container.
+            text = {
+                Text(
+                    session?.let(::deleteConfirmText)
+                        ?: "Container, Volume und der gespeicherte Verlauf werden entfernt. " +
+                        "Das lässt sich nicht rückgängig machen.",
+                )
+            },
             confirmButton = {
-                TextButton(onClick = { confirmDelete = false; vm.delete() }) { Text("Löschen") }
+                TextButton(onClick = { confirmDelete = false; vm.delete() }) {
+                    Text("Löschen", color = MaterialTheme.colorScheme.error)
+                }
             },
             dismissButton = {
                 TextButton(onClick = { confirmDelete = false }) { Text("Abbrechen") }

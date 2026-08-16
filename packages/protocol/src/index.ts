@@ -329,6 +329,10 @@ export interface SessionInfo {
   networkPolicy?: NetworkPolicy;
   /** Persisted reasoning budget; absent when the session never set one. */
   reasoningEffort?: string;
+  /** User-set name (`session.rename`); absent => the client derives one as before. */
+  title?: string;
+  /** Absent => false. Archived sessions stay in `session.list`; the client filters. */
+  archived?: boolean;
 }
 
 export interface RepoInfo {
@@ -415,6 +419,16 @@ export type ClientMessage =
   | { type: 'session.push'; sessionId: string }
   | { type: 'session.diff.get'; requestId: string; sessionId: string }
   | { type: 'session.list'; requestId: string }
+  /**
+   * Stored timeline of a session, so a client that dropped its in-memory
+   * messages (screen left, app restarted) can show the conversation again.
+   * `limit` counts the most recent events (default 200, max 1000); the answer
+   * carries them in chronological order, oldest first.
+   */
+  | { type: 'session.events.get'; requestId: string; sessionId: string; limit?: number }
+  /** Rename a session; an empty title removes it (client derives a name again). */
+  | { type: 'session.rename'; requestId: string; sessionId: string; title: string }
+  | { type: 'session.archive'; requestId: string; sessionId: string; archived: boolean }
   | { type: 'session.delete'; requestId: string; sessionId: string }
   | { type: 'adapter.list'; requestId: string }
   | { type: 'repo.list'; requestId: string }
@@ -453,6 +467,8 @@ export type ServerMessage =
   | { type: 'request.ok'; requestId: string; payload?: unknown }
   | { type: 'session.list'; requestId: string; sessions: SessionInfo[] }
   | { type: 'session.event'; sessionId: string; event: AgentEvent }
+  /** Answer to `session.events.get`: chronological, oldest first. */
+  | { type: 'session.events'; requestId: string; sessionId: string; events: AgentEvent[] }
   | { type: 'session.diff'; requestId: string; sessionId: string; diff: DiffEntry[] }
   | { type: 'session.status'; sessionId: string; status: SessionStatus; session?: SessionInfo }
   | { type: 'session.models'; requestId: string; sessionId: string; models: ModelInfo[] }

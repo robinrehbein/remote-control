@@ -183,6 +183,13 @@ data class SessionInfo(
     val prUrl: String? = null,
     val networkPolicy: String? = null,
     val reasoningEffort: String? = null,
+    /**
+     * Vom Nutzer vergebener Titel. Fehlt das Feld (alter Server) oder ist es
+     * leer, gibt es keinen Titel — die Liste zeigt dann wie bisher das Repo.
+     */
+    val title: String? = null,
+    /** Aus der Hauptliste ausgeblendet. Fehlt das Feld, ist die Session aktiv. */
+    val archived: Boolean = false,
 )
 
 @Serializable
@@ -317,6 +324,18 @@ sealed interface ServerMessage {
         override val type: String get() = "session.diff"
     }
 
+    /**
+     * Der gespeicherte Verlauf einer Session — chronologisch, ältestes zuerst.
+     * Eine leere Liste ist ein gültiges Ergebnis (Session ohne Ereignisse).
+     */
+    data class SessionEventsMsg(
+        val requestId: String,
+        val sessionId: String,
+        val events: List<AgentEvent>,
+    ) : ServerMessage {
+        override val type: String get() = "session.events"
+    }
+
     data class SessionStatusMsg(val sessionId: String, val status: SessionStatus, val session: SessionInfo? = null) : ServerMessage {
         override val type: String get() = "session.status"
     }
@@ -382,6 +401,7 @@ fun requestIdOf(msg: ServerMessage): String? = when (msg) {
     is ServerMessage.RequestOk -> msg.requestId
     is ServerMessage.SessionListMsg -> msg.requestId
     is ServerMessage.SessionDiffMsg -> msg.requestId
+    is ServerMessage.SessionEventsMsg -> msg.requestId
     is ServerMessage.SessionDeletedMsg -> msg.requestId
     is ServerMessage.SessionModelsMsg -> msg.requestId
     is ServerMessage.AdapterListMsg -> msg.requestId
@@ -543,6 +563,16 @@ fun parseServerMessage(raw: String): ServerMessage? {
                     event = event,
                 )
             }
+
+            // Der gespeicherte Verlauf. Unbekannte Event-Typen (neuerer Server)
+            // fallen still heraus, der Rest des Verlaufs bleibt nutzbar.
+            "session.events" -> ServerMessage.SessionEventsMsg(
+                requestId = root.optString("requestId") ?: return null,
+                sessionId = root.optString("sessionId") ?: return null,
+                events = root["events"]?.jsonArray?.mapNotNull { el ->
+                    (el as? JsonObject)?.let { parseAgentEvent(it) }
+                } ?: emptyList(),
+            )
 
             "session.diff" -> ServerMessage.SessionDiffMsg(
                 requestId = root.optString("requestId") ?: return null,
@@ -735,6 +765,32 @@ fun encodeSessionDiffGet(requestId: String, sessionId: String): String = buildJs
     put("type", "session.diff.get")
     put("requestId", requestId)
     put("sessionId", sessionId)
+}.toString()
+
+/**
+ * Den gespeicherten Verlauf einer Session holen. Ohne [limit] entscheidet der
+ * Server (Vertrag: 200, jüngste zuletzt); die Antwort kommt chronologisch.
+ */
+fun encodeSessionEventsGet(requestId: String, sessionId: String, limit: Int? = null): String = buildJsonObject {
+    put("type", "session.events.get")
+    put("requestId", requestId)
+    put("sessionId", sessionId)
+    limit?.let { put("limit", it) }
+}.toString()
+
+/** Titel setzen; leerer String entfernt ihn wieder. */
+fun encodeSessionRename(requestId: String, sessionId: String, title: String): String = buildJsonObject {
+    put("type", "session.rename")
+    put("requestId", requestId)
+    put("sessionId", sessionId)
+    put("title", title)
+}.toString()
+
+fun encodeSessionArchive(requestId: String, sessionId: String, archived: Boolean): String = buildJsonObject {
+    put("type", "session.archive")
+    put("requestId", requestId)
+    put("sessionId", sessionId)
+    put("archived", archived)
 }.toString()
 
 private fun requestCommand(type: String, requestId: String): String = buildJsonObject {

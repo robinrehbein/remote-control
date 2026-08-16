@@ -135,6 +135,8 @@ class AppRepository(
 
             is ServerMessage.SessionDiffMsg -> completePending(msg.requestId, msg)
 
+            is ServerMessage.SessionEventsMsg -> completePending(msg.requestId, msg)
+
             is ServerMessage.SessionModelsMsg -> completePending(msg.requestId, msg)
 
             is ServerMessage.SessionDeletedMsg -> {
@@ -248,6 +250,45 @@ class AppRepository(
         }
     }
 
+    /**
+     * Der serverseitig gespeicherte Verlauf einer Session, chronologisch mit
+     * dem ältesten Ereignis zuerst. Eine leere Liste ist ein gültiges
+     * Ergebnis; nur ein Fehler oder eine fehlende Verbindung sind Misserfolg.
+     */
+    suspend fun loadEvents(sessionId: String, limit: Int? = null): Result<List<AgentEvent>> {
+        val response = request { id -> encodeSessionEventsGet(id, sessionId, limit) }
+        return when (response) {
+            is ServerMessage.SessionEventsMsg -> Result.success(response.events)
+            is ServerMessage.ErrorMsg -> Result.failure(IllegalStateException(response.message))
+            null -> Result.failure(IllegalStateException("Keine Verbindung"))
+            else -> Result.failure(IllegalStateException("Unerwartete Antwort"))
+        }
+    }
+
+    /**
+     * Titel der Session setzen; leerer String entfernt ihn. Der Server
+     * bestätigt mit request.ok und schickt die geänderte Session als
+     * session.status — die Liste aktualisiert sich darüber von selbst.
+     */
+    suspend fun renameSession(sessionId: String, title: String): Result<Unit> {
+        val response = request { id -> encodeSessionRename(id, sessionId, title) }
+        return when (response) {
+            is ServerMessage.ErrorMsg -> Result.failure(IllegalStateException(response.message))
+            null -> Result.failure(IllegalStateException("Keine Verbindung"))
+            else -> Result.success(Unit)
+        }
+    }
+
+    /** Session archivieren oder zurückholen; Antwortweg wie bei [renameSession]. */
+    suspend fun setArchived(sessionId: String, archived: Boolean): Result<Unit> {
+        val response = request { id -> encodeSessionArchive(id, sessionId, archived) }
+        return when (response) {
+            is ServerMessage.ErrorMsg -> Result.failure(IllegalStateException(response.message))
+            null -> Result.failure(IllegalStateException("Keine Verbindung"))
+            else -> Result.success(Unit)
+        }
+    }
+
     suspend fun loadDiff(sessionId: String): Result<List<DiffEntry>> {
         val response = request { id -> encodeSessionDiffGet(id, sessionId) }
         return when (response) {
@@ -354,6 +395,9 @@ class AppRepository(
             else -> Result.failure(IllegalStateException("Unerwartete Antwort"))
         }
     }
+
+    /** „Jetzt neu verbinden“ — überspringt die laufende Wartezeit. */
+    fun reconnectNow() = ws.reconnectNow()
 
     fun onFcmToken(token: String) {
         fcmToken = token

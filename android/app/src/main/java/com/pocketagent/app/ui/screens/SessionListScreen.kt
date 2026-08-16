@@ -92,12 +92,13 @@ fun SessionListScreen(
                 .padding(padding),
         ) {
             // Connection chrome only when it is actually worth knowing.
+            // Ein Tap darauf holt den nächsten Versuch nach vorn.
             AnimatedVisibility(
                 visible = connState !is WsClient.ConnState.Connected,
                 enter = fadeIn(),
                 exit = fadeOut(),
             ) {
-                OfflineNotice(connState)
+                ConnectionLine(state = connState, onReconnect = { repository.reconnectNow() })
             }
             PullToRefreshBox(
                 isRefreshing = refreshing,
@@ -184,33 +185,6 @@ private fun EmptySessions(onNewSession: () -> Unit) {
             Spacer(modifier = Modifier.width(8.dp))
             Text("Erste Session starten")
         }
-    }
-}
-
-@Composable
-private fun OfflineNotice(state: WsClient.ConnState) {
-    val label = when (state) {
-        is WsClient.ConnState.Connecting -> "Verbinde mit dem Server …"
-        is WsClient.ConnState.Waiting -> "Warte auf den Server …"
-        else -> "Offline – Sessions sind womöglich nicht aktuell"
-    }
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.Center,
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = ScreenGutter, vertical = 4.dp),
-    ) {
-        val live = state is WsClient.ConnState.Connecting || state is WsClient.ConnState.Waiting
-        DotLabel(
-            color = if (live) {
-                MaterialTheme.colorScheme.onSurfaceVariant
-            } else {
-                MaterialTheme.colorScheme.error
-            },
-            label = label,
-            pulse = live,
-        )
     }
 }
 

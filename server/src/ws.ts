@@ -19,6 +19,74 @@ function auditWarn(kind: string, fields: Record<string, unknown>): void {
 const wsConnCounts = new Map<string, number>();
 const MAX_CONNS_PER_ADDRESS = 10;
 
+/** Heartbeat round; two rounds without a pong end a connection (~50s). */
+export const WS_HEARTBEAT_MS = 25_000;
+const MAX_MISSED_PONGS = 2;
+
+/**
+ * Liveness check for every socket on /ws. A phone that loses its network (or a
+ * NAT that drops the flow) never sends a close frame: the socket stays open
+ * forever on this side, the device counts as online, and a link session stays
+ * bound to a peer nobody is behind any more. So the server pings on its own and
+ * terminates what does not answer twice in a row - `terminate()` then runs the
+ * ordinary close handling (hub cleanup, link disconnect).
+ *
+ * These are protocol-level ping/pong frames: the ws client answers them itself,
+ * independent of the JSON `agent.ping`/`agent.pong` keepalive link agents speak
+ * on top of the connection. Both run side by side without interfering.
+ */
+export class Heartbeat {
+  /** socket -> rounds since the last pong (or since it was tracked). */
+  private readonly missed = new Map<WebSocket, number>();
+  private timer: NodeJS.Timeout | null = null;
+
+  constructor(private readonly intervalMs: number = WS_HEARTBEAT_MS) {}
+
+  track(socket: WebSocket): void {
+    this.missed.set(socket, 0);
+    socket.on('pong', () => {
+      if (this.missed.has(socket)) this.missed.set(socket, 0);
+    });
+    socket.once('close', () => this.missed.delete(socket));
+    if (this.timer === null) {
+      this.timer = setInterval(() => this.tick(), this.intervalMs);
+      // must not keep the process alive on its own
+      this.timer.unref?.();
+    }
+  }
+
+  private tick(): void {
+    for (const [socket, missed] of [...this.missed]) {
+      if (missed >= MAX_MISSED_PONGS) {
+        this.missed.delete(socket);
+        try {
+          socket.terminate();
+        } catch {
+          /* already gone */
+        }
+        continue;
+      }
+      this.missed.set(socket, missed + 1);
+      try {
+        socket.ping();
+      } catch {
+        this.missed.delete(socket);
+      }
+    }
+  }
+
+  /** Live socket count (diagnostics/tests). */
+  size(): number {
+    return this.missed.size;
+  }
+
+  stop(): void {
+    if (this.timer !== null) clearInterval(this.timer);
+    this.timer = null;
+    this.missed.clear();
+  }
+}
+
 export class Hub {
   private readonly sockets = new Set<WebSocket>();
   private readonly deviceIds = new Map<WebSocket, string>();
@@ -155,6 +223,7 @@ export function registerWs(
   store: Store,
   manager: SessionManager,
   hub: Hub,
+  heartbeat?: Heartbeat,
 ): void {
   // maxPayload (1 MiB) is enforced at the websocket plugin registration in index.ts.
   app.get('/ws', { websocket: true }, (socket: WebSocket, request: FastifyRequest) => {
@@ -173,6 +242,9 @@ export function registerWs(
       socket.close(4001, 'too many connections');
       return;
     }
+    // every accepted socket, device and link agent alike - a half-dead
+    // connection costs the same on both roles
+    heartbeat?.track(socket);
 
     let authed = false;
     let role: 'device' | 'link' = 'device';
@@ -350,8 +422,37 @@ export function registerWs(
           return;
         }
         case 'session.list':
+          // archived sessions ride along on purpose (see Store.listSessions)
           send({ type: 'session.list', requestId: msg.requestId, sessions: manager.listSessions() });
           return;
+        case 'session.events.get': {
+          try {
+            const events = manager.sessionEvents(msg.sessionId, msg.limit);
+            send({ type: 'session.events', requestId: msg.requestId, sessionId: msg.sessionId, events });
+          } catch (e) {
+            send({ type: 'error', requestId: msg.requestId, sessionId: msg.sessionId, message: errText(e) });
+          }
+          return;
+        }
+        case 'session.rename': {
+          try {
+            // renameSession already broadcast the updated session
+            const session = manager.renameSession(msg.sessionId, msg.title);
+            send({ type: 'request.ok', requestId: msg.requestId, payload: { session } });
+          } catch (e) {
+            send({ type: 'error', requestId: msg.requestId, sessionId: msg.sessionId, message: errText(e) });
+          }
+          return;
+        }
+        case 'session.archive': {
+          try {
+            const session = await manager.archiveSession(msg.sessionId, msg.archived);
+            send({ type: 'request.ok', requestId: msg.requestId, payload: { session } });
+          } catch (e) {
+            send({ type: 'error', requestId: msg.requestId, sessionId: msg.sessionId, message: errText(e) });
+          }
+          return;
+        }
         case 'session.delete': {
           try {
             await manager.deleteSession(msg.sessionId);

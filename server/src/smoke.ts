@@ -490,6 +490,8 @@ async function egressPeerSmoke(store: Store, manager: SessionManager, repoId: st
     link_id: null,
     network_policy: 'allowlist',
     reasoning_effort: null,
+    title: null,
+    archived: 0,
     created_at: now,
     last_active_at: now,
   });
@@ -586,6 +588,8 @@ async function reconcileSmoke(store: Store, manager: SessionManager, c2: Client,
     link_id: null,
     network_policy: policy,
     reasoning_effort: null,
+    title: null,
+    archived: 0,
     created_at: now,
     last_active_at: now,
   });
@@ -809,6 +813,241 @@ async function protocolLoadsOnPlainNode(): Promise<void> {
       },
     );
   });
+}
+
+/**
+ * Event history, rename and archive: everything a client needs to bring a
+ * timeline back after the screen was left, plus the two list gestures. Runs
+ * against the real store and the real WS handlers, without a shim.
+ */
+async function historySmoke(store: Store, manager: SessionManager, c2: Client, repoId: string): Promise<void> {
+  const { clampEventLimit, sanitizeSessionTitle, MAX_TITLE_LEN, EVENTS_DEFAULT_LIMIT, EVENTS_MAX_LIMIT } =
+    await import('./sessions.js');
+
+  /* ---- pure helpers: limit clamping and title normalization ---- */
+
+  assert(clampEventLimit(undefined) === EVENTS_DEFAULT_LIMIT, 'a missing limit falls back to the default');
+  assert(clampEventLimit('50') === EVENTS_DEFAULT_LIMIT, 'a non-numeric limit falls back to the default');
+  assert(clampEventLimit(Number.NaN) === EVENTS_DEFAULT_LIMIT, 'NaN falls back to the default');
+  assert(clampEventLimit(50_000) === EVENTS_MAX_LIMIT, 'an oversized limit is capped');
+  assert(clampEventLimit(0) === 1 && clampEventLimit(-9) === 1, 'a limit below 1 becomes 1');
+  assert(clampEventLimit(10.7) === 10, 'a fractional limit is floored');
+
+  assert(sanitizeSessionTitle('  Mein  Feature  ') === 'Mein Feature', 'a title is trimmed and collapsed');
+  assert(sanitizeSessionTitle('a\nb\tc d') === 'a b c d', 'control characters never survive a title');
+  assert(sanitizeSessionTitle('   ') === null, 'a blank title clears the title');
+  const long = sanitizeSessionTitle('x'.repeat(200));
+  assert(long !== null && long.length === MAX_TITLE_LEN, `a title is cut to ${MAX_TITLE_LEN} chars`);
+
+  /* ---- a session with a timeline ---- */
+
+  const id = randomUUID();
+  const now = new Date().toISOString();
+  store.insertSession({
+    id,
+    tenant_id: 'default',
+    repo_id: repoId,
+    repo_full_name: 'acme/demo',
+    adapter: 'opencode',
+    provider: 'zai',
+    model: 'glm-4.6',
+    mode: 'ask',
+    status: 'idle',
+    branch: `agent/${id}`,
+    session_ref: null,
+    container_id: 'cid-history',
+    volume_name: `pocketagent-sess-${id}`,
+    shim_token: null,
+    pr_url: null,
+    shim_endpoint: null,
+    link_id: null,
+    network_policy: 'allowlist',
+    reasoning_effort: null,
+    title: null,
+    archived: 0,
+    created_at: now,
+    last_active_at: now,
+  });
+
+  // The prompt path stores the user's own message. Without a shim the send
+  // fails right after - the message still belongs in the timeline.
+  await manager.prompt(id, 'Bitte den Bug fixen').catch(() => {});
+  manager.handleLinkEvent(id, { type: 'ping', ts: Date.now() });
+  manager.handleLinkEvent(id, { type: 'notice', message: 'Image wird gebaut', phase: 'image-build' });
+  manager.handleLinkEvent(id, { type: 'notice', message: 'Agent gewechselt: kilo → claude' });
+  for (let i = 0; i < 2; i++) {
+    manager.handleLinkEvent(id, { type: 'message.completed', role: 'assistant', text: `Antwort ${i}` });
+  }
+  // a row no longer readable as JSON (truncated write, older format...), right
+  // in the middle of the conversation
+  store.appendEvent(id, 'message.completed', '{"type":"message.completed",');
+  for (let i = 2; i < 5; i++) {
+    manager.handleLinkEvent(id, { type: 'message.completed', role: 'assistant', text: `Antwort ${i}` });
+  }
+
+  const stored = store.db
+    .prepare('SELECT type, payload FROM session_events WHERE session_id = ?')
+    .all(id) as Array<{ type: string; payload: string }>;
+  assert(!stored.some((r) => r.type === 'ping'), 'ping frames never reach the stored history');
+  assert(
+    !stored.some((r) => r.payload.includes('"phase"')),
+    'progress notices never reach the stored history',
+  );
+
+  const full = await request(c2, { type: 'session.events.get', requestId: 'ev1', sessionId: id });
+  assert(full.type === 'session.events' && full.sessionId === id, 'session.events.get -> session.events');
+  const events = full.type === 'session.events' ? full.events : [];
+  assert(
+    events.length === 7,
+    `history carries prompt + notice + 5 answers, broken row skipped (got ${events.length})`,
+  );
+  const first = events[0];
+  assert(
+    first?.type === 'message.completed' && first.role === 'user' && first.text === 'Bitte den Bug fixen',
+    'the history starts with the user prompt (no shim reports it back)',
+  );
+  assert(
+    events[1]?.type === 'notice' && events[1].message.includes('Agent gewechselt'),
+    'a notice without a phase stays an ordinary timeline entry',
+  );
+  assert(
+    events.map((e) => (e.type === 'message.completed' && e.role === 'assistant' ? e.text : '')).join('|') ===
+      '||Antwort 0|Antwort 1|Antwort 2|Antwort 3|Antwort 4',
+    'the history is chronological, oldest first',
+  );
+  assert(!events.some((e) => e.type === 'ping'), 'no ping frame in the answer');
+  assert(!events.some((e) => e.type === 'notice' && e.phase !== undefined), 'no progress notice in the answer');
+
+  const limited = await request(c2, { type: 'session.events.get', requestId: 'ev2', sessionId: id, limit: 3 });
+  const tail = limited.type === 'session.events' ? limited.events : [];
+  assert(tail.length === 3, 'the limit is honoured');
+  assert(
+    tail.map((e) => (e.type === 'message.completed' ? e.text : '')).join('|') === 'Antwort 2|Antwort 3|Antwort 4',
+    'the limit keeps the youngest events, still oldest first',
+  );
+
+  const capped = await request(c2, {
+    type: 'session.events.get',
+    requestId: 'ev3',
+    sessionId: id,
+    limit: 10_000,
+  });
+  assert(capped.type === 'session.events' && capped.events.length === 7, 'an oversized limit is capped, not refused');
+
+  const unknownSession = await request(c2, {
+    type: 'session.events.get',
+    requestId: 'ev4',
+    sessionId: 'no-such-session',
+  });
+  assert(unknownSession.type === 'error', 'history of an unknown session is an error, not an empty answer');
+
+  /* ---- rename: trim, length cap, broadcast, reset ---- */
+
+  const renamed = await request(c2, {
+    type: 'session.rename',
+    requestId: 'ren1',
+    sessionId: id,
+    title: '  Login\n  Bugfix  ',
+  });
+  assert(renamed.type === 'request.ok', 'session.rename -> request.ok');
+  assert(store.getSession(id)?.title === 'Login Bugfix', 'the title is stored normalized');
+  const renameStatus = await c2.wait(
+    (m) => m.type === 'session.status' && m.sessionId === id && m.session?.title === 'Login Bugfix',
+  );
+  assert(renameStatus.type === 'session.status', 'the renamed session is broadcast to every device');
+
+  await request(c2, { type: 'session.rename', requestId: 'ren2', sessionId: id, title: 'y'.repeat(300) });
+  assert(store.getSession(id)?.title?.length === MAX_TITLE_LEN, 'an overlong title is cut');
+
+  const cleared = await request(c2, { type: 'session.rename', requestId: 'ren3', sessionId: id, title: '   ' });
+  assert(cleared.type === 'request.ok', 'an empty title is accepted');
+  assert(store.getSession(id)?.title === null, 'an empty title removes the stored title');
+  const clearedInfo = (cleared.type === 'request.ok' ? cleared.payload : undefined) as
+    | { session?: { title?: string } }
+    | undefined;
+  assert(clearedInfo?.session !== undefined && clearedInfo.session.title === undefined, 'a session without a title carries none');
+
+  const badTitle = await request(c2, { type: 'session.rename', requestId: 'ren4', sessionId: id, title: 42 });
+  assert(badTitle.type === 'error', 'a non-string title is refused');
+
+  /* ---- archive: flag, container stop, broadcast, list ---- */
+
+  const archived = await request(c2, { type: 'session.archive', requestId: 'arc1', sessionId: id, archived: true });
+  assert(archived.type === 'request.ok', 'session.archive -> request.ok');
+  const archivedRow = store.getSession(id);
+  assert(archivedRow?.archived === 1, 'the archive flag is stored');
+  assert(archivedRow?.status === 'stopped', 'archiving stops the session container (volume kept)');
+  assert(archivedRow?.volume_name === `pocketagent-sess-${id}`, 'archiving keeps the volume');
+  const archiveStatus = await c2.wait(
+    (m) => m.type === 'session.status' && m.sessionId === id && m.session?.archived === true,
+  );
+  assert(
+    archiveStatus.type === 'session.status' && archiveStatus.status === 'stopped',
+    'the archived session is broadcast as stopped',
+  );
+
+  const listWithArchived = await request(c2, { type: 'session.list', requestId: 'arc2' });
+  const listed = listWithArchived.type === 'session.list' ? listWithArchived.sessions.find((s) => s.id === id) : undefined;
+  assert(listed?.archived === true, 'session.list still contains archived sessions (the app filters)');
+
+  const unarchived = await request(c2, { type: 'session.archive', requestId: 'arc3', sessionId: id, archived: false });
+  assert(unarchived.type === 'request.ok', 'unarchiving is acked');
+  assert(store.getSession(id)?.archived === 0, 'the archive flag is cleared');
+  assert(store.getSession(id)?.status === 'stopped', 'unarchiving does not restart anything (session.resume does)');
+
+  const badArchive = await request(c2, {
+    type: 'session.archive',
+    requestId: 'arc4',
+    sessionId: id,
+    archived: 'yes',
+  });
+  assert(badArchive.type === 'error', 'a non-boolean archived flag is refused');
+
+  /* ---- delete removes the stored events with the session ---- */
+
+  await manager.deleteSession(id);
+  const leftover = store.db
+    .prepare('SELECT COUNT(*) AS c FROM session_events WHERE session_id = ?')
+    .get(id) as { c: number };
+  assert(leftover.c === 0, 'session.delete removes the stored events too');
+  assert(store.getSession(id) === undefined, 'session.delete removes the row');
+}
+
+/**
+ * WS heartbeat: a socket that stops answering has to be terminated by the
+ * server. Runs on its own ws server with a 40ms round, so the check costs
+ * milliseconds instead of the production minute.
+ */
+async function heartbeatSmoke(): Promise<void> {
+  const { WebSocketServer } = await import('ws');
+  const { Heartbeat, WS_HEARTBEAT_MS } = await import('./ws.js');
+  assert(WS_HEARTBEAT_MS === 25_000, 'production pings every 25s');
+
+  const hb = new Heartbeat(40);
+  const wss = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+  await new Promise<void>((resolve) => wss.once('listening', () => resolve()));
+  const port = (wss.address() as AddressInfo).port;
+  wss.on('connection', (s) => hb.track(s));
+
+  const alive = new WebSocket(`ws://127.0.0.1:${port}`);
+  await new Promise<void>((resolve) => alive.once('open', () => resolve()));
+  // autoPong off = the client never answers a ping, exactly like a phone whose
+  // network is gone while the socket still looks open here
+  const mute = new WebSocket(`ws://127.0.0.1:${port}`, { autoPong: false });
+  const muteClosed = new Promise<boolean>((resolve) => {
+    mute.once('close', () => resolve(true));
+    setTimeout(() => resolve(false), 5_000);
+  });
+  await new Promise<void>((resolve) => mute.once('open', () => resolve()));
+
+  assert(await muteClosed, 'a socket that misses two pong rounds is terminated');
+  assert(alive.readyState === WebSocket.OPEN, 'a socket that answers pongs stays connected');
+  assert(hb.size() === 1, 'the heartbeat forgets terminated sockets');
+
+  hb.stop();
+  assert(hb.size() === 0, 'shutdown clears the heartbeat');
+  alive.close();
+  wss.close();
 }
 
 async function main(): Promise<void> {
@@ -1302,6 +1541,8 @@ async function main(): Promise<void> {
   await startProgressSmoke(store, manager, c2, added.repo.id);
   await egressPeerSmoke(store, manager, added.repo.id);
   await reconcileSmoke(store, manager, c2, added.repo.id);
+  await historySmoke(store, manager, c2, added.repo.id);
+  await heartbeatSmoke();
 
   const models = await request(c2, { type: 'session.models.get', requestId: 'mod1', sessionId });
   assert(

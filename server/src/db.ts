@@ -2,6 +2,7 @@ import Database from 'better-sqlite3';
 import { mkdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
+import type { AgentEvent } from '@pocketagent/protocol';
 import { config } from './config.js';
 import { decrypt, decryptStrict, encrypt } from './vault.js';
 
@@ -26,6 +27,10 @@ export interface SessionRow {
   volume_name: string | null; shim_token: string | null; pr_url: string | null;
   shim_endpoint: string | null; link_id: string | null; network_policy: string | null;
   reasoning_effort: string | null;
+  /** User-set title; null = the client derives the name from repo/branch. */
+  title: string | null;
+  /** 0/1 (sqlite has no boolean). */
+  archived: number;
   created_at: string; last_active_at: string;
 }
 export interface PairingCodeRow {
@@ -93,6 +98,12 @@ export class Store {
     }
     if (!sessionCols.some((c) => c.name === 'reasoning_effort')) {
       this.db.exec('ALTER TABLE sessions ADD COLUMN reasoning_effort TEXT');
+    }
+    if (!sessionCols.some((c) => c.name === 'title')) {
+      this.db.exec('ALTER TABLE sessions ADD COLUMN title TEXT');
+    }
+    if (!sessionCols.some((c) => c.name === 'archived')) {
+      this.db.exec('ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0');
     }
     const pairingCols = this.db.prepare('PRAGMA table_info(pairing_codes)').all() as Array<{ name: string }>;
     if (!pairingCols.some((c) => c.name === 'attempts')) {
@@ -260,14 +271,15 @@ export class Store {
       .prepare(
         `INSERT INTO sessions (id, tenant_id, repo_id, repo_full_name, adapter, provider, model, mode,
          status, branch, session_ref, container_id, volume_name, shim_token, pr_url, shim_endpoint, link_id,
-         network_policy, reasoning_effort, created_at, last_active_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         network_policy, reasoning_effort, title, archived, created_at, last_active_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         row.id, row.tenant_id, row.repo_id, row.repo_full_name, row.adapter, row.provider,
         row.model, row.mode, row.status, row.branch, row.session_ref, row.container_id,
         row.volume_name, row.shim_token, row.pr_url, row.shim_endpoint, row.link_id,
-        row.network_policy, row.reasoning_effort, row.created_at, row.last_active_at,
+        row.network_policy, row.reasoning_effort, row.title, row.archived ? 1 : 0,
+        row.created_at, row.last_active_at,
       );
   }
 
@@ -275,6 +287,13 @@ export class Store {
     return this.db.prepare('SELECT * FROM sessions WHERE id = ?').get(id) as SessionRow | undefined;
   }
 
+  /**
+   * All sessions of a tenant, archived ones included. No server-side archive
+   * filter on purpose: the row is what a client needs to *un*archive a session,
+   * so hiding it here would make archiving a one-way trip for every device. The
+   * list is one small row per session, and `SessionInfo.archived` tells the
+   * client what to fold away.
+   */
   listSessions(tenant: string): SessionRow[] {
     return this.db
       .prepare('SELECT * FROM sessions WHERE tenant_id = ? ORDER BY created_at DESC')
@@ -361,6 +380,15 @@ export class Store {
     this.db.prepare('UPDATE sessions SET pr_url = ? WHERE id = ?').run(url, id);
   }
 
+  /** `null` clears the title (the client derives a name again). */
+  setSessionTitle(id: string, title: string | null): void {
+    this.db.prepare('UPDATE sessions SET title = ? WHERE id = ?').run(title, id);
+  }
+
+  setSessionArchived(id: string, archived: boolean): void {
+    this.db.prepare('UPDATE sessions SET archived = ? WHERE id = ?').run(archived ? 1 : 0, id);
+  }
+
   touchSession(id: string): void {
     this.db.prepare('UPDATE sessions SET last_active_at = ? WHERE id = ?').run(new Date().toISOString(), id);
   }
@@ -375,6 +403,42 @@ export class Store {
         'DELETE FROM session_events WHERE session_id = ? AND id NOT IN (SELECT id FROM session_events WHERE session_id = ? ORDER BY id DESC LIMIT 5000)',
       )
       .run(sessionId, sessionId);
+  }
+
+  /**
+   * The `limit` youngest stored events of a session, returned oldest first so
+   * a client can append them to an empty timeline as they happened.
+   *
+   * Two kinds of noise never make it into the answer: 'ping' keepalives and
+   * progress notices (a `phase` field), which describe a start that is long
+   * over by the time anyone reloads. They are already dropped on write
+   * (isHistoryEvent in sessions.ts) - repeating the rule here covers the rows
+   * a database written before that filter still holds.
+   *
+   * A row whose payload is not readable JSON is skipped, never thrown on: one
+   * damaged line must not cost the whole conversation.
+   */
+  listSessionEvents(sessionId: string, limit: number): AgentEvent[] {
+    const rows = this.db
+      .prepare(
+        "SELECT payload FROM session_events WHERE session_id = ? AND type <> 'ping' ORDER BY id DESC LIMIT ?",
+      )
+      .all(sessionId, limit) as Array<{ payload: string }>;
+    const events: AgentEvent[] = [];
+    for (const row of rows.reverse()) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(row.payload);
+      } catch {
+        continue;
+      }
+      if (typeof parsed !== 'object' || parsed === null) continue;
+      const ev = parsed as { type?: unknown; phase?: unknown };
+      if (typeof ev.type !== 'string') continue;
+      if (ev.type === 'ping' || (ev.type === 'notice' && ev.phase !== undefined)) continue;
+      events.push(parsed as AgentEvent);
+    }
+    return events;
   }
 
   deleteSession(id: string): void {

@@ -6,7 +6,7 @@ import type { PairingConfirmBody } from '@pocketagent/protocol';
 import { SERVER_VERSION, config } from './config.js';
 import { Store } from './db.js';
 import { SessionManager } from './sessions.js';
-import { Hub, registerWs } from './ws.js';
+import { Heartbeat, Hub, registerWs } from './ws.js';
 import { confirmPairing, generatePairingCode, adminTokenOk, SlidingWindowRateLimiter } from './pairing.js';
 import { registerSecretsApi } from './secrets-api.js';
 import { startEgressProxy } from './egress-proxy.js';
@@ -16,6 +16,7 @@ export interface App {
   store: Store;
   manager: SessionManager;
   hub: Hub;
+  heartbeat: Heartbeat;
 }
 
 /** Security audit line (stdout-warn JSON; never log full pairing codes or tokens). */
@@ -27,6 +28,7 @@ export async function buildApp(): Promise<App> {
   const app = Fastify({ logger: false, bodyLimit: 1024 * 1024 });
   const store = new Store();
   const hub = new Hub();
+  const heartbeat = new Heartbeat();
   const manager = new SessionManager(store, (m) => hub.broadcast(m));
   manager.setLinkTransport({
     call: (linkId, path, method, body) => hub.callLink(linkId, path, method, body),
@@ -73,7 +75,7 @@ export async function buildApp(): Promise<App> {
 
   // maxPayload: reject WS frames larger than 1 MiB at the protocol level.
   await app.register(websocket, { options: { maxPayload: 1048576 } });
-  registerWs(app, store, manager, hub);
+  registerWs(app, store, manager, hub, heartbeat);
 
   // A redeploy starts a fresh orchestrator container next to the still running
   // session containers: reconnect it to their networks and event streams.
@@ -82,11 +84,11 @@ export async function buildApp(): Promise<App> {
     console.error(`[orchestrator] session reconcile failed: ${e instanceof Error ? e.message : String(e)}`);
   });
 
-  return { app, store, manager, hub };
+  return { app, store, manager, hub, heartbeat };
 }
 
 export async function main(): Promise<void> {
-  const { app, manager } = await buildApp();
+  const { app, manager, heartbeat } = await buildApp();
   await app.listen({ port: config.port, host: '0.0.0.0' });
   console.log(`[orchestrator] listening on :${config.port} (docker=${config.dockerEnabled})`);
   let egress: HttpServer | null = null;
@@ -110,6 +112,7 @@ export async function main(): Promise<void> {
     if (closing) return;
     closing = true;
     manager.shutdown();
+    heartbeat.stop();
     egress?.close();
     void app.close().finally(() => process.exit(0));
   };

@@ -50,6 +50,48 @@ export function isNoticePhase(v: unknown): v is NoticePhase {
   return typeof v === 'string' && (NOTICE_PHASES as readonly string[]).includes(v);
 }
 
+/** `session.events.get`: youngest events, chronological; the client may ask for fewer. */
+export const EVENTS_DEFAULT_LIMIT = 200;
+export const EVENTS_MAX_LIMIT = 1000;
+
+/**
+ * Event limit of a history request. Anything unusable (missing, not a finite
+ * number) falls back to the default, everything else is clamped into
+ * [1, EVENTS_MAX_LIMIT] - the limit reaches sqlite, so it must never be a
+ * client-controlled way to read the whole table.
+ */
+export function clampEventLimit(v: unknown): number {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return EVENTS_DEFAULT_LIMIT;
+  return Math.min(Math.max(Math.floor(v), 1), EVENTS_MAX_LIMIT);
+}
+
+/**
+ * Does an event belong in the stored timeline? 'ping' is pure keepalive, and a
+ * notice with a `phase` is live progress of a start that is over by the time
+ * anyone reloads the history. Both are dropped on write so they cannot push
+ * real messages out of the 5000 events a session keeps (appendEvent); the read
+ * path applies the same rule to rows written before this filter existed.
+ */
+export function isHistoryEvent(ev: AgentEvent): boolean {
+  if (ev.type === 'ping') return false;
+  return !(ev.type === 'notice' && ev.phase !== undefined);
+}
+
+/** Longest title a client may set; beyond that the list layout is unreadable anyway. */
+export const MAX_TITLE_LEN = 80;
+
+/**
+ * Normalize a user-set session title: control characters (a pasted newline
+ * would break every list row) collapse into spaces, and the result is cut to
+ * MAX_TITLE_LEN. An empty result means "no title" - the documented way to get
+ * the derived name back.
+ */
+export function sanitizeSessionTitle(raw: string): string | null {
+  const cleaned = raw.replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (cleaned.length === 0) return null;
+  return cleaned.slice(0, MAX_TITLE_LEN).trim();
+}
+
 /**
  * Provider a session falls back to when it switches to another harness: the
  * manifest default, else its first provider key, else none (adapters whose
@@ -160,6 +202,8 @@ export class SessionManager {
       link_id: null,
       network_policy: null,
       reasoning_effort: null,
+      title: null,
+      archived: 0,
       created_at: now,
       last_active_at: now,
     };
@@ -224,6 +268,8 @@ export class SessionManager {
       link_id: null,
       network_policy: networkPolicy,
       reasoning_effort: null,
+      title: null,
+      archived: 0,
       created_at: now,
       last_active_at: now,
     };
@@ -394,8 +440,14 @@ export class SessionManager {
     client.startEvents((ev) => this.onEvent(id, ev));
   }
 
-  private onEvent(sessionId: string, ev: AgentEvent): void {
+  /** Single write path into the stored timeline (noise never reaches the table). */
+  private persistEvent(sessionId: string, ev: AgentEvent): void {
+    if (!isHistoryEvent(ev)) return;
     this.store.appendEvent(sessionId, ev.type, JSON.stringify(ev));
+  }
+
+  private onEvent(sessionId: string, ev: AgentEvent): void {
+    this.persistEvent(sessionId, ev);
     this.store.touchSession(sessionId);
     this.broadcast({ type: 'session.event', sessionId, event: ev });
     if (ev.type === 'status' && ev.sessionRef) this.store.setSessionRef(sessionId, ev.sessionRef);
@@ -417,7 +469,7 @@ export class SessionManager {
   }
 
   private emitEvent(sessionId: string, ev: AgentEvent): void {
-    this.store.appendEvent(sessionId, ev.type, JSON.stringify(ev));
+    this.persistEvent(sessionId, ev);
     this.broadcast({ type: 'session.event', sessionId, event: ev });
   }
 
@@ -497,6 +549,11 @@ export class SessionManager {
   async prompt(id: string, text: string, mode?: AgentMode): Promise<void> {
     const row = this.requireSession(id);
     const body = buildPromptBody(row, text, mode);
+    // The prompt itself, so a reloaded timeline shows the user's own message:
+    // no shim reports it back, and without this line the history would start
+    // at the agent's answer. Stored only, never broadcast - the sending client
+    // already has the message on screen and would draw it twice.
+    this.persistEvent(id, { type: 'message.completed', role: 'user', text });
     if (row.link_id) {
       const res = await this.linkCall(row, '/prompt', 'POST', body);
       if (!res.ok) {
@@ -765,6 +822,56 @@ export class SessionManager {
     this.emitEvent(id, { type: 'pushed', branch: row.branch, auto: false });
   }
 
+  /** Stored timeline of a session, oldest first (see Store.listSessionEvents). */
+  sessionEvents(id: string, limit?: number): AgentEvent[] {
+    this.requireSession(id);
+    return this.store.listSessionEvents(id, clampEventLimit(limit));
+  }
+
+  /**
+   * Rename a session. An empty (or all-whitespace) title clears the column,
+   * which is how a client asks for the derived name back. The updated session
+   * goes to every device as `session.status`, like every other session change.
+   */
+  renameSession(id: string, title: unknown): SessionInfo {
+    this.requireSession(id);
+    if (typeof title !== 'string') throw new Error('title must be a string');
+    this.store.setSessionTitle(id, sanitizeSessionTitle(title));
+    return this.broadcastSession(id);
+  }
+
+  /**
+   * Archive/unarchive a session. Archiving stops the container: an archived
+   * session is one the user is done with for now, and a stopped container frees
+   * RAM and CPU. Its volume stays, so `session.resume` picks the work up
+   * exactly where it was - archiving is a view decision plus the resource
+   * saving, never data loss. Link sessions are left running: their agent
+   * process lives on the user's own machine and a 'bye' would shut it down,
+   * which a list gesture must not do.
+   *
+   * Nothing else changes: idle-stop and GC keep treating the row as before (an
+   * archived session is already stopped, so reapIdle skips it anyway, and GC
+   * still removes it once it is old enough - archiving is not "keep forever").
+   */
+  async archiveSession(id: string, archived: unknown): Promise<SessionInfo> {
+    const row = this.requireSession(id);
+    if (typeof archived !== 'boolean') throw new Error('archived must be a boolean');
+    this.store.setSessionArchived(id, archived);
+    if (archived && !row.link_id && row.status !== 'stopped') {
+      await this.stopSession(id).catch((e: unknown) => {
+        console.warn(`[sessions] archive: stopping ${id.slice(0, 8)} failed: ${e instanceof Error ? e.message : String(e)}`);
+      });
+    }
+    return this.broadcastSession(id);
+  }
+
+  /** Send the session's current state to every device and return it. */
+  private broadcastSession(id: string): SessionInfo {
+    const info = this.toInfo(this.requireSession(id));
+    this.broadcast({ type: 'session.status', sessionId: info.id, status: info.status, session: info });
+    return info;
+  }
+
   async deleteSession(id: string): Promise<void> {
     const row = this.store.getSession(id);
     this.clients.get(id)?.stop();
@@ -779,9 +886,17 @@ export class SessionManager {
         await docker.stopContainer(row.container_id);
         await docker.removeContainer(row.container_id);
       }
-      if (row.volume_name) await docker.removeVolume(row.volume_name);
+      // The volume name is derived from the session id (provision), so it is
+      // also removable for a session deleted while it was still being created -
+      // the row does not know the name yet at that point.
+      await docker.removeVolume(row.volume_name ?? `pocketagent-sess-${row.id}`);
       await docker.removeSessionNetwork(row.id);
+      // The egress proxy authorizes by source IP from a cached container list;
+      // without this refresh the deleted container's address stays allowed
+      // until the cache expires by itself.
+      await docker.refreshSessionPeers().catch(() => {});
     }
+    // deletes the stored events with the row (see Store.deleteSession)
     this.store.deleteSession(id);
   }
 
@@ -805,6 +920,9 @@ export class SessionManager {
       ...(row.pr_url ? { prUrl: row.pr_url } : {}),
       ...(isNetworkPolicy(row.network_policy) ? { networkPolicy: row.network_policy } : {}),
       ...(row.reasoning_effort ? { reasoningEffort: row.reasoning_effort } : {}),
+      // both additive: an older app ignores them, and "absent" is the default
+      ...(row.title ? { title: row.title } : {}),
+      ...(row.archived ? { archived: true } : {}),
     };
   }
 

@@ -60,10 +60,15 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.pocketagent.app.data.SessionStatus
 import com.pocketagent.app.data.WsClient
+import com.pocketagent.app.ui.theme.CardInset
 import com.pocketagent.app.ui.theme.ContentInset
 import com.pocketagent.app.ui.theme.IconRowDividerInset
+import com.pocketagent.app.ui.theme.ListItemTitle
 import com.pocketagent.app.ui.theme.PillShape
+import com.pocketagent.app.ui.theme.RowVerticalPadding
 import com.pocketagent.app.ui.theme.ScreenGutter
+import com.pocketagent.app.ui.theme.SectionHeaderBottom
+import com.pocketagent.app.ui.theme.SectionHeaderTop
 import com.pocketagent.app.ui.theme.TileMinHeight
 import com.pocketagent.app.ui.theme.semantic
 import java.time.Duration
@@ -358,9 +363,13 @@ fun SectionHeader(text: String, modifier: Modifier = Modifier) {
     Text(
         text = text,
         style = MaterialTheme.typography.labelMedium,
-        fontWeight = FontWeight.SemiBold,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
-        modifier = modifier.padding(start = ContentInset, end = ContentInset, top = 20.dp, bottom = 8.dp),
+        modifier = modifier.padding(
+            start = ContentInset,
+            end = ContentInset,
+            top = SectionHeaderTop,
+            bottom = SectionHeaderBottom,
+        ),
     )
 }
 
@@ -409,8 +418,8 @@ fun NoticeCard(
     ScreenCard(color = s.warningContainer) {
         Column(
             modifier = Modifier.padding(
-                start = 18.dp,
-                end = 18.dp,
+                start = CardInset,
+                end = CardInset,
                 top = 14.dp,
                 bottom = if (actionLabel != null) 8.dp else 14.dp,
             ),
@@ -456,17 +465,17 @@ fun SelectableTile(
             .fillMaxWidth()
             .selectable(selected = selected, onClick = onClick, role = Role.RadioButton)
             .heightIn(min = TileMinHeight)
-            .padding(start = 4.dp, end = 16.dp),
+            .padding(start = 4.dp, end = CardInset),
     ) {
         RadioButton(selected = selected, onClick = null)
         Column(
             modifier = Modifier
                 .weight(1f)
-                .padding(start = 4.dp, top = 10.dp, bottom = 10.dp),
+                .padding(start = 4.dp, top = RowVerticalPadding, bottom = RowVerticalPadding),
         ) {
             Text(
                 text = title,
-                style = MaterialTheme.typography.titleSmall,
+                style = ListItemTitle,
                 color = if (titleColor == Color.Unspecified) MaterialTheme.colorScheme.onSurface else titleColor,
             )
             if (!subtitle.isNullOrBlank()) {

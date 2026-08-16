@@ -535,12 +535,8 @@ fun NewSessionScreen(
 /* Was tatsächlich startet                                             */
 /* ------------------------------------------------------------------ */
 
-private fun modeLabel(mode: AgentMode): String = when (mode) {
-    AgentMode.ASK -> "Ask"
-    AgentMode.ACCEPT_EDITS -> "Accept Edits"
-    AgentMode.AUTO -> "Auto"
-    AgentMode.YOLO -> "Yolo"
-}
+// modeLabel() lives in SessionScreen.kt — same package, one wording for a
+// mode everywhere it is named.
 
 private fun networkLabel(policy: String): String = when (policy) {
     "isolated" -> "Isoliert"

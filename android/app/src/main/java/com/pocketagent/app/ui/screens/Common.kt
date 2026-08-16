@@ -271,6 +271,7 @@ fun OneUiScaffold(
     actions: @Composable RowScope.() -> Unit = {},
     floatingActionButton: @Composable () -> Unit = {},
     bottomBar: @Composable () -> Unit = {},
+    snackbarHost: @Composable () -> Unit = {},
     content: @Composable (PaddingValues) -> Unit,
 ) {
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior(rememberTopAppBarState())
@@ -279,6 +280,7 @@ fun OneUiScaffold(
         containerColor = MaterialTheme.colorScheme.background,
         floatingActionButton = floatingActionButton,
         bottomBar = bottomBar,
+        snackbarHost = snackbarHost,
         topBar = {
             LargeTopAppBar(
                 title = {

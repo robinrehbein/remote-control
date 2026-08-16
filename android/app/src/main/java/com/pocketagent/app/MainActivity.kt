@@ -86,13 +86,14 @@ private fun AppRoot(deepLinkSessionId: String?, onConsumeDeepLink: () -> Unit) {
             }
             if (unlocked) {
                 val navController = rememberNavController()
-                LaunchedEffect(deepLinkSessionId) {
-                    deepLinkSessionId?.let { id ->
-                        navController.navigate("session/$id")
-                        onConsumeDeepLink()
-                    }
-                }
-                PocketAgentNavHost(navController = navController)
+                // Der Deep Link wird bewusst nicht mehr hier navigiert: ob
+                // eine Session als eigener Screen oder als rechte Spalte
+                // gehört, weiß nur der NavHost — er kennt die Fensterbreite.
+                PocketAgentNavHost(
+                    navController = navController,
+                    deepLinkSessionId = deepLinkSessionId,
+                    onConsumeDeepLink = onConsumeDeepLink,
+                )
             }
         }
     }

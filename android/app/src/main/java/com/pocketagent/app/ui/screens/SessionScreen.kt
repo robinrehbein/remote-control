@@ -589,153 +589,159 @@ fun SessionScreen(
             )
         },
         bottomBar = {
-            Surface(color = MaterialTheme.colorScheme.background, tonalElevation = 0.dp) {
-                Column(modifier = Modifier.navigationBarsPadding().imePadding()) {
-                    // Steht die Verbindung nicht, sagt es genau eine Zeile —
-                    // mit Restzeit und einem Tap, der den Versuch vorzieht.
-                    ConnectionLine(state = connState, onReconnect = { repository.reconnectNow() })
-                    // Der Text ist nicht bestätigt und steht noch im Feld.
-                    // Bewusst kein automatisches Nachsenden (siehe sendPrompt).
-                    if (sendFailed) {
-                        Text(
-                            text = "Nicht gesendet – keine Verbindung oder keine Bestätigung. " +
-                                "Dein Text bleibt stehen, tippe erneut auf Senden.",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.error,
-                            modifier = Modifier.padding(
-                                start = ContentInset,
-                                end = ContentInset,
-                                top = 2.dp,
-                                bottom = 2.dp,
-                            ),
-                        )
-                    }
-                    // Der Start braucht Minuten — er steht ruhig über dem
-                    // Composer statt in der Timeline, wo er wegscrollen würde.
-                    startProgressOf(session?.status, progress)?.let { StartProgressCard(it) }
-                    AnimatedVisibility(
-                        visible = busy,
-                        enter = fadeIn(tween(MotionShort, easing = LinearEasing)),
-                        exit = fadeOut(tween(MotionShort, easing = LinearEasing)),
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier.padding(start = ContentInset, top = 6.dp, bottom = 2.dp),
-                        ) {
-                            PulsingDot(
-                                color = MaterialTheme.colorScheme.primary,
-                                pulse = true,
-                                size = 6.dp,
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
+            // Dieselbe Lesespalte wie der Verlauf darüber. Dieser Screen baut
+            // sein eigenes Scaffold und bekommt sie deshalb nicht von
+            // OneUiScaffold — im Vollbild auf einem Tablet liefe der Composer
+            // sonst randbreit unter einem schmalen Verlauf.
+            CenteredContentWidth {
+                Surface(color = MaterialTheme.colorScheme.background, tonalElevation = 0.dp) {
+                    Column(modifier = Modifier.navigationBarsPadding().imePadding()) {
+                        // Steht die Verbindung nicht, sagt es genau eine Zeile —
+                        // mit Restzeit und einem Tap, der den Versuch vorzieht.
+                        ConnectionLine(state = connState, onReconnect = { repository.reconnectNow() })
+                        // Der Text ist nicht bestätigt und steht noch im Feld.
+                        // Bewusst kein automatisches Nachsenden (siehe sendPrompt).
+                        if (sendFailed) {
                             Text(
-                                text = "Agent arbeitet …",
+                                text = "Nicht gesendet – keine Verbindung oder keine Bestätigung. " +
+                                    "Dein Text bleibt stehen, tippe erneut auf Senden.",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                color = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.padding(
+                                    start = ContentInset,
+                                    end = ContentInset,
+                                    top = 2.dp,
+                                    bottom = 2.dp,
+                                ),
                             )
                         }
-                    }
-                    // Kompakte Chip-Reihe: Agent und Modus immer, Modell und
-                    // Reasoning nur, wenn der Adapter sie wirklich unterstützt.
-                    // Während der Agent hochfährt ist nichts davon einstellbar.
-                    session?.let { s ->
-                        val chipsEnabled = s.status != SessionStatus.CREATING
-                        Row(
-                            horizontalArrangement = Arrangement.spacedBy(ChipSpacing),
-                            verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .horizontalScroll(rememberScrollState())
-                                .padding(start = ScreenGutter, end = ScreenGutter, top = 2.dp, bottom = 4.dp),
+                        // Der Start braucht Minuten — er steht ruhig über dem
+                        // Composer statt in der Timeline, wo er wegscrollen würde.
+                        startProgressOf(session?.status, progress)?.let { StartProgressCard(it) }
+                        AnimatedVisibility(
+                            visible = busy,
+                            enter = fadeIn(tween(MotionShort, easing = LinearEasing)),
+                            exit = fadeOut(tween(MotionShort, easing = LinearEasing)),
                         ) {
-                            SettingChip(
-                                label = "Agent",
-                                value = adapterLabel(adapters, s.adapter),
-                                enabled = chipsEnabled,
-                                onClick = {
-                                    sheet = SessionSheet.AGENT
-                                    vm.loadSecrets()
-                                },
-                            )
-                            SettingChip(
-                                label = "Modus",
-                                value = modeLabel(s.mode),
-                                enabled = chipsEnabled,
-                                onClick = { sheet = SessionSheet.MODE },
-                            )
-                            if (capabilities.modelSwitch) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.padding(start = ContentInset, top = 6.dp, bottom = 2.dp),
+                            ) {
+                                PulsingDot(
+                                    color = MaterialTheme.colorScheme.primary,
+                                    pulse = true,
+                                    size = 6.dp,
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = "Agent arbeitet …",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                        // Kompakte Chip-Reihe: Agent und Modus immer, Modell und
+                        // Reasoning nur, wenn der Adapter sie wirklich unterstützt.
+                        // Während der Agent hochfährt ist nichts davon einstellbar.
+                        session?.let { s ->
+                            val chipsEnabled = s.status != SessionStatus.CREATING
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(ChipSpacing),
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .horizontalScroll(rememberScrollState())
+                                    .padding(start = ScreenGutter, end = ScreenGutter, top = 2.dp, bottom = 4.dp),
+                            ) {
                                 SettingChip(
-                                    label = "Modell",
-                                    value = s.model.ifBlank { "Standard" },
+                                    label = "Agent",
+                                    value = adapterLabel(adapters, s.adapter),
                                     enabled = chipsEnabled,
                                     onClick = {
-                                        sheet = SessionSheet.MODEL
-                                        vm.loadModels()
+                                        sheet = SessionSheet.AGENT
+                                        vm.loadSecrets()
                                     },
                                 )
-                            }
-                            if (capabilities.reasoning) {
                                 SettingChip(
-                                    label = "Reasoning",
-                                    value = reasoningLabel(ReasoningEffort.fromRaw(s.reasoningEffort)),
+                                    label = "Modus",
+                                    value = modeLabel(s.mode),
                                     enabled = chipsEnabled,
-                                    onClick = { sheet = SessionSheet.REASONING },
+                                    onClick = { sheet = SessionSheet.MODE },
                                 )
+                                if (capabilities.modelSwitch) {
+                                    SettingChip(
+                                        label = "Modell",
+                                        value = s.model.ifBlank { "Standard" },
+                                        enabled = chipsEnabled,
+                                        onClick = {
+                                            sheet = SessionSheet.MODEL
+                                            vm.loadModels()
+                                        },
+                                    )
+                                }
+                                if (capabilities.reasoning) {
+                                    SettingChip(
+                                        label = "Reasoning",
+                                        value = reasoningLabel(ReasoningEffort.fromRaw(s.reasoningEffort)),
+                                        enabled = chipsEnabled,
+                                        onClick = { sheet = SessionSheet.REASONING },
+                                    )
+                                }
                             }
                         }
-                    }
-                    // Eingabefeld und Senden-Knopf teilen sich ComposerHeight,
-                    // damit sie als eine Zeile lesen. Wächst der Text über
-                    // mehrere Zeilen, wächst nur die Pille — der Kreis bleibt
-                    // unten bündig auf Höhe der letzten Zeile (One UI hängt
-                    // die Aktion an das Ende der Eingabe, nicht an ihre Mitte).
-                    Row(
-                        verticalAlignment = Alignment.Bottom,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(start = ScreenGutter, end = ScreenGutter, top = 4.dp, bottom = 8.dp),
-                    ) {
-                        OutlinedTextField(
-                            value = input,
-                            onValueChange = vm::updateInput,
-                            placeholder = { Text("Aufgabe oder Rückfrage …") },
+                        // Eingabefeld und Senden-Knopf teilen sich ComposerHeight,
+                        // damit sie als eine Zeile lesen. Wächst der Text über
+                        // mehrere Zeilen, wächst nur die Pille — der Kreis bleibt
+                        // unten bündig auf Höhe der letzten Zeile (One UI hängt
+                        // die Aktion an das Ende der Eingabe, nicht an ihre Mitte).
+                        Row(
+                            verticalAlignment = Alignment.Bottom,
                             modifier = Modifier
-                                .weight(1f)
-                                .heightIn(min = ComposerHeight),
-                            maxLines = 5,
-                            shape = PillShape,
-                            keyboardOptions = KeyboardOptions(
-                                capitalization = KeyboardCapitalization.Sentences,
-                                imeAction = ImeAction.Default,
-                            ),
-                            colors = OutlinedTextFieldDefaults.colors(
-                                focusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
-                                unfocusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
-                                disabledContainerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
-                                focusedBorderColor = Color.Transparent,
-                                unfocusedBorderColor = Color.Transparent,
-                                disabledBorderColor = Color.Transparent,
-                            ),
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        // Filled circle when there is something to send: the
-                        // primary action of this screen should look like one.
-                        // Gesperrt, solange die letzte Anfrage noch auf ihre
-                        // Bestätigung wartet — kein Doppel-Senden per Doppeltap.
-                        FilledIconButton(
-                            onClick = { vm.sendPrompt() },
-                            enabled = input.isNotBlank() && !sending,
-                            shape = CircleShape,
-                            modifier = Modifier.size(ComposerHeight),
+                                .fillMaxWidth()
+                                .padding(start = ScreenGutter, end = ScreenGutter, top = 4.dp, bottom = 8.dp),
                         ) {
-                            if (sending) {
-                                CircularProgressIndicator(
-                                    strokeWidth = 2.dp,
-                                    modifier = Modifier.size(18.dp),
-                                    color = MaterialTheme.colorScheme.onPrimary,
-                                )
-                            } else {
-                                Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Senden")
+                            OutlinedTextField(
+                                value = input,
+                                onValueChange = vm::updateInput,
+                                placeholder = { Text("Aufgabe oder Rückfrage …") },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .heightIn(min = ComposerHeight),
+                                maxLines = 5,
+                                shape = PillShape,
+                                keyboardOptions = KeyboardOptions(
+                                    capitalization = KeyboardCapitalization.Sentences,
+                                    imeAction = ImeAction.Default,
+                                ),
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+                                    unfocusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+                                    disabledContainerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+                                    focusedBorderColor = Color.Transparent,
+                                    unfocusedBorderColor = Color.Transparent,
+                                    disabledBorderColor = Color.Transparent,
+                                ),
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            // Filled circle when there is something to send: the
+                            // primary action of this screen should look like one.
+                            // Gesperrt, solange die letzte Anfrage noch auf ihre
+                            // Bestätigung wartet — kein Doppel-Senden per Doppeltap.
+                            FilledIconButton(
+                                onClick = { vm.sendPrompt() },
+                                enabled = input.isNotBlank() && !sending,
+                                shape = CircleShape,
+                                modifier = Modifier.size(ComposerHeight),
+                            ) {
+                                if (sending) {
+                                    CircularProgressIndicator(
+                                        strokeWidth = 2.dp,
+                                        modifier = Modifier.size(18.dp),
+                                        color = MaterialTheme.colorScheme.onPrimary,
+                                    )
+                                } else {
+                                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Senden")
+                                }
                             }
                         }
                     }

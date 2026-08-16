@@ -12,15 +12,19 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.outlined.SmartToy
 import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material.icons.outlined.SmartToy
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationRail
 import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalConfiguration
@@ -102,11 +106,57 @@ private val RailTargets = listOf(
 fun PocketAgentNavHost(
     navController: NavHostController,
     modifier: Modifier = Modifier,
+    deepLinkSessionId: String? = null,
+    onConsumeDeepLink: () -> Unit = {},
 ) {
     val widthDp = LocalConfiguration.current.screenWidthDp
     val widthClass = widthClassFor(widthDp)
+    val twoPanes = usesTwoPanes(widthClass)
     val foldedVertically by rememberVerticalFold()
     val currentRoute = navController.currentBackStackEntryAsState().value?.destination?.route
+
+    // Die offene Session liegt hier, nicht in der Spalte: nur so bleibt es
+    // dieselbe Session, egal ob sie gerade als rechte Spalte oder als eigener
+    // Screen gezeigt wird.
+    var selectedSession by rememberSaveable { mutableStateOf<String?>(null) }
+
+    // Eine offene Session überlebt das Falten. One UI verlangt Kontinuität
+    // über den Wechsel des Bildschirms hinweg; ohne das hier bliebe beim
+    // Aufklappen der Vollbild-Screen über dem Zwei-Spalten-Layout liegen, und
+    // beim Zuklappen verschwände die geöffnete Session ersatzlos, weil ihre
+    // Spalte nicht mehr existiert.
+    LaunchedEffect(twoPanes) {
+        if (twoPanes) {
+            val entry = navController.currentBackStackEntry
+            if (entry?.destination?.route == Routes.SESSION) {
+                selectedSession = entry.arguments?.getString("id")
+                navController.popBackStack(Routes.MAIN, inclusive = false)
+            }
+        } else {
+            selectedSession?.let { id ->
+                selectedSession = null
+                navController.navigate(Routes.session(id))
+            }
+        }
+    }
+
+    // Ein Deep Link meint eine Session, keinen Screen. Wo zwei Spalten stehen,
+    // füllt er die rechte — sonst sähe dieselbe Session anders aus, je nachdem
+    // ob man sie in der Liste antippt oder aus einer Benachrichtigung öffnet.
+    LaunchedEffect(deepLinkSessionId, twoPanes) {
+        val id = deepLinkSessionId ?: return@LaunchedEffect
+        if (twoPanes) {
+            selectedSession = id
+            // Liegt gerade Einstellungen oder Neue Session oben, füllte die
+            // Auswahl eine Spalte, die niemand sieht.
+            if (navController.currentBackStackEntry?.destination?.route != Routes.MAIN) {
+                navController.popBackStack(Routes.MAIN, inclusive = false)
+            }
+        } else {
+            navController.navigate(Routes.session(id))
+        }
+        onConsumeDeepLink()
+    }
 
     Row(modifier = modifier.fillMaxSize()) {
         // Erst ab Medium. Auf einem Telefon nähme die Rail Breite weg, die
@@ -145,9 +195,11 @@ fun PocketAgentNavHost(
             popExitTransition = { popExit() },
         ) {
             composable(Routes.MAIN) {
-                if (usesTwoPanes(widthClass)) {
+                if (twoPanes) {
                     SessionListDetail(
                         listFraction = listPaneFraction(widthDp, foldedVertically),
+                        selectedId = selectedSession,
+                        onSelect = { selectedSession = it },
                         onNewSession = { navController.navigate(Routes.NEW_SESSION) },
                         onOpenSettings = { navController.navigate(Routes.SETTINGS) },
                         onOpenDiff = { sid -> navController.navigate(Routes.diff(sid)) },

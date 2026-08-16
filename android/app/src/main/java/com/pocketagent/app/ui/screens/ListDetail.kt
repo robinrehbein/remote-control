@@ -40,46 +40,50 @@ import com.pocketagent.app.ui.theme.ScreenGutter
  * at once." Genau das war der Zustand vorher: dieselbe eine Spalte, nur
  * breiter gezogen.
  *
- * Die Auswahl lebt hier und nicht im Navigationsstack. Das ist Absicht: in
- * zwei Spalten *ersetzt* das Öffnen einer Session nichts, es füllt nur die
- * rechte Seite. Ein Push würde die Liste verdrängen, die weiterhin sichtbar
- * ist — und die Rückwärtstaste müsste etwas rückgängig machen, das nie
- * passiert ist.
+ * Die Auswahl liegt nicht im Navigationsstack. Das ist Absicht: in zwei
+ * Spalten *ersetzt* das Öffnen einer Session nichts, es füllt nur die rechte
+ * Seite. Ein Push würde die Liste verdrängen, die weiterhin sichtbar ist —
+ * und die Rückwärtstaste müsste etwas rückgängig machen, das nie passiert
+ * ist.
+ *
+ * Gehalten wird sie eine Ebene höher, im NavHost. Nur von dort aus lässt sich
+ * dieselbe offene Session über einen Faltvorgang hinweg mal als Spalte und
+ * mal als eigener Screen zeigen — und ein Deep Link in der Spalte statt im
+ * Vollbild landen.
  */
 @Composable
 fun SessionListDetail(
     listFraction: Float,
+    selectedId: String?,
+    onSelect: (String?) -> Unit,
     onNewSession: () -> Unit,
     onOpenSettings: () -> Unit,
     onOpenDiff: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    var selectedId by rememberSaveable { mutableStateOf<String?>(null) }
-
     // Zurück schließt erst das Detail, bevor es die App verlässt. Nur wenn
     // wirklich etwas ausgewählt ist — sonst schluckt der Handler die Taste.
-    BackHandler(enabled = selectedId != null) { selectedId = null }
+    BackHandler(enabled = selectedId != null) { onSelect(null) }
 
     Row(modifier = modifier.fillMaxSize()) {
         Box(modifier = Modifier.fillMaxHeight().weight(listFraction)) {
             SessionListScreen(
                 onNewSession = onNewSession,
-                onOpenSession = { id -> selectedId = id },
+                onOpenSession = { id -> onSelect(id) },
                 onOpenSettings = onOpenSettings,
             )
         }
         VerticalDivider(color = MaterialTheme.colorScheme.outlineVariant)
         Box(modifier = Modifier.fillMaxHeight().weight(1f - listFraction)) {
-            val id = selectedId
-            if (id == null) {
+            if (selectedId == null) {
                 NoSessionSelected()
             } else {
                 SessionScreen(
                     // Der Schlüssel hängt an der Id, damit der Wechsel der
                     // Auswahl auch das ViewModel wechselt und nicht der
                     // Verlauf der vorigen Session stehen bleibt.
-                    sessionId = id,
-                    onBack = { selectedId = null },
+                    sessionId = selectedId,
+                    onBack = { onSelect(null) },
                     onOpenDiff = onOpenDiff,
                 )
             }

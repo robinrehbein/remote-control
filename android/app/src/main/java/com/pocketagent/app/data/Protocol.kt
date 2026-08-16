@@ -128,6 +128,34 @@ enum class PermissionKind {
 
 /** SecretKind is an open string in the contract -> plain String on the client. */
 
+/**
+ * Phase eines laufenden Session-Starts — das optionale Feld `phase` einer
+ * Notice. Der Server darf jederzeit neue Phasen einführen; alles Unbekannte
+ * landet auf [UNKNOWN], das Event selbst bleibt gültig.
+ */
+enum class StartPhase {
+    /** Image wird gebaut — der langsame Fall, dauert beim ersten Mal Minuten. */
+    IMAGE_BUILD,
+    CONTAINER_START,
+    SHIM_START,
+
+    /** Start abgeschlossen — die Fortschrittsanzeige verschwindet. */
+    READY,
+    UNKNOWN;
+
+    companion object {
+        /** null nur, wenn gar keine Phase mitkam (= normale Systemzeile). */
+        fun fromRaw(raw: String?): StartPhase? = when {
+            raw.isNullOrBlank() -> null
+            raw.equals("image-build", ignoreCase = true) -> IMAGE_BUILD
+            raw.equals("container-start", ignoreCase = true) -> CONTAINER_START
+            raw.equals("shim-start", ignoreCase = true) -> SHIM_START
+            raw.equals("ready", ignoreCase = true) -> READY
+            else -> UNKNOWN
+        }
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* Payload types                                                       */
 /* ------------------------------------------------------------------ */
@@ -237,8 +265,19 @@ sealed interface AgentEvent {
     data class Pushed(val branch: String, val prUrl: String? = null, val auto: Boolean) : AgentEvent
     data class ErrorEvent(val message: String, val fatal: Boolean? = null) : AgentEvent
 
-    /** Systemhinweis des Servers (Image-Build, Agent-Wechsel) — kein Agent-Output. */
-    data class Notice(val message: String) : AgentEvent
+    /**
+     * Systemhinweis des Servers (Image-Build, Agent-Wechsel) — kein Agent-Output.
+     *
+     * Mit [phase] ist der Hinweis Fortschritt eines laufenden Starts: er
+     * ersetzt die Fortschrittsanzeige, statt sich in der Timeline zu stapeln.
+     * Ohne [phase] bleibt es eine gewöhnliche Systemzeile.
+     * [detail] ist ein bereits serverseitig gekürzter Log-Auszug.
+     */
+    data class Notice(
+        val message: String,
+        val phase: String? = null,
+        val detail: String? = null,
+    ) : AgentEvent
 
     data class Ping(val ts: Long) : AgentEvent
 }
@@ -448,7 +487,11 @@ fun parseAgentEvent(obj: JsonObject): AgentEvent? {
                 fatal = obj["fatal"]?.jsonPrimitive?.booleanOrNullCompat(),
             )
 
-            "notice" -> AgentEvent.Notice(message = obj.optString("message") ?: return null)
+            "notice" -> AgentEvent.Notice(
+                message = obj.optString("message") ?: return null,
+                phase = obj.optString("phase"),
+                detail = obj.optString("detail"),
+            )
 
             "ping" -> AgentEvent.Ping(ts = obj["ts"]?.jsonPrimitive?.longOrNull ?: 0L)
 

@@ -242,6 +242,17 @@ export interface TokenUsage {
   costUsd?: number;
 }
 
+/**
+ * Step a session start is currently in, carried by progress notices:
+ *  - 'image-build'     : the adapter image is being built on the daemon
+ *  - 'container-start' : the session container is being started
+ *  - 'shim-start'      : the container boots (repo clone, agent process)
+ *  - 'ready'           : the shim answers, the session can take prompts
+ * The order is the order of a start, but clients must not assume every phase
+ * occurs (a cached image skips 'image-build').
+ */
+export type NoticePhase = 'image-build' | 'container-start' | 'shim-start' | 'ready';
+
 export type AgentEvent =
   | {
       type: 'status';
@@ -275,11 +286,16 @@ export type AgentEvent =
   | { type: 'pushed'; branch: string; prUrl?: string; auto: boolean }
   | { type: 'error'; message: string; fatal?: boolean }
   /**
-   * Informational, non-fatal progress line for the session log (e.g. "the
-   * agent image is being built"). Purely additive: clients that predate this
-   * variant ignore unknown event types.
+   * Informational, non-fatal line for the session log (e.g. "the agent image is
+   * being built"). Purely additive: clients that predate this variant ignore
+   * unknown event types.
+   *
+   * With `phase` it is live progress of a starting session: the client replaces
+   * its status display with it (same phase = update of the same line, new phase
+   * = next step). Without `phase` it stays an ordinary timeline entry
+   * (e.g. "Agent gewechselt: kilo → claude").
    */
-  | { type: 'notice'; message: string }
+  | { type: 'notice'; message: string; phase?: NoticePhase; detail?: string }
   | { type: 'ping'; ts: number };
 
 /** SSE wire format: `event: agent` + `data: <AgentEvent JSON>` */

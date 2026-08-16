@@ -1,5 +1,5 @@
 import Docker from 'dockerode';
-import type { NetworkPolicy } from '@pocketagent/protocol';
+import type { NetworkPolicy, NoticePhase } from '@pocketagent/protocol';
 import {
   GATEWAY_ALIAS,
   GATEWAY_AUTH_HEADER,
@@ -11,12 +11,25 @@ import {
 } from './config.js';
 import { adapterImage, getAdapter } from './adapters.js';
 import { buildShimImage, shimContextFiles } from './image-build.js';
+import { LOG_TAIL_LINES, redactTokens, stripLogFraming } from './progress.js';
 import type { SessionRow } from './db.js';
 
-/** Progress line handed to the app while a session is being provisioned. */
-export type NoticeFn = (message: string) => void;
+/** Optional payload of a progress notice (phases are the protocol contract). */
+export interface NoticeProgress {
+  phase?: NoticePhase;
+  /** Shortened, token-masked log excerpt (see progress.ts). */
+  detail?: string;
+}
+
+/** Progress channel handed to the app while a session is being provisioned. */
+export type NoticeFn = (message: string, progress?: NoticeProgress) => void;
 
 let client: Docker | null = null;
+
+/** Drop the cached daemon connection (docker config changed at runtime, tests). */
+export function resetDockerClient(): void {
+  client = null;
+}
 
 function docker(): Docker | null {
   if (!config.dockerEnabled) return null;
@@ -579,19 +592,35 @@ export async function shimEndpoint(containerId: string, sessionId: string): Prom
 }
 
 /**
+ * Last log lines of a container, framing stripped, never redacted (callers that
+ * forward the text mask it themselves). Unavailable logs are '' on purpose:
+ * this feeds both diagnostics and the live start progress, and neither may fail
+ * a session because the daemon has nothing to say.
+ */
+export async function containerLogTail(id: string, lines = LOG_TAIL_LINES): Promise<string> {
+  const d = docker();
+  if (!d) return '';
+  try {
+    const raw = await d.getContainer(id).logs({ stdout: true, stderr: true, tail: lines });
+    return stripLogFraming(Buffer.isBuffer(raw) ? raw : Buffer.from(String(raw)));
+  } catch {
+    return ''; // container removed / daemon unreachable
+  }
+}
+
+/**
  * Last log lines of a container plus its exit state. When a shim never becomes
  * ready, its own stderr holds the reason (failed clone, missing key, crash) -
  * without this the app only ever sees "shim did not become ready in time".
  * Token-shaped words are masked: shim logs are not supposed to contain secrets,
  * but this text is forwarded to the app and the server log.
  */
-export async function containerDiagnostics(id: string, lines = 20): Promise<string> {
+export async function containerDiagnostics(id: string, lines = LOG_TAIL_LINES): Promise<string> {
   const d = docker();
   if (!d) return '';
-  const c = d.getContainer(id);
   const parts: string[] = [];
   try {
-    const info = await c.inspect();
+    const info = await d.getContainer(id).inspect();
     const state = info.State;
     if (state) {
       const exit = state.ExitCode === undefined ? '' : ` exit=${state.ExitCode}`;
@@ -601,38 +630,9 @@ export async function containerDiagnostics(id: string, lines = 20): Promise<stri
   } catch {
     parts.push('Container: nicht mehr vorhanden');
   }
-  try {
-    const raw = await c.logs({ stdout: true, stderr: true, tail: lines });
-    const text = stripLogFraming(Buffer.isBuffer(raw) ? raw : Buffer.from(String(raw)));
-    if (text.length > 0) parts.push(`Log:\n${redactTokens(text)}`);
-  } catch {
-    /* logs unavailable (container removed) */
-  }
+  const text = await containerLogTail(id, lines);
+  if (text.length > 0) parts.push(`Log:\n${redactTokens(text)}`);
   return parts.join('\n');
-}
-
-/**
- * Docker multiplexes non-TTY logs into 8-byte-framed chunks; strip the frames
- * so the payload stays readable when a stream carries both stdout and stderr.
- */
-function stripLogFraming(buf: Buffer): string {
-  const out: string[] = [];
-  let off = 0;
-  while (off + 8 <= buf.length) {
-    const type = buf[off] ?? 255;
-    const len = buf.readUInt32BE(off + 4);
-    // Frame headers always start with stream id 0-2; anything else means the
-    // daemon sent a raw (TTY) stream, which is already plain text.
-    if (type > 2 || len > buf.length - off - 8) return buf.toString('utf8').trim();
-    out.push(buf.toString('utf8', off + 8, off + 8 + len));
-    off += 8 + len;
-  }
-  return (off === 0 ? buf.toString('utf8') : out.join('')).trim();
-}
-
-/** Mask long token-shaped words (>=20 chars of key/token alphabet). */
-function redactTokens(text: string): string {
-  return text.replace(/\b[A-Za-z0-9_-]{20,}\b/g, (m) => `${m.slice(0, 4)}…[gekürzt]`);
 }
 
 export async function stopContainer(id: string): Promise<void> {

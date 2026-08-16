@@ -228,6 +228,20 @@ val PrimaryButtonTextSize = 18.sp
  */
 val ComposerHeight = 56.dp
 
+/**
+ * Height of a settings chip — the pill that names one value and opens its
+ * sheet. Deliberately below [MinTouchTarget]: a chip is small by nature, and
+ * the rows it opens are full-height. Both the session screen and the new
+ * session screen build their chip row from this.
+ */
+val ChipHeight = 34.dp
+
+/**
+ * Widest a chip's value may get before it ellipsizes. Long model ids would
+ * otherwise push every other chip off the row.
+ */
+val ChipValueMaxWidth = 160.dp
+
 /** Vertical air between one section's card and the next section header. */
 val SectionSpacing = 20.dp
 

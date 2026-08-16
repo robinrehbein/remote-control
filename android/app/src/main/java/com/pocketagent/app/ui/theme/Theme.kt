@@ -185,6 +185,13 @@ val MinTouchTarget = 48.dp
 /** Height of the primary full-width action button. */
 val PrimaryButtonHeight = 52.dp
 
+/**
+ * Height of one composer line: the input pill and the round send button
+ * next to it share it, so the two read as a single row. Never below
+ * [MinTouchTarget].
+ */
+val ComposerHeight = 56.dp
+
 /** Vertical air between one section's card and the next section header. */
 val SectionSpacing = 20.dp
 

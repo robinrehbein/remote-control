@@ -132,6 +132,42 @@ function proxyGet(
 }
 
 /**
+ * Raw CONNECT against the proxy (the path an https request takes), resolved
+ * with the status code of the response line. 407 = refused by a gate, anything
+ * else means both gates passed and the tunnel was attempted.
+ */
+function proxyConnect(
+  net: typeof import('node:net'),
+  proxyPort: number,
+  hostPort: string,
+  token?: string,
+): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const sock = net.connect(proxyPort, '127.0.0.1', () => {
+      const auth = token ? `Proxy-Authorization: Basic ${Buffer.from(`pa:${token}`).toString('base64')}\r\n` : '';
+      sock.write(`CONNECT ${hostPort} HTTP/1.1\r\nHost: ${hostPort}\r\n${auth}\r\n`);
+    });
+    const timer = setTimeout(() => {
+      sock.destroy();
+      reject(new Error('proxy did not answer the CONNECT'));
+    }, 10_000);
+    let buf = '';
+    sock.on('data', (c) => {
+      buf += String(c);
+      const status = /^HTTP\/1\.\d (\d{3})/.exec(buf.split('\r\n')[0] ?? '');
+      if (!status) return;
+      clearTimeout(timer);
+      sock.destroy();
+      resolve(Number(status[1]));
+    });
+    sock.on('error', (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+  });
+}
+
+/**
  * Remote-runner gateway: pure routing/auth logic plus the two servers it runs,
  * all without a docker daemon. Session ids are plain DNS labels, so '127.0.0.1'
  * is a valid one and lets us point the ingress at a local fake shim.
@@ -304,6 +340,16 @@ async function startProgressSmoke(store: Store, manager: SessionManager, c2: Cli
   cfg.dockerEnabled = true;
   dockerMod.resetDockerClient();
 
+  // The egress setup of a starting session has to be readable from the server
+  // log alone - "denied ... no proxy credentials" says nothing about which side
+  // of the container boundary lost the credentials.
+  const logged: string[] = [];
+  const logBefore = console.log;
+  console.log = (...args: unknown[]): void => {
+    logged.push(args.map((a) => String(a)).join(' '));
+    logBefore(...args);
+  };
+
   let sessionId = '';
   try {
     const created = await request(c2, {
@@ -341,7 +387,18 @@ async function startProgressSmoke(store: Store, manager: SessionManager, c2: Cli
       'allowlist sessions reach the network through the authenticated egress proxy',
     );
     assert(store.getSession(sessionId)?.container_id === CID, 'the container id is recorded before the start');
+
+    const setupLine = logged.find((l) => l.startsWith(`[docker] session ${sessionId.slice(0, 8)} `));
+    assert(setupLine !== undefined, 'the container creation logs the session egress setup');
+    assert(
+      setupLine?.includes('policy=allowlist') === true &&
+        setupLine.includes('egress=orchestrator:') &&
+        setupLine.endsWith('auth=yes'),
+      `the egress setup line names policy, proxy and whether credentials are set: ${String(setupLine)}`,
+    );
+    assert(!logged.some((l) => l.includes(String(store.getSession(sessionId)?.shim_token))), 'the log never carries the token');
   } finally {
+    console.log = logBefore;
     cfg.dockerEnabled = false;
     cfg.dockerHost = null;
     cfg.dockerHostIsLocal = false;
@@ -352,6 +409,143 @@ async function startProgressSmoke(store: Store, manager: SessionManager, c2: Cli
     // The shim never answers here, so provisioning keeps polling in the
     // background until its timeout - dropping the session ends it cleanly.
     if (sessionId) await manager.deleteSession(sessionId).catch(() => {});
+  }
+}
+
+/**
+ * Egress authorization that does not depend on the HTTP client: an 'allowlist'
+ * session reaches the network when its source IP belongs to a live session
+ * container, even without Proxy-Authorization (node/undici drop the userinfo of
+ * HTTP(S)_PROXY, git sends it). The token gate stays the second path, and the
+ * only caller that could ever build a proxy URL without credentials - a push on
+ * a session without shim_token - is refused before the container exists.
+ */
+async function egressPeerSmoke(store: Store, manager: SessionManager, repoId: string): Promise<void> {
+  const http = await import('node:http');
+  const dockerMod = await import('./docker.js');
+  const { createEgressProxyServer, normalizePeerIp } = await import('./egress-proxy.js');
+  const cfg = config as unknown as { dockerEnabled: boolean; dockerHost: string | null; dockerHostIsLocal: boolean };
+
+  /* ---- peer address normalization (pure) ---- */
+
+  assert(normalizePeerIp('::ffff:10.0.0.5') === '10.0.0.5', 'an IPv4-mapped IPv6 peer normalizes to its IPv4 form');
+  assert(normalizePeerIp('10.0.0.5') === '10.0.0.5', 'a plain IPv4 peer stays as it is');
+  assert(normalizePeerIp('FE80::1%eth0') === 'fe80::1', 'the zone id of a link-local peer is stripped');
+  assert(normalizePeerIp(undefined) === '', 'a socket without a peer address normalizes to empty');
+
+  /* ---- the two gates on a live proxy ---- */
+
+  const upstream = http.createServer((_req, res) => res.writeHead(200).end('pong'));
+  const upstreamPort = await listen(upstream);
+  const peers = new Set(['127.0.0.1']);
+  const proxy = createEgressProxyServer(
+    ['127.0.0.1'],
+    (t) => t === 'live-session-token',
+    (ip) => peers.has(ip),
+  );
+  const proxyPort = await listen(proxy);
+  const target = `http://127.0.0.1:${upstreamPort}/ping`;
+
+  const byPeer = await proxyGet(http, proxyPort, target);
+  assert(byPeer.status === 200, 'a request from a live session container passes without any credentials');
+  peers.clear();
+  const unknownPeer = await proxyGet(http, proxyPort, target);
+  assert(unknownPeer.status === 407, 'an unknown peer without credentials is refused with 407');
+  const byToken = await proxyGet(http, proxyPort, target, 'live-session-token');
+  assert(byToken.status === 200, 'a valid token still passes when the peer is unknown');
+  const badBoth = await proxyGet(http, proxyPort, target, 'stale-token');
+  assert(badBoth.status === 407, 'an unknown token from an unknown peer stays refused');
+
+  // CONNECT reads the peer from the tunnel socket, not from the request - the
+  // https path every LLM call takes, and the one that failed in production.
+  const net = await import('node:net');
+  const blindConnect = await proxyConnect(net, proxyPort, '127.0.0.1:443');
+  assert(blindConnect === 407, 'CONNECT without credentials from an unknown peer is refused');
+  peers.add('127.0.0.1');
+  const peerConnect = await proxyConnect(net, proxyPort, '127.0.0.1:443');
+  assert(peerConnect !== 407, 'CONNECT from a live session container needs no credentials');
+  peers.clear();
+
+  /* ---- push without a shim token: refused before a container exists ---- */
+
+  const tokenless = randomUUID();
+  const now = new Date().toISOString();
+  store.insertSession({
+    id: tokenless,
+    tenant_id: 'default',
+    repo_id: repoId,
+    repo_full_name: 'acme/demo',
+    adapter: 'opencode',
+    provider: 'zai',
+    model: 'glm-4.6',
+    mode: 'ask',
+    status: 'idle',
+    branch: `agent/${tokenless}`,
+    session_ref: null,
+    container_id: null,
+    volume_name: `pocketagent-sess-${tokenless}`,
+    shim_token: null,
+    pr_url: null,
+    shim_endpoint: null,
+    link_id: null,
+    network_policy: 'allowlist',
+    reasoning_effort: null,
+    created_at: now,
+    last_active_at: now,
+  });
+  let pushError = '';
+  await manager.push(tokenless).catch((e: unknown) => {
+    pushError = e instanceof Error ? e.message : String(e);
+  });
+  assert(pushError.includes('not provisioned'), 'a push without a shim token is refused instead of run without proxy credentials');
+  await manager.deleteSession(tokenless).catch(() => {});
+
+  /* ---- ip -> session lookup against a fake daemon (cache, failures) ---- */
+
+  let listCalls = 0;
+  let daemonBroken = false;
+  const daemon = http.createServer((req, res) => {
+    req.resume();
+    if ((req.url ?? '').startsWith('/containers/json')) {
+      listCalls++;
+      if (daemonBroken) return void res.writeHead(500).end('{"message":"daemon down"}');
+      return void res.writeHead(200, { 'content-type': 'application/json' }).end(
+        JSON.stringify([
+          {
+            Id: 'cid-peer',
+            NetworkSettings: { Networks: { 'pocketagent-s-1': { IPAddress: '10.9.0.7' } } },
+          },
+        ]),
+      );
+    }
+    res.writeHead(200, { 'content-type': 'application/json' }).end('{}');
+  });
+  const daemonPort = await listen(daemon);
+
+  cfg.dockerHost = `http://127.0.0.1:${daemonPort}`;
+  cfg.dockerHostIsLocal = true;
+  cfg.dockerEnabled = true;
+  dockerMod.resetDockerClient();
+  try {
+    await dockerMod.refreshSessionPeers();
+    assert(listCalls === 1, 'the peer set is loaded with a single daemon call');
+    assert(manager.egressPeerAllowed('10.9.0.7'), 'the IP of a live session container authorizes');
+    assert(manager.egressPeerAllowed('::ffff:10.9.0.7'), 'the same IP as IPv4-mapped IPv6 authorizes');
+    assert(!manager.egressPeerAllowed('10.9.0.8'), 'an IP outside the session containers does not authorize');
+    assert(!manager.egressPeerAllowed(''), 'an empty peer address never authorizes');
+    assert(listCalls === 1, 'the lookup is cached - no daemon call per proxied request');
+
+    daemonBroken = true;
+    await dockerMod.refreshSessionPeers();
+    assert(!manager.egressPeerAllowed('10.9.0.7'), 'a failing daemon denies conservatively instead of crashing');
+  } finally {
+    cfg.dockerEnabled = false;
+    cfg.dockerHost = null;
+    cfg.dockerHostIsLocal = false;
+    dockerMod.resetDockerClient();
+    daemon.close();
+    proxy.close();
+    upstream.close();
   }
 }
 
@@ -1106,6 +1300,7 @@ async function main(): Promise<void> {
   }
 
   await startProgressSmoke(store, manager, c2, added.repo.id);
+  await egressPeerSmoke(store, manager, added.repo.id);
   await reconcileSmoke(store, manager, c2, added.repo.id);
 
   const models = await request(c2, { type: 'session.models.get', requestId: 'mod1', sessionId });

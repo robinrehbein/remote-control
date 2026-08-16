@@ -113,6 +113,17 @@ export class SessionManager {
     return this.store.listSessions(TENANT).some((r) => r.shim_token === token);
   }
 
+  /**
+   * Second, client-independent egress gate: a request coming from the IP of a
+   * live session container passes without credentials. Node/undici drop the
+   * userinfo of HTTP(S)_PROXY, so an agent talking to its LLM through fetch()
+   * never authenticates - the token gate alone would deny every one of its
+   * turns while git (which does send it) keeps working.
+   */
+  egressPeerAllowed(ip: string): boolean {
+    return docker.isSessionPeerIp(ip);
+  }
+
   setLinkTransport(t: LinkTransport): void {
     this.linkTransport = t;
   }
@@ -740,10 +751,13 @@ export class SessionManager {
     if (row.link_id) {
       throw new Error('tap-push is not supported for linked sessions (yolo mode auto-pushes from the agent host)');
     }
-    if (!row.volume_name) throw new Error('session not provisioned');
+    // The push container talks to github through the same egress proxy, and its
+    // proxy credentials are the session's shim_token: without one it would be
+    // started with an unauthenticated proxy URL (the only path that could).
+    if (!row.volume_name || !row.shim_token) throw new Error('session not provisioned');
     const repo = this.store.getRepo(row.repo_id);
     if (!repo) throw new Error('repo missing');
-    const env = this.buildEnv(row, repo, row.shim_token ?? '', repo.default_branch);
+    const env = this.buildEnv(row, repo, row.shim_token, repo.default_branch);
     const pat = this.githubPatFor(row);
     if (!(await docker.oneShotPush(row, env, pat ? { githubPat: pat } : undefined, this.noticeFor(id)))) {
       throw new Error('push failed');
@@ -823,6 +837,9 @@ export class SessionManager {
    */
   async reconcile(tenant: string = TENANT): Promise<void> {
     if (!config.dockerEnabled) return;
+    // The still running containers keep talking to the egress proxy while this
+    // runs, so their IPs have to be known before the first of those requests.
+    await docker.refreshSessionPeers().catch(() => {});
     for (const row of this.store.listSessions(tenant)) {
       // link agents redial by themselves; rows without a container have nothing
       // to reconnect to, and stopped/error sessions are resumed explicitly.

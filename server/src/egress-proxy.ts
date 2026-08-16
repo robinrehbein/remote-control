@@ -36,11 +36,37 @@ export function hostAllowed(host: string, allowlist: string[]): boolean {
 
 export type TokenValidator = (token: string) => boolean;
 
+/**
+ * Source-address gate: true when an IP belongs to a live session container.
+ * The token gate alone makes egress depend on every HTTP client forwarding the
+ * userinfo of HTTP(S)_PROXY as Proxy-Authorization - git does, node/undici does
+ * not - so a session whose agent uses fetch() would see every request denied
+ * with "no proxy credentials". The peer IP is known to the orchestrator through
+ * the docker daemon and needs no client cooperation at all.
+ */
+export type PeerValidator = (ip: string) => boolean;
+
 export interface EgressProxyOptions {
   port?: number;
   allowlist?: string[];
   /** Per-session token gate (Proxy-Authorization); unset = accept unauthenticated. */
   tokenValidator?: TokenValidator;
+  /** Peer-IP gate; unset (remote gateway: no docker access) = token only. */
+  peerValidator?: PeerValidator;
+}
+
+/**
+ * Source address in the form docker reports container IPs in: node hands out an
+ * IPv4 peer of a dual-stack listener as '::ffff:10.0.0.5', and a link-local
+ * address carries a zone id the daemon never mentions.
+ */
+export function normalizePeerIp(ip: string | undefined | null): string {
+  const raw = (ip ?? '').trim().toLowerCase();
+  if (!raw) return '';
+  const bare = raw.startsWith('[') && raw.endsWith(']') ? raw.slice(1, -1) : raw;
+  const zone = bare.indexOf('%');
+  const noZone = zone === -1 ? bare : bare.slice(0, zone);
+  return noZone.startsWith('::ffff:') && noZone.includes('.') ? noZone.slice('::ffff:'.length) : noZone;
 }
 
 function forbidden(socket: net.Socket): void {
@@ -79,9 +105,25 @@ export function denyReason(
   return null;
 }
 
-function logDenial(method: string, host: string, port: number, reason: DenyReason, hadToken: boolean): void {
-  const detail = reason === 'auth' ? (hadToken ? 'token not accepted' : 'no proxy credentials') : reason;
-  console.warn(`[egress] denied ${method} ${host}:${port} (${detail})`);
+/**
+ * Outcome of both gates for one request. Kept together because a denial is only
+ * diagnosable with all of it: whether credentials were sent at all, and whether
+ * the caller's address could be tied to a live session container.
+ */
+interface AuthResult {
+  authorized: boolean;
+  hadToken: boolean;
+  /** normalized source address ('' when the socket reports none) */
+  peer: string;
+  /** whether the peer belongs to a live session; null = no peer gate configured */
+  peerKnown: boolean | null;
+}
+
+function logDenial(method: string, host: string, port: number, reason: DenyReason, auth: AuthResult): void {
+  const detail = reason === 'auth' ? (auth.hadToken ? 'token not accepted' : 'no proxy credentials') : reason;
+  const peer = `peer=${auth.peer === '' ? 'unknown' : auth.peer}`;
+  const session = auth.peerKnown === null ? '' : ` session=${auth.peerKnown ? 'yes' : 'no'}`;
+  console.warn(`[egress] denied ${method} ${host}:${port} (${detail}, ${peer}${session})`);
 }
 
 /**
@@ -103,25 +145,41 @@ export function parseProxyAuth(header: string | undefined): string | null {
   return null;
 }
 
-function proxyAuthorized(req: http.IncomingMessage, tokenValidator: TokenValidator | undefined): boolean {
-  if (!tokenValidator) return true;
+/**
+ * A caller passes with EITHER a live session's token OR a source address that
+ * belongs to a live session container - the two gates are independent on
+ * purpose (defense in depth, and neither alone survives every client).
+ */
+function proxyAuthorized(
+  req: http.IncomingMessage,
+  peerIp: string | undefined,
+  tokenValidator: TokenValidator | undefined,
+  peerValidator: PeerValidator | undefined,
+): AuthResult {
   const header = req.headers['proxy-authorization'];
+  const peer = normalizePeerIp(peerIp);
+  const peerKnown = peerValidator === undefined ? null : peer !== '' && peerValidator(peer);
+  const base = { hadToken: header !== undefined, peer, peerKnown };
+  if (!tokenValidator) return { authorized: true, ...base };
+  if (peerKnown === true) return { authorized: true, ...base };
   const token = parseProxyAuth(Array.isArray(header) ? header[0] : header);
-  return token !== null && tokenValidator(token);
+  return { authorized: token !== null && tokenValidator(token), ...base };
 }
 
 /**
  * Build the proxy server without binding it. Used in-process by the
- * orchestrator (local mode, with a per-session token validator) and standalone
- * by the remote gateway container (server/src/gateway.ts, ingress auth via
- * GATEWAY_TOKEN instead) — identical filtering logic in both.
+ * orchestrator (local mode, with a per-session token validator and the peer-IP
+ * gate the daemon feeds) and standalone by the remote gateway container
+ * (server/src/gateway.ts: no docker access, so no peerValidator; ingress auth
+ * via GATEWAY_TOKEN instead) — identical filtering logic in both.
  */
 export function createEgressProxyServer(
   allowlist: string[],
   tokenValidator?: TokenValidator,
+  peerValidator?: PeerValidator,
 ): http.Server {
   const server = http.createServer((req, res) => {
-    const authorized = proxyAuthorized(req, tokenValidator);
+    const auth = proxyAuthorized(req, req.socket.remoteAddress, tokenValidator, peerValidator);
     let target: URL;
     try {
       target = new URL(req.url ?? '/');
@@ -130,9 +188,9 @@ export function createEgressProxyServer(
       return;
     }
     const port = target.port ? Number(target.port) : target.protocol === 'https:' ? 443 : 80;
-    const reason = denyReason(authorized, target.hostname, null, allowlist);
+    const reason = denyReason(auth.authorized, target.hostname, null, allowlist);
     if (reason !== null) {
-      logDenial(req.method ?? 'GET', target.hostname, port, reason, req.headers['proxy-authorization'] !== undefined);
+      logDenial(req.method ?? 'GET', target.hostname, port, reason, auth);
       if (reason === 'auth') {
         res.writeHead(407, { 'proxy-authenticate': 'Basic realm="pocketagent"' }).end('proxy auth required');
       } else {
@@ -162,9 +220,10 @@ export function createEgressProxyServer(
     const idx = url.lastIndexOf(':');
     const host = idx === -1 ? url : url.slice(0, idx);
     const portNum = idx === -1 ? 443 : Number(url.slice(idx + 1));
-    const reason = denyReason(proxyAuthorized(req, tokenValidator), host, portNum, allowlist);
+    const auth = proxyAuthorized(req, socket.remoteAddress, tokenValidator, peerValidator);
+    const reason = denyReason(auth.authorized, host, portNum, allowlist);
     if (reason !== null) {
-      logDenial('CONNECT', host, portNum, reason, req.headers['proxy-authorization'] !== undefined);
+      logDenial('CONNECT', host, portNum, reason, auth);
       if (reason === 'auth') proxyAuthRequired(socket);
       else forbidden(socket);
       return;
@@ -187,7 +246,7 @@ export function createEgressProxyServer(
 export function startEgressProxy(opts: EgressProxyOptions = {}): http.Server {
   const port = opts.port ?? config.egressProxyPort;
   const allowlist = opts.allowlist ?? config.networkAllowlist;
-  const server = createEgressProxyServer(allowlist, opts.tokenValidator);
+  const server = createEgressProxyServer(allowlist, opts.tokenValidator, opts.peerValidator);
   server.listen(port, '0.0.0.0');
   return server;
 }

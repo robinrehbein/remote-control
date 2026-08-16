@@ -188,7 +188,10 @@ class AppRepository(
 
     /* ---------------- request/response ---------------- */
 
-    suspend fun request(jsonFactory: (requestId: String) -> String): ServerMessage? {
+    suspend fun request(
+        timeoutMs: Long = REQUEST_TIMEOUT_MS,
+        jsonFactory: (requestId: String) -> String,
+    ): ServerMessage? {
         val id = UUID.randomUUID().toString()
         val deferred = CompletableDeferred<ServerMessage>()
         pending[id] = deferred
@@ -198,7 +201,7 @@ class AppRepository(
             return null
         }
         return try {
-            withTimeoutOrNull(REQUEST_TIMEOUT_MS) { deferred.await() }
+            withTimeoutOrNull(timeoutMs) { deferred.await() }
         } finally {
             pending.remove(id)
         }
@@ -341,8 +344,20 @@ class AppRepository(
             else -> true
         }
 
-    fun sendPrompt(sessionId: String, text: String, mode: AgentMode?): Boolean =
-        ws.send(encodeSessionPrompt(sessionId, text, mode))
+    /**
+     * Prompt abschicken und auf die Bestätigung warten (`request.ok`), bevor
+     * der Aufrufer den Text als angekommen behandelt. Der Server quittiert
+     * jetzt explizit — ein `send()`, das nur „im Sendepuffer" hieß, reichte
+     * nicht, um stillen Nachrichtenverlust nach einem Reconnect auszuschließen.
+     */
+    suspend fun sendPrompt(sessionId: String, text: String, mode: AgentMode?): Result<Unit> {
+        val response = request { id -> encodeSessionPrompt(id, sessionId, text, mode) }
+        return when (response) {
+            is ServerMessage.ErrorMsg -> Result.failure(IllegalStateException(response.message))
+            null -> Result.failure(IllegalStateException("Keine Verbindung"))
+            else -> Result.success(Unit)
+        }
+    }
 
     fun sendPermission(sessionId: String, permissionId: String, decision: PermissionDecision): Boolean =
         ws.send(encodeSessionPermission(sessionId, permissionId, decision))
@@ -399,6 +414,46 @@ class AppRepository(
     /** „Jetzt neu verbinden“ — überspringt die laufende Wartezeit. */
     fun reconnectNow() = ws.reconnectNow()
 
+    /** Zeitpunkt der letzten Lebendigkeits-Prüfung — bremst Anstoß-Stürme. */
+    @Volatile
+    private var lastProbeAt = 0L
+
+    /**
+     * Sicherstellen, dass die Verbindung wirklich lebt — nicht nur laut
+     * Zustand „Connected". Ein still gestorbener Socket (Netzwechsel, Doze)
+     * meldet sich bei OkHttp erst nach bis zu ~40s (Ping 20s + Pong-Wartezeit);
+     * bis dahin sieht alles gut aus, obwohl nichts mehr ankommt.
+     *
+     * Nicht suspend, damit Netz-Callback und Vordergrund-Wechsel sie ohne
+     * eigene Coroutine anstoßen können — sie startet ihre Arbeit selbst im
+     * [scope]. Debounced über [lastProbeAt]: `registerNetworkCallback` feuert
+     * `onAvailable` sofort bei jeder Registrierung, also bei jedem
+     * Vordergrund-Wechsel neu — ohne Bremse würde eine gesunde Verbindung
+     * dauernd geprobt. Mehr als die Bremse braucht es nicht, die Prüfung
+     * selbst ist billig.
+     */
+    fun ensureAlive() {
+        val now = System.currentTimeMillis()
+        if (now - lastProbeAt < ENSURE_ALIVE_DEBOUNCE_MS) return
+        lastProbeAt = now
+        scope.launch {
+            if (ws.state.value !is WsClient.ConnState.Connected) {
+                ws.reconnectNow()
+                return@launch
+            }
+            // Laut Zustand verbunden — das beweist nicht, dass der Socket
+            // noch lebt. Eine billige Anfrage mit kurzem Timeout deckt einen
+            // stillen Tod auf; kommt keine Antwort, reisst forceReconnect
+            // den toten Socket ab und baut sofort neu auf. Eine erfolgreiche
+            // Antwort aktualisiert nebenbei die Sessionliste — erwünscht,
+            // nicht nur ein Abfallprodukt der Prüfung.
+            val response = request(timeoutMs = ENSURE_ALIVE_TIMEOUT_MS) { id -> encodeSessionList(id) }
+            if (response == null) {
+                ws.forceReconnect()
+            }
+        }
+    }
+
     fun onFcmToken(token: String) {
         fcmToken = token
         if (ws.state.value is WsClient.ConnState.Connected) {
@@ -419,5 +474,11 @@ class AppRepository(
 
     companion object {
         private const val REQUEST_TIMEOUT_MS = 15_000L
+
+        /** Bremse für [ensureAlive] — s.o., gegen Anstoß-Stürme durch Doppel-Callbacks. */
+        private const val ENSURE_ALIVE_DEBOUNCE_MS = 3_000L
+
+        /** Kurzes Timeout der Liveness-Probe — soll schnell ehrlich sein, nicht 15s warten. */
+        private const val ENSURE_ALIVE_TIMEOUT_MS = 4_000L
     }
 }

@@ -227,9 +227,12 @@ export function registerWs(
 ): void {
   // maxPayload (1 MiB) is enforced at the websocket plugin registration in index.ts.
   app.get('/ws', { websocket: true }, (socket: WebSocket, request: FastifyRequest) => {
-    // NOTE: reverse proxies may collapse many distinct clients into a single
-    // remote address; this cap is a coarse DoS guard, not an identity bound.
-    const addr = request.socket.remoteAddress ?? 'unknown';
+    // request.ip is Fastify's resolved address: plain socket IP normally, but
+    // the X-Forwarded-For client when TRUST_PROXY=1 - without that, every
+    // client behind a reverse proxy (Coolify/Traefik) collapses onto the
+    // proxy's one address and this cap fires on unrelated devices. Still a
+    // coarse DoS guard, not an identity bound.
+    const addr = request.ip || 'unknown';
     const conns = (wsConnCounts.get(addr) ?? 0) + 1;
     wsConnCounts.set(addr, conns);
     socket.once('close', () => {
@@ -239,7 +242,9 @@ export function registerWs(
     });
     if (conns > MAX_CONNS_PER_ADDRESS) {
       auditWarn('ws.conn-limit', { ip: addr });
-      socket.close(4001, 'too many connections');
+      // 4002, not 4001: 4001 is reserved for auth failure/revocation so a
+      // client can tell "too many conns" apart from "credentials rejected".
+      socket.close(4002, 'too many connections');
       return;
     }
     // every accepted socket, device and link agent alike - a half-dead
@@ -361,9 +366,21 @@ export function registerWs(
           return;
         }
         case 'session.prompt':
-          await manager.prompt(msg.sessionId, msg.text, msg.mode).catch((e) =>
-            send({ type: 'error', sessionId: msg.sessionId, message: errText(e) }),
-          );
+          await manager
+            .prompt(msg.sessionId, msg.text, msg.mode)
+            .then(() => {
+              // requestId is opt-in: older clients that never send one keep the
+              // original fire-and-forget behaviour (no ack on success either).
+              if (msg.requestId) send({ type: 'request.ok', requestId: msg.requestId, payload: { sessionId: msg.sessionId } });
+            })
+            .catch((e) =>
+              send({
+                type: 'error',
+                ...(msg.requestId ? { requestId: msg.requestId } : {}),
+                sessionId: msg.sessionId,
+                message: errText(e),
+              }),
+            );
           return;
         case 'session.update': {
           try {

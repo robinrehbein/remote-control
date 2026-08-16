@@ -386,7 +386,12 @@ export type ClientMessage =
       branch?: string;
       networkPolicy?: NetworkPolicy;
     }
-  | { type: 'session.prompt'; sessionId: string; text: string; mode?: AgentMode }
+  /**
+   * With `requestId` the server acknowledges acceptance via `request.ok`
+   * (or `error` on failure) carrying the same id; without it the call stays
+   * fire-and-forget as before, for older clients.
+   */
+  | { type: 'session.prompt'; sessionId: string; text: string; mode?: AgentMode; requestId?: string }
   /**
    * Change mode / model / reasoning effort / harness of a live session. Every
    * field is optional; the server persists what is set and answers with

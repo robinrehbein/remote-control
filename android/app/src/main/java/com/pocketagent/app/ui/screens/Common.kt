@@ -10,7 +10,9 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -57,6 +59,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.pocketagent.app.data.SessionStatus
+import com.pocketagent.app.data.WsClient
 import com.pocketagent.app.ui.theme.ContentInset
 import com.pocketagent.app.ui.theme.IconRowDividerInset
 import com.pocketagent.app.ui.theme.PillShape
@@ -185,6 +188,69 @@ fun StatusLine(status: SessionStatus, details: List<String>, modifier: Modifier 
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Verbindung                                                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Was die Verbindungszeile sagt — als reine Funktion, damit der Text
+ * überall derselbe ist. null heißt: alles in Ordnung, nichts anzeigen.
+ *
+ * Die Zustände sind bewusst ehrlich. Es gibt kein „gescheitert“, solange
+ * die App weiterprobiert; wartet sie, steht die Restzeit dabei.
+ */
+fun connectionLabel(state: WsClient.ConnState): String? = when (state) {
+    is WsClient.ConnState.Connected -> null
+    is WsClient.ConnState.Connecting -> "Verbinde mit dem Server …"
+    is WsClient.ConnState.Waiting -> "Keine Verbindung – neuer Versuch in ${state.retryInSec}s"
+    is WsClient.ConnState.Disconnected -> "Getrennt – ${state.reason}"
+    WsClient.ConnState.Idle -> "Nicht verbunden"
+}
+
+/**
+ * Eine ruhige Zeile über dem Inhalt, wenn die Verbindung nicht steht.
+ * Solange gerade verbunden wird, ist sie nur Information; wartet die App
+ * oder ist sie getrennt, holt ein Tap den Versuch nach vorn.
+ */
+@Composable
+fun ConnectionLine(
+    state: WsClient.ConnState,
+    onReconnect: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val label = connectionLabel(state) ?: return
+    val connecting = state is WsClient.ConnState.Connecting
+    val severe = state is WsClient.ConnState.Disconnected
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.Center,
+        modifier = modifier
+            .fillMaxWidth()
+            .then(if (connecting) Modifier else Modifier.clickable(onClick = onReconnect))
+            .heightIn(min = 36.dp)
+            .padding(horizontal = ScreenGutter, vertical = 4.dp),
+    ) {
+        DotLabel(
+            color = if (severe) {
+                MaterialTheme.colorScheme.error
+            } else {
+                MaterialTheme.colorScheme.onSurfaceVariant
+            },
+            label = label,
+            pulse = connecting,
+        )
+        if (!connecting) {
+            Spacer(modifier = Modifier.width(10.dp))
+            Text(
+                text = "Jetzt verbinden",
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.primary,
+            )
+        }
     }
 }
 

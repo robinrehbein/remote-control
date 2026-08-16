@@ -4,6 +4,7 @@ import android.app.Application
 import com.google.firebase.FirebaseApp
 import com.google.firebase.FirebaseOptions
 import com.pocketagent.app.data.AppRepository
+import com.pocketagent.app.data.ConnectivityWatcher
 import com.pocketagent.app.data.PairingApi
 import com.pocketagent.app.data.TokenStore
 import com.pocketagent.app.data.WsClient
@@ -16,6 +17,18 @@ class AppContainer(app: Application, scope: CoroutineScope) {
     val pairingApi = PairingApi(PairingApi.default())
     val wsClient = WsClient(PairingApi.default())
     val repository = AppRepository(wsClient, tokenStore, scope)
+
+    /**
+     * Netzwechsel und Vordergrund stoßen die Verbindung sofort an, statt den
+     * Backoff abzuwarten. Der Beobachter meldet sich mit dem letzten
+     * sichtbaren Activity selbst wieder ab.
+     */
+    val connectivity = ConnectivityWatcher(
+        app = app,
+        onNetworkAvailable = { wsClient.onNetworkAvailable() },
+        onNetworkLost = { wsClient.onNetworkLost() },
+        onForeground = { wsClient.reconnectNow() },
+    )
 }
 
 class PocketAgentApp : Application() {
@@ -29,6 +42,7 @@ class PocketAgentApp : Application() {
         container = AppContainer(this, appScope)
         initFirebase()
         container.repository.start()
+        container.connectivity.attach()
     }
 
     private fun initFirebase() {

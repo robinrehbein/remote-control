@@ -409,6 +409,131 @@ class ProtocolDecodeTest {
         assertFalse(modeOnly.contains("\"adapter\""))
     }
 
+    /* -------------------- session.events (Verlauf) -------------------- */
+
+    @Test
+    fun `decodes stored session events in order`() {
+        val msg = parseServerMessage(
+            """
+            {
+              "type": "session.events",
+              "requestId": "req-hist",
+              "sessionId": "s1",
+              "unknownTop": 1,
+              "events": [
+                { "type": "message.completed", "role": "user", "text": "Bau den Login um" },
+                { "type": "tool.call", "id": "c1", "tool": "bash", "input": {"command": "npm test"} },
+                { "type": "tool.result", "id": "c1", "tool": "bash", "output": "ok" },
+                { "type": "message.completed", "role": "assistant", "text": "Fertig." },
+                { "type": "turn.completed", "commitSha": "abcdef1234" },
+                { "type": "brandneu.aus.der.zukunft", "was": "auch immer" }
+              ]
+            }
+            """.trimIndent(),
+        )
+        assertTrue(msg is ServerMessage.SessionEventsMsg)
+        val events = (msg as ServerMessage.SessionEventsMsg).events
+        assertEquals("s1", msg.sessionId)
+        assertEquals("req-hist", msg.requestId)
+        // Unbekannte Event-Typen fallen still heraus, der Rest bleibt nutzbar
+        assertEquals(5, events.size)
+        assertEquals("Bau den Login um", (events[0] as AgentEvent.MessageCompleted).text)
+        assertEquals("user", (events[0] as AgentEvent.MessageCompleted).role)
+        assertEquals("c1", (events[1] as AgentEvent.ToolCall).id)
+        assertEquals("ok", (events[2] as AgentEvent.ToolResult).output)
+        assertEquals("abcdef1234", (events[4] as AgentEvent.TurnCompleted).commitSha)
+    }
+
+    @Test
+    fun `decodes empty and missing event lists`() {
+        val empty = parseServerMessage(
+            """{"type":"session.events","requestId":"r1","sessionId":"s1","events":[]}""",
+        )
+        assertTrue(empty is ServerMessage.SessionEventsMsg)
+        assertTrue((empty as ServerMessage.SessionEventsMsg).events.isEmpty())
+
+        // Fehlt das Feld ganz, ist das dasselbe wie "kein Verlauf"
+        val missing = parseServerMessage(
+            """{"type":"session.events","requestId":"r2","sessionId":"s1"}""",
+        ) as ServerMessage.SessionEventsMsg
+        assertTrue(missing.events.isEmpty())
+
+        // Ohne requestId oder sessionId ist die Antwort nicht zuzuordnen
+        assertNull(parseServerMessage("""{"type":"session.events","sessionId":"s1","events":[]}"""))
+        assertNull(parseServerMessage("""{"type":"session.events","requestId":"r3","events":[]}"""))
+    }
+
+    /* -------------------- Titel und Archiv -------------------- */
+
+    @Test
+    fun `decodes session title and archived flag`() {
+        val msg = parseServerMessage(
+            """
+            {
+              "type": "session.list",
+              "requestId": "req-t",
+              "sessions": [
+                {
+                  "id": "s1", "repoId": "r1", "adapter": "claude", "provider": "anthropic",
+                  "model": "", "mode": "auto", "status": "idle", "branch": "agent/s1",
+                  "createdAt": "2026-01-01T10:00:00Z", "lastActiveAt": "2026-01-01T11:00:00Z",
+                  "title": "Login-Timeout", "archived": true
+                },
+                {
+                  "id": "s2", "repoId": "r1", "adapter": "claude", "provider": "anthropic",
+                  "model": "", "mode": "auto", "status": "idle", "branch": "agent/s2",
+                  "createdAt": "2026-01-01T10:00:00Z", "lastActiveAt": "2026-01-01T11:00:00Z"
+                }
+              ]
+            }
+            """.trimIndent(),
+        )
+        val sessions = (msg as ServerMessage.SessionListMsg).sessions
+        assertEquals("Login-Timeout", sessions[0].title)
+        assertTrue(sessions[0].archived)
+        // Alter Server ohne die Felder: kein Titel, nicht archiviert
+        assertNull(sessions[1].title)
+        assertFalse(sessions[1].archived)
+    }
+
+    /* -------------------- Neue Client-Nachrichten -------------------- */
+
+    @Test
+    fun `encodes session events get with and without limit`() {
+        val plain = com.pocketagent.app.data.encodeSessionEventsGet("req-1", "s1")
+        assertTrue(plain.contains(""""type":"session.events.get""""))
+        assertTrue(plain.contains(""""requestId":"req-1""""))
+        assertTrue(plain.contains(""""sessionId":"s1""""))
+        // Ohne Limit entscheidet der Server (Vertrag: 200)
+        assertFalse(plain.contains("\"limit\""))
+
+        val limited = com.pocketagent.app.data.encodeSessionEventsGet("req-2", "s1", 50)
+        assertTrue(limited.contains(""""limit":50"""))
+    }
+
+    @Test
+    fun `encodes session rename including title removal`() {
+        val named = com.pocketagent.app.data.encodeSessionRename("req-3", "s1", "Login-Timeout")
+        assertTrue(named.contains(""""type":"session.rename""""))
+        assertTrue(named.contains(""""title":"Login-Timeout""""))
+
+        // Leerer Titel ist der Vertragsweg, den Titel zu entfernen — das Feld
+        // muss also mitgehen und darf nicht wegoptimiert werden.
+        val cleared = com.pocketagent.app.data.encodeSessionRename("req-4", "s1", "")
+        assertTrue(cleared.contains(""""title":""""))
+    }
+
+    @Test
+    fun `encodes session archive both ways`() {
+        val on = com.pocketagent.app.data.encodeSessionArchive("req-5", "s1", true)
+        assertTrue(on.contains(""""type":"session.archive""""))
+        assertTrue(on.contains(""""sessionId":"s1""""))
+        assertTrue(on.contains(""""archived":true"""))
+
+        val off = com.pocketagent.app.data.encodeSessionArchive("req-6", "s1", false)
+        assertTrue(off.contains(""""archived":false"""))
+    }
+
     @Test
     fun `returns null for garbage and unknown types`() {
         assertNull(parseServerMessage("not json"))

@@ -73,10 +73,16 @@ class PairingApi(private val client: OkHttpClient) {
             return "$base/ws"
         }
 
+        /**
+         * Ping alle 20s: Mobilfunk-NATs räumen stille Verbindungen gern nach
+         * 30–60s ab. Mit 30s Ping lag der Abbruch genau im Risikofenster —
+         * 20s hält die Verbindung offen und lässt einen toten Socket auch
+         * schneller auffliegen (OkHttp bricht ab, wenn ein Pong ausbleibt).
+         */
         fun default(): OkHttpClient = OkHttpClient.Builder()
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(0, TimeUnit.MILLISECONDS)
-            .pingInterval(30, TimeUnit.SECONDS)
+            .pingInterval(20, TimeUnit.SECONDS)
             .build()
     }
 }

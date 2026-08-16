@@ -110,6 +110,7 @@ import com.pocketagent.app.data.ReasoningEffort
 import com.pocketagent.app.data.SessionInfo
 import com.pocketagent.app.data.SessionStatus
 import com.pocketagent.app.data.StartPhase
+import com.pocketagent.app.data.WsClient
 import com.pocketagent.app.data.wireName
 import com.pocketagent.app.ui.components.MarkdownText
 import com.pocketagent.app.ui.theme.CardInset
@@ -131,48 +132,8 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 /* ------------------------------------------------------------------ */
-/* Timeline model                                                      */
+/* Timeline: Modell und Reduktion liegen in Timeline.kt                */
 /* ------------------------------------------------------------------ */
-
-sealed interface TimelineItem {
-    data class Chat(
-        val role: String,
-        val text: String,
-    ) : TimelineItem
-
-    data class Tool(
-        val id: String,
-        val tool: String,
-        val title: String?,
-        val input: kotlinx.serialization.json.JsonElement?,
-        val result: AgentEvent.ToolResult?,
-    ) : TimelineItem
-
-    data class Approval(
-        val permissionId: String,
-        val kind: String,
-        val title: String,
-        val detail: String?,
-        val diff: String?,
-        val resolved: PermissionDecision?,
-    ) : TimelineItem
-
-    data class TurnEnd(
-        val summary: String?,
-        val commitSha: String?,
-    ) : TimelineItem
-
-    data class Pushed(
-        val branch: String,
-        val prUrl: String?,
-        val auto: Boolean,
-    ) : TimelineItem
-
-    data class Error(val message: String) : TimelineItem
-
-    /** Systemhinweis des Servers, z. B. Image-Build oder Agent-Wechsel. */
-    data class Notice(val text: String) : TimelineItem
-}
 
 /**
  * Was gerade beim Start passiert — immer nur der jüngste Stand, nie ein
@@ -198,6 +159,17 @@ class SessionViewModel : ViewModel() {
 
     private val _items = MutableStateFlow<List<TimelineItem>>(emptyList())
     val items: StateFlow<List<TimelineItem>> = _items
+
+    /** True, solange der gespeicherte Verlauf unterwegs ist. */
+    private val _historyLoading = MutableStateFlow(false)
+    val historyLoading: StateFlow<Boolean> = _historyLoading
+
+    /**
+     * Der letzte Prompt, der die Verbindung nicht mehr erreicht hat. Der Text
+     * bleibt im Eingabefeld stehen; das hier ist nur der Hinweis darüber.
+     */
+    private val _sendFailed = MutableStateFlow(false)
+    val sendFailed: StateFlow<Boolean> = _sendFailed
 
     private val _session = MutableStateFlow<SessionInfo?>(null)
     val session: StateFlow<SessionInfo?> = _session
@@ -248,68 +220,83 @@ class SessionViewModel : ViewModel() {
         viewModelScope.launch {
             repository.adapters.collect { list -> _adapters.value = list }
         }
+        // Beim Öffnen und nach jedem erfolgreichen (Wieder-)Verbinden den
+        // gespeicherten Verlauf holen. connState ist ein StateFlow, der
+        // aktuelle Wert kommt also sofort — steht die Verbindung schon,
+        // lädt das hier direkt; sonst, sobald sie steht.
+        viewModelScope.launch {
+            repository.connState.collect { state ->
+                if (state is WsClient.ConnState.Connected) {
+                    _sendFailed.value = false
+                    loadHistory()
+                }
+            }
+        }
         viewModelScope.launch { repository.refreshSessions() }
         viewModelScope.launch { if (repository.adapters.value.isEmpty()) repository.refreshAdapters() }
     }
 
+    /* ---------------- Verlauf ---------------- */
+
+    /**
+     * Puffer für alles, was hereinkommt, während die Verlaufsanfrage
+     * unterwegs ist. Die Timeline bleibt solange stehen — kein Flackern,
+     * keine Zeile, die gleich wieder verschwindet.
+     */
+    private val liveWhileLoading = mutableListOf<AgentEvent>()
+
+    private var historyJob: kotlinx.coroutines.Job? = null
+
+    /**
+     * Den gespeicherten Verlauf holen und die Timeline daraus neu aufbauen.
+     * Was während der Anfrage live ankam, wird anschließend obendrauf
+     * gelegt — dedupliziert über [mergeEvents].
+     */
+    private fun loadHistory() {
+        if (historyJob?.isActive == true) return
+        historyJob = viewModelScope.launch {
+            _historyLoading.value = true
+            liveWhileLoading.clear()
+            val result = repository.loadEvents(sessionId)
+            val history = result.getOrNull()
+            if (history != null) {
+                _items.value = buildTimeline(mergeEvents(history, liveWhileLoading.toList()))
+            } else {
+                // Ohne Verlauf bleibt das Bisherige stehen; die gepufferten
+                // Ereignisse dürfen trotzdem nicht verloren gehen.
+                _items.value = liveWhileLoading.fold(_items.value, ::reduceTimeline)
+            }
+            liveWhileLoading.clear()
+            _historyLoading.value = false
+        }
+    }
+
     private fun applyEvent(event: AgentEvent) {
+        applySideEffects(event)
+        if (_historyLoading.value) {
+            liveWhileLoading += event
+            return
+        }
+        _items.value = reduceTimeline(_items.value, event)
+    }
+
+    /**
+     * Wirkung eines Ereignisses außerhalb der Timeline: Busy-Anzeige und
+     * Startfortschritt. Nur für Live-Ereignisse — ein gespeicherter Verlauf
+     * sagt nichts darüber, was gerade läuft.
+     */
+    private fun applySideEffects(event: AgentEvent) {
         when (event) {
-            is AgentEvent.MessageCompleted -> append(TimelineItem.Chat(event.role, event.text))
-
-            is AgentEvent.ToolCall -> append(
-                TimelineItem.Tool(
-                    id = event.id,
-                    tool = event.tool,
-                    title = event.title,
-                    input = event.input,
-                    result = null,
-                )
-            )
-
-            is AgentEvent.ToolResult -> {
-                _items.value = _items.value.map { item ->
-                    if (item is TimelineItem.Tool && item.id == event.id) item.copy(result = event) else item
-                }
-            }
-
-            is AgentEvent.PermissionRequest -> append(
-                TimelineItem.Approval(
-                    permissionId = event.permissionId,
-                    kind = event.kind.name.lowercase(),
-                    title = event.title,
-                    detail = event.detail,
-                    diff = event.diff,
-                    resolved = null,
-                )
-            )
-
-            is AgentEvent.PermissionResolved -> {
-                _items.value = _items.value.map { item ->
-                    if (item is TimelineItem.Approval && item.permissionId == event.permissionId) {
-                        item.copy(resolved = event.decision)
-                    } else item
-                }
-            }
-
-            is AgentEvent.TurnCompleted -> append(TimelineItem.TurnEnd(event.summary, event.commitSha))
-            is AgentEvent.Pushed -> append(TimelineItem.Pushed(event.branch, event.prUrl, event.auto))
+            is AgentEvent.Status -> _busy.value = event.busy
 
             // Ein Fehler beendet den Start: er wird als Karte gezeigt, die
             // Fortschrittsanzeige hat dann nichts mehr zu melden.
-            is AgentEvent.TurnFailed -> {
-                _progress.value = null
-                append(TimelineItem.Error("Turn fehlgeschlagen: ${event.error}"))
-            }
-
-            is AgentEvent.ErrorEvent -> {
-                _progress.value = null
-                append(TimelineItem.Error(event.message))
-            }
+            is AgentEvent.TurnFailed, is AgentEvent.ErrorEvent -> _progress.value = null
 
             // Mit Phase ist die Notice Fortschritt und ersetzt den vorherigen
             // Stand; ohne Phase bleibt sie eine Systemzeile in der Timeline.
             is AgentEvent.Notice -> when (val phase = StartPhase.fromRaw(event.phase)) {
-                null -> append(TimelineItem.Notice(event.message))
+                null -> Unit
                 StartPhase.READY -> _progress.value = null
                 else -> _progress.value = StartProgress(
                     message = event.message,
@@ -318,8 +305,7 @@ class SessionViewModel : ViewModel() {
                 )
             }
 
-            is AgentEvent.Status -> _busy.value = event.busy
-            is AgentEvent.MessageDelta, is AgentEvent.Ping -> Unit
+            else -> Unit
         }
     }
 
@@ -329,12 +315,30 @@ class SessionViewModel : ViewModel() {
 
     fun updateInput(text: String) {
         _input.value = text
+        if (text.isNotBlank()) _sendFailed.value = false
     }
 
+    /**
+     * Prompt abschicken. Kommt er nicht auf die Leitung, bleibt der Text im
+     * Feld stehen und die Timeline bekommt keine Zeile — es ist nichts
+     * passiert, also darf auch nichts so aussehen.
+     *
+     * Bewusst kein automatisches Nachsenden nach dem Reconnect:
+     * `session.prompt` hat im Vertrag weder requestId noch Bestätigung, und
+     * ein erfolgreiches `send()` heißt nur „im Puffer“, nicht „angekommen“.
+     * Die App kann also nicht wissen, ob der Agent den Auftrag schon hat —
+     * automatisches Wiederholen könnte dieselbe Aufgabe zweimal starten
+     * (zweimal committen, zweimal pushen). Der Text steht bereit, ein Tap
+     * schickt ihn los.
+     */
     fun sendPrompt() {
         val text = _input.value.trim()
         if (text.isEmpty()) return
-        repository.sendPrompt(sessionId, text, null)
+        if (!repository.sendPrompt(sessionId, text, null)) {
+            _sendFailed.value = true
+            return
+        }
+        _sendFailed.value = false
         _input.value = ""
         _busy.value = true
         append(TimelineItem.Chat("user", text))
@@ -422,6 +426,9 @@ fun SessionScreen(
         SessionViewModel().also { it.bind(sessionId, repository) }
     }
     val items by vm.items.collectAsState()
+    val historyLoading by vm.historyLoading.collectAsState()
+    val sendFailed by vm.sendFailed.collectAsState()
+    val connState by repository.connState.collectAsState()
     val session by vm.session.collectAsState()
     val input by vm.input.collectAsState()
     val busy by vm.busy.collectAsState()
@@ -437,9 +444,21 @@ fun SessionScreen(
 
     var sheet by remember { mutableStateOf<SessionSheet?>(null) }
 
+    // Nach dem Laden ans Ende — aber ohne Animation, damit der Verlauf
+    // fertig unten steht statt sichtbar durchzurauschen. Erst danach wird
+    // jede neue Zeile weich nachgezogen. Ein erneutes Laden (Reconnect)
+    // setzt das zurück, damit auch dann nichts springt.
     val listState = androidx.compose.foundation.lazy.rememberLazyListState()
-    LaunchedEffect(items.size) {
-        if (items.isNotEmpty()) listState.animateScrollToItem(items.size - 1)
+    var settled by remember { mutableStateOf(false) }
+    LaunchedEffect(historyLoading) { if (historyLoading) settled = false }
+    LaunchedEffect(items.size, historyLoading) {
+        if (items.isEmpty() || historyLoading) return@LaunchedEffect
+        if (settled) {
+            listState.animateScrollToItem(items.size - 1)
+        } else {
+            listState.scrollToItem(items.size - 1)
+            settled = true
+        }
     }
 
     var menuOpen by remember { mutableStateOf(false) }
@@ -527,6 +546,25 @@ fun SessionScreen(
         bottomBar = {
             Surface(color = MaterialTheme.colorScheme.background, tonalElevation = 0.dp) {
                 Column(modifier = Modifier.navigationBarsPadding().imePadding()) {
+                    // Steht die Verbindung nicht, sagt es genau eine Zeile —
+                    // mit Restzeit und einem Tap, der den Versuch vorzieht.
+                    ConnectionLine(state = connState, onReconnect = { repository.reconnectNow() })
+                    // Der Text ist nicht rausgegangen und steht noch im Feld.
+                    // Bewusst kein automatisches Nachsenden (siehe sendPrompt).
+                    if (sendFailed) {
+                        Text(
+                            text = "Nicht gesendet – keine Verbindung. Dein Text bleibt stehen, " +
+                                "tippe nach dem Verbinden erneut auf Senden.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.padding(
+                                start = ContentInset,
+                                end = ContentInset,
+                                top = 2.dp,
+                                bottom = 2.dp,
+                            ),
+                        )
+                    }
                     // Der Start braucht Minuten — er steht ruhig über dem
                     // Composer statt in der Timeline, wo er wegscrollen würde.
                     startProgressOf(session?.status, progress)?.let { StartProgressCard(it) }
@@ -653,22 +691,37 @@ fun SessionScreen(
                     .padding(padding),
                 contentAlignment = Alignment.Center,
             ) {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    modifier = Modifier.padding(horizontal = 40.dp),
-                ) {
-                    Text(
-                        text = "Woran soll gearbeitet werden?",
-                        style = MaterialTheme.typography.titleMedium,
-                    )
-                    Text(
-                        text = "Beschreibe die Aufgabe unten – zum Beispiel „Fixe den Login-Timeout und " +
-                            "schreib einen Test dafür“.",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier.padding(top = 6.dp),
-                    )
+                // Solange der Verlauf unterwegs ist, wird nicht behauptet,
+                // die Session sei leer — sonst blitzt die Einladung auf und
+                // wird eine halbe Sekunde später vom Verlauf verdrängt.
+                if (historyLoading) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Text(
+                            text = "Verlauf wird geladen …",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                } else {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier.padding(horizontal = 40.dp),
+                    ) {
+                        Text(
+                            text = "Woran soll gearbeitet werden?",
+                            style = MaterialTheme.typography.titleMedium,
+                        )
+                        Text(
+                            text = "Beschreibe die Aufgabe unten – zum Beispiel „Fixe den Login-Timeout und " +
+                                "schreib einen Test dafür“.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.padding(top = 6.dp),
+                        )
+                    }
                 }
             }
         } else {

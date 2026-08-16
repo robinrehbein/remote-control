@@ -226,11 +226,14 @@ export class SessionManager {
       this.store.setProvisioned(row.id, cid, staged.volume_name as string, shimToken);
       this.store.setShimEndpoint(row.id, endpoint);
       const base = this.shimBase(row.id, endpoint);
-      await this.waitForShim(base, shimToken, 60_000);
+      await this.waitForShim(base, shimToken, 60_000, cid);
       this.connectEvents(row.id, base, shimToken);
       this.setStatus(row.id, 'idle');
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      // Also on the server log: the app is not always in reach when a session
+      // dies, and provisioning failures were previously invisible in `docker logs`.
+      console.error(`[sessions] provisioning failed for ${row.id.slice(0, 8)} (${row.adapter}): ${message}`);
       this.store.updateSessionStatus(row.id, 'error');
       this.emitEvent(row.id, { type: 'error', message, fatal: true });
       this.broadcastStatus(row.id, 'error');
@@ -294,14 +297,24 @@ export class SessionManager {
     return env;
   }
 
-  private async waitForShim(base: string, token: string, timeoutMs: number): Promise<void> {
+  private async waitForShim(
+    base: string,
+    token: string,
+    timeoutMs: number,
+    containerId?: string | null,
+  ): Promise<void> {
     const client = this.shimClient(base, token);
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       if (await client.status()) return;
       await new Promise((r) => setTimeout(r, 1500));
     }
-    throw new Error('shim did not become ready in time');
+    // The bare timeout says nothing actionable; the container's own output does.
+    const diag = containerId ? await docker.containerDiagnostics(containerId) : '';
+    throw new Error(
+      `Der Agent-Container ist nicht gestartet (keine Antwort nach ${Math.round(timeoutMs / 1000)}s).` +
+        (diag ? `\n${diag}` : ''),
+    );
   }
 
   private connectEvents(id: string, base: string, token: string): void {
@@ -503,11 +516,12 @@ export class SessionManager {
       const endpoint = await docker.shimEndpoint(cid, id);
       this.store.setShimEndpoint(id, endpoint);
       const base = this.shimBase(id, endpoint);
-      await this.waitForShim(base, row.shim_token, 60_000);
+      await this.waitForShim(base, row.shim_token, 60_000, cid);
       this.connectEvents(id, base, row.shim_token);
       this.setStatus(id, 'idle');
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      console.error(`[sessions] adapter switch failed for ${id.slice(0, 8)}: ${message}`);
       this.store.updateSessionStatus(id, 'error');
       this.emitEvent(id, { type: 'error', message, fatal: true });
       this.broadcastStatus(id, 'error');

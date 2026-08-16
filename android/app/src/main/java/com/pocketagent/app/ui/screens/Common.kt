@@ -30,6 +30,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
@@ -72,6 +73,7 @@ import com.pocketagent.app.data.SessionStatus
 import com.pocketagent.app.data.WsClient
 import com.pocketagent.app.ui.theme.CardInset
 import com.pocketagent.app.ui.theme.ContentInset
+import com.pocketagent.app.ui.theme.ContentMaxWidth
 import com.pocketagent.app.ui.theme.IconRowDividerInset
 import com.pocketagent.app.ui.theme.ListItemTitle
 import com.pocketagent.app.ui.theme.MinTouchTarget
@@ -325,7 +327,11 @@ fun OneUiScaffold(
         // und auf einem aufgeklappten Foldable überlappt sie sonst den Text.
         contentWindowInsets = WindowInsets.safeDrawing,
         floatingActionButton = floatingActionButton,
-        bottomBar = bottomBar,
+        // Die untere Leiste hält dieselbe Spaltenbreite wie der Inhalt — sonst
+        // steht auf einem Tablet ein randbreites Eingabefeld unter einer
+        // schmalen Textspalte. Die obere Leiste bleibt bewusst randbreit, so
+        // wie eine App-Bar es überall tut.
+        bottomBar = { CenteredContentWidth { bottomBar() } },
         snackbarHost = snackbarHost,
         topBar = {
             LargeTopAppBar(
@@ -357,8 +363,32 @@ fun OneUiScaffold(
                 scrollBehavior = scrollBehavior,
             )
         },
-        content = content,
-    )
+    ) { padding ->
+        // Der Inhalt füllt die Höhe: die Screens darunter setzen selbst
+        // fillMaxSize und brauchen die Randbedingung.
+        CenteredContentWidth(modifier = Modifier.fillMaxSize()) { content(padding) }
+    }
+}
+
+/**
+ * Hält seinen Inhalt auf [ContentMaxWidth] und zentriert ihn.
+ *
+ * Auf einem Telefon greift die Grenze nie — dort ist das Fenster schmaler.
+ * Auf einem Tablet oder einem aufgeklappten Foldable verhindert sie, dass
+ * eine Textzeile über die volle Gerätebreite läuft und „Session starten" ein
+ * meterbreiter Knopf wird.
+ */
+@Composable
+fun CenteredContentWidth(
+    modifier: Modifier = Modifier,
+    content: @Composable () -> Unit,
+) {
+    Box(
+        modifier = modifier.fillMaxWidth(),
+        contentAlignment = Alignment.TopCenter,
+    ) {
+        Box(modifier = Modifier.widthIn(max = ContentMaxWidth)) { content() }
+    }
 }
 
 /* ------------------------------------------------------------------ */

@@ -5,6 +5,8 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type Docker from 'dockerode';
 import tar from 'tar-fs';
+import { BUILD_NOTICE_INTERVAL_MS, buildProgressMessage, createThrottle, detailFrom } from './progress.js';
+import type { NoticeFn } from './docker.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -159,7 +161,7 @@ export function buildShimImage(
   d: Docker,
   adapterId: string,
   tag: string,
-  onNotice?: (message: string) => void,
+  onNotice?: NoticeFn,
 ): Promise<void> {
   let pending = inFlight.get(tag);
   if (!pending) {
@@ -173,7 +175,7 @@ async function runBuild(
   d: Docker,
   adapterId: string,
   tag: string,
-  onNotice?: (message: string) => void,
+  onNotice?: NoticeFn,
 ): Promise<void> {
   const root = shimContextRoot();
   const files = shimContextFiles(adapterId);
@@ -182,7 +184,9 @@ async function runBuild(
       `im Orchestrator-Image liegt kein Build-Kontext für Adapter "${adapterId}" (erwartet shims/${adapterId}/Dockerfile)`,
     );
   }
-  onNotice?.('Agent-Image wird gebaut – erster Start dieses Agenten, dauert einige Minuten …');
+  onNotice?.('Agent-Image wird gebaut – erster Start dieses Agenten, dauert einige Minuten …', {
+    phase: 'image-build',
+  });
   console.log(`[image-build] building ${tag} from ${files.length} context files`);
   const started = Date.now();
   const ctx = stage(root, files);
@@ -206,6 +210,9 @@ async function runBuild(
     // only, so both have to be checked.
     const lines: string[] = [];
     let failure: string | null = null;
+    // A build emits many lines per second; the app only needs to see that it
+    // moves, so notices are throttled (the first one always passes).
+    const mayNotice = createThrottle(BUILD_NOTICE_INTERVAL_MS);
     await new Promise<void>((res, rej) => {
       d.modem.followProgress(
         stream,
@@ -214,14 +221,21 @@ async function runBuild(
           const failed = (ev.error ?? ev.errorDetail?.message ?? '').trim();
           if (failed.length > 0) failure = failed;
           const text = (ev.stream ?? '').trim();
-          if (text.length > 0) lines.push(text);
+          if (text.length === 0) return;
+          lines.push(text);
+          // Only the tail is ever read (error message, notice detail); a long
+          // build would otherwise keep every line of its output in memory.
+          if (lines.length > 200) lines.splice(0, lines.length - 200);
+          if (onNotice && mayNotice()) {
+            onNotice(buildProgressMessage(lines), { phase: 'image-build', detail: detailFrom(lines) });
+          }
         },
       );
     });
     if (failure !== null) throw new Error(withTail(failure, lines));
     const sec = Math.round((Date.now() - started) / 1000);
     console.log(`[image-build] ${tag} built in ${sec}s`);
-    onNotice?.(`Agent-Image fertig gebaut (${sec}s) – Session startet.`);
+    onNotice?.(`Agent-Image fertig gebaut (${sec}s) – Session startet.`, { phase: 'image-build' });
   } finally {
     pack.destroy();
     rmSync(ctx, { recursive: true, force: true });

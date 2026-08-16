@@ -13,7 +13,9 @@ process.env.PORT = '0';
 const { buildApp } = await import('./index.js');
 const { generatePairingCode, SlidingWindowRateLimiter } = await import('./pairing.js');
 const { validateSecret } = await import('./secret-validate.js');
-const { buildPromptBody } = await import('./sessions.js');
+const { buildPromptBody, isNoticePhase } = await import('./sessions.js');
+type SessionManager = import('./sessions.js').SessionManager;
+type Store = import('./db.js').Store;
 type FetchLike = import('./secret-validate.js').FetchLike;
 const vault = await import('./vault.js');
 const admin = await import('./admin.js');
@@ -211,6 +213,115 @@ async function gatewaySmoke(): Promise<void> {
   assert(blocked.status === 403, 'egress proxy blocks hosts outside the allowlist');
 
   for (const s of [shim, ingress, upstream, egress]) s.close();
+}
+
+/**
+ * Session start against a fake docker daemon: the phased progress notices the
+ * app renders while a session boots, plus the ordering invariant behind them -
+ * a session's egress token must already be valid when its container starts,
+ * otherwise the shim's first clone runs into a 407 on the allowlist proxy.
+ */
+async function startProgressSmoke(store: Store, manager: SessionManager, c2: Client, repoId: string): Promise<void> {
+  const http = await import('node:http');
+  const dockerMod = await import('./docker.js');
+  const cfg = config as unknown as { dockerEnabled: boolean; dockerHost: string | null; dockerHostIsLocal: boolean };
+
+  const CID = 'fake-container-id';
+  const SECRET_LOOKING = 'ghp_abcdefghijklmnopqrstuvwxyz012345';
+  const LOG = [
+    '[shim] boot',
+    '[git] cloning https://github.com/acme/demo.git (branch main) -> /work',
+    `Cloning into '/work'... token ${SECRET_LOOKING}`,
+    '',
+  ].join('\n');
+
+  let createdEnv: string[] = [];
+  let tokenValidAtStart: boolean | null = null;
+
+  const daemon = http.createServer((req, res) => {
+    const url = req.url ?? '';
+    const method = req.method ?? 'GET';
+    const send = (code: number, body: string, type = 'application/json'): void => {
+      res.writeHead(code, { 'content-type': type }).end(body);
+    };
+    if (method === 'POST' && url.startsWith('/containers/create')) {
+      let body = '';
+      req.on('data', (c) => (body += String(c)));
+      req.on('end', () => {
+        createdEnv = (JSON.parse(body) as { Env?: string[] }).Env ?? [];
+        send(201, JSON.stringify({ Id: CID, Warnings: [] }));
+      });
+      return;
+    }
+    req.resume();
+    if (method === 'POST' && url === `/containers/${CID}/start`) {
+      const token = createdEnv.find((e) => e.startsWith('SHIM_TOKEN='))?.slice('SHIM_TOKEN='.length) ?? '';
+      tokenValidAtStart = token.length > 0 && manager.egressTokenAllowed(token);
+      res.writeHead(204).end();
+      return;
+    }
+    if (method === 'GET' && url.startsWith(`/containers/${CID}/logs`)) return send(200, LOG, 'application/octet-stream');
+    if (method === 'POST' && url.startsWith('/volumes/create')) return send(201, '{"Name":"v"}');
+    send(200, '{}'); // network inspect/connect, image inspect, everything else
+  });
+  const daemonPort = await listen(daemon);
+
+  const hostnameBefore = process.env.HOSTNAME;
+  process.env.HOSTNAME = 'smoke-orchestrator';
+  cfg.dockerHost = `http://127.0.0.1:${daemonPort}`;
+  cfg.dockerHostIsLocal = true; // socket-proxy semantics: local behaviour, no published ports
+  cfg.dockerEnabled = true;
+  dockerMod.resetDockerClient();
+
+  let sessionId = '';
+  try {
+    const created = await request(c2, {
+      type: 'session.create',
+      requestId: 'prog1',
+      repoId,
+      adapter: 'opencode',
+      provider: 'zai',
+      model: 'glm-4.6',
+      mode: 'ask',
+    });
+    assert(created.type === 'request.ok', 'progress session created');
+    sessionId = (created.payload as { sessionId: string }).sessionId;
+
+    const isNoticeFor = (m: ServerMessage, phase: string): boolean =>
+      m.type === 'session.event' && m.sessionId === sessionId && m.event.type === 'notice' && m.event.phase === phase;
+
+    const starting = await c2.wait((m) => isNoticeFor(m, 'container-start'), 20_000);
+    assert(
+      starting.type === 'session.event' &&
+        starting.event.type === 'notice' &&
+        starting.event.message === 'Container startet',
+      'the app is told when the container starts',
+    );
+
+    const booting = await c2.wait((m) => isNoticeFor(m, 'shim-start'), 20_000);
+    const bootNotice = booting.type === 'session.event' && booting.event.type === 'notice' ? booting.event : null;
+    assert(bootNotice?.message === 'Repo wird geklont', 'a clone line in the container log becomes "Repo wird geklont"');
+    assert(bootNotice?.detail?.includes('[git] cloning') === true, 'the shim-start notice carries the log tail');
+    assert(bootNotice?.detail?.includes(SECRET_LOOKING) === false, 'token-shaped words are masked in a live detail');
+
+    assert(tokenValidAtStart === true, 'the egress token is valid before the container starts (proxy 407 race)');
+    assert(
+      createdEnv.some((e) => e.startsWith('HTTP_PROXY=http://pa:')),
+      'allowlist sessions reach the network through the authenticated egress proxy',
+    );
+    assert(store.getSession(sessionId)?.container_id === CID, 'the container id is recorded before the start');
+  } finally {
+    cfg.dockerEnabled = false;
+    cfg.dockerHost = null;
+    cfg.dockerHostIsLocal = false;
+    dockerMod.resetDockerClient();
+    if (hostnameBefore === undefined) delete process.env.HOSTNAME;
+    else process.env.HOSTNAME = hostnameBefore;
+    daemon.close();
+    // The shim never answers here, so provisioning keeps polling in the
+    // background until its timeout - dropping the session ends it cleanly.
+    if (sessionId) await manager.deleteSession(sessionId).catch(() => {});
+  }
 }
 
 async function main(): Promise<void> {
@@ -489,15 +600,109 @@ async function main(): Promise<void> {
     },
   };
   let buildErr = '';
+  const buildNotices: { message: string; phase?: string; detail?: string }[] = [];
   await Promise.all([
-    imageBuild.buildShimImage(fakeDocker as never, 'kilo', 'pa-smoke/kilo-shim:test').catch((e: unknown) => {
-      buildErr = e instanceof Error ? e.message : String(e);
-    }),
+    imageBuild
+      .buildShimImage(fakeDocker as never, 'kilo', 'pa-smoke/kilo-shim:test', (message, p) => {
+        buildNotices.push({ message, ...p });
+      })
+      .catch((e: unknown) => {
+        buildErr = e instanceof Error ? e.message : String(e);
+      }),
     imageBuild.buildShimImage(fakeDocker as never, 'kilo', 'pa-smoke/kilo-shim:test').catch(() => {}),
   ]);
   assert(buildCalls === 1, 'parallel builds of one tag are deduped into a single build');
   assert(buildErr.includes('non-zero code: 1'), 'build error frame becomes the exception cause');
   assert(buildErr.includes('ENOSPC'), 'exception carries the last build log lines');
+
+  /* ---- build progress: phase, docker step, throttling ---- */
+
+  assert(
+    buildNotices[0]?.phase === 'image-build' && buildNotices[0].message.includes('Agent-Image wird gebaut'),
+    'the build announces itself as image-build progress',
+  );
+  const stepNotices = buildNotices.filter((n) => n.message.startsWith('Image wird gebaut'));
+  assert(stepNotices.length === 1, 'build log lines within one interval produce a single notice (throttled)');
+  assert(stepNotices[0]?.message === 'Image wird gebaut (Schritt 1/12)', 'the docker step becomes the progress message');
+  assert(stepNotices[0]?.phase === 'image-build', 'build progress carries the image-build phase');
+  assert(
+    stepNotices[0]?.detail?.includes('FROM node:22-bookworm-slim') === true,
+    'the build notice carries the log tail as detail',
+  );
+
+  /* ---- start progress: pure derivation, dedupe, detail clamping ---- */
+
+  const progress = await import('./progress.js');
+
+  assert(isNoticePhase('image-build') && isNoticePhase('ready'), 'the contract phases are accepted');
+  assert(!isNoticePhase('done') && !isNoticePhase(undefined), 'unknown notice phases are rejected');
+
+  assert(
+    progress.buildProgressMessage(['Step 7/14 : RUN npm ci']) === 'Image wird gebaut (Schritt 7/14)',
+    'classic builder step lines become a step message',
+  );
+  assert(
+    progress.buildProgressMessage(['#9 [3/8] RUN apk add git']) === 'Image wird gebaut (Schritt 3/8)',
+    'buildkit step lines become a step message',
+  );
+  assert(
+    progress.buildProgressMessage(['Step 2/14 : RUN a', 'Step 9/14 : RUN b', ' ---> cached']) ===
+      'Image wird gebaut (Schritt 9/14)',
+    'the newest step wins',
+  );
+  assert(progress.buildProgressMessage(['pulling fs layer']) === 'Image wird gebaut', 'unknown build output stays generic');
+
+  assert(
+    progress.shimProgressMessage(['[git] cloning https://github.com/acme/demo.git (branch main) -> /work']) ===
+      'Repo wird geklont',
+    'a clone line is recognized',
+  );
+  assert(
+    progress.shimProgressMessage(['[git] cloning x', '[git] on branch agent/1']) === 'Branch wird vorbereitet',
+    'the newest shim marker wins',
+  );
+  assert(
+    progress.shimProgressMessage(['[shim] listening on :8080 (opencode spawned :4096)']).startsWith('Agent-Prozess läuft'),
+    'a listening shim is recognized',
+  );
+  assert(progress.shimProgressMessage(['some unrelated output']) === 'Agent-Container startet', 'unknown lines stay generic');
+
+  const tail1 = ['a', 'b', 'c'];
+  assert(progress.newTailLines([], tail1).length === 3, 'the first poll reports every line');
+  assert(progress.newTailLines(tail1, tail1).length === 0, 'an unchanged tail reports nothing');
+  assert(
+    JSON.stringify(progress.newTailLines(tail1, ['b', 'c', 'd'])) === JSON.stringify(['d']),
+    'a scrolled window reports only the new line',
+  );
+  assert(
+    JSON.stringify(progress.newTailLines(['a', 'b'], ['a', 'b', 'c', 'd'])) === JSON.stringify(['c', 'd']),
+    'a growing tail reports only its new lines',
+  );
+  assert(
+    JSON.stringify(progress.newTailLines(['a'], ['x', 'y'])) === JSON.stringify(['x', 'y']),
+    'a window without overlap counts as entirely new',
+  );
+
+  const gate = progress.createThrottle(2_000);
+  assert(gate(1_000), 'the first progress notice always passes');
+  assert(!gate(1_500), 'a notice within the interval is dropped');
+  assert(gate(3_000) && !gate(3_500), 'the next notice passes only after the interval');
+
+  const secret = 'ghp_abcdefghijklmnopqrstuvwxyz012345';
+  const detail = progress.detailFrom(['fetching origin', `remote: token ${secret} used`]);
+  assert(!detail.includes(secret) && detail.includes('[gekürzt]'), 'token-shaped words are masked in a detail');
+  const clamped = progress.detailFrom(Array.from({ length: 20 }, (_, i) => `line ${i}`));
+  assert(clamped.split('\n').length === 6 && clamped.endsWith('line 19'), 'a detail keeps at most the 6 youngest lines');
+  const wide = 'ab '.repeat(150).trim();
+  const dropped = progress.detailFrom([wide, wide]);
+  assert(dropped.length <= 600 && !dropped.includes('\n'), 'oldest lines are dropped until the detail fits');
+  const single = progress.detailFrom(['ab '.repeat(300).trim()]);
+  assert(single.length === 600 && single.startsWith('…'), 'one oversized line is cut from the front');
+
+  assert(
+    progress.splitLogLines('  a  \n\n b \r\n') .join('|') === 'a|b',
+    'log blobs become trimmed, non-empty lines',
+  );
 
   /* ---- harness switch: session.update { adapter } ---------------------- */
 
@@ -605,6 +810,8 @@ async function main(): Promise<void> {
     if (hostnameBefore === undefined) delete process.env.HOSTNAME;
     else process.env.HOSTNAME = hostnameBefore;
   }
+
+  await startProgressSmoke(store, manager, c2, added.repo.id);
 
   const models = await request(c2, { type: 'session.models.get', requestId: 'mod1', sessionId });
   assert(

@@ -7,6 +7,7 @@ import type {
   DiffEntry,
   ModelInfo,
   NetworkPolicy,
+  NoticePhase,
   PermissionDecision,
   PromptRequest,
   ReasoningEffort,
@@ -17,6 +18,15 @@ import type {
 import { SERVER_VERSION, config, isNetworkPolicy } from './config.js';
 import type { LinkRow, RepoRow, SessionRow, Store } from './db.js';
 import * as docker from './docker.js';
+import type { NoticeFn } from './docker.js';
+import {
+  LOG_TAIL_LINES,
+  SHIM_LOG_POLL_MS,
+  detailFrom,
+  newTailLines,
+  shimProgressMessage,
+  splitLogLines,
+} from './progress.js';
 
 import { getAdapter } from './adapters.js';
 import { ShimClient, normalizeModels } from './shim-client.js';
@@ -26,6 +36,7 @@ const TENANT = 'default';
 
 const AGENT_MODES: readonly AgentMode[] = ['yolo', 'auto', 'acceptEdits', 'ask'];
 const REASONING_EFFORTS: readonly ReasoningEffort[] = ['low', 'medium', 'high'];
+const NOTICE_PHASES: readonly NoticePhase[] = ['image-build', 'container-start', 'shim-start', 'ready'];
 
 export function isAgentMode(v: unknown): v is AgentMode {
   return typeof v === 'string' && (AGENT_MODES as readonly string[]).includes(v);
@@ -33,6 +44,10 @@ export function isAgentMode(v: unknown): v is AgentMode {
 
 export function isReasoningEffort(v: unknown): v is ReasoningEffort {
   return typeof v === 'string' && (REASONING_EFFORTS as readonly string[]).includes(v);
+}
+
+export function isNoticePhase(v: unknown): v is NoticePhase {
+  return typeof v === 'string' && (NOTICE_PHASES as readonly string[]).includes(v);
 }
 
 /**
@@ -206,27 +221,45 @@ export class SessionManager {
     return row;
   }
 
-  /** Progress channel of a provisioning run (image build takes minutes). */
-  private noticeFor(sessionId: string): (message: string) => void {
-    return (message) => this.emitEvent(sessionId, { type: 'notice', message });
+  /**
+   * Progress channel of a provisioning run (image build takes minutes).
+   * A notice with a `phase` is live progress the app shows instead of its
+   * status line; one without stays an ordinary timeline entry.
+   */
+  private noticeFor(sessionId: string): NoticeFn {
+    return (message, progress) =>
+      this.emitEvent(sessionId, {
+        type: 'notice',
+        message,
+        ...(progress?.phase ? { phase: progress.phase } : {}),
+        ...(progress?.detail ? { detail: progress.detail } : {}),
+      });
   }
 
   private async provision(row: SessionRow, repo: RepoRow, baseBranch: string): Promise<void> {
+    const notice = this.noticeFor(row.id);
     try {
       if (!config.dockerEnabled) throw new Error('docker is disabled on this server');
       await docker.ensureNetwork();
       const shimToken = randomBytes(24).toString('hex');
       const staged: SessionRow = { ...row, volume_name: `pocketagent-sess-${row.id}`, shim_token: shimToken };
       const env = this.buildEnv(staged, repo, shimToken, baseBranch);
-      const cid = await docker.createSessionContainer(staged, env, this.noticeFor(row.id));
+      const cid = await docker.createSessionContainer(staged, env, notice);
       const pat = this.githubPatFor(row);
       if (pat) await docker.injectCredsFile(cid, { githubPat: pat });
+      // Persist BEFORE the start: the egress proxy authorizes a session by its
+      // stored shim_token (egressTokenAllowed), and an 'allowlist' shim clones
+      // through that proxy the moment its container runs - a token that is
+      // still unknown then turns the first clone into a 407. Recording the
+      // container id here also keeps a failed start cleanable.
+      this.store.setProvisioned(row.id, cid, staged.volume_name as string, shimToken);
+      notice('Container startet', { phase: 'container-start' });
       if (!(await docker.startContainer(cid))) throw new Error('failed to start session container');
       const endpoint = await docker.shimEndpoint(cid, row.id);
-      this.store.setProvisioned(row.id, cid, staged.volume_name as string, shimToken);
       this.store.setShimEndpoint(row.id, endpoint);
       const base = this.shimBase(row.id, endpoint);
-      await this.waitForShim(base, shimToken, 60_000, cid);
+      await this.waitForShim(base, shimToken, 60_000, cid, notice);
+      notice('Bereit', { phase: 'ready' });
       this.connectEvents(row.id, base, shimToken);
       this.setStatus(row.id, 'idle');
     } catch (err) {
@@ -302,11 +335,18 @@ export class SessionManager {
     token: string,
     timeoutMs: number,
     containerId?: string | null,
+    notice?: NoticeFn,
   ): Promise<void> {
     const client = this.shimClient(base, token);
     const deadline = Date.now() + timeoutMs;
+    const reported: string[] = [];
+    let nextLogPoll = 0;
     while (Date.now() < deadline) {
       if (await client.status()) return;
+      if (containerId && notice && Date.now() >= nextLogPoll) {
+        nextLogPoll = Date.now() + SHIM_LOG_POLL_MS;
+        await this.reportContainerProgress(containerId, notice, reported);
+      }
       await new Promise((r) => setTimeout(r, 1500));
     }
     // The bare timeout says nothing actionable; the container's own output does.
@@ -315,6 +355,25 @@ export class SessionManager {
       `Der Agent-Container ist nicht gestartet (keine Antwort nach ${Math.round(timeoutMs / 1000)}s).` +
         (diag ? `\n${diag}` : ''),
     );
+  }
+
+  /**
+   * Send the container log lines that appeared since the last poll as
+   * 'shim-start' progress (`reported` carries the window across calls).
+   * Best effort by contract: a start must never fail because of its progress
+   * display, so every failure is swallowed.
+   */
+  private async reportContainerProgress(id: string, notice: NoticeFn, reported: string[]): Promise<void> {
+    try {
+      const tail = splitLogLines(await docker.containerLogTail(id, LOG_TAIL_LINES));
+      if (tail.length === 0) return;
+      const fresh = newTailLines(reported, tail);
+      reported.splice(0, reported.length, ...tail);
+      if (fresh.length === 0) return;
+      notice(shimProgressMessage(fresh), { phase: 'shim-start', detail: detailFrom(fresh) });
+    } catch {
+      /* no logs (yet) */
+    }
   }
 
   private connectEvents(id: string, base: string, token: string): void {
@@ -495,6 +554,7 @@ export class SessionManager {
    * harness is exchanged (the shims clone only into an empty /work).
    */
   private async reprovisionAdapter(id: string): Promise<void> {
+    const notice = this.noticeFor(id);
     try {
       const row = this.requireSession(id);
       if (!row.shim_token || !row.volume_name) throw new Error('Session ist nicht provisioniert.');
@@ -508,15 +568,20 @@ export class SessionManager {
       }
       await docker.ensureNetwork();
       const env = this.buildEnv(row, repo, row.shim_token, repo.default_branch);
-      const cid = await docker.createSessionContainer(row, env, this.noticeFor(id));
+      const cid = await docker.createSessionContainer(row, env, notice);
       const pat = this.githubPatFor(row);
       if (pat) await docker.injectCredsFile(cid, { githubPat: pat });
-      if (!(await docker.startContainer(cid))) throw new Error('failed to start session container');
+      // shim_token is already stored (the session keeps it across the switch),
+      // so only the container id has to be recorded before the start - see
+      // provision(): a container the row does not know cannot be cleaned up.
       this.store.setContainer(id, cid);
+      notice('Container startet', { phase: 'container-start' });
+      if (!(await docker.startContainer(cid))) throw new Error('failed to start session container');
       const endpoint = await docker.shimEndpoint(cid, id);
       this.store.setShimEndpoint(id, endpoint);
       const base = this.shimBase(id, endpoint);
-      await this.waitForShim(base, row.shim_token, 60_000, cid);
+      await this.waitForShim(base, row.shim_token, 60_000, cid, notice);
+      notice('Bereit', { phase: 'ready' });
       this.connectEvents(id, base, row.shim_token);
       this.setStatus(id, 'idle');
     } catch (err) {
@@ -598,8 +663,10 @@ export class SessionManager {
     }
     if (!row.shim_token || !row.volume_name) throw new Error('session not provisioned');
     if (!config.dockerEnabled) throw new Error('docker is disabled on this server');
+    const notice = this.noticeFor(id);
     await docker.ensureNetwork();
     let cid = row.container_id;
+    notice('Container startet', { phase: 'container-start' });
     let started = cid ? await docker.startContainer(cid) : false;
     if (!started) {
       const repo = this.store.getRepo(row.repo_id);
@@ -607,10 +674,12 @@ export class SessionManager {
       cid = await docker.createSessionContainer(
         row,
         this.buildEnv(row, repo, row.shim_token, repo.default_branch),
-        this.noticeFor(id),
+        notice,
       );
       const pat = this.githubPatFor(row);
       if (pat) await docker.injectCredsFile(cid, { githubPat: pat });
+      // recorded before the start, like in provision()
+      this.store.setContainer(id, cid);
       started = await docker.startContainer(cid);
       if (!started) throw new Error('failed to start session container');
     }
@@ -619,11 +688,12 @@ export class SessionManager {
     const endpoint = cid ? await docker.shimEndpoint(cid, id) : row.shim_endpoint;
     this.store.setShimEndpoint(id, endpoint);
     const base = this.shimBase(id, endpoint);
-    await this.waitForShim(base, row.shim_token, 60_000);
+    await this.waitForShim(base, row.shim_token, 60_000, cid, notice);
     if (row.session_ref) {
       const res = await this.shimClient(base, row.shim_token).resume(row.session_ref);
       if (!res?.ok) throw new Error(res && !res.ok ? res.error : 'resume failed');
     }
+    notice('Bereit', { phase: 'ready' });
     this.connectEvents(id, base, row.shim_token);
     this.setStatus(id, 'idle');
   }

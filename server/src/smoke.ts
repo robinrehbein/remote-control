@@ -562,7 +562,32 @@ async function reconcileSmoke(store: Store, manager: SessionManager, c2: Client,
   }
 }
 
+/**
+ * Session containers run compiled JS on plain node and load the protocol
+ * package as TypeScript source (node type stripping). Unlike tsx/tsc, node does
+ * not map a './x.js' import onto './x.ts', so a protocol package split across
+ * files loads fine in every dev tool and crashes every container at startup.
+ * This check runs the same way a shim does: plain node, no loader.
+ */
+async function protocolLoadsOnPlainNode(): Promise<void> {
+  const { execFile } = await import('node:child_process');
+  const { fileURLToPath } = await import('node:url');
+  const repoRoot = fileURLToPath(new URL('../..', import.meta.url));
+  await new Promise<void>((resolve) => {
+    execFile(
+      process.execPath,
+      ['-e', "import('@pocketagent/protocol').then(m => { if (typeof m.selectModel !== 'function') process.exit(2); })"],
+      { cwd: repoRoot },
+      (err, _stdout, stderr) => {
+        assert(!err, `protocol package must import on plain node (no tsx): ${String(stderr).trim()}`);
+        resolve();
+      },
+    );
+  });
+}
+
 async function main(): Promise<void> {
+  await protocolLoadsOnPlainNode();
   const { app, store, manager } = await buildApp();
   await app.listen({ port: 0, host: '127.0.0.1' });
   const addr = app.server.address() as AddressInfo;

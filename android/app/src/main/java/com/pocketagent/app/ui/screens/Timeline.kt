@@ -94,7 +94,15 @@ fun reduceTimeline(items: List<TimelineItem>, event: AgentEvent): List<TimelineI
 
     is AgentEvent.TurnCompleted -> items + TimelineItem.TurnEnd(event.summary, event.commitSha)
     is AgentEvent.Pushed -> items + TimelineItem.Pushed(event.branch, event.prUrl, event.auto)
-    is AgentEvent.TurnFailed -> items + TimelineItem.Error("Turn fehlgeschlagen: ${event.error}")
+
+    is AgentEvent.TurnFailed -> {
+        // Kopfzeile bleibt handlungsleitend; der Servertext – falls
+        // vorhanden – steht nur als Nebensatz dahinter (wie beim
+        // Fehlschlag einer Änderung im SessionScreen).
+        val cause = event.error.takeIf { it.isNotBlank() }?.let { " ($it)" }.orEmpty()
+        items + TimelineItem.Error("Der Auftrag ist fehlgeschlagen – bitte erneut versuchen.$cause")
+    }
+
     is AgentEvent.ErrorEvent -> items + TimelineItem.Error(event.message)
 
     // Mit Phase ist die Notice Startfortschritt und lebt über dem Composer,

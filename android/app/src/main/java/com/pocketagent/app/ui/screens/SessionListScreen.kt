@@ -17,7 +17,6 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -40,7 +39,6 @@ import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.SmartToy
 import androidx.compose.material.icons.outlined.StopCircle
 import androidx.compose.material.icons.outlined.Unarchive
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
@@ -66,6 +64,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -86,8 +85,8 @@ import com.pocketagent.app.PocketAgentApp
 import com.pocketagent.app.data.SessionInfo
 import com.pocketagent.app.data.SessionStatus
 import com.pocketagent.app.data.WsClient
-import com.pocketagent.app.data.wireName
 import com.pocketagent.app.ui.theme.CardInset
+import com.pocketagent.app.ui.theme.OneUiAccent
 import com.pocketagent.app.ui.theme.PillShape
 import com.pocketagent.app.ui.theme.PrimaryButtonHeight
 import com.pocketagent.app.ui.theme.PrimaryButtonTextSize
@@ -123,12 +122,13 @@ fun SessionListScreen(
     val active = remember(allSessions) { activeSessions(allSessions) }
     val archived = remember(allSessions) { archivedSessions(allSessions) }
 
-    var archiveOpen by remember { mutableStateOf(false) }
+    // rememberSaveable: ein offener Dialog übersteht so eine Faltung (Fold/Unfold).
+    var archiveOpen by rememberSaveable { mutableStateOf(false) }
     // Sheets und Dialoge halten nur die Id — die Session selbst kommt immer
     // frisch aus dem Flow, damit ein Statuswechsel sofort durchschlägt.
-    var menuFor by remember { mutableStateOf<String?>(null) }
-    var renameFor by remember { mutableStateOf<String?>(null) }
-    var deleteFor by remember { mutableStateOf<String?>(null) }
+    var menuFor by rememberSaveable { mutableStateOf<String?>(null) }
+    var renameFor by rememberSaveable { mutableStateOf<String?>(null) }
+    var deleteFor by rememberSaveable { mutableStateOf<String?>(null) }
 
     LaunchedEffect(Unit) { repository.refreshSessions() }
     // Ist das Archiv leer, gibt es nichts aufzuklappen.
@@ -143,7 +143,11 @@ fun SessionListScreen(
             val result = repository.setArchived(session.id, archive)
             if (result.isFailure) {
                 snackbarHostState.showSnackbar(
-                    if (archive) "Archivieren fehlgeschlagen" else "Wiederherstellen fehlgeschlagen",
+                    if (archive) {
+                        "Archivieren nicht möglich – keine Verbindung."
+                    } else {
+                        "Wiederherstellen nicht möglich – keine Verbindung."
+                    },
                 )
                 return@launch
             }
@@ -161,7 +165,17 @@ fun SessionListScreen(
     fun deleteNow(sessionId: String) {
         scope.launch {
             if (!repository.deleteSession(sessionId)) {
-                snackbarHostState.showSnackbar("Löschen fehlgeschlagen – keine Verbindung?")
+                // deleteSession liefert nur ein Boolean zurück — wir kennen die Ursache
+                // nicht wirklich, also keine Vermutung, sondern eine ehrliche Formulierung
+                // plus ein Weg nach vorn: nochmal versuchen.
+                val choice = snackbarHostState.showSnackbar(
+                    message = "Löschen nicht möglich. Versuch es gleich noch einmal.",
+                    actionLabel = "Erneut versuchen",
+                    duration = SnackbarDuration.Short,
+                )
+                if (choice == SnackbarResult.ActionPerformed) {
+                    deleteNow(sessionId)
+                }
             }
         }
     }
@@ -174,7 +188,13 @@ fun SessionListScreen(
             }
         },
         floatingActionButton = {
-            FloatingActionButton(onClick = onNewSession) {
+            // One UI reserviert den helleren Blauton für FABs und Slider, der
+            // dunklere `primary` ist wegen Weiß-auf-Blau-Kontrast für Buttons da.
+            FloatingActionButton(
+                onClick = onNewSession,
+                containerColor = OneUiAccent,
+                contentColor = Color.White,
+            ) {
                 Icon(Icons.Filled.Add, contentDescription = "Neue Session")
             }
         },
@@ -305,7 +325,7 @@ fun SessionListScreen(
                 renameFor = null
                 scope.launch {
                     if (repository.renameSession(session.id, name).isFailure) {
-                        snackbarHostState.showSnackbar("Umbenennen fehlgeschlagen")
+                        snackbarHostState.showSnackbar("Umbenennen nicht möglich – keine Verbindung.")
                     }
                 }
             },
@@ -313,9 +333,9 @@ fun SessionListScreen(
     }
 
     allSessions.firstOrNull { it.id == deleteFor }?.let { session ->
-        AlertDialog(
+        OneUiDialog(
             onDismissRequest = { deleteFor = null },
-            title = { Text("„${sessionDisplayName(session)}“ löschen?") },
+            title = "„${sessionDisplayName(session)}“ löschen?",
             text = { Text(deleteConfirmText(session)) },
             confirmButton = {
                 TextButton(onClick = {
@@ -355,20 +375,36 @@ private fun SwipeableSessionRow(
 ) {
     val archiveAction by rememberUpdatedState(onArchiveSwipe)
     val deleteAction by rememberUpdatedState(onDeleteSwipe)
+    val haptics = LocalHapticFeedback.current
+    // confirmValueChange kann für denselben Zielwert mehrfach aufgerufen werden
+    // (z. B. bei erneutem Layout) — ohne diese Sperre würde derselbe Wisch
+    // doppelt vibrieren.
+    var lastHapticValue by remember { mutableStateOf<SwipeToDismissBoxValue?>(null) }
     val state = rememberSwipeToDismissBoxState(
         confirmValueChange = { value ->
             when (value) {
                 SwipeToDismissBoxValue.EndToStart -> {
+                    if (lastHapticValue != value) {
+                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                        lastHapticValue = value
+                    }
                     archiveAction()
                     true
                 }
 
                 SwipeToDismissBoxValue.StartToEnd -> {
+                    if (lastHapticValue != value) {
+                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                        lastHapticValue = value
+                    }
                     deleteAction()
                     false
                 }
 
-                SwipeToDismissBoxValue.Settled -> true
+                SwipeToDismissBoxValue.Settled -> {
+                    lastHapticValue = null
+                    true
+                }
             }
         },
         positionalThreshold = { distance -> distance * SwipeThreshold },
@@ -485,7 +521,7 @@ private fun EmptySessions(onNewSession: () -> Unit) {
             shape = PillShape,
             modifier = Modifier
                 .padding(top = 24.dp)
-                .height(PrimaryButtonHeight),
+                .heightIn(min = PrimaryButtonHeight),
         ) {
             Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(18.dp))
             Spacer(modifier = Modifier.width(8.dp))
@@ -529,7 +565,7 @@ private fun SessionCard(
                 onLongClickLabel = "Aktionen für diese Session",
             ),
     ) {
-        Column(Modifier.padding(horizontal = 18.dp, vertical = 16.dp)) {
+        Column(Modifier.padding(horizontal = CardInset, vertical = 16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
@@ -554,7 +590,7 @@ private fun SessionCard(
                 modifier = Modifier.padding(top = 10.dp),
             ) {
                 InfoChip(session.adapter)
-                InfoChip(session.mode.wireName())
+                InfoChip(modeLabel(session.mode))
                 session.networkPolicy
                     ?.takeIf { it != "allowlist" }
                     ?.let { policy -> InfoChip(networkPolicyLabel(policy)) }
@@ -590,7 +626,7 @@ private fun ArchiveRow(count: Int, expanded: Boolean, onToggle: () -> Unit) {
                 .fillMaxWidth()
                 .clickable(onClick = onToggle)
                 .heightIn(min = TileMinHeight)
-                .padding(horizontal = 18.dp),
+                .padding(horizontal = CardInset),
         ) {
             Icon(
                 Icons.Outlined.Archive,
@@ -704,9 +740,9 @@ private fun RenameDialog(
     onSave: (String) -> Unit,
 ) {
     var text by remember(session.id) { mutableStateOf(session.title.orEmpty()) }
-    AlertDialog(
+    OneUiDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Session umbenennen") },
+        title = "Session umbenennen",
         text = {
             Column {
                 OutlinedTextField(

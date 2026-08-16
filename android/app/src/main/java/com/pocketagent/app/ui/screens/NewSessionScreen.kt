@@ -3,6 +3,12 @@
 package com.pocketagent.app.ui.screens
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -27,7 +33,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
@@ -46,6 +51,8 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.Saver
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -66,8 +73,13 @@ import com.pocketagent.app.data.AppRepository
 import com.pocketagent.app.data.ReasoningEffort
 import com.pocketagent.app.data.RepoInfo
 import com.pocketagent.app.ui.theme.CardInset
+import com.pocketagent.app.ui.theme.ChipSpacing
 import com.pocketagent.app.ui.theme.ComposerHeight
 import com.pocketagent.app.ui.theme.ListItemTitle
+import com.pocketagent.app.ui.theme.MinTouchTarget
+import com.pocketagent.app.ui.theme.MotionMedium
+import com.pocketagent.app.ui.theme.MotionShort
+import com.pocketagent.app.ui.theme.OneUiEasing
 import com.pocketagent.app.ui.theme.PillShape
 import com.pocketagent.app.ui.theme.PrimaryButtonHeight
 import com.pocketagent.app.ui.theme.PrimaryButtonTextSize
@@ -370,6 +382,16 @@ fun modelChipValue(model: String, reasoning: ReasoningEffort?, canReason: Boolea
 /** Welches Sheet gerade über dem Anlege-Screen liegt. */
 enum class NewSessionSheet { AGENT, MODEL, MODE, NETWORK, ADVANCED }
 
+/**
+ * Sichert das offene Sheet als seinen Namen statt als Enum-Wert — ein
+ * Bundle kann kein `NewSessionSheet?` von sich aus tragen, ein leerer
+ * String steht für „kein Sheet offen".
+ */
+private val NewSessionSheetSaver = Saver<NewSessionSheet?, String>(
+    save = { it?.name.orEmpty() },
+    restore = { name -> name.takeIf { it.isNotEmpty() }?.let(NewSessionSheet::valueOf) },
+)
+
 @Composable
 fun NewSessionScreen(
     onCreated: (String) -> Unit,
@@ -384,8 +406,11 @@ fun NewSessionScreen(
     val adapters by repository.adapters.collectAsState()
     val secrets by repository.secrets.collectAsState()
 
-    var showAddRepo by remember { mutableStateOf(false) }
-    var sheet by remember { mutableStateOf<NewSessionSheet?>(null) }
+    // Halb getippter Repo-Name oder ein offenes Sheet darf ein Falten/Drehen
+    // nicht verlieren — genau der Fall, den die One-UI-Foldable-Richtlinie
+    // nennt.
+    var showAddRepo by rememberSaveable { mutableStateOf(false) }
+    var sheet by rememberSaveable(stateSaver = NewSessionSheetSaver) { mutableStateOf<NewSessionSheet?>(null) }
 
     LaunchedEffect(Unit) {
         repository.refreshRepos()
@@ -448,7 +473,10 @@ fun NewSessionScreen(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(start = ScreenGutter, end = ScreenGutter, top = 6.dp, bottom = 10.dp)
-                            .height(PrimaryButtonHeight),
+                            // min statt fest: bei 200% Textgröße darf der
+                            // Button wachsen, statt die Beschriftung
+                            // abzuschneiden.
+                            .heightIn(min = PrimaryButtonHeight),
                     ) {
                         if (state.busy) {
                             CircularProgressIndicator(
@@ -484,8 +512,8 @@ fun NewSessionScreen(
             // steckt im Sheet. Vier Listen à sechs Zeilen werden so zu zwei
             // Zeilen, ohne dass ein einziger Wert unsichtbar wird.
             FlowRow(
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp),
+                horizontalArrangement = Arrangement.spacedBy(ChipSpacing),
+                verticalArrangement = Arrangement.spacedBy(ChipSpacing),
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(start = ScreenGutter, end = ScreenGutter, top = 4.dp),
@@ -697,7 +725,16 @@ private fun ModelAccessSheet(
                     selected = custom,
                     onClick = { custom = true },
                 )
-                AnimatedVisibility(visible = custom) {
+                AnimatedVisibility(
+                    visible = custom,
+                    // Explizite Spec statt der ungebremsten Spring-Vorgabe:
+                    // Ortswechsel in MotionMedium, Ein-/Ausblenden in
+                    // MotionShort, beide mit der One-UI-Kurve.
+                    enter = expandVertically(tween(MotionMedium, easing = OneUiEasing)) +
+                        fadeIn(tween(MotionShort, easing = LinearEasing)),
+                    exit = shrinkVertically(tween(MotionMedium, easing = OneUiEasing)) +
+                        fadeOut(tween(MotionShort, easing = LinearEasing)),
+                ) {
                     OutlinedTextField(
                         value = typed,
                         onValueChange = { typed = it },
@@ -756,7 +793,7 @@ private fun ModelAccessSheet(
                 shape = PillShape,
                 modifier = Modifier
                     .padding(start = ScreenGutter)
-                    .heightIn(min = 44.dp),
+                    .heightIn(min = MinTouchTarget),
             ) {
                 Text("Zugang in Einstellungen hinterlegen")
             }
@@ -769,7 +806,7 @@ private fun ModelAccessSheet(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = ScreenGutter, vertical = 10.dp)
-                .height(PrimaryButtonHeight),
+                .heightIn(min = PrimaryButtonHeight),
         ) {
             Text("Übernehmen")
         }
@@ -938,14 +975,18 @@ fun AddRepoDialog(
     onDismiss: () -> Unit,
     onSave: (fullName: String, defaultBranch: String) -> Unit,
 ) {
-    var fullName by remember { mutableStateOf("") }
-    var branch by remember { mutableStateOf("") }
+    // Ein halb getippter Repo-Name darf ein Falten/Drehen überleben — das ist
+    // der Fall, den die One-UI-Foldable-Richtlinie ausdrücklich nennt.
+    var fullName by rememberSaveable { mutableStateOf("") }
+    var branch by rememberSaveable { mutableStateOf("") }
     val valid = Regex("^[\\w.-]+/[\\w.-]+$").matches(fullName.trim())
     val effectiveBranch = branch.trim().ifEmpty { "main" }
 
-    AlertDialog(
+    // Wahl- und Bestätigungsdialoge sitzen bei One UI unten, nicht in der
+    // Bildmitte (one-ui/comp/dialog).
+    OneUiDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Repository hinzufügen") },
+        title = "Repository hinzufügen",
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 OutlinedTextField(

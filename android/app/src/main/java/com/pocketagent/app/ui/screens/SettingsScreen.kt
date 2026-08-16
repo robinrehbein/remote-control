@@ -35,7 +35,6 @@ import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Key
 import androidx.compose.material.icons.outlined.Visibility
 import androidx.compose.material.icons.outlined.VisibilityOff
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -57,6 +56,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -91,6 +91,16 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
+/**
+ * Fehlermeldung für den Nutzer: eine deutsche Ansage mit nächstem Schritt.
+ * Die rohe Exception-Message landet, falls vorhanden, nur als Nebensatz —
+ * nie als Überschrift, denn Server-/Exception-Text ist selten verständlich.
+ */
+private fun userMessage(headline: String, cause: Throwable): String {
+    val detail = cause.message?.trim()?.takeIf { it.isNotBlank() }
+    return if (detail != null) "$headline ($detail)" else headline
+}
+
 class SettingsViewModel : ViewModel() {
     lateinit var repository: AppRepository
 
@@ -111,7 +121,7 @@ class SettingsViewModel : ViewModel() {
         viewModelScope.launch {
             repository.addSecret(kind, value).fold(
                 onSuccess = { _error.value = null },
-                onFailure = { _error.value = it.message },
+                onFailure = { _error.value = userMessage("Zugang konnte nicht gespeichert werden. Prüf die Verbindung zum Server und versuch es erneut.", it) },
             )
             onDone()
         }
@@ -130,7 +140,7 @@ class SettingsViewModel : ViewModel() {
         viewModelScope.launch {
             repository.addRepo(fullName, defaultBranch).fold(
                 onSuccess = { _error.value = null },
-                onFailure = { _error.value = it.message },
+                onFailure = { _error.value = userMessage("Repository konnte nicht hinzugefügt werden. Prüf den Namen und versuch es erneut.", it) },
             )
             onDone()
         }
@@ -184,6 +194,20 @@ private val KIND_PREFIXES = mapOf(
     "openai" to listOf("sk-"),
     "openrouter" to listOf("sk-or-"),
 )
+
+/**
+ * Konkrete Ansage statt Warnung ohne Ausweg: "Sieht ungewöhnlich aus" nennt
+ * ein mögliches Problem und nimmt es im selben Satz zurück. Das hier sagt
+ * stattdessen, wie ein gültiger Wert für diese Art aussieht.
+ */
+private fun prefixHint(displayName: String, prefixes: List<String>): String {
+    val joined = if (prefixes.size == 1) {
+        prefixes.first()
+    } else {
+        prefixes.dropLast(1).joinToString(", ") + " oder " + prefixes.last()
+    }
+    return "Ein $displayName-Token beginnt mit $joined."
+}
 
 /**
  * Der statische Katalog bleibt die Grundlage (er kennt auch Arten, die kein
@@ -272,12 +296,14 @@ fun SettingsScreen(onBack: () -> Unit) {
     val existingKinds = secrets.map { it.kind }.toSet()
     val recommended = recommendedKinds(adapters, existingKinds)
 
-    var showSecretDialog by remember { mutableStateOf(false) }
-    var secretDialogKind by remember { mutableStateOf<String?>(null) }
+    // Faltbare Geräte: ein Faltvorgang darf die offenen Dialoge nicht
+    // schließen. Boolean/String überleben das ohne eigenen Saver.
+    var showSecretDialog by rememberSaveable { mutableStateOf(false) }
+    var secretDialogKind by rememberSaveable { mutableStateOf<String?>(null) }
     var manageSecret by remember { mutableStateOf<SecretInfo?>(null) }
     var confirmDeleteSecret by remember { mutableStateOf<SecretInfo?>(null) }
-    var showAddRepo by remember { mutableStateOf(false) }
-    var confirmLogout by remember { mutableStateOf(false) }
+    var showAddRepo by rememberSaveable { mutableStateOf(false) }
+    var confirmLogout by rememberSaveable { mutableStateOf(false) }
 
     LaunchedEffect(Unit) { vm.refresh() }
 
@@ -472,10 +498,10 @@ fun SettingsScreen(onBack: () -> Unit) {
     }
     manageSecret?.let { secret ->
         val meta = metaFor(secret.kind, catalog)
-        AlertDialog(
-            onDismissRequest = { manageSecret = null },
-            title = { Text(meta.displayName) },
-            text = {
+        // Per-item Optionen sind ein Menü, kein betitelter Dialog — dieselbe
+        // Form wie das Kontextmenü der Session-Liste (SettingSheet + GroupCard).
+        SettingSheet(title = meta.displayName, onDismiss = { manageSecret = null }) {
+            GroupCard {
                 Column {
                     DialogActionRow(icon = Icons.Outlined.Edit, label = "Wert aktualisieren") {
                         secretDialogKind = secret.kind
@@ -491,18 +517,14 @@ fun SettingsScreen(onBack: () -> Unit) {
                         manageSecret = null
                     }
                 }
-            },
-            confirmButton = {},
-            dismissButton = {
-                TextButton(onClick = { manageSecret = null }) { Text("Abbrechen") }
-            },
-        )
+            }
+        }
     }
     confirmDeleteSecret?.let { secret ->
         val meta = metaFor(secret.kind, catalog)
-        AlertDialog(
+        OneUiDialog(
             onDismissRequest = { confirmDeleteSecret = null },
-            title = { Text("„${meta.displayName}“ löschen?") },
+            title = "„${meta.displayName}“ löschen?",
             text = { Text("Der Zugang wird vom Server-Vault entfernt. Adapter, die ihn nutzen, können danach nicht mehr starten.") },
             confirmButton = {
                 TextButton(onClick = {
@@ -522,9 +544,9 @@ fun SettingsScreen(onBack: () -> Unit) {
         )
     }
     if (confirmLogout) {
-        AlertDialog(
+        OneUiDialog(
             onDismissRequest = { confirmLogout = false },
-            title = { Text("Abmelden?") },
+            title = "Abmelden?",
             text = { Text("Device-Token und Server-URL werden von diesem Gerät gelöscht.") },
             confirmButton = {
                 TextButton(onClick = { confirmLogout = false; onBack(); vm.logout {} }) { Text("Abmelden") }
@@ -607,7 +629,7 @@ private fun SettingsRow(label: String, value: String) {
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier
             .fillMaxWidth()
-            .heightIn(min = 48.dp)
+            .heightIn(min = TileMinHeight)
             .padding(horizontal = CardInset),
     ) {
         Text(label, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
@@ -728,9 +750,10 @@ private fun SecretDialog(
     onValidate: (kind: String, value: String, onResult: (Result<SecretValidation>) -> Unit) -> Unit,
 ) {
     var selectedKind by remember(initialKind) { mutableStateOf(initialKind) }
-    var customKind by remember { mutableStateOf("") }
-    var value by remember { mutableStateOf("") }
-    var showValue by remember { mutableStateOf(false) }
+    // Ein halb eingetippter Zugang muss einen Faltvorgang überleben.
+    var customKind by rememberSaveable { mutableStateOf("") }
+    var value by rememberSaveable { mutableStateOf("") }
+    var showValue by rememberSaveable { mutableStateOf(false) }
     var expanded by remember { mutableStateOf(false) }
     var checking by remember { mutableStateOf(false) }
     var check by remember { mutableStateOf<SecretValidation?>(null) }
@@ -753,10 +776,11 @@ private fun SecretDialog(
         value.isNotBlank() &&
         expectedPrefixes != null &&
         expectedPrefixes.none { value.trim().startsWith(it) }
+    val prefixHintText = expectedPrefixes?.let { prefixHint(selectedMeta?.displayName ?: effectiveKind, it) }
 
-    AlertDialog(
+    OneUiDialog(
         onDismissRequest = onDismiss,
-        title = { Text(if (initialKind != null && initialKind != CUSTOM_KIND) "Zugang aktualisieren" else "Zugang hinzufügen") },
+        title = if (initialKind != null && initialKind != CUSTOM_KIND) "Zugang aktualisieren" else "Zugang hinzufügen",
         text = {
             Column(
                 verticalArrangement = Arrangement.spacedBy(10.dp),
@@ -852,7 +876,7 @@ private fun SecretDialog(
                             modifier = Modifier.size(16.dp),
                         )
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text("Key erstellen")
+                        Text("Auf der Website anlegen")
                     }
                 }
 
@@ -891,7 +915,7 @@ private fun SecretDialog(
                         supportingText = if (looksOdd) {
                             {
                                 Text(
-                                    "Sieht ungewöhnlich aus — trotzdem speicherbar.",
+                                    prefixHintText.orEmpty(),
                                     color = semantic().warning,
                                 )
                             }
@@ -937,7 +961,7 @@ private fun SecretDialog(
 }
 
 /**
- * Ergebniszeile der Live-Prüfung. Grün nur bei bestätigtem Key; Arten ohne
+ * Ergebniszeile der Live-Prüfung. Grün nur bei bestätigtem Zugang; Arten ohne
  * Prüfung bleiben bewusst neutral, damit „ungeprüft" nicht wie „geprüft" aussieht.
  */
 @Composable
@@ -949,7 +973,7 @@ private fun CheckResultRow(
     if (!checking && result == null && error == null) return
 
     val (icon, tint, text) = when {
-        checking -> Triple(null, MaterialTheme.colorScheme.onSurfaceVariant, "Key wird geprüft …")
+        checking -> Triple(null, MaterialTheme.colorScheme.onSurfaceVariant, "Zugang wird geprüft …")
         error != null -> Triple(Icons.Outlined.ErrorOutline, MaterialTheme.colorScheme.error, error)
         result != null && result.unverified -> Triple(
             Icons.Outlined.Info,
@@ -960,13 +984,13 @@ private fun CheckResultRow(
         result != null && result.ok -> Triple(
             Icons.Outlined.CheckCircleOutline,
             semantic().success,
-            result.detail ?: "Key funktioniert",
+            result.detail ?: "Zugang funktioniert",
         )
 
         else -> Triple(
             Icons.Outlined.ErrorOutline,
             MaterialTheme.colorScheme.error,
-            result?.detail ?: "Key konnte nicht bestätigt werden",
+            result?.detail ?: "Zugang konnte nicht bestätigt werden",
         )
     }
 

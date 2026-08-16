@@ -99,9 +99,9 @@ class SessionActionsTest {
         assertTrue(archiveSwipeArchives(archived = false))
         assertFalse(archiveSwipeArchives(archived = true))
         assertEquals("Archivieren", archiveSwipeLabel(archived = false))
-        assertEquals("Wiederherstellen", archiveSwipeLabel(archived = true))
+        assertEquals("Aus Archiv holen", archiveSwipeLabel(archived = true))
         assertEquals("Session archiviert", archiveDoneLabel(archived = true))
-        assertEquals("Session wiederhergestellt", archiveDoneLabel(archived = false))
+        assertEquals("Aus Archiv geholt", archiveDoneLabel(archived = false))
     }
 
     /* ---------------- Kontextmenü ---------------- */

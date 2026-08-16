@@ -11,7 +11,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.core.content.ContextCompat
@@ -50,6 +50,11 @@ class MainActivity : FragmentActivity() {
         val data = intent?.data ?: return
         if (data.scheme == "pocketagent" && data.host == "session") {
             data.lastPathSegment?.let { deepLinkSessionId = it }
+            // Intent als verarbeitet markieren: getIntent() liefert nach jeder
+            // Konfigurationsänderung (Fold, Rotation, ...) weiterhin denselben
+            // Intent zurück. Ohne das würde der Session-Screen bei jedem Recreate
+            // erneut auf den Back-Stack gepusht.
+            intent.data = null
         }
     }
 }
@@ -58,8 +63,13 @@ class MainActivity : FragmentActivity() {
 private fun AppRoot(deepLinkSessionId: String?, onConsumeDeepLink: () -> Unit) {
     val context = LocalContext.current
     val app = context.applicationContext as PocketAgentApp
-    var paired by remember { mutableStateOf<Boolean?>(null) }
-    var unlocked by remember { mutableStateOf(false) }
+    // rememberSaveable statt remember: die Activity wird bei Fold/Rotation neu erzeugt
+    // (siehe AndroidManifest configChanges), aber der Compose-State sonst nicht über
+    // solche Recreates hinweg erhalten. Ohne das landet der Nutzer bei jedem Aufklappen
+    // wieder vor dem BiometricPrompt und verliert den Nav-Stack. Übersteht keinen
+    // Prozesstod — dafür bleibt paired/unlocked bewusst ungesichert (kein Secret).
+    var paired by rememberSaveable { mutableStateOf<Boolean?>(null) }
+    var unlocked by rememberSaveable { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         paired = app.container.tokenStore.setup.first() != null

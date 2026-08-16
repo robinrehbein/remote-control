@@ -10,7 +10,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
@@ -120,23 +120,28 @@ fun DiffScreen(
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
                 Text(
-                    text = "Änderungen konnten nicht geladen werden",
+                    text = "Die Änderungen konnten nicht geladen werden.",
                     style = MaterialTheme.typography.titleMedium,
                     textAlign = TextAlign.Center,
                 )
-                Text(
-                    text = state.error ?: "Unbekannter Fehler",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.padding(top = 6.dp),
-                )
+                // Der Servertext steht nur noch als Nebensatz da, wenn er
+                // wirklich etwas sagt — die Kopfzeile allein bleibt
+                // handlungsleitend, den Weg dorthin weist der Knopf darunter.
+                state.error?.takeIf { it.isNotBlank() }?.let { detail ->
+                    Text(
+                        text = detail,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(top = 6.dp),
+                    )
+                }
                 Button(
                     onClick = { vm.load() },
                     shape = PillShape,
                     modifier = Modifier
                         .padding(top = 20.dp)
-                        .height(PrimaryButtonHeight),
+                        .heightIn(min = PrimaryButtonHeight),
                 ) {
                     Text("Erneut versuchen")
                 }
@@ -156,7 +161,7 @@ fun DiffScreen(
                     textAlign = TextAlign.Center,
                 )
                 Text(
-                    text = "Der Agent hat im Working Tree bisher nichts verändert.",
+                    text = "Der Agent hat bisher keine Datei geändert.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     textAlign = TextAlign.Center,

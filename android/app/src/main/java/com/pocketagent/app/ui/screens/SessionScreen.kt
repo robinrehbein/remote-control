@@ -6,6 +6,7 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -97,12 +98,14 @@ import com.pocketagent.app.data.PermissionDecision
 import com.pocketagent.app.data.ReasoningEffort
 import com.pocketagent.app.data.SessionInfo
 import com.pocketagent.app.data.SessionStatus
+import com.pocketagent.app.data.StartPhase
 import com.pocketagent.app.data.wireName
 import com.pocketagent.app.ui.components.MarkdownText
 import com.pocketagent.app.ui.theme.CardInset
 import com.pocketagent.app.ui.theme.ContentInset
 import com.pocketagent.app.ui.theme.MinTouchTarget
 import com.pocketagent.app.ui.theme.MonoMedium
+import com.pocketagent.app.ui.theme.MonoSmall
 import com.pocketagent.app.ui.theme.PillShape
 import com.pocketagent.app.ui.theme.PrimaryButtonHeight
 import com.pocketagent.app.ui.theme.RadioRowDividerInset
@@ -159,6 +162,16 @@ sealed interface TimelineItem {
     data class Notice(val text: String) : TimelineItem
 }
 
+/**
+ * Was gerade beim Start passiert — immer nur der jüngste Stand, nie ein
+ * Verlauf. [phase] ist null, solange der Server noch nichts gemeldet hat.
+ */
+data class StartProgress(
+    val message: String,
+    val phase: StartPhase? = null,
+    val detail: String? = null,
+)
+
 /** Ladezustand des Modellkatalogs (session.models.get). */
 sealed interface ModelsState {
     data object Idle : ModelsState
@@ -183,6 +196,10 @@ class SessionViewModel : ViewModel() {
     private val _busy = MutableStateFlow(false)
     val busy: StateFlow<Boolean> = _busy
 
+    /** Fortschritt des laufenden Starts; null, sobald nichts mehr startet. */
+    private val _progress = MutableStateFlow<StartProgress?>(null)
+    val progress: StateFlow<StartProgress?> = _progress
+
     private val _deleted = MutableStateFlow(false)
     val deleted: StateFlow<Boolean> = _deleted
 
@@ -204,7 +221,11 @@ class SessionViewModel : ViewModel() {
         repository = repo
         viewModelScope.launch {
             repository.sessions.collect { list ->
-                _session.value = list.firstOrNull { it.id == id }
+                val current = list.firstOrNull { it.id == id }
+                _session.value = current
+                // Sobald die Session nicht mehr startet, ist der Fortschritt
+                // erledigt — ein späterer Start beginnt wieder bei null.
+                if (current != null && current.status != SessionStatus.CREATING) _progress.value = null
             }
         }
         viewModelScope.launch {
@@ -260,9 +281,30 @@ class SessionViewModel : ViewModel() {
 
             is AgentEvent.TurnCompleted -> append(TimelineItem.TurnEnd(event.summary, event.commitSha))
             is AgentEvent.Pushed -> append(TimelineItem.Pushed(event.branch, event.prUrl, event.auto))
-            is AgentEvent.TurnFailed -> append(TimelineItem.Error("Turn fehlgeschlagen: ${event.error}"))
-            is AgentEvent.ErrorEvent -> append(TimelineItem.Error(event.message))
-            is AgentEvent.Notice -> append(TimelineItem.Notice(event.message))
+
+            // Ein Fehler beendet den Start: er wird als Karte gezeigt, die
+            // Fortschrittsanzeige hat dann nichts mehr zu melden.
+            is AgentEvent.TurnFailed -> {
+                _progress.value = null
+                append(TimelineItem.Error("Turn fehlgeschlagen: ${event.error}"))
+            }
+
+            is AgentEvent.ErrorEvent -> {
+                _progress.value = null
+                append(TimelineItem.Error(event.message))
+            }
+
+            // Mit Phase ist die Notice Fortschritt und ersetzt den vorherigen
+            // Stand; ohne Phase bleibt sie eine Systemzeile in der Timeline.
+            is AgentEvent.Notice -> when (val phase = StartPhase.fromRaw(event.phase)) {
+                null -> append(TimelineItem.Notice(event.message))
+                StartPhase.READY -> _progress.value = null
+                else -> _progress.value = StartProgress(
+                    message = event.message,
+                    phase = phase,
+                    detail = event.detail?.takeIf { it.isNotBlank() },
+                )
+            }
 
             is AgentEvent.Status -> _busy.value = event.busy
             is AgentEvent.MessageDelta, is AgentEvent.Ping -> Unit
@@ -371,6 +413,7 @@ fun SessionScreen(
     val session by vm.session.collectAsState()
     val input by vm.input.collectAsState()
     val busy by vm.busy.collectAsState()
+    val progress by vm.progress.collectAsState()
     val deleted by vm.deleted.collectAsState()
     val capabilities by vm.capabilities.collectAsState()
     val models by vm.models.collectAsState()
@@ -472,6 +515,9 @@ fun SessionScreen(
         bottomBar = {
             Surface(color = MaterialTheme.colorScheme.background, tonalElevation = 0.dp) {
                 Column(modifier = Modifier.navigationBarsPadding().imePadding()) {
+                    // Der Start braucht Minuten — er steht ruhig über dem
+                    // Composer statt in der Timeline, wo er wegscrollen würde.
+                    startProgressOf(session?.status, progress)?.let { StartProgressCard(it) }
                     AnimatedVisibility(visible = busy, enter = fadeIn(), exit = fadeOut()) {
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
@@ -671,6 +717,94 @@ fun SessionScreen(
                 TextButton(onClick = { confirmDelete = false }) { Text("Abbrechen") }
             },
         )
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Startfortschritt                                                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Was während des Starts über dem Composer steht. Der Status entscheidet,
+ * ob überhaupt etwas läuft; sobald der Server meldet, tritt seine Meldung
+ * an die Stelle des neutralen Texts — eine leere Wartefläche gibt es nie.
+ */
+private fun startProgressOf(status: SessionStatus?, progress: StartProgress?): StartProgress? = when (status) {
+    SessionStatus.CREATING -> progress ?: StartProgress("Session wird vorbereitet …")
+    // Session noch nicht geladen: melden darf trotzdem, wer schon etwas weiß.
+    null -> progress
+    else -> null
+}
+
+/**
+ * Eine Karte, ein Vorgang: Spinner, was gerade passiert, und darunter der
+ * gekürzte Log. Antippen zeigt den ganzen Auszug. Kein Verlauf — jede neue
+ * Meldung ersetzt die vorige.
+ */
+@Composable
+private fun StartProgressCard(progress: StartProgress) {
+    var expanded by remember { mutableStateOf(false) }
+    // Neue Phase heißt neuer Log: der alte Aufklapp-Zustand gilt nicht mehr.
+    LaunchedEffect(progress.phase) { expanded = false }
+    val detail = progress.detail
+    ScreenCard(modifier = Modifier.padding(bottom = 8.dp)) {
+        Column(
+            modifier = Modifier
+                .let { if (detail != null) it.clickable { expanded = !expanded } else it }
+                .padding(horizontal = CardInset, vertical = 14.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.size(16.dp))
+                Text(
+                    text = progress.message,
+                    style = MaterialTheme.typography.titleSmall,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(start = 12.dp),
+                )
+                if (detail != null) {
+                    Icon(
+                        if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                        contentDescription = if (expanded) "Log einklappen" else "Log ausklappen",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(18.dp),
+                    )
+                }
+            }
+            if (progress.phase == StartPhase.IMAGE_BUILD) {
+                Text(
+                    text = "Der erste Start eines Agenten dauert einige Minuten – sein Image wird einmalig gebaut.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 8.dp),
+                )
+            }
+            if (detail != null) {
+                if (!expanded) {
+                    Text(
+                        text = detail,
+                        style = MonoSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
+                }
+                AnimatedVisibility(visible = expanded) {
+                    Text(
+                        text = detail,
+                        style = MonoSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier
+                            .padding(top = 8.dp)
+                            .heightIn(max = 220.dp)
+                            .verticalScroll(rememberScrollState()),
+                    )
+                }
+            }
+        }
     }
 }
 

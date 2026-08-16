@@ -2,6 +2,7 @@ package com.pocketagent.app
 
 import com.pocketagent.app.data.AgentEvent
 import com.pocketagent.app.data.ServerMessage
+import com.pocketagent.app.data.StartPhase
 import com.pocketagent.app.data.parseServerMessage
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -289,9 +290,78 @@ class ProtocolDecodeTest {
         assertTrue(msg is ServerMessage.SessionEventMsg)
         val notice = (msg as ServerMessage.SessionEventMsg).event as AgentEvent.Notice
         assertEquals("Agent gewechselt: kilo → claude …", notice.message)
+        // Ohne phase bleibt es eine gewoehnliche Systemzeile in der Timeline
+        assertNull(notice.phase)
+        assertNull(StartPhase.fromRaw(notice.phase))
+        assertNull(notice.detail)
 
         // Ohne message ist der Hinweis wertlos -> Event wird verworfen
         assertNull(parseServerMessage("""{"type":"session.event","sessionId":"s1","event":{"type":"notice"}}"""))
+    }
+
+    @Test
+    fun `decodes notice with start phase and log detail`() {
+        val msg = parseServerMessage(
+            """
+            {
+              "type": "session.event",
+              "sessionId": "s1",
+              "event": {
+                "type": "notice",
+                "message": "Image wird gebaut (Schritt 7/14)",
+                "phase": "image-build",
+                "detail": "Step 7/14 : RUN npm ci\nadded 412 packages",
+                "futureField": 1
+              }
+            }
+            """.trimIndent(),
+        )
+        val notice = (msg as ServerMessage.SessionEventMsg).event as AgentEvent.Notice
+        assertEquals("Image wird gebaut (Schritt 7/14)", notice.message)
+        assertEquals("image-build", notice.phase)
+        assertEquals(StartPhase.IMAGE_BUILD, StartPhase.fromRaw(notice.phase))
+        assertEquals("Step 7/14 : RUN npm ci\nadded 412 packages", notice.detail)
+
+        // Die uebrigen Phasen des Vertrags
+        assertEquals(StartPhase.CONTAINER_START, StartPhase.fromRaw("container-start"))
+        assertEquals(StartPhase.SHIM_START, StartPhase.fromRaw("shim-start"))
+        assertEquals(StartPhase.READY, StartPhase.fromRaw("ready"))
+
+        // phase ohne detail ist erlaubt — dann gibt es eben keinen Log
+        val ready = (
+            parseServerMessage(
+                """{"type":"session.event","sessionId":"s1","event":{"type":"notice","message":"Bereit","phase":"ready"}}""",
+            ) as ServerMessage.SessionEventMsg
+            ).event as AgentEvent.Notice
+        assertEquals(StartPhase.READY, StartPhase.fromRaw(ready.phase))
+        assertNull(ready.detail)
+    }
+
+    @Test
+    fun `tolerates unknown start phases`() {
+        val msg = parseServerMessage(
+            """
+            {
+              "type": "session.event",
+              "sessionId": "s1",
+              "event": {
+                "type": "notice",
+                "message": "Volume wird angelegt",
+                "phase": "volume-create",
+                "detail": "creating volume pocketagent-s1"
+              }
+            }
+            """.trimIndent(),
+        )
+        // Das Event wird nicht verworfen, nur die Phase ist unbekannt
+        assertNotNull(msg)
+        val notice = (msg as ServerMessage.SessionEventMsg).event as AgentEvent.Notice
+        assertEquals("Volume wird angelegt", notice.message)
+        assertEquals(StartPhase.UNKNOWN, StartPhase.fromRaw(notice.phase))
+        assertEquals("creating volume pocketagent-s1", notice.detail)
+
+        // Leerer String zaehlt als "keine Phase", nicht als unbekannte
+        assertNull(StartPhase.fromRaw(""))
     }
 
     @Test

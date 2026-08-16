@@ -92,8 +92,12 @@ export async function main(): Promise<void> {
   let egress: HttpServer | null = null;
   if (config.dockerEnabled) {
     try {
-      // Token-gated: only requests carrying a live session's shim token pass.
-      egress = startEgressProxy({ tokenValidator: (t) => manager.egressTokenAllowed(t) });
+      // Two gates: a live session's shim token, or the source IP of a live
+      // session container (clients that drop the proxy URL's userinfo).
+      egress = startEgressProxy({
+        tokenValidator: (t) => manager.egressTokenAllowed(t),
+        peerValidator: (ip) => manager.egressPeerAllowed(ip),
+      });
       egress.on('error', (e) => console.error(`[orchestrator] egress proxy error: ${String(e)}`));
       console.log(`[orchestrator] egress proxy listening on :${config.egressProxyPort}`);
     } catch (e) {

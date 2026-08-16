@@ -10,6 +10,7 @@ import {
   isNetworkPolicy,
 } from './config.js';
 import { adapterImage, getAdapter } from './adapters.js';
+import { normalizePeerIp } from './egress-proxy.js';
 import { buildShimImage, shimContextFiles } from './image-build.js';
 import { LOG_TAIL_LINES, redactTokens, stripLogFraming } from './progress.js';
 import type { SessionRow } from './db.js';
@@ -29,6 +30,8 @@ let client: Docker | null = null;
 /** Drop the cached daemon connection (docker config changed at runtime, tests). */
 export function resetDockerClient(): void {
   client = null;
+  peerIps = new Set();
+  peerIpsAt = 0;
 }
 
 function docker(): Docker | null {
@@ -53,6 +56,72 @@ function docker(): Docker | null {
     }
   }
   return client;
+}
+
+/**
+ * Peer-IP authorization for the egress proxy (see egress-proxy.ts): the source
+ * addresses of all live session containers, as the daemon reports them.
+ *
+ * The TTL keeps the proxy off the daemon on the hot path (one list call per
+ * window, not per request) and still picks up a new container within seconds;
+ * every start additionally primes it (startContainer), so a shim's very first
+ * request is already covered. A daemon error yields an empty set - never a
+ * throw and never a stale allow.
+ */
+const PEER_CACHE_TTL_MS = 10_000;
+let peerIps = new Set<string>();
+let peerIpsAt = 0; // 0 = never loaded
+let peerRefresh: Promise<Set<string>> | null = null;
+
+async function loadSessionPeers(): Promise<Set<string>> {
+  const next = new Set<string>();
+  try {
+    const d = docker();
+    const raw = d ? await d.listContainers({ filters: { label: ['pocketagent.session'] } }) : [];
+    for (const c of Array.isArray(raw) ? raw : []) {
+      for (const net of Object.values(c.NetworkSettings?.Networks ?? {})) {
+        for (const ip of [net?.IPAddress, net?.GlobalIPv6Address]) {
+          const norm = normalizePeerIp(ip);
+          if (norm) next.add(norm);
+        }
+      }
+    }
+  } catch (e) {
+    console.warn(`[docker] session peer lookup failed: ${String(e)}`);
+  }
+  peerIps = next;
+  peerIpsAt = Date.now();
+  return next;
+}
+
+/** Reload the peer-IP cache now (deduplicated); never rejects. */
+export async function refreshSessionPeers(): Promise<Set<string>> {
+  if (!peerRefresh) {
+    peerRefresh = loadSessionPeers().finally(() => {
+      peerRefresh = null;
+    });
+  }
+  return peerRefresh;
+}
+
+/**
+ * Prime the cache right after a container start. Skipped for a remote daemon:
+ * those sessions egress through the gateway container, which has no docker
+ * access and therefore no peer gate to feed.
+ */
+async function primeSessionPeers(): Promise<void> {
+  if (isRemote()) return;
+  await refreshSessionPeers();
+}
+
+/**
+ * Synchronous gate for the egress proxy: does `ip` belong to a live session
+ * container? Answers from the cache and refreshes it in the background when
+ * stale - the proxy must never block a request on a daemon round trip.
+ */
+export function isSessionPeerIp(ip: string): boolean {
+  if (Date.now() - peerIpsAt >= PEER_CACHE_TTL_MS) void refreshSessionPeers();
+  return peerIps.has(normalizePeerIp(ip));
 }
 
 /**
@@ -395,17 +464,31 @@ async function sessionNetworking(
   const { name: netName, relay } = sessionNetworkFor(session);
   await requireAttached(session);
   const viaGateway = relay === 'gateway';
+  let egress = 'none';
+  let auth = 'n/a';
   if (policy === 'allowlist') {
     // Proxy auth: egress proxies accept requests carrying a valid per-session
     // shim token (Basic "pa:<token>"); instances without a validator ignore it.
-    const auth = session.shim_token ? `pa:${session.shim_token}@` : '';
+    // Every caller of this function must therefore hand in a row that already
+    // has its shim_token (provision stages it, reprovisionAdapter/resumeSession/
+    // push refuse an unprovisioned session) - a URL without credentials leaves
+    // the session dependent on the peer-IP gate alone, hence the auth= in the
+    // log line below.
+    const userinfo = session.shim_token ? `pa:${session.shim_token}@` : '';
     const proxyHost = viaGateway
       ? `${GATEWAY_ALIAS}:${GATEWAY_EGRESS_PORT}`
       : `${ORCHESTRATOR_ALIAS}:${config.egressProxyPort}`;
-    env.HTTP_PROXY = `http://${auth}${proxyHost}`;
-    env.HTTPS_PROXY = `http://${auth}${proxyHost}`;
+    env.HTTP_PROXY = `http://${userinfo}${proxyHost}`;
+    env.HTTPS_PROXY = `http://${userinfo}${proxyHost}`;
     env.NO_PROXY = 'localhost,127.0.0.1';
+    egress = proxyHost;
+    auth = userinfo ? 'yes' : 'no';
   }
+  // The one line that tells a broken session's egress setup apart from a broken
+  // network at a glance (no secrets: host and presence of credentials only).
+  console.log(
+    `[docker] session ${session.id.slice(0, 8)} policy=${policy} net=${netName} egress=${egress} auth=${auth}`,
+  );
   return { EndpointsConfig: { [netName]: { Aliases: [session.id] } } };
 }
 
@@ -583,12 +666,17 @@ export async function createSessionContainer(
 export async function startContainer(id: string): Promise<boolean> {
   const d = docker();
   if (!d) return false;
+  let started: boolean;
   try {
     await d.getContainer(id).start();
-    return true;
+    started = true;
   } catch (e) {
-    return String(e).includes('already started');
+    started = String(e).includes('already started');
   }
+  // A container only has an IP once it runs: reloading here is what lets the
+  // egress proxy authorize the shim's very first request by peer IP.
+  if (started) await primeSessionPeers();
+  return started;
 }
 
 /**
@@ -757,6 +845,7 @@ export async function oneShotPush(
     });
     if (creds && Object.keys(creds).length > 0) await injectCredsFile(c.id, creds);
     await c.start();
+    await primeSessionPeers(); // the push container pushes through the egress proxy too
     const res = await c.wait();
     await c.remove().catch(() => {});
     return res.StatusCode === 0;

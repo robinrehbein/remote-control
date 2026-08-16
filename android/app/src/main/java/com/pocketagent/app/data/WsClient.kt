@@ -20,8 +20,10 @@ import kotlin.random.Random
 class WsClient(private val client: OkHttpClient) {
 
     /**
-     * Die vier ehrlichen Zustände. Es gibt bewusst kein „gescheitert“ mehr:
-     * solange die App weiterprobiert, sagt sie das auch — mit Restzeit.
+     * Die ehrlichen Zustände. Es gibt bewusst kein generisches „gescheitert“:
+     * solange die App weiterprobiert, sagt sie das auch — mit Restzeit. Die
+     * einzige Ausnahme ist [Unauthorized]: da hat der Server explizit nein
+     * gesagt, weiterprobieren wäre falsch.
      */
     sealed interface ConnState {
         /** Noch nicht gestartet oder bewusst getrennt. */
@@ -34,6 +36,15 @@ class WsClient(private val client: OkHttpClient) {
 
         /** Getrennt, ohne laufenden Versuch — praktisch immer: kein Netz. */
         data class Disconnected(val reason: String) : ConnState
+
+        /**
+         * Der Server hat das Gerät abgelehnt (Token unbekannt oder entzogen,
+         * Close-Code 4001). Kein automatischer Reconnect — das wäre nur
+         * weiteres Klopfen an eine Tür, die bewusst zu ist. Ein manueller
+         * Tap (`reconnectNow`) darf es trotzdem versuchen, z.B. nach
+         * erneutem Koppeln mit einem neuen Token.
+         */
+        data object Unauthorized : ConnState
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -81,8 +92,18 @@ class WsClient(private val client: OkHttpClient) {
     @Synchronized
     fun connect() {
         val url = wsUrl ?: return
-        val creds = credentials ?: return
+        credentials ?: return
         if (_state.value is ConnState.Connecting || _state.value is ConnState.Connected) return
+        doConnect(url)
+    }
+
+    /**
+     * Der eigentliche Verbindungsaufbau, ohne den Connected/Connecting-Guard
+     * von [connect] — den braucht [forceReconnect], der genau aus Connected
+     * heraus neu verbinden will. Ruft nur mit bereits geprüftem [url] auf.
+     */
+    @Synchronized
+    private fun doConnect(url: String) {
         manualClose = false
         lastAttemptAt = System.currentTimeMillis()
         _state.value = ConnState.Connecting
@@ -117,6 +138,34 @@ class WsClient(private val client: OkHttpClient) {
         reconnectJob = null
         backoff.reset()
         connect()
+    }
+
+    /**
+     * Reisst eine als „Connected“ gemeldete, aber tatsächlich tote Verbindung
+     * hart ab und baut sofort neu auf. Für den Fall, dass ein Socket still
+     * gestorben ist (Netzwechsel, Doze) und OkHttp das noch nicht bemerkt hat
+     * — das dauert bis zu ~40s (Ping alle 20s + Pong-Wartezeit). [connect]
+     * allein hilft hier nicht: sein Connected-Guard würde sofort zurückkehren,
+     * ohne etwas zu tun.
+     */
+    @Synchronized
+    fun forceReconnect() {
+        if (manualClose) return
+        val url = wsUrl ?: return
+        credentials ?: return
+        reconnectJob?.cancel()
+        reconnectJob = null
+        // Hartes Abreissen ohne Close-Handshake — der Socket antwortet
+        // ohnehin nicht mehr. socket wird schon hier auf null gesetzt (und
+        // sofort durch doConnect neu belegt), damit handleDisconnect den
+        // gleich folgenden onFailure-Callback des alten (abgerissenen)
+        // Sockets an seiner veralteten Referenz erkennt und ignoriert —
+        // sonst würde er einen zweiten, überflüssigen Reconnect-Zyklus
+        // anstossen.
+        socket?.cancel()
+        socket = null
+        backoff.reset()
+        doConnect(url)
     }
 
     /** Android meldet ein nutzbares Netz. */
@@ -165,16 +214,31 @@ class WsClient(private val client: OkHttpClient) {
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-            handleDisconnect(t.message ?: "Verbindung abgebrochen")
+            handleDisconnect(webSocket, t.message ?: "Verbindung abgebrochen")
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-            handleDisconnect("Verbindung geschlossen ($code)")
+            // Der Server lehnt das Gerät endgültig ab (unbekanntes oder
+            // entzogenes Token) — das ist kein Netzflackern, also gehört es
+            // nicht in den generischen Retry-Loop von handleDisconnect.
+            if (isUnauthorizedClose(code, reason)) {
+                handleUnauthorized(webSocket)
+                return
+            }
+            handleDisconnect(webSocket, "Verbindung geschlossen ($code)")
         }
     }
 
+    /**
+     * [webSocket] ist der Socket, der den Abbruch meldet — nicht zwingend
+     * mehr der aktuelle. [forceReconnect] reisst einen Socket hart ab und
+     * baut sofort einen neuen auf; der onFailure/onClosed-Callback des alten
+     * kommt trotzdem noch (asynchron) und darf dann keinen zweiten,
+     * überflüssigen Reconnect-Zyklus anstossen.
+     */
     @Synchronized
-    private fun handleDisconnect(reason: String) {
+    private fun handleDisconnect(webSocket: WebSocket, reason: String) {
+        if (webSocket !== socket) return
         socket = null
         if (manualClose) {
             _state.value = ConnState.Idle
@@ -200,8 +264,32 @@ class WsClient(private val client: OkHttpClient) {
         }
     }
 
+    /**
+     * Endgültige Ablehnung durch den Server — kein Backoff, kein weiterer
+     * Versuch von selbst. Derselbe Referenz-Check wie in [handleDisconnect]:
+     * ein Close von einem schon ersetzten Socket wird ignoriert.
+     */
+    @Synchronized
+    private fun handleUnauthorized(webSocket: WebSocket) {
+        if (webSocket !== socket) return
+        socket = null
+        reconnectJob?.cancel()
+        reconnectJob = null
+        _state.value = ConnState.Unauthorized
+    }
+
     private companion object {
         const val MIN_ATTEMPT_GAP_MS = 900L
         const val JITTER_MS = 400L
     }
 }
+
+/**
+ * Lehnt der Server das Gerät endgültig ab (Code 4001, Grund 'unauthorized'
+ * für ein unbekanntes Token oder 'revoked' für ein entzogenes Gerät)? Als
+ * reine Funktion ausgelagert, damit sie ohne Android-Framework/OkHttp
+ * testbar ist. Das Verbindungs-LIMIT läuft serverseitig über Code 4002 —
+ * der bleibt bewusst außen vor und landet weiter im normalen Retry-Loop.
+ */
+fun isUnauthorizedClose(code: Int, reason: String): Boolean =
+    code == 4001 && (reason == "unauthorized" || reason == "revoked")

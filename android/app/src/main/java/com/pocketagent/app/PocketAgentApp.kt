@@ -22,12 +22,22 @@ class AppContainer(app: Application, scope: CoroutineScope) {
      * Netzwechsel und Vordergrund stoßen die Verbindung sofort an, statt den
      * Backoff abzuwarten. Der Beobachter meldet sich mit dem letzten
      * sichtbaren Activity selbst wieder ab.
+     *
+     * Beide Auslöser rufen zusätzlich `repository.ensureAlive()`: ein
+     * `Connected`-Zustand allein beweist nicht, dass der Socket noch lebt —
+     * er kann still gestorben sein, ohne dass OkHttp es schon bemerkt hat.
+     * `onNetworkAvailable()` bleibt daneben nötig, damit der Backoff/State-
+     * Übergang (raus aus `Waiting`/`Disconnected`) sofort greift, statt auf
+     * den Debounce von `ensureAlive` zu warten.
      */
     val connectivity = ConnectivityWatcher(
         app = app,
-        onNetworkAvailable = { wsClient.onNetworkAvailable() },
+        onNetworkAvailable = {
+            wsClient.onNetworkAvailable()
+            repository.ensureAlive()
+        },
         onNetworkLost = { wsClient.onNetworkLost() },
-        onForeground = { wsClient.reconnectNow() },
+        onForeground = { repository.ensureAlive() },
     )
 }
 

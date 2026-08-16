@@ -534,6 +534,52 @@ class ProtocolDecodeTest {
         assertTrue(off.contains(""""archived":false"""))
     }
 
+    /* -------------------- session.prompt (Ack) -------------------- */
+
+    @Test
+    fun `encodes session prompt with requestId for the new ack contract`() {
+        val withMode = com.pocketagent.app.data.encodeSessionPrompt(
+            requestId = "req-p1",
+            sessionId = "s1",
+            text = "Bau den Login um",
+            mode = com.pocketagent.app.data.AgentMode.AUTO,
+        )
+        assertTrue(withMode.contains(""""type":"session.prompt""""))
+        assertTrue(withMode.contains(""""sessionId":"s1""""))
+        assertTrue(withMode.contains(""""text":"Bau den Login um""""))
+        assertTrue(withMode.contains(""""mode":"auto""""))
+        assertTrue(withMode.contains(""""requestId":"req-p1""""))
+
+        // Ohne Modus bleibt das Feld weg, requestId geht trotzdem mit — ohne
+        // sie gäbe es keine Bestätigung, auf die der Client warten könnte.
+        val withoutMode = com.pocketagent.app.data.encodeSessionPrompt(
+            requestId = "req-p2",
+            sessionId = "s1",
+            text = "weiter",
+            mode = null,
+        )
+        assertFalse(withoutMode.contains("\"mode\""))
+        assertTrue(withoutMode.contains(""""requestId":"req-p2""""))
+    }
+
+    @Test
+    fun `decodes request ok and error as the ack for session prompt`() {
+        val ok = parseServerMessage(
+            """{"type":"request.ok","requestId":"req-p1","payload":{"sessionId":"s1"}}""",
+        )
+        assertTrue(ok is ServerMessage.RequestOk)
+        assertEquals("req-p1", (ok as ServerMessage.RequestOk).requestId)
+
+        val error = parseServerMessage(
+            """{"type":"error","requestId":"req-p2","sessionId":"s1","message":"Session nicht gefunden"}""",
+        )
+        assertTrue(error is ServerMessage.ErrorMsg)
+        val errorMsg = error as ServerMessage.ErrorMsg
+        assertEquals("req-p2", errorMsg.requestId)
+        assertEquals("s1", errorMsg.sessionId)
+        assertEquals("Session nicht gefunden", errorMsg.message)
+    }
+
     @Test
     fun `returns null for garbage and unknown types`() {
         assertNull(parseServerMessage("not json"))

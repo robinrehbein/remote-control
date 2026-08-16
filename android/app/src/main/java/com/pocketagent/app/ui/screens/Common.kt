@@ -213,6 +213,10 @@ fun connectionLabel(state: WsClient.ConnState): String? = when (state) {
     is WsClient.ConnState.Waiting -> "Keine Verbindung – neuer Versuch in ${state.retryInSec}s"
     is WsClient.ConnState.Disconnected -> "Getrennt – ${state.reason}"
     WsClient.ConnState.Idle -> "Nicht verbunden"
+    // Kein "neuer Versuch in …" — der Server hat bewusst nein gesagt, das
+    // ist kein Netzflackern, das sich von selbst löst.
+    WsClient.ConnState.Unauthorized ->
+        "Getrennt – Gerät nicht mehr gekoppelt. Bitte in den Einstellungen neu koppeln."
 }
 
 /**
@@ -228,7 +232,7 @@ fun ConnectionLine(
 ) {
     val label = connectionLabel(state) ?: return
     val connecting = state is WsClient.ConnState.Connecting
-    val severe = state is WsClient.ConnState.Disconnected
+    val severe = state is WsClient.ConnState.Disconnected || state is WsClient.ConnState.Unauthorized
     Row(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.Center,

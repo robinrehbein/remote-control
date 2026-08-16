@@ -171,6 +171,10 @@ class SessionViewModel : ViewModel() {
     private val _sendFailed = MutableStateFlow(false)
     val sendFailed: StateFlow<Boolean> = _sendFailed
 
+    /** True, während ein Prompt raus ist und auf die Bestätigung wartet. */
+    private val _sending = MutableStateFlow(false)
+    val sending: StateFlow<Boolean> = _sending
+
     private val _session = MutableStateFlow<SessionInfo?>(null)
     val session: StateFlow<SessionInfo?> = _session
 
@@ -319,29 +323,38 @@ class SessionViewModel : ViewModel() {
     }
 
     /**
-     * Prompt abschicken. Kommt er nicht auf die Leitung, bleibt der Text im
-     * Feld stehen und die Timeline bekommt keine Zeile — es ist nichts
-     * passiert, also darf auch nichts so aussehen.
+     * Prompt abschicken und auf die Bestätigung (`request.ok`) warten, bevor
+     * das Eingabefeld geleert wird. Kommt keine Bestätigung — keine
+     * Verbindung, Timeout oder Server-Fehler —, bleibt der Text stehen und
+     * die Timeline bekommt keine Zeile: es ist nichts passiert, also darf
+     * auch nichts so aussehen. Während die Anfrage läuft, ist der
+     * Senden-Knopf gesperrt (`_sending`), damit derselbe Text nicht doppelt
+     * losgeschickt wird.
      *
-     * Bewusst kein automatisches Nachsenden nach dem Reconnect:
-     * `session.prompt` hat im Vertrag weder requestId noch Bestätigung, und
-     * ein erfolgreiches `send()` heißt nur „im Puffer“, nicht „angekommen“.
-     * Die App kann also nicht wissen, ob der Agent den Auftrag schon hat —
-     * automatisches Wiederholen könnte dieselbe Aufgabe zweimal starten
-     * (zweimal committen, zweimal pushen). Der Text steht bereit, ein Tap
-     * schickt ihn los.
+     * Bewusst weiterhin kein automatisches Nachsenden bei einem Timeout: der
+     * bestätigt zwar jetzt den Erfolgsfall sauber, aber ein Timeout heißt nur
+     * „unklar, ob der Agent den Auftrag schon hat“ — nicht „gescheitert“.
+     * Automatisches Wiederholen könnte dieselbe Aufgabe zweimal anstoßen
+     * (zweimal committen, zweimal pushen). Der Text bleibt bereit, ein
+     * erneuter Tap schickt ihn los.
      */
     fun sendPrompt() {
         val text = _input.value.trim()
-        if (text.isEmpty()) return
-        if (!repository.sendPrompt(sessionId, text, null)) {
-            _sendFailed.value = true
-            return
+        if (text.isEmpty() || _sending.value) return
+        _sending.value = true
+        viewModelScope.launch {
+            repository.sendPrompt(sessionId, text, null)
+                .onSuccess {
+                    _sendFailed.value = false
+                    _input.value = ""
+                    _busy.value = true
+                    append(TimelineItem.Chat("user", text))
+                }
+                .onFailure {
+                    _sendFailed.value = true
+                }
+            _sending.value = false
         }
-        _sendFailed.value = false
-        _input.value = ""
-        _busy.value = true
-        append(TimelineItem.Chat("user", text))
     }
 
     fun decide(permissionId: String, decision: PermissionDecision) {
@@ -428,6 +441,7 @@ fun SessionScreen(
     val items by vm.items.collectAsState()
     val historyLoading by vm.historyLoading.collectAsState()
     val sendFailed by vm.sendFailed.collectAsState()
+    val sending by vm.sending.collectAsState()
     val connState by repository.connState.collectAsState()
     val session by vm.session.collectAsState()
     val input by vm.input.collectAsState()
@@ -552,12 +566,12 @@ fun SessionScreen(
                     // Steht die Verbindung nicht, sagt es genau eine Zeile —
                     // mit Restzeit und einem Tap, der den Versuch vorzieht.
                     ConnectionLine(state = connState, onReconnect = { repository.reconnectNow() })
-                    // Der Text ist nicht rausgegangen und steht noch im Feld.
+                    // Der Text ist nicht bestätigt und steht noch im Feld.
                     // Bewusst kein automatisches Nachsenden (siehe sendPrompt).
                     if (sendFailed) {
                         Text(
-                            text = "Nicht gesendet – keine Verbindung. Dein Text bleibt stehen, " +
-                                "tippe nach dem Verbinden erneut auf Senden.",
+                            text = "Nicht gesendet – keine Verbindung oder keine Bestätigung. " +
+                                "Dein Text bleibt stehen, tippe erneut auf Senden.",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.error,
                             modifier = Modifier.padding(
@@ -674,13 +688,23 @@ fun SessionScreen(
                         Spacer(modifier = Modifier.width(6.dp))
                         // Filled circle when there is something to send: the
                         // primary action of this screen should look like one.
+                        // Gesperrt, solange die letzte Anfrage noch auf ihre
+                        // Bestätigung wartet — kein Doppel-Senden per Doppeltap.
                         FilledIconButton(
                             onClick = { vm.sendPrompt() },
-                            enabled = input.isNotBlank(),
+                            enabled = input.isNotBlank() && !sending,
                             shape = CircleShape,
                             modifier = Modifier.size(ComposerHeight),
                         ) {
-                            Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Senden")
+                            if (sending) {
+                                CircularProgressIndicator(
+                                    strokeWidth = 2.dp,
+                                    modifier = Modifier.size(18.dp),
+                                    color = MaterialTheme.colorScheme.onPrimary,
+                                )
+                            } else {
+                                Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Senden")
+                            }
                         }
                     }
                 }

@@ -707,11 +707,17 @@ fun encodeSessionCreate(
     networkPolicy?.let { put("networkPolicy", it) }
 }.toString()
 
-fun encodeSessionPrompt(sessionId: String, text: String, mode: AgentMode?): String = buildJsonObject {
+/**
+ * [requestId] macht aus dem bisherigen Fire-and-forget eine Anfrage mit
+ * Bestätigung (`request.ok`/`error`) — ohne sie wüsste die App nie, ob der
+ * Agent den Auftrag wirklich bekommen hat.
+ */
+fun encodeSessionPrompt(requestId: String, sessionId: String, text: String, mode: AgentMode?): String = buildJsonObject {
     put("type", "session.prompt")
     put("sessionId", sessionId)
     put("text", text)
     mode?.let { put("mode", it.wireName()) }
+    put("requestId", requestId)
 }.toString()
 
 /**

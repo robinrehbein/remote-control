@@ -47,6 +47,43 @@ function forbidden(socket: net.Socket): void {
   socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
 }
 
+/** 407 (not 403) so a client can tell "authenticate" from "not allowed". */
+function proxyAuthRequired(socket: net.Socket): void {
+  socket.end(
+    'HTTP/1.1 407 Proxy Authentication Required\r\n' +
+      'Proxy-Authenticate: Basic realm="pocketagent"\r\n' +
+      'Connection: close\r\n\r\n',
+  );
+}
+
+export type DenyReason = 'auth' | 'port' | 'host';
+
+/**
+ * Why a request was refused, or null when it passes. A denial is otherwise
+ * invisible: the caller only sees "CONNECT tunnel failed, response 403", which
+ * says nothing about which gate closed.
+ *
+ * `port` is only gated for CONNECT (an opaque tunnel to an arbitrary port is
+ * the actual risk); pass null for forwarded plain-HTTP requests, which the
+ * proxy parses and may address any port.
+ */
+export function denyReason(
+  authorized: boolean,
+  host: string,
+  port: number | null,
+  allowlist: string[],
+): DenyReason | null {
+  if (!authorized) return 'auth';
+  if (port !== null && port !== 443 && port !== 80) return 'port';
+  if (!hostAllowed(host, allowlist)) return 'host';
+  return null;
+}
+
+function logDenial(method: string, host: string, port: number, reason: DenyReason, hadToken: boolean): void {
+  const detail = reason === 'auth' ? (hadToken ? 'token not accepted' : 'no proxy credentials') : reason;
+  console.warn(`[egress] denied ${method} ${host}:${port} (${detail})`);
+}
+
 /**
  * Extract the proxy-auth token from a Proxy-Authorization header value:
  * 'Bearer <t>' or 'Basic <base64 of "pa:<t>">'. Malformed values -> null.
@@ -84,10 +121,7 @@ export function createEgressProxyServer(
   tokenValidator?: TokenValidator,
 ): http.Server {
   const server = http.createServer((req, res) => {
-    if (!proxyAuthorized(req, tokenValidator)) {
-      res.writeHead(403).end('forbidden');
-      return;
-    }
+    const authorized = proxyAuthorized(req, tokenValidator);
     let target: URL;
     try {
       target = new URL(req.url ?? '/');
@@ -95,8 +129,15 @@ export function createEgressProxyServer(
       res.writeHead(400).end('bad request');
       return;
     }
-    if (!hostAllowed(target.hostname, allowlist)) {
-      res.writeHead(403).end('host not allowed');
+    const port = target.port ? Number(target.port) : target.protocol === 'https:' ? 443 : 80;
+    const reason = denyReason(authorized, target.hostname, null, allowlist);
+    if (reason !== null) {
+      logDenial(req.method ?? 'GET', target.hostname, port, reason, req.headers['proxy-authorization'] !== undefined);
+      if (reason === 'auth') {
+        res.writeHead(407, { 'proxy-authenticate': 'Basic realm="pocketagent"' }).end('proxy auth required');
+      } else {
+        res.writeHead(403).end(`${reason} not allowed`);
+      }
       return;
     }
     const headers = { ...req.headers };
@@ -121,12 +162,11 @@ export function createEgressProxyServer(
     const idx = url.lastIndexOf(':');
     const host = idx === -1 ? url : url.slice(0, idx);
     const portNum = idx === -1 ? 443 : Number(url.slice(idx + 1));
-    if (
-      !proxyAuthorized(req, tokenValidator) ||
-      (portNum !== 443 && portNum !== 80) ||
-      !hostAllowed(host, allowlist)
-    ) {
-      forbidden(socket);
+    const reason = denyReason(proxyAuthorized(req, tokenValidator), host, portNum, allowlist);
+    if (reason !== null) {
+      logDenial('CONNECT', host, portNum, reason, req.headers['proxy-authorization'] !== undefined);
+      if (reason === 'auth') proxyAuthRequired(socket);
+      else forbidden(socket);
       return;
     }
     const upstream = net.connect({ host, port: portNum }, () => {

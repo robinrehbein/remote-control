@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -114,6 +115,8 @@ import com.pocketagent.app.data.WsClient
 import com.pocketagent.app.data.wireName
 import com.pocketagent.app.ui.components.MarkdownText
 import com.pocketagent.app.ui.theme.CardInset
+import com.pocketagent.app.ui.theme.ChipHeight
+import com.pocketagent.app.ui.theme.ChipValueMaxWidth
 import com.pocketagent.app.ui.theme.ComposerHeight
 import com.pocketagent.app.ui.theme.ContentInset
 import com.pocketagent.app.ui.theme.MinTouchTarget
@@ -938,13 +941,25 @@ fun reasoningLabel(effort: ReasoningEffort?): String = when (effort) {
     null -> "Standard"
 }
 
-/** Kompakter Pill-Chip: Label klein und grau, aktiver Wert darunter/daneben. */
+/**
+ * Kompakter Pill-Chip: Label klein und grau, aktiver Wert darunter/daneben.
+ *
+ * Beide Screens bauen ihre Chip-Reihe hieraus — die laufende Session und das
+ * Anlegen einer neuen. Deshalb liegt der Chip hier öffentlich und nicht in
+ * einer zweiten, fast gleichen Fassung im anderen Screen.
+ *
+ * [tag] ist ein Kennzeichen hinter dem Wert, das eine Eigenschaft des Werts
+ * benennt statt eines eigenen Banners — etwa die Herkunft des Zugangs. Mit
+ * [tagWarning] wird daraus eine Warnung: derselbe Platz, andere Aussage.
+ */
 @Composable
-private fun SettingChip(
+fun SettingChip(
     label: String,
     value: String,
     onClick: () -> Unit,
     enabled: Boolean = true,
+    tag: String? = null,
+    tagWarning: Boolean = false,
 ) {
     Surface(
         shape = PillShape,
@@ -952,7 +967,7 @@ private fun SettingChip(
         onClick = onClick,
         enabled = enabled,
         modifier = Modifier
-            .heightIn(min = 34.dp)
+            .heightIn(min = ChipHeight)
             .alpha(if (enabled) 1f else 0.4f),
     ) {
         Row(
@@ -971,13 +986,72 @@ private fun SettingChip(
                 fontWeight = FontWeight.Medium,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.widthIn(max = 160.dp),
+                modifier = Modifier.widthIn(max = ChipValueMaxWidth),
             )
+            if (tag != null) {
+                Spacer(modifier = Modifier.width(6.dp))
+                val tagColor = if (tagWarning) {
+                    semantic().warning
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                }
+                Text(
+                    text = tag,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = tagColor,
+                    maxLines = 1,
+                    modifier = Modifier
+                        .background(
+                            if (tagWarning) {
+                                semantic().warningContainer
+                            } else {
+                                MaterialTheme.colorScheme.surfaceVariant
+                            },
+                            PillShape,
+                        )
+                        .padding(horizontal = 7.dp, vertical = 1.dp),
+                )
+            }
             Icon(
                 Icons.Filled.ExpandMore,
                 contentDescription = null,
                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.size(16.dp),
+            )
+        }
+    }
+}
+
+/**
+ * Chip ohne Wort: ein Symbol, das ein Sheet öffnet. Für Einstellungen, die
+ * selten angefasst werden und deren Name mehr Platz kostet als er einbringt.
+ */
+@Composable
+fun SettingIconChip(
+    icon: ImageVector,
+    contentDescription: String,
+    onClick: () -> Unit,
+    enabled: Boolean = true,
+) {
+    Surface(
+        shape = PillShape,
+        color = MaterialTheme.colorScheme.surfaceContainerHighest,
+        onClick = onClick,
+        enabled = enabled,
+        modifier = Modifier
+            .heightIn(min = ChipHeight)
+            .alpha(if (enabled) 1f else 0.4f),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+        ) {
+            Icon(
+                icon,
+                contentDescription = contentDescription,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(18.dp),
             )
         }
     }
@@ -1032,28 +1106,12 @@ private fun AgentSheet(
 ) {
     var picked by remember(current) { mutableStateOf(current) }
     SettingSheet(title = "Agent", onDismiss = onDismiss) {
-        GroupCard {
-            Column(
-                modifier = Modifier
-                    .heightIn(max = 320.dp)
-                    .verticalScroll(rememberScrollState()),
-            ) {
-                adapters.forEachIndexed { index, descriptor ->
-                    if (index > 0) ListDivider(RadioRowDividerInset)
-                    SelectableTile(
-                        title = descriptor.name,
-                        subtitle = shortDescription(descriptor.description),
-                        selected = picked == descriptor.id,
-                        onClick = { picked = descriptor.id },
-                        trailing = if (!adapterKeyPresent(descriptor, secretKinds)) {
-                            { DotLabel(color = semantic().warning, label = "Kein Zugang") }
-                        } else {
-                            null
-                        },
-                    )
-                }
-            }
-        }
+        AgentPickList(
+            adapters = adapters,
+            picked = picked,
+            secretKinds = secretKinds,
+            onPick = { picked = it },
+        )
         SectionNote(
             "Der neue Agent startet frisch auf dem aktuellen Code-Stand dieser Session. " +
                 "Der bisherige Gesprächskontext des Agenten geht verloren; der Verlauf hier " +
@@ -1073,6 +1131,67 @@ private fun AgentSheet(
     }
 }
 
+/**
+ * Die Agentenliste, wie sie beide Screens zeigen — beim Wechsel einer
+ * laufenden Session und beim Anlegen einer neuen. Eine Liste, damit ein
+ * Agent an beiden Stellen gleich heißt und gleich aussieht.
+ *
+ * [compact] entscheidet, wie viel vom Manifest mitkommt: im Wechsel-Sheet
+ * genügt die erste Zeile der Beschreibung, weil der Agent dort schon gewählt
+ * war. Beim Anlegen ist es eine echte Erstauswahl — dort steht die ganze
+ * Beschreibung und dazu, was der Agent kann.
+ */
+@Composable
+fun AgentPickList(
+    adapters: List<AdapterDescriptor>,
+    picked: String,
+    secretKinds: Set<String>,
+    onPick: (String) -> Unit,
+    compact: Boolean = true,
+) {
+    GroupCard {
+        Column(
+            modifier = Modifier
+                .heightIn(max = 320.dp)
+                .verticalScroll(rememberScrollState()),
+        ) {
+            adapters.forEachIndexed { index, descriptor ->
+                if (index > 0) ListDivider(RadioRowDividerInset)
+                val caps = descriptor.capabilities
+                SelectableTile(
+                    title = descriptor.name,
+                    subtitle = if (compact) {
+                        shortDescription(descriptor.description)
+                    } else {
+                        descriptor.description?.takeIf { it.isNotBlank() }
+                    },
+                    selected = picked == descriptor.id,
+                    onClick = { onPick(descriptor.id) },
+                    trailing = if (!adapterKeyPresent(descriptor, secretKinds)) {
+                        { DotLabel(color = semantic().warning, label = "Kein Zugang") }
+                    } else {
+                        null
+                    },
+                    extra = if (!compact && (caps.approvals || caps.resume || caps.streaming)) {
+                        {
+                            FlowRow(
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp),
+                            ) {
+                                if (caps.approvals) InfoChip("Rückfragen")
+                                if (caps.resume) InfoChip("Fortsetzen")
+                                if (caps.streaming) InfoChip("Streaming")
+                            }
+                        }
+                    } else {
+                        null
+                    },
+                )
+            }
+        }
+    }
+}
+
 /** Erste Zeile der Adapter-Beschreibung, auf Sheet-Länge gekürzt. */
 private fun shortDescription(raw: String?): String? =
     raw?.takeIf { it.isNotBlank() }
@@ -1080,13 +1199,19 @@ private fun shortDescription(raw: String?): String? =
         ?.first()
         ?.let { if (it.length > 64) it.take(63).trimEnd() + "…" else it }
 
+/**
+ * Die Modusliste. Der Titel ist einstellbar, weil dieselbe Entscheidung in
+ * der laufenden Session „Modus“ heißt und beim Anlegen „Autonomie“ — die
+ * Einträge sind wortgleich dieselben und sollen es bleiben.
+ */
 @Composable
-private fun ModeSheet(
+fun ModeSheet(
     current: AgentMode?,
     onDismiss: () -> Unit,
     onPick: (AgentMode) -> Unit,
+    title: String = "Modus",
 ) {
-    SettingSheet(title = "Modus", onDismiss = onDismiss) {
+    SettingSheet(title = title, onDismiss = onDismiss) {
         GroupCard {
             Column {
                 val entries = listOf(
@@ -1114,6 +1239,48 @@ private fun ModeSheet(
     }
 }
 
+/**
+ * Die Reasoning-Stufen als Gruppenliste. Eigene Funktion, weil die laufende
+ * Session sie in einem eigenen Sheet zeigt und der Anlege-Screen sie unter
+ * das Modell hängt — dieselben drei Stufen mit denselben Worten.
+ */
+@Composable
+fun ReasoningPickList(
+    current: ReasoningEffort?,
+    onPick: (ReasoningEffort) -> Unit,
+    onDefault: (() -> Unit)? = null,
+) {
+    GroupCard {
+        Column {
+            // Nur wo „keine Stufe“ ein gültiger Zustand ist, gibt es eine
+            // Zeile dafür. In einer laufenden Session hat der Agent immer
+            // eine — dort wäre „Standard“ eine Auswahl ohne Wirkung.
+            if (onDefault != null) {
+                SelectableTile(
+                    title = "Standard",
+                    subtitle = "Stufe dem Agenten überlassen",
+                    selected = current == null,
+                    onClick = onDefault,
+                )
+            }
+            val entries = listOf(
+                Triple(ReasoningEffort.LOW, "Niedrig", "Schnelle Antworten, wenig Nachdenken"),
+                Triple(ReasoningEffort.MEDIUM, "Mittel", "Ausgewogen zwischen Tempo und Tiefe"),
+                Triple(ReasoningEffort.HIGH, "Hoch", "Gründliches Nachdenken, langsamer und teurer"),
+            )
+            entries.forEachIndexed { index, (effort, title, subtitle) ->
+                if (index > 0 || onDefault != null) ListDivider(RadioRowDividerInset)
+                SelectableTile(
+                    title = title,
+                    subtitle = subtitle,
+                    selected = current == effort,
+                    onClick = { onPick(effort) },
+                )
+            }
+        }
+    }
+}
+
 @Composable
 private fun ReasoningSheet(
     current: ReasoningEffort?,
@@ -1121,24 +1288,7 @@ private fun ReasoningSheet(
     onPick: (ReasoningEffort) -> Unit,
 ) {
     SettingSheet(title = "Reasoning", onDismiss = onDismiss) {
-        GroupCard {
-            Column {
-                val entries = listOf(
-                    Triple(ReasoningEffort.LOW, "Niedrig", "Schnelle Antworten, wenig Nachdenken"),
-                    Triple(ReasoningEffort.MEDIUM, "Mittel", "Ausgewogen zwischen Tempo und Tiefe"),
-                    Triple(ReasoningEffort.HIGH, "Hoch", "Gründliches Nachdenken, langsamer und teurer"),
-                )
-                entries.forEachIndexed { index, (effort, title, subtitle) ->
-                    if (index > 0) ListDivider(RadioRowDividerInset)
-                    SelectableTile(
-                        title = title,
-                        subtitle = subtitle,
-                        selected = current == effort,
-                        onClick = { onPick(effort) },
-                    )
-                }
-            }
-        }
+        ReasoningPickList(current = current, onPick = onPick)
         SectionNote("Gilt ab dem nächsten Prompt dieser Session.")
     }
 }

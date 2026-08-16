@@ -1,4 +1,4 @@
-@file:OptIn(ExperimentalMaterial3Api::class)
+@file:OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 
 package com.pocketagent.app.ui.screens
 
@@ -11,19 +11,26 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.isImeVisible
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.horizontalScroll
@@ -36,11 +43,13 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.CloudUpload
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Difference
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.Close
@@ -65,6 +74,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -81,6 +91,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -102,6 +113,7 @@ import com.pocketagent.app.data.StartPhase
 import com.pocketagent.app.data.wireName
 import com.pocketagent.app.ui.components.MarkdownText
 import com.pocketagent.app.ui.theme.CardInset
+import com.pocketagent.app.ui.theme.ComposerHeight
 import com.pocketagent.app.ui.theme.ContentInset
 import com.pocketagent.app.ui.theme.MinTouchTarget
 import com.pocketagent.app.ui.theme.MonoMedium
@@ -585,6 +597,11 @@ fun SessionScreen(
                             }
                         }
                     }
+                    // Eingabefeld und Senden-Knopf teilen sich ComposerHeight,
+                    // damit sie als eine Zeile lesen. Wächst der Text über
+                    // mehrere Zeilen, wächst nur die Pille — der Kreis bleibt
+                    // unten bündig auf Höhe der letzten Zeile (One UI hängt
+                    // die Aktion an das Ende der Eingabe, nicht an ihre Mitte).
                     Row(
                         verticalAlignment = Alignment.Bottom,
                         modifier = Modifier
@@ -595,7 +612,9 @@ fun SessionScreen(
                             value = input,
                             onValueChange = vm::updateInput,
                             placeholder = { Text("Aufgabe oder Rückfrage …") },
-                            modifier = Modifier.weight(1f),
+                            modifier = Modifier
+                                .weight(1f)
+                                .heightIn(min = ComposerHeight),
                             maxLines = 5,
                             shape = PillShape,
                             keyboardOptions = KeyboardOptions(
@@ -618,9 +637,7 @@ fun SessionScreen(
                             onClick = { vm.sendPrompt() },
                             enabled = input.isNotBlank(),
                             shape = CircleShape,
-                            modifier = Modifier
-                                .padding(bottom = 4.dp)
-                                .size(MinTouchTarget),
+                            modifier = Modifier.size(ComposerHeight),
                         ) {
                             Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Senden")
                         }
@@ -880,6 +897,10 @@ private fun SettingChip(
 /**
  * Gemeinsame Hülle aller Einstell-Sheets: Titel + One-UI-Gruppenkarte.
  * Auch der New-Session-Screen baut sein Modell-Sheet hierauf.
+ *
+ * Das Sheet öffnet immer ganz — lange Listen und Textfelder brauchen die
+ * volle Höhe. Der Inhalt weicht der Tastatur aus (Insets werden vereinigt,
+ * damit Navigationsleiste und IME nicht doppelt zählen).
  */
 @Composable
 fun SettingSheet(
@@ -889,12 +910,13 @@ fun SettingSheet(
 ) {
     ModalBottomSheet(
         onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
         containerColor = MaterialTheme.colorScheme.background,
     ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .navigationBarsPadding()
+                .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars))
                 .padding(bottom = 12.dp),
         ) {
             Text(
@@ -1032,6 +1054,81 @@ private fun ReasoningSheet(
     }
 }
 
+/**
+ * Ab so vielen Einträgen lohnt sich das Suchfeld. Darunter wäre es Ballast:
+ * drei Modelle sieht man auf einen Blick.
+ */
+private const val ModelSearchThreshold = 8
+
+/**
+ * Passt ein Modell zur Suche? Gesucht wird über Anzeigename *und* Id, ohne
+ * auf Groß-/Kleinschreibung zu achten — „5.3“ findet „zai · GLM-5.3“ über
+ * die Id `zai/glm-5.3`, „coding“ die Einträge von `zai-coding-cn`.
+ * Eine leere Suche passt auf alles.
+ */
+fun modelMatchesQuery(model: ModelInfo, query: String): Boolean {
+    val needle = query.trim()
+    if (needle.isEmpty()) return true
+    return model.id.contains(needle, ignoreCase = true) ||
+        model.name?.contains(needle, ignoreCase = true) == true
+}
+
+/** Die gefilterte Liste; leere oder reine Whitespace-Suche gibt alles zurück. */
+fun filterModels(models: List<ModelInfo>, query: String): List<ModelInfo> =
+    if (query.isBlank()) models else models.filter { modelMatchesQuery(it, query) }
+
+/**
+ * Suchfeld über der Modellliste im One-UI-Stil: gefüllte Pille ohne Rand,
+ * Lupe links, Kreuz zum Leeren rechts.
+ */
+@Composable
+private fun ModelSearchField(
+    query: String,
+    onQueryChange: (String) -> Unit,
+) {
+    OutlinedTextField(
+        value = query,
+        onValueChange = onQueryChange,
+        placeholder = { Text("Modell suchen") },
+        leadingIcon = {
+            Icon(
+                Icons.Filled.Search,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        },
+        trailingIcon = if (query.isNotEmpty()) {
+            {
+                IconButton(onClick = { onQueryChange("") }) {
+                    Icon(
+                        Icons.Filled.Close,
+                        contentDescription = "Suche leeren",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        } else {
+            null
+        },
+        singleLine = true,
+        shape = PillShape,
+        keyboardOptions = KeyboardOptions(
+            autoCorrectEnabled = false,
+            keyboardType = KeyboardType.Ascii,
+            imeAction = ImeAction.Search,
+        ),
+        colors = OutlinedTextFieldDefaults.colors(
+            focusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+            unfocusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+            focusedBorderColor = Color.Transparent,
+            unfocusedBorderColor = Color.Transparent,
+        ),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = ScreenGutter, end = ScreenGutter, bottom = 10.dp),
+    )
+}
+
 @Composable
 private fun ModelSheet(
     current: String,
@@ -1041,6 +1138,9 @@ private fun ModelSheet(
     onPick: (String) -> Unit,
 ) {
     var custom by remember(current) { mutableStateOf(current) }
+    // Der Suchtext gehört dem geöffneten Sheet: Schließen und erneutes
+    // Öffnen beginnt wieder bei der vollen Liste.
+    var query by remember { mutableStateOf("") }
     SettingSheet(title = "Modell", onDismiss = onDismiss) {
         when (state) {
             is ModelsState.Loading, ModelsState.Idle -> Row(
@@ -1072,27 +1172,53 @@ private fun ModelSheet(
             is ModelsState.Loaded -> if (state.models.isEmpty()) {
                 SectionNote("Dieser Adapter liefert keine Modellliste – Modell unten frei eintragen.")
             } else {
-                GroupCard {
-                    Column(modifier = Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState())) {
-                        SelectableTile(
-                            title = "Adapter-Standard",
-                            subtitle = "Modellwahl dem Adapter überlassen",
-                            selected = current.isBlank(),
-                            onClick = { onPick("") },
-                        )
-                        state.models.forEach { model ->
-                            ListDivider(RadioRowDividerInset)
-                            SelectableTile(
-                                title = model.name ?: model.id,
-                                subtitle = model.id,
-                                selected = current == model.id,
-                                onClick = { onPick(model.id) },
-                            )
+                val searchable = state.models.size > ModelSearchThreshold
+                if (searchable) ModelSearchField(query = query, onQueryChange = { query = it })
+                val searching = searchable && query.isNotBlank()
+                val visible = if (searchable) filterModels(state.models, query) else state.models
+                // Mit offener Tastatur bleibt weniger Platz: die Liste gibt
+                // ihn her, damit Suchfeld und Treffer sichtbar bleiben.
+                val listMaxHeight = if (WindowInsets.isImeVisible) 200.dp else 320.dp
+                if (visible.isEmpty()) {
+                    Text(
+                        text = "Kein Modell gefunden",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = ContentInset, vertical = 12.dp),
+                    )
+                } else {
+                    GroupCard {
+                        Column(
+                            modifier = Modifier
+                                .heightIn(max = listMaxHeight)
+                                .verticalScroll(rememberScrollState()),
+                        ) {
+                            // Während gesucht wird zeigt die Liste nur
+                            // Treffer – der Standard ist keiner davon.
+                            if (!searching) {
+                                SelectableTile(
+                                    title = "Adapter-Standard",
+                                    subtitle = "Modellwahl dem Adapter überlassen",
+                                    selected = current.isBlank(),
+                                    onClick = { onPick("") },
+                                )
+                            }
+                            visible.forEachIndexed { index, model ->
+                                if (index > 0 || !searching) ListDivider(RadioRowDividerInset)
+                                SelectableTile(
+                                    title = model.name ?: model.id,
+                                    subtitle = model.id,
+                                    selected = current == model.id,
+                                    onClick = { onPick(model.id) },
+                                )
+                            }
                         }
                     }
                 }
             }
         }
+        // Eigener Zweck, eigene Sektion: hier wird ein Modell gesetzt, das
+        // die Liste gar nicht kennt — nicht in ihr gesucht.
         SectionHeader("Eigenes Modell")
         Row(
             verticalAlignment = Alignment.CenterVertically,
@@ -1106,6 +1232,11 @@ private fun ModelSheet(
                 placeholder = { Text("z. B. anbieter/modell") },
                 singleLine = true,
                 shape = PillShape,
+                keyboardOptions = KeyboardOptions(
+                    autoCorrectEnabled = false,
+                    keyboardType = KeyboardType.Ascii,
+                    imeAction = ImeAction.Done,
+                ),
                 modifier = Modifier.weight(1f),
             )
             Spacer(modifier = Modifier.width(8.dp))
@@ -1118,6 +1249,7 @@ private fun ModelSheet(
                 Text("Setzen")
             }
         }
+        SectionNote("Falls dein Modell nicht in der Liste steht.")
     }
 }
 

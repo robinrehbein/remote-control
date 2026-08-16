@@ -528,6 +528,10 @@ async function main(): Promise<void> {
   store.setSessionRef(sessionId, 'runtime-session-ref');
   store.updateSessionStatus(sessionId, 'idle');
   cfg.dockerEnabled = true;
+  // The orchestrator identifies its own container by HOSTNAME to join session
+  // networks; docker always sets it, this run has to emulate that.
+  const hostnameBefore = process.env.HOSTNAME;
+  process.env.HOSTNAME = 'smoke-orchestrator';
   try {
     const unknownAdapter = await request(c2, {
       type: 'session.update',
@@ -573,8 +577,33 @@ async function main(): Promise<void> {
         buildFailed.event.message.includes('konnte nicht gebaut werden'),
       'a failing self build surfaces the real cause instead of a generic message',
     );
+
+    // Without HOSTNAME nothing can reach the shim; that has to be said, not
+    // waited out until the readiness timeout.
+    delete process.env.HOSTNAME;
+    const switchedAgain = await request(c2, {
+      type: 'session.update',
+      requestId: 'sw3',
+      sessionId,
+      adapter: 'opencode',
+    });
+    assert(switchedAgain.type === 'request.ok', 'switch back is acked');
+    const hostnameErr = await c2.wait(
+      (m) =>
+        m.type === 'session.event' &&
+        m.sessionId === sessionId &&
+        m.event.type === 'error' &&
+        m.event.message.includes('HOSTNAME'),
+      30_000,
+    );
+    assert(
+      hostnameErr.type === 'session.event' && hostnameErr.event.type === 'error',
+      'a missing HOSTNAME fails the session with its real cause',
+    );
   } finally {
     cfg.dockerEnabled = false;
+    if (hostnameBefore === undefined) delete process.env.HOSTNAME;
+    else process.env.HOSTNAME = hostnameBefore;
   }
 
   const models = await request(c2, { type: 'session.models.get', requestId: 'mod1', sessionId });

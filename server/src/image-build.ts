@@ -186,10 +186,16 @@ async function runBuild(
   console.log(`[image-build] building ${tag} from ${files.length} context files`);
   const started = Date.now();
   const ctx = stage(root, files);
+  // The pack streams from disk while the daemon consumes it. When a build fails
+  // early (unreachable daemon), cleanup would otherwise pull the staged files
+  // out from under a still-reading stream, whose unhandled 'error' event takes
+  // the whole process down - so it is kept addressable and silenced here.
+  const pack = tar.pack(ctx);
+  pack.on('error', () => {});
   try {
     // context layout == repo root, so `dockerfile` is the in-context path the
     // shims/<id>/Dockerfile itself documents (`docker build -f ... .`).
-    const stream = await d.buildImage(tar.pack(ctx), {
+    const stream = await d.buildImage(pack, {
       t: tag,
       dockerfile: `shims/${adapterId}/Dockerfile`,
       // no pull:true - a stale base image is better than failing a build on a
@@ -217,6 +223,7 @@ async function runBuild(
     console.log(`[image-build] ${tag} built in ${sec}s`);
     onNotice?.(`Agent-Image fertig gebaut (${sec}s) – Session startet.`);
   } finally {
+    pack.destroy();
     rmSync(ctx, { recursive: true, force: true });
   }
 }

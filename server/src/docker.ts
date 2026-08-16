@@ -233,21 +233,47 @@ export async function ensureNetwork(): Promise<void> {
  * container the daemon knows. Skipped only for a truly remote daemon, where
  * HOSTNAME means nothing.
  */
-export async function ensureSelfAttached(networkName: string): Promise<void> {
+export async function ensureSelfAttached(networkName: string): Promise<string | null> {
   const d = docker();
-  if (!d || isRemote()) return;
+  if (!d || isRemote()) return null;
   const selfId = process.env.HOSTNAME;
-  if (!selfId) return;
+  // Without HOSTNAME there is no way to name our own container to the daemon.
+  // Silently skipping used to leave the session reachable by nobody, surfacing
+  // minutes later as a bare "shim did not become ready in time".
+  if (!selfId) {
+    return 'HOSTNAME ist im Orchestrator-Container nicht gesetzt – der Orchestrator kann sich nicht selbst ans Session-Netz hängen.';
+  }
   try {
     await d.getNetwork(networkName).connect({
       Container: selfId,
       EndpointConfig: { Aliases: [ORCHESTRATOR_ALIAS] },
     });
+    return null;
   } catch (e) {
     const msg = String(e);
-    if (!msg.includes('already')) {
-      console.warn(`[docker] self-attach to ${networkName} failed: ${msg}`);
-    }
+    if (msg.includes('already')) return null;
+    console.warn(`[docker] self-attach to ${networkName} failed: ${msg}`);
+    // An unreachable daemon is not an attach problem: every later call fails
+    // the same way and says so more precisely, so only a daemon that answered
+    // (e.g. "no such container" for a HOSTNAME that is not ours) blocks here.
+    if (/ECONNREFUSED|ENOENT|EAI_AGAIN|ETIMEDOUT|ECONNRESET|socket hang up/.test(msg)) return null;
+    return `Orchestrator (HOSTNAME=${selfId}) konnte nicht ans Netz ${networkName} angebunden werden: ${msg}`;
+  }
+}
+
+/**
+ * Local mode reaches the shim only through the shared docker network, and an
+ * 'allowlist' session reaches the egress proxy only the same way. A failed
+ * attach therefore has to fail the session immediately with its real cause
+ * instead of running into the shim-readiness timeout.
+ */
+async function requireSelfAttached(networkName: string): Promise<void> {
+  const failure = await ensureSelfAttached(networkName);
+  if (failure) {
+    throw new Error(
+      `${failure} Ohne diese Anbindung ist der Agent-Container nicht erreichbar. ` +
+        'Prüfe, ob der Orchestrator selbst als Docker-Container mit gesetztem HOSTNAME läuft.',
+    );
   }
 }
 
@@ -323,12 +349,13 @@ async function sessionNetworking(
     // With a gateway even 'open' sessions are reached through it (no published
     // port), so it has to sit on the shared network too.
     if (gatewayEnabled()) await attachGateway(config.networkName);
+    else await requireSelfAttached(config.networkName);
     return { EndpointsConfig: { [config.networkName]: { Aliases: [session.id] } } };
   }
   const netName = await ensureSessionNetwork(session.id);
   const viaGateway = gatewayEnabled();
   if (viaGateway) await attachGateway(netName);
-  else await ensureSelfAttached(netName);
+  else await requireSelfAttached(netName);
   if (policy === 'allowlist') {
     // Proxy auth: egress proxies accept requests carrying a valid per-session
     // shim token (Basic "pa:<token>"); instances without a validator ignore it.
@@ -549,6 +576,63 @@ export async function shimEndpoint(containerId: string, sessionId: string): Prom
     console.error(`[docker] endpoint inspect failed: ${String(e)}`);
     return null;
   }
+}
+
+/**
+ * Last log lines of a container plus its exit state. When a shim never becomes
+ * ready, its own stderr holds the reason (failed clone, missing key, crash) -
+ * without this the app only ever sees "shim did not become ready in time".
+ * Token-shaped words are masked: shim logs are not supposed to contain secrets,
+ * but this text is forwarded to the app and the server log.
+ */
+export async function containerDiagnostics(id: string, lines = 20): Promise<string> {
+  const d = docker();
+  if (!d) return '';
+  const c = d.getContainer(id);
+  const parts: string[] = [];
+  try {
+    const info = await c.inspect();
+    const state = info.State;
+    if (state) {
+      const exit = state.ExitCode === undefined ? '' : ` exit=${state.ExitCode}`;
+      const err = state.Error ? ` error=${state.Error}` : '';
+      parts.push(`Container: ${state.Status ?? 'unknown'}${exit}${err}`);
+    }
+  } catch {
+    parts.push('Container: nicht mehr vorhanden');
+  }
+  try {
+    const raw = await c.logs({ stdout: true, stderr: true, tail: lines });
+    const text = stripLogFraming(Buffer.isBuffer(raw) ? raw : Buffer.from(String(raw)));
+    if (text.length > 0) parts.push(`Log:\n${redactTokens(text)}`);
+  } catch {
+    /* logs unavailable (container removed) */
+  }
+  return parts.join('\n');
+}
+
+/**
+ * Docker multiplexes non-TTY logs into 8-byte-framed chunks; strip the frames
+ * so the payload stays readable when a stream carries both stdout and stderr.
+ */
+function stripLogFraming(buf: Buffer): string {
+  const out: string[] = [];
+  let off = 0;
+  while (off + 8 <= buf.length) {
+    const type = buf[off] ?? 255;
+    const len = buf.readUInt32BE(off + 4);
+    // Frame headers always start with stream id 0-2; anything else means the
+    // daemon sent a raw (TTY) stream, which is already plain text.
+    if (type > 2 || len > buf.length - off - 8) return buf.toString('utf8').trim();
+    out.push(buf.toString('utf8', off + 8, off + 8 + len));
+    off += 8 + len;
+  }
+  return (off === 0 ? buf.toString('utf8') : out.join('')).trim();
+}
+
+/** Mask long token-shaped words (>=20 chars of key/token alphabet). */
+function redactTokens(text: string): string {
+  return text.replace(/\b[A-Za-z0-9_-]{20,}\b/g, (m) => `${m.slice(0, 4)}…[gekürzt]`);
 }
 
 export async function stopContainer(id: string): Promise<void> {

@@ -91,10 +91,14 @@ export class ShimClient {
     return this.call<DiffEntry[]>('/diff', 'GET');
   }
 
-  /** GET /models; older shims without the route answer 404 -> empty catalog. */
-  async models(): Promise<ModelInfo[]> {
+  /**
+   * GET /models; older shims without the route answer 404 -> empty catalog.
+   * null is reserved for a transport failure (no answer at all), which the
+   * caller heals by re-attaching the session network and retrying.
+   */
+  async models(): Promise<ModelInfo[] | null> {
     const res = await this.call<ModelsResponse>('/models', 'GET');
-    return normalizeModels(res);
+    return res === null ? null : normalizeModels(res);
   }
 
   startEvents(onEvent: (e: AgentEvent) => void): void {

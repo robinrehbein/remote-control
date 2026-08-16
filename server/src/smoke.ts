@@ -324,6 +324,244 @@ async function startProgressSmoke(store: Store, manager: SessionManager, c2: Cli
   }
 }
 
+/**
+ * Startup reconcile + request-path self healing against a fake docker daemon
+ * and a fake shim. Both model the production case behind them: a redeploy
+ * replaces the orchestrator container, so it hangs on no session network any
+ * more and holds no event stream, while the session containers keep running.
+ */
+async function reconcileSmoke(store: Store, manager: SessionManager, c2: Client, repoId: string): Promise<void> {
+  const http = await import('node:http');
+  const dockerMod = await import('./docker.js');
+  const cfg = config as unknown as {
+    dockerEnabled: boolean;
+    dockerHost: string | null;
+    dockerHostIsLocal: boolean;
+    gatewayToken: string | null;
+  };
+
+  const now = new Date().toISOString();
+  const rowFor = (id: string, policy: string | null, status: string, containerId: string): import('./db.js').SessionRow => ({
+    id,
+    tenant_id: 'default',
+    repo_id: repoId,
+    repo_full_name: 'acme/demo',
+    adapter: 'opencode',
+    provider: 'zai',
+    model: 'glm-4.6',
+    mode: 'ask',
+    status,
+    branch: `agent/${id}`,
+    session_ref: null,
+    container_id: containerId,
+    volume_name: `pocketagent-sess-${id}`,
+    shim_token: `token-${id.slice(0, 8)}`,
+    pr_url: null,
+    shim_endpoint: null,
+    link_id: null,
+    network_policy: policy,
+    reasoning_effort: null,
+    created_at: now,
+    last_active_at: now,
+  });
+
+  /* ---- sessionNetworkFor: policy -> network name, mode -> relay (pure) ---- */
+
+  const probe = rowFor(randomUUID(), 'allowlist', 'idle', 'cid-probe');
+  assert(
+    dockerMod.sessionNetworkFor(probe).name === dockerMod.sessionNetworkName(probe.id),
+    'allowlist sessions live on their own per-session network',
+  );
+  assert(
+    dockerMod.sessionNetworkFor({ ...probe, network_policy: 'isolated' }).name === dockerMod.sessionNetworkName(probe.id),
+    'isolated sessions live on their own per-session network',
+  );
+  assert(
+    dockerMod.sessionNetworkFor({ ...probe, network_policy: 'open' }).name === config.networkName,
+    'open sessions share the main network',
+  );
+  assert(
+    dockerMod.sessionNetworkFor({ ...probe, network_policy: 'nonsense' }).name === dockerMod.sessionNetworkName(probe.id),
+    'an unreadable policy falls back to the configured default (allowlist)',
+  );
+  assert(dockerMod.sessionNetworkFor(probe).relay === 'orchestrator', 'locally the orchestrator itself is the relay');
+  cfg.dockerHost = 'tcp://runner.example:2375';
+  cfg.dockerHostIsLocal = false;
+  assert(dockerMod.sessionNetworkFor(probe).relay === 'none', 'remote without gateway reaches the shim via a published port');
+  cfg.gatewayToken = 'gw-smoke';
+  assert(dockerMod.sessionNetworkFor(probe).relay === 'gateway', 'remote with a gateway relays through the gateway container');
+  assert(
+    dockerMod.sessionNetworkFor({ ...probe, network_policy: 'open' }).name === config.networkName,
+    'gateway mode keeps open sessions on the main network',
+  );
+  cfg.gatewayToken = null;
+  cfg.dockerHost = null;
+
+  /* ---- fake shim: SSE stream + a /prompt that can fail at the transport ---- */
+
+  let shimMode: 'ok' | 'fail-once' | 'dead' = 'ok';
+  let promptCalls = 0;
+  const shim = http.createServer((req, res) => {
+    const url = req.url ?? '';
+    if (url.startsWith('/events')) {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write('data: {"type":"notice","message":"stream-live"}\n\n'); // stays open
+      return;
+    }
+    if (url.startsWith('/prompt')) {
+      promptCalls++;
+      if (shimMode === 'dead' || (shimMode === 'fail-once' && promptCalls === 1)) return void res.destroy();
+      return void res.writeHead(200, { 'content-type': 'application/json' }).end('{"ok":true}');
+    }
+    res.writeHead(200, { 'content-type': 'application/json' }).end('{"ok":true}');
+  });
+  const shimPort = await listen(shim);
+  const shimBase = `http://127.0.0.1:${shimPort}`;
+
+  /* ---- fake daemon: container states + a log of every network connect ---- */
+
+  const RUNNING = new Set(['cid-run-a', 'cid-run-b']);
+  const STOPPED = new Set(['cid-stopped']);
+  const connects: { network: string; container: string; aliases: string[] }[] = [];
+  const daemon = http.createServer((req, res) => {
+    const url = req.url ?? '';
+    const method = req.method ?? 'GET';
+    const send = (code: number, body: string, type = 'application/json'): void => {
+      res.writeHead(code, { 'content-type': type }).end(body);
+    };
+    const connect = /^\/networks\/([^/]+)\/connect/.exec(url);
+    if (method === 'POST' && connect) {
+      let body = '';
+      req.on('data', (c) => (body += String(c)));
+      req.on('end', () => {
+        const parsed = JSON.parse(body) as { Container?: string; EndpointConfig?: { Aliases?: string[] } };
+        connects.push({
+          network: decodeURIComponent(connect[1] as string),
+          container: parsed.Container ?? '',
+          aliases: parsed.EndpointConfig?.Aliases ?? [],
+        });
+        send(200, '{}');
+      });
+      return;
+    }
+    req.resume();
+    const inspect = /^\/containers\/([^/]+)\/json/.exec(url);
+    if (method === 'GET' && inspect) {
+      const cid = inspect[1] as string;
+      if (RUNNING.has(cid)) return send(200, '{"State":{"Running":true,"Status":"running"}}');
+      if (STOPPED.has(cid)) return send(200, '{"State":{"Running":false,"Status":"exited","ExitCode":0}}');
+      return send(404, '{"message":"No such container"}');
+    }
+    if (method === 'GET' && /^\/containers\/[^/]+\/logs/.test(url)) {
+      return send(200, '[shim] listening on :8080\n', 'application/octet-stream');
+    }
+    send(200, '{}'); // network inspect, volume/container removal, everything else
+  });
+  const daemonPort = await listen(daemon);
+
+  const hostnameBefore = process.env.HOSTNAME;
+  process.env.HOSTNAME = 'smoke-orchestrator';
+  cfg.dockerHost = `http://127.0.0.1:${daemonPort}`;
+  cfg.dockerHostIsLocal = true;
+  cfg.dockerEnabled = true;
+  dockerMod.resetDockerClient();
+
+  const running = randomUUID(); // allowlist, mid-turn during the restart
+  const idle = randomUUID(); // open, idle
+  const gone = randomUUID(); // container removed behind our back
+  const stopped = randomUUID(); // container still there, but not running
+  try {
+    store.insertSession({ ...rowFor(running, 'allowlist', 'running', 'cid-run-a'), shim_endpoint: shimBase });
+    store.insertSession({ ...rowFor(idle, 'open', 'idle', 'cid-run-b'), shim_endpoint: shimBase });
+    store.insertSession(rowFor(gone, 'allowlist', 'running', 'cid-gone'));
+    store.insertSession(rowFor(stopped, 'open', 'idle', 'cid-stopped'));
+
+    await manager.reconcile();
+
+    const attached = (network: string): boolean =>
+      connects.some((c) => c.network === network && c.container === 'smoke-orchestrator' && c.aliases.includes('orchestrator'));
+    assert(attached(dockerMod.sessionNetworkName(running)), 'reconcile re-attaches the orchestrator to a per-session network');
+    assert(attached(config.networkName), 'reconcile re-attaches the orchestrator to the shared network of an open session');
+    assert(
+      !connects.some((c) => c.network === dockerMod.sessionNetworkName(gone)),
+      'a session whose container is gone is not re-attached',
+    );
+
+    assert(store.getSession(running)?.status === 'idle', 'a turn interrupted by the restart ends as idle, not running');
+    assert(store.getSession(idle)?.status === 'idle', 'an idle session with a live container stays idle');
+    assert(store.getSession(gone)?.status === 'error', 'a session whose container vanished ends in error');
+    assert(store.getSession(stopped)?.status === 'stopped', 'a session with a stopped container ends as stopped');
+
+    const goneErr = await c2.wait(
+      (m) => m.type === 'session.event' && m.sessionId === gone && m.event.type === 'error',
+      5_000,
+    );
+    assert(
+      goneErr.type === 'session.event' &&
+        goneErr.event.type === 'error' &&
+        goneErr.event.message.includes('existiert nicht mehr'),
+      'the vanished container is reported with its cause',
+    );
+    const restored = await c2.wait(
+      (m) =>
+        m.type === 'session.event' &&
+        m.sessionId === running &&
+        m.event.type === 'notice' &&
+        m.event.message.includes('neu gestartet'),
+      5_000,
+    );
+    assert(
+      restored.type === 'session.event' &&
+        restored.event.type === 'notice' &&
+        restored.event.message.includes('abgebrochen'),
+      'the interrupted turn is called out in the timeline',
+    );
+
+    const streamed = await c2.wait(
+      (m) =>
+        m.type === 'session.event' &&
+        m.sessionId === running &&
+        m.event.type === 'notice' &&
+        m.event.message === 'stream-live',
+      10_000,
+    );
+    assert(streamed.type === 'session.event', 'reconcile reconnects the shim event stream');
+
+    /* ---- self healing: a transport failure re-attaches and retries once ---- */
+
+    shimMode = 'fail-once';
+    promptCalls = 0;
+    const connectsBefore = connects.length;
+    await manager.prompt(idle, 'hallo');
+    assert(promptCalls === 2, 'a prompt that fails at the transport is retried exactly once');
+    assert(connects.length > connectsBefore, 'the retry happens only after the session network was re-attached');
+    assert(store.getSession(idle)?.status === 'running', 'the healed prompt leaves the session running');
+
+    shimMode = 'dead';
+    promptCalls = 0;
+    await manager.prompt(idle, 'nochmal');
+    const failed = await c2.wait(
+      (m) => m.type === 'session.event' && m.sessionId === idle && m.event.type === 'error',
+      5_000,
+    );
+    const failMsg = failed.type === 'session.event' && failed.event.type === 'error' ? failed.event.message : '';
+    assert(promptCalls === 2, 'a permanently unreachable shim is tried twice, not endlessly');
+    assert(failMsg.includes('Der Agent-Container ist nicht erreichbar'), 'the app is told the container is unreachable');
+    assert(failMsg.includes('Container: running') && failMsg.includes('[shim] listening'), 'the message carries the container diagnostics');
+    assert(store.getSession(idle)?.status === 'error', 'a failed prompt leaves the session in error');
+  } finally {
+    for (const id of [running, idle, gone, stopped]) await manager.deleteSession(id).catch(() => {});
+    cfg.dockerEnabled = false;
+    cfg.dockerHost = null;
+    cfg.dockerHostIsLocal = false;
+    dockerMod.resetDockerClient();
+    if (hostnameBefore === undefined) delete process.env.HOSTNAME;
+    else process.env.HOSTNAME = hostnameBefore;
+    shim.close();
+    daemon.close();
+  }
+}
+
 async function main(): Promise<void> {
   const { app, store, manager } = await buildApp();
   await app.listen({ port: 0, host: '127.0.0.1' });
@@ -812,6 +1050,7 @@ async function main(): Promise<void> {
   }
 
   await startProgressSmoke(store, manager, c2, added.repo.id);
+  await reconcileSmoke(store, manager, c2, added.repo.id);
 
   const models = await request(c2, { type: 'session.models.get', requestId: 'mod1', sessionId });
   assert(

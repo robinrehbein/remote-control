@@ -75,6 +75,13 @@ export async function buildApp(): Promise<App> {
   await app.register(websocket, { options: { maxPayload: 1048576 } });
   registerWs(app, store, manager, hub);
 
+  // A redeploy starts a fresh orchestrator container next to the still running
+  // session containers: reconnect it to their networks and event streams.
+  // Deliberately not awaited - the server must come up either way.
+  void manager.reconcile().catch((e: unknown) => {
+    console.error(`[orchestrator] session reconcile failed: ${e instanceof Error ? e.message : String(e)}`);
+  });
+
   return { app, store, manager, hub };
 }
 

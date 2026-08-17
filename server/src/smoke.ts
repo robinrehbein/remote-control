@@ -1,7 +1,10 @@
-import { cpSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
+import { spawn } from 'node:child_process';
 import type { AddressInfo } from 'node:net';
 import WebSocket from 'ws';
 import type { ServerMessage } from '@pocketagent/protocol';
@@ -22,6 +25,16 @@ const vault = await import('./vault.js');
 const admin = await import('./admin.js');
 const { sha256 } = await import('./db.js');
 const { config } = await import('./config.js');
+const { CodexJsonRpc } = await import('./codex-jsonrpc.js');
+type CodexAuthTransport = import('./codex-auth.js').CodexAuthTransport;
+type CodexAppServerSession = import('./codex-auth.js').CodexAppServerSession;
+const {
+  parseCallbackPort,
+  parseLoginResult,
+  isLoginCompleted,
+  isLoginError,
+  accountLabelFrom,
+} = await import('./codex-auth.js');
 
 function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) {
@@ -2472,6 +2485,141 @@ async function turnLifecycleSmoke(store: Store, manager: SessionManager, c2: Cli
   }
 }
 
+const HERE = dirname(fileURLToPath(import.meta.url));
+const FAKE_CODEX = join(HERE, 'smoke-fake-codex.mjs');
+
+/**
+ * Transport for the auth smoke test: spawns the fake codex app-server (JSON-RPC
+ * over stdio + a real loopback login HTTP server) with CODEX_HOME pointed at a
+ * temp dir, so the whole CodexAuthManager flow runs against it without docker.
+ */
+class SpawnCodexAuthTransport implements CodexAuthTransport {
+  constructor(
+    private readonly codexHome: string,
+    private readonly env: Record<string, string> = {},
+  ) {}
+
+  open(): Promise<CodexAppServerSession> {
+    const child = spawn(process.execPath, [FAKE_CODEX], {
+      env: { ...process.env, ...this.env, CODEX_HOME: this.codexHome },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    child.stderr.setEncoding('utf8');
+    const rpc = new CodexJsonRpc(child.stdin, child.stdout, { onLog: () => {} });
+    const codexHome = this.codexHome;
+    return rpc.request('initialize', { clientInfo: { name: 'smoke', version: '0' } }, 10_000).then(() => {
+      rpc.notify('initialized', {});
+      const session: CodexAppServerSession = {
+        rpc,
+        async forwardCallback(port: number, code: string, state: string): Promise<number> {
+          const res = await fetch(
+            `http://127.0.0.1:${port}/auth/callback?${new URLSearchParams({ code, state }).toString()}`,
+          );
+          return res.status;
+        },
+        async readAuthJson(): Promise<string | null> {
+          try {
+            return await readFile(join(codexHome, 'auth.json'), 'utf8');
+          } catch {
+            return null;
+          }
+        },
+        async close(): Promise<void> {
+          rpc.close();
+          child.kill('SIGTERM');
+        },
+      };
+      return session;
+    });
+  }
+}
+
+/**
+ * Pure-helper unit checks for the codex auth parsing (CODEX-OAUTH.md §1/§4),
+ * then the full auth.* WS flow against the fake app-server + login server.
+ */
+async function codexAuthFlow(): Promise<void> {
+  // ---- pure parsing helpers ----
+  assert(
+    parseCallbackPort('https://auth.openai.com/authorize?redirect_uri=' +
+      encodeURIComponent('http://localhost:1457/auth/callback')) === 1457,
+    'parseCallbackPort reads the redirect_uri port',
+  );
+  assert(parseCallbackPort('not a url') === 1455, 'parseCallbackPort falls back to 1455');
+  assert(parseCallbackPort(undefined) === 1455, 'parseCallbackPort default without a url');
+  const login = parseLoginResult({ auth_url: 'https://x', login_id: 'l1', user_code: 'CODE' });
+  assert(login.authUrl === 'https://x' && login.loginId === 'l1' && login.userCode === 'CODE', 'parseLoginResult snake_case');
+  assert(isLoginCompleted('AccountLoginCompletedNotification'), 'isLoginCompleted matches the codex notification');
+  assert(!isLoginCompleted('item/started'), 'isLoginCompleted ignores unrelated notifications');
+  assert(isLoginError('accountLoginError'), 'isLoginError matches a login error notification');
+  assert(
+    accountLabelFrom({ account: { plan: 'ChatGPT Plus', email: 'a@b.c' } }) === 'ChatGPT Plus, a@b.c',
+    'accountLabelFrom builds a plan+email label',
+  );
+
+  // ---- full flow through a real WS against the fake transport ----
+  const codexHome = mkdtempSync(join(tmpdir(), 'pa-smoke-codexhome-'));
+  const { app, store } = await buildApp({ codexAuthTransport: new SpawnCodexAuthTransport(codexHome) });
+  await app.listen({ port: 0, host: '127.0.0.1' });
+  const addr = app.server.address() as AddressInfo;
+  const wsBase = `ws://127.0.0.1:${addr.port}/ws`;
+
+  const code = generatePairingCode(store);
+  const pairRes = await fetch(`http://127.0.0.1:${addr.port}/api/pairing/confirm`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ code, deviceName: 'auth-device' }),
+  });
+  const paired = (await pairRes.json()) as { deviceId?: string; deviceToken?: string };
+
+  const c = new Client(wsBase);
+  await c.opened;
+  c.send({ type: 'hello', deviceId: paired.deviceId, token: paired.deviceToken });
+  await c.wait((m) => m.type === 'welcome');
+
+  // The codex manifest's authFlows must reach the app (W2.3 declared them but
+  // the server dropped the field on load until this package wired it through).
+  const adapters = await request(c, { type: 'adapter.list', requestId: 'adpA' });
+  const codex = adapters.type === 'adapter.list' ? adapters.adapters.find((a) => a.id === 'codex') : undefined;
+  assert(codex !== undefined, 'adapter.list includes codex');
+  const flowTypes = (codex?.authFlows ?? []).map((f) => f.type);
+  assert(flowTypes.includes('oauth-loopback'), 'codex authFlows carry oauth-loopback');
+  assert(flowTypes.includes('device-code'), 'codex authFlows carry device-code');
+  const loopback = (codex?.authFlows ?? []).find((f) => f.type === 'oauth-loopback');
+  assert(loopback?.ports?.includes(1455) === true, 'oauth-loopback flow lists port 1455');
+
+  // auth.start -> auth.url
+  c.send({ type: 'auth.start', requestId: 'authX', adapter: 'codex', flow: 'oauth-loopback' });
+  const urlMsg = await c.wait((m) => m.type === 'auth.url' && m.requestId === 'authX');
+  assert(urlMsg.type === 'auth.url', 'auth.start yields auth.url');
+  if (urlMsg.type !== 'auth.url') throw new Error('unreachable');
+  assert(urlMsg.url.includes('auth.openai.com'), 'auth.url carries the provider login URL');
+  assert(urlMsg.port > 0, 'auth.url reports the loopback port for the phone listener');
+
+  // auth.callback is forwarded to the login server inside the (fake) container,
+  // which writes auth.json and reports completion.
+  c.send({ type: 'auth.callback', requestId: 'authX', code: 'the-code', state: 'fake-state' });
+  const doneMsg = await c.wait((m) => m.type === 'auth.done' && m.requestId === 'authX');
+  assert(doneMsg.type === 'auth.done' && doneMsg.ok === true, 'auth.done ok after the callback is forwarded');
+  if (doneMsg.type !== 'auth.done') throw new Error('unreachable');
+  assert(doneMsg.account?.includes('ChatGPT Plus') === true, 'auth.done carries the account label');
+
+  // Vault backup written (secret kind codex_oauth), value equals the volume auth.json.
+  const backup = store.getSecretValue('codex_oauth', 'default');
+  assert(backup !== null && backup.includes('sk-fake-from-exchange'), 'auth.json is backed up to the vault as codex_oauth');
+  const onDisk = readFileSync(join(codexHome, 'auth.json'), 'utf8');
+  assert(backup === onDisk, 'vault backup matches the auth.json in the shared CODEX_HOME');
+
+  // A non-codex adapter has no in-app login.
+  c.send({ type: 'auth.start', requestId: 'authY', adapter: 'claude' });
+  const noAuth = await c.wait((m) => m.type === 'auth.done' && m.requestId === 'authY');
+  assert(noAuth.type === 'auth.done' && noAuth.ok === false, 'non-codex adapter gets auth.done ok:false');
+
+  await app.close();
+  rmSync(codexHome, { recursive: true, force: true });
+  console.log('codex auth flow: OK');
+}
+
 async function main(): Promise<void> {
   await protocolLoadsOnPlainNode();
   const { app, store, manager } = await buildApp();
@@ -3247,6 +3395,12 @@ async function main(): Promise<void> {
   /* ---------------- W2.4 link relay: heartbeat, capabilities, close codes --------------------------- */
 
   await linkRelaySmoke(store, wsBase, c2);
+
+  /* ---------------- W3.4 codex OAuth: auth.* flow + vault backup ------------------------------------- */
+  // Runs last: it builds a second app on the shared DB and would otherwise
+  // leave a codex_oauth secret / extra device behind for earlier assertions.
+
+  await codexAuthFlow();
 
   console.log('SMOKE OK');
   process.exit(0);

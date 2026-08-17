@@ -2,14 +2,14 @@
   "$schema": "https://pocketagent.dev/schemas/adapter.json",
   "id": "codex",
   "name": "OpenAI Codex",
-  "description": "OpenAI Codex via `codex app-server` (JSON-RPC over stdio); OPENAI_API_KEY (BYOK) or ChatGPT sign-in (device code now, in-app OAuth in W3.4). Remote approvals + resume.",
+  "description": "OpenAI Codex via `codex app-server` (JSON-RPC over stdio); OPENAI_API_KEY (BYOK) or in-app ChatGPT sign-in (Browser-Loopback-OAuth + Device-Code). Remote approvals + resume.",
   "capabilities": { "approvals": true, "resume": true, "streaming": true, "autoPush": true, "reasoning": false, "modelSwitch": true },
   "credentials": {},
   "providerEnv": {
     "openai": "OPENAI_API_KEY"
   },
   "providers": [
-    { "id": "openai", "name": "OpenAI", "keyUrl": "https://platform.openai.com/api-keys", "hint": "API-Key von platform.openai.com (sk-…); alternativ ChatGPT-Login (Device-Code) — voller In-App-Login folgt" }
+    { "id": "openai", "name": "OpenAI", "keyUrl": "https://platform.openai.com/api-keys", "hint": "API-Key von platform.openai.com (sk-…); alternativ In-App-Login mit dem ChatGPT-Abo (Browser oder Device-Code)" }
   ],
   "authFlows": [
     { "type": "oauth-loopback", "ports": [1455, 1457] },

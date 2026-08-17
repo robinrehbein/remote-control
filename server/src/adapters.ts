@@ -1,7 +1,7 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { AdapterDescriptor, ProviderDescriptor } from '@pocketagent/protocol';
+import type { AdapterDescriptor, AuthFlow, ProviderDescriptor } from '@pocketagent/protocol';
 import { config } from './config.js';
 import { shimContextHash } from './image-build.js';
 
@@ -72,6 +72,34 @@ function validateCredentials(raw: unknown, source: string): Record<string, strin
   return out;
 }
 
+/**
+ * `authFlows` (CODEX-OAUTH.md §5) declares how a user signs the adapter in, so
+ * the app renders the right login affordance without a hard-coded table. In
+ * W2.3 the field lived in adapter.json but was dropped on load; this passes it
+ * through, keeping only well-formed entries. It is display/flow metadata (never
+ * an env var), so a malformed entry is skipped rather than failing the whole
+ * manifest — an adapter with no readable flow just falls back to secret-paste.
+ */
+function authFlowList(raw: unknown): AuthFlow[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const out: AuthFlow[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== 'object' || entry === null) continue;
+    const e = entry as Record<string, unknown>;
+    if (typeof e.type !== 'string' || e.type.length === 0) continue;
+    const ports = Array.isArray(e.ports)
+      ? e.ports.filter((p): p is number => typeof p === 'number' && Number.isInteger(p) && p > 0 && p < 65536)
+      : undefined;
+    out.push({
+      type: e.type,
+      ...(ports && ports.length > 0 ? { ports } : {}),
+      ...(typeof e.hint === 'string' && e.hint.length > 0 ? { hint: e.hint } : {}),
+      ...(typeof e.keyUrl === 'string' && e.keyUrl.length > 0 ? { keyUrl: e.keyUrl } : {}),
+    });
+  }
+  return out.length > 0 ? out : undefined;
+}
+
 /** `providerEnv` maps a provider id to the single env var its key goes into. */
 function validateProviderEnv(raw: unknown, source: string): Record<string, string> | undefined {
   if (raw === undefined) return undefined;
@@ -136,6 +164,10 @@ function validate(id: string, raw: unknown, source: string): AdapterDescriptor {
     ...((): { providers?: ProviderDescriptor[] } => {
       const providers = providerList(m.providers);
       return providers ? { providers } : {};
+    })(),
+    ...((): { authFlows?: AuthFlow[] } => {
+      const authFlows = authFlowList(m.authFlows);
+      return authFlows ? { authFlows } : {};
     })(),
     defaults,
   };

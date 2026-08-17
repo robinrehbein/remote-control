@@ -25,6 +25,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.Logout
 import androidx.compose.material.icons.automirrored.outlined.OpenInNew
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.outlined.AccountCircle
 import androidx.compose.material.icons.outlined.CheckCircleOutline
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Edit
@@ -56,6 +57,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -79,6 +81,8 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.pocketagent.app.PocketAgentApp
 import com.pocketagent.app.data.AdapterDescriptor
 import com.pocketagent.app.data.AppRepository
+import com.pocketagent.app.data.CodexAuthUiState
+import com.pocketagent.app.data.CodexOAuthController
 import com.pocketagent.app.data.ProviderDescriptor
 import com.pocketagent.app.data.SecretInfo
 import com.pocketagent.app.data.SecretValidation
@@ -305,6 +309,16 @@ fun SettingsScreen(onBack: () -> Unit) {
     var showAddRepo by rememberSaveable { mutableStateOf(false) }
     var confirmLogout by rememberSaveable { mutableStateOf(false) }
 
+    // In-App-Login (CODEX-OAUTH.md): der Controller treibt den Flow, öffnet die
+    // Login-URL im Browser (LocalUriHandler) und lauscht auf dem Loopback-Port.
+    val uriHandler = LocalUriHandler.current
+    val authScope = rememberCoroutineScope()
+    val codexAuth = remember {
+        CodexOAuthController(authScope, repository) { url -> runCatching { uriHandler.openUri(url) } }
+    }
+    val authState by codexAuth.state.collectAsState()
+    val loginAdapters = adapters.filter { adapter -> adapter.authFlows.any { it.type == "oauth-loopback" || it.type == "device-code" } }
+
     LaunchedEffect(Unit) { vm.refresh() }
 
     OneUiScaffold(title = "Einstellungen", onBack = onBack) { padding ->
@@ -414,6 +428,40 @@ fun SettingsScreen(onBack: () -> Unit) {
                         }
                     }
                 }
+            }
+
+            /* ---------- Anmelden (In-App-OAuth) ---------- */
+            if (loginAdapters.isNotEmpty()) {
+                SectionHeader("Anmelden")
+                GroupCard {
+                    Column(Modifier.padding(vertical = 4.dp)) {
+                        loginAdapters.forEachIndexed { index, adapter ->
+                            if (index > 0) ListDivider()
+                            val hasLoopback = adapter.authFlows.any { it.type == "oauth-loopback" }
+                            val hasDevice = adapter.authFlows.any { it.type == "device-code" }
+                            val subtitle = when {
+                                hasLoopback -> "Im Browser mit dem Abo anmelden – kein Key nötig"
+                                else -> "Code auf einem anderen Gerät eingeben"
+                            }
+                            SettingsTile(
+                                icon = Icons.Outlined.AccountCircle,
+                                title = "${adapter.name}: Mit ChatGPT anmelden",
+                                subtitle = subtitle,
+                                onClick = { codexAuth.begin(if (hasLoopback) "oauth-loopback" else "device-code") },
+                                trailing = if (hasLoopback && hasDevice) {
+                                    {
+                                        TextButton(onClick = { codexAuth.begin("device-code") }) {
+                                            Text("Code", style = MaterialTheme.typography.labelLarge)
+                                        }
+                                    }
+                                } else {
+                                    null
+                                },
+                            )
+                        }
+                    }
+                }
+                SectionNote("Der Login läuft im Browser; die App fängt nur den Rücksprung ab und speichert nichts im Klartext.")
             }
 
             /* ---------- Zugänge ---------- */
@@ -556,6 +604,82 @@ fun SettingsScreen(onBack: () -> Unit) {
             },
         )
     }
+    if (authState !is CodexAuthUiState.Idle) {
+        CodexAuthDialog(
+            state = authState,
+            onReopen = { url -> runCatching { uriHandler.openUri(url) } },
+            onDismiss = { codexAuth.cancel() },
+        )
+    }
+}
+
+/**
+ * Fortschritt/Ergebnis eines In-App-Logins (CODEX-OAUTH.md). Zeigt bei
+ * device-code den Code, bei oauth-loopback den Wartezustand, und schließlich
+ * „Codex verbunden" bzw. den Fehler. Schließen bricht einen laufenden Flow ab.
+ */
+@Composable
+private fun CodexAuthDialog(
+    state: CodexAuthUiState,
+    onReopen: (String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val title = when (state) {
+        is CodexAuthUiState.Success -> "Codex verbunden"
+        is CodexAuthUiState.Failed -> "Login fehlgeschlagen"
+        else -> "Mit ChatGPT anmelden"
+    }
+    OneUiDialog(
+        onDismissRequest = onDismiss,
+        title = title,
+        text = {
+            when (state) {
+                is CodexAuthUiState.Starting ->
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                        Spacer(Modifier.width(12.dp))
+                        Text("Login wird vorbereitet …")
+                    }
+
+                is CodexAuthUiState.AwaitingBrowser ->
+                    if (state.userCode != null) {
+                        Column {
+                            Text("Öffne die Seite und gib diesen Code ein:")
+                            Spacer(Modifier.height(8.dp))
+                            Text(
+                                state.userCode,
+                                style = MaterialTheme.typography.headlineSmall,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                        }
+                    } else {
+                        Text("Melde dich im Browser an. Danach kehrst du automatisch zur App zurück.")
+                    }
+
+                is CodexAuthUiState.Success ->
+                    Text(state.account?.let { "Angemeldet: $it" } ?: "Der Login ist abgeschlossen.")
+
+                is CodexAuthUiState.Failed -> Text(state.error)
+                CodexAuthUiState.Idle -> Unit
+            }
+        },
+        confirmButton = {
+            when (state) {
+                is CodexAuthUiState.Success, is CodexAuthUiState.Failed ->
+                    TextButton(onClick = onDismiss) { Text("Fertig") }
+
+                is CodexAuthUiState.AwaitingBrowser ->
+                    TextButton(onClick = { onReopen(state.url) }) { Text("Browser öffnen") }
+
+                else -> Unit
+            }
+        },
+        dismissButton = if (state is CodexAuthUiState.Success || state is CodexAuthUiState.Failed) {
+            null
+        } else {
+            { TextButton(onClick = onDismiss) { Text("Abbrechen") } }
+        },
+    )
 }
 
 /* ------------------------------------------------------------------ */

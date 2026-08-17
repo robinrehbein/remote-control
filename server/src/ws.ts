@@ -8,6 +8,7 @@ import { sha256 } from './db.js';
 import type { Store } from './db.js';
 import { listAdapters } from './adapters.js';
 import type { SessionManager } from './sessions.js';
+import type { CodexAuthManager } from './codex-auth.js';
 import { encrypt } from './vault.js';
 import { validateSecret } from './secret-validate.js';
 import { isValidSecretKind } from './secrets-api.js';
@@ -257,6 +258,7 @@ export function registerWs(
   manager: SessionManager,
   hub: Hub,
   heartbeat?: Heartbeat,
+  codexAuth?: CodexAuthManager,
   authTimeoutMs: number = WS_AUTH_TIMEOUT_MS,
 ): void {
   // maxPayload (1 MiB) is enforced at the websocket plugin registration in index.ts.
@@ -290,6 +292,9 @@ export function registerWs(
     let role: 'device' | 'link' = 'device';
     let deviceId: string | null = null;
     let linkId: string | null = null;
+    // In-flight codex auth flows this socket started (cancelled on disconnect so
+    // an orphaned flow's auth container is torn down when the app goes away).
+    const authRequests = new Set<string>();
 
     // Neither hello variant arrived in time: close before the heartbeat ever
     // gets a chance to keep this socket alive on protocol pongs alone.
@@ -413,8 +418,15 @@ export function registerWs(
       void handle(msg).catch((e) => send({ type: 'error', message: errText(e) }));
     });
 
+    const cleanupAuth = (): void => {
+      if (!codexAuth || authRequests.size === 0) return;
+      const ids = new Set(authRequests);
+      authRequests.clear();
+      codexAuth.cancelAll((requestId) => ids.has(requestId));
+    };
     socket.on('close', () => {
       hub.remove(socket);
+      cleanupAuth();
       if (role === 'link' && linkId) {
         // dropLink is identity-guarded; only report the link as gone when no
         // other socket has taken over in the meantime. The displaced socket's
@@ -427,6 +439,7 @@ export function registerWs(
     });
     socket.on('error', () => {
       hub.remove(socket);
+      cleanupAuth();
       if (role === 'link' && linkId) {
         hub.dropLink(linkId, socket);
         if (!hub.hasLink(linkId)) manager.linkDisconnected(linkId);
@@ -656,6 +669,29 @@ export function registerWs(
         case 'secret.delete':
           store.deleteSecret(msg.id, 'default');
           send({ type: 'secret.deleted', requestId: msg.requestId, id: msg.id });
+          return;
+        case 'auth.start': {
+          if (!codexAuth) {
+            send({ type: 'auth.done', requestId: msg.requestId, ok: false, error: 'In-App-Login ist auf diesem Server nicht verfügbar' });
+            return;
+          }
+          authRequests.add(msg.requestId);
+          // auth.done (success or failure) is delivered via `send`; drop the id
+          // from the socket's set on either close event fired by the manager.
+          await codexAuth.start(msg.requestId, msg.adapter, msg.flow, (m) => {
+            if (m.type === 'auth.done') authRequests.delete(msg.requestId);
+            send(m);
+          });
+          return;
+        }
+        case 'auth.callback':
+          if (codexAuth) await codexAuth.callback(msg.requestId, msg.code, msg.state);
+          return;
+        case 'auth.cancel':
+          if (codexAuth) {
+            authRequests.delete(msg.requestId);
+            codexAuth.cancel(msg.requestId);
+          }
           return;
         case 'device.list': {
           // Single-tenant trust model: any authenticated device may list/revoke.

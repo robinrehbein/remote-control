@@ -127,24 +127,37 @@ fun buildTimeline(events: List<AgentEvent>): List<TimelineItem> =
 /**
  * Erkennungsmerkmal eines Ereignisses für die Dedupe.
  *
- * Der Vertrag gibt Ereignissen weder Id noch Zeitstempel — also muss die
- * Identität aus dem Inhalt kommen. Wo es eine fachliche Id gibt (Tool-Call,
- * Permission), ist sie das Kriterium; sonst zählt der vollständige Inhalt.
+ * Der Vertrag gab Ereignissen ursprünglich weder Id noch Zeitstempel — also
+ * kam die Identität aus dem Inhalt. Wo es eine fachliche Id gibt (Tool-Call,
+ * Permission), ist sie das Kriterium; sonst zählte der vollständige Inhalt.
+ * Seit W2.1 (Event-Replay) prägt der Server jedem sequenzierten Ereignis
+ * eine `seq` auf (`AgentEvent.seq`) — trägt ein Ereignis sie, ist sie das
+ * präzisere Merkmal: zwei Zeilen mit derselben `seq` sind serverseitig
+ * garantiert dasselbe Ereignis (etwa nach einem Reconnect, wenn der geladene
+ * Verlauf einen bereits live gesehenen Turn erneut liefert), während
+ * Inhaltsgleichheit offenlässt, ob das ein Resend ist oder eine echte
+ * Wiederholung (zwei tatsächlich gesendete „ok“). Fehlt sie (älterer
+ * Server), bleibt es beim Inhaltsvergleich.
+ *
  * null heißt „hat keine eigene Zeile“ (Status, Delta, Ping) — solche
- * Ereignisse werden nie dedupliziert, weil sie die Liste nicht verändern.
+ * Ereignisse werden nie dedupliziert, weil sie die Liste nicht verändern;
+ * das gilt unabhängig von einer vorhandenen `seq`.
  */
-fun eventIdentity(event: AgentEvent): String? = when (event) {
-    is AgentEvent.ToolCall -> "tool.call:${event.id}"
-    is AgentEvent.ToolResult -> "tool.result:${event.id}"
-    is AgentEvent.PermissionRequest -> "permission.request:${event.permissionId}"
-    is AgentEvent.PermissionResolved -> "permission.resolved:${event.permissionId}"
-    is AgentEvent.MessageCompleted -> "message.completed:${event.role}\u0000${event.text}"
-    is AgentEvent.TurnCompleted -> "turn.completed:${event.commitSha}\u0000${event.summary}"
-    is AgentEvent.Pushed -> "pushed:${event.branch}\u0000${event.prUrl}\u0000${event.auto}"
-    is AgentEvent.TurnFailed -> "turn.failed:${event.error}"
-    is AgentEvent.ErrorEvent -> "error:${event.message}"
-    is AgentEvent.Notice -> "notice:${event.phase}\u0000${event.message}\u0000${event.detail}"
-    is AgentEvent.Status, is AgentEvent.MessageDelta, is AgentEvent.Ping -> null
+fun eventIdentity(event: AgentEvent): String? {
+    val contentKey = when (event) {
+        is AgentEvent.ToolCall -> "tool.call:${event.id}"
+        is AgentEvent.ToolResult -> "tool.result:${event.id}"
+        is AgentEvent.PermissionRequest -> "permission.request:${event.permissionId}"
+        is AgentEvent.PermissionResolved -> "permission.resolved:${event.permissionId}"
+        is AgentEvent.MessageCompleted -> "message.completed:${event.role}\u0000${event.text}"
+        is AgentEvent.TurnCompleted -> "turn.completed:${event.commitSha}\u0000${event.summary}"
+        is AgentEvent.Pushed -> "pushed:${event.branch}\u0000${event.prUrl}\u0000${event.auto}"
+        is AgentEvent.TurnFailed -> "turn.failed:${event.error}"
+        is AgentEvent.ErrorEvent -> "error:${event.message}"
+        is AgentEvent.Notice -> "notice:${event.phase}\u0000${event.message}\u0000${event.detail}"
+        is AgentEvent.Status, is AgentEvent.MessageDelta, is AgentEvent.Ping -> null
+    } ?: return null
+    return event.seq?.let { "seq:$it" } ?: contentKey
 }
 
 /**

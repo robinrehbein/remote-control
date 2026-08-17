@@ -2,6 +2,7 @@
 
 package com.pocketagent.app.ui.screens
 
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -25,6 +26,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.Logout
 import androidx.compose.material.icons.automirrored.outlined.OpenInNew
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.outlined.CheckCircleOutline
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Edit
@@ -56,6 +59,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -177,8 +181,11 @@ private val SECRET_CATALOG = listOf(
     SecretMeta("anthropic", "Anthropic API", "API-Key von console.anthropic.com (sk-ant-…)"),
     SecretMeta("openai", "OpenAI", "API-Key von platform.openai.com (sk-…)"),
     SecretMeta("zai", "Z.AI", "API-Key aus dem Z.AI-Dashboard"),
-    SecretMeta("moonshot", "Moonshot/Kimi", "API-Key von platform.moonshot.ai"),
-    SecretMeta("kimi", "Kimi", "API-Key von platform.moonshot.ai"),
+    // "moonshot" und "kimi" waren zwei Katalog-Einträge für denselben
+    // Zugang — mancher Adapter (z. B. pi) mappt beide Provider-Ids sogar auf
+    // dieselbe Umgebungsvariable. Fund: "Secret-Katalog … Duplikat
+    // (moonshot/kimi)". Ein Eintrag, Alias über [SECRET_KIND_ALIASES].
+    SecretMeta("moonshot", "Moonshot / Kimi", "API-Key von platform.moonshot.ai"),
     SecretMeta("google", "Google Gemini", "API-Key aus Google AI Studio"),
     SecretMeta("groq", "Groq", "API-Key von console.groq.com"),
     SecretMeta("openrouter", "OpenRouter", "API-Key von openrouter.ai (sk-or-…)"),
@@ -186,6 +193,17 @@ private val SECRET_CATALOG = listOf(
     SecretMeta("junie", "JetBrains Junie", "Junie API-Key (usage-based)"),
     SecretMeta("kilo", "Kilo Gateway", "Kompletter Inhalt der Gateway-auth.json einfügen", multiline = true),
 )
+
+/**
+ * Kind-Ids, die serverseitig zwei Provider-Ids desselben Zugangs sind
+ * (siehe SECRET_CATALOG-Kommentar zu "moonshot"/"kimi"). Rein clientseitige
+ * Anzeige-Zusammenführung — ein bereits unter dem Alias gespeicherter Secret
+ * bleibt unter seiner echten Kind-Id funktionsfähig (Löschen läuft über die
+ * Id, nicht die Art), zeigt aber denselben Anzeigenamen wie der Kanon.
+ */
+private val SECRET_KIND_ALIASES = mapOf("kimi" to "moonshot")
+
+private fun canonicalKind(kind: String): String = SECRET_KIND_ALIASES[kind] ?: kind
 
 /** Soft format hints per kind — warn, never block. */
 private val KIND_PREFIXES = mapOf(
@@ -232,7 +250,10 @@ private fun buildCatalog(adapters: List<AdapterDescriptor>): List<SecretMeta> {
         )
     }
 
-    val known = SECRET_CATALOG.map { it.kind }.toSet()
+    // Alias-Ids (z. B. "kimi") zählen als bekannt, sonst würde ein Adapter,
+    // der sie als eigene providerEnv-Id führt, den Katalog-Eintrag erneut
+    // duplizieren, den SECRET_KIND_ALIASES gerade zusammengeführt hat.
+    val known = SECRET_CATALOG.map { it.kind }.toSet() + SECRET_KIND_ALIASES.keys
     val dynamic = adapters
         .flatMap { it.credentials.keys + it.providerEnv.keys }
         .distinct()
@@ -251,8 +272,11 @@ private fun buildCatalog(adapters: List<AdapterDescriptor>): List<SecretMeta> {
     return enriched + dynamic
 }
 
+/** Kanonisiert Alias-Kinds (siehe [SECRET_KIND_ALIASES]) vor dem Nachschlagen —
+ *  ein bereits unter "kimi" gespeicherter Zugang zeigt so denselben Namen
+ *  wie ein neu unter "moonshot" angelegter. */
 private fun metaFor(kind: String, catalog: List<SecretMeta>): SecretMeta =
-    catalog.firstOrNull { it.kind == kind } ?: SecretMeta(kind, kind, "")
+    catalog.firstOrNull { it.kind == canonicalKind(kind) } ?: SecretMeta(kind, kind, "")
 
 /** Adapter ids that consume a secret kind (credential or provider env). */
 private fun adaptersUsing(kind: String, adapters: List<AdapterDescriptor>): List<String> =
@@ -304,6 +328,7 @@ fun SettingsScreen(onBack: () -> Unit) {
     var confirmDeleteSecret by remember { mutableStateOf<SecretInfo?>(null) }
     var showAddRepo by rememberSaveable { mutableStateOf(false) }
     var confirmLogout by rememberSaveable { mutableStateOf(false) }
+    var serverDetailsOpen by rememberSaveable { mutableStateOf(false) }
 
     LaunchedEffect(Unit) { vm.refresh() }
 
@@ -315,6 +340,11 @@ fun SettingsScreen(onBack: () -> Unit) {
                 .verticalScroll(rememberScrollState()),
         ) {
             /* ---------- Server ---------- */
+            // Nur Verbindung ist auf einen Blick sichtbar — Sessions/
+            // Container/Laufzeit sind Debug-Werte ohne Handlungswert und
+            // beantworten keine Frage, die die App stellt (Fund:
+            // "Server-Statistik-Block … ohne Handlungswert"). Wer sie
+            // braucht, tippt "Details" auf.
             SectionHeader("Server")
             GroupCard {
                 Column(Modifier.padding(vertical = 4.dp)) {
@@ -324,11 +354,36 @@ fun SettingsScreen(onBack: () -> Unit) {
                         value = if (connected) "verbunden" else "offline",
                     )
                     ListDivider(CardInset)
-                    SettingsRow(label = "Aktive Sessions", value = s?.sessionsActive?.toString() ?: "…")
-                    ListDivider(CardInset)
-                    SettingsRow(label = "Laufende Container", value = s?.containersRunning?.toString() ?: "…")
-                    ListDivider(CardInset)
-                    SettingsRow(label = "Laufzeit", value = s?.let { formatUptime(it.uptimeSec) } ?: "…")
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { serverDetailsOpen = !serverDetailsOpen }
+                            .heightIn(min = TileMinHeight)
+                            .padding(horizontal = CardInset),
+                    ) {
+                        Text(
+                            "Details",
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Icon(
+                            if (serverDetailsOpen) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                            contentDescription = if (serverDetailsOpen) "Details einklappen" else "Details ausklappen",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    AnimatedVisibility(visible = serverDetailsOpen) {
+                        Column {
+                            ListDivider(CardInset)
+                            SettingsRow(label = "Aktive Sessions", value = s?.sessionsActive?.toString() ?: "…")
+                            ListDivider(CardInset)
+                            SettingsRow(label = "Laufende Container", value = s?.containersRunning?.toString() ?: "…")
+                            ListDivider(CardInset)
+                            SettingsRow(label = "Laufzeit", value = s?.let { formatUptime(it.uptimeSec) } ?: "…")
+                        }
+                    }
                 }
             }
 
@@ -429,7 +484,12 @@ fun SettingsScreen(onBack: () -> Unit) {
                         val users = adaptersUsing(secret.kind, adapters)
                         val age = relativeTime(secret.createdAt)
                         val ageText = if (age == "jetzt") "gerade hinterlegt" else "hinterlegt vor $age"
-                        SwipeToDismissRow(onDismiss = { vm.deleteSecret(secret.id) }) {
+                        // Wisch fragt statt sofort zu löschen — dasselbe
+                        // Muster wie der Lösch-Wisch der Session-Liste (Fund:
+                        // "Secret-Löschen per Wisch ohne Bestätigung und ohne
+                        // Undo"). Der Tap-Weg über das Sheet (unten) hatte
+                        // diese Sicherung schon; jetzt gilt sie auf beiden Wegen.
+                        SwipeToDismissRow(onRequestDelete = { confirmDeleteSecret = secret }) {
                             SettingsTile(
                                 icon = Icons.Outlined.Key,
                                 title = meta.displayName,
@@ -694,16 +754,20 @@ private fun DialogActionRow(
     }
 }
 
+/**
+ * Der Wisch löscht nicht mehr direkt — er federt immer zurück und meldet
+ * nur die Absicht ([onRequestDelete]), die der Aufrufer hinter einen
+ * Bestätigungsdialog hängt (dieselbe Sicherung, die der Tap-Weg über das
+ * Sheet schon hatte). Endgültiges Löschen ohne Rückfrage per Wisch war eine
+ * Schutzlücke (Fund, HOCH).
+ */
 @Composable
-private fun SwipeToDismissRow(onDismiss: () -> Unit, content: @Composable () -> Unit) {
+private fun SwipeToDismissRow(onRequestDelete: () -> Unit, content: @Composable () -> Unit) {
+    val request by rememberUpdatedState(onRequestDelete)
     val state = rememberSwipeToDismissBoxState(
         confirmValueChange = { value ->
-            if (value == SwipeToDismissBoxValue.EndToStart) {
-                onDismiss()
-                true
-            } else {
-                false
-            }
+            if (value == SwipeToDismissBoxValue.EndToStart) request()
+            false
         },
     )
     SwipeToDismissBox(
@@ -814,11 +878,19 @@ private fun SecretDialog(
                                             meta.displayName,
                                             fontWeight = if (meta.kind == selectedKind) FontWeight.SemiBold else FontWeight.Normal,
                                         )
-                                        Text(
-                                            meta.kind,
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        )
+                                        // Anzeigename + Beschreibung genügen —
+                                        // die rohe Kind-Id ist nur für "Eigene
+                                        // Art" relevant (Fund: "kryptische
+                                        // Kind-Ids im Dialog").
+                                        meta.description.takeIf { it.isNotBlank() }?.let { desc ->
+                                            Text(
+                                                text = desc,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                        }
                                     }
                                 },
                                 onClick = {

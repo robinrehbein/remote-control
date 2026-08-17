@@ -40,6 +40,7 @@ import androidx.compose.material.icons.outlined.SmartToy
 import androidx.compose.material.icons.outlined.StopCircle
 import androidx.compose.material.icons.outlined.Unarchive
 import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
@@ -76,6 +77,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.style.TextAlign
@@ -86,6 +88,7 @@ import com.pocketagent.app.data.SessionInfo
 import com.pocketagent.app.data.SessionStatus
 import com.pocketagent.app.data.WsClient
 import com.pocketagent.app.ui.theme.CardInset
+import com.pocketagent.app.ui.theme.EmptyStateInset
 import com.pocketagent.app.ui.theme.OneUiAccent
 import com.pocketagent.app.ui.theme.PillShape
 import com.pocketagent.app.ui.theme.PrimaryButtonHeight
@@ -113,6 +116,7 @@ fun SessionListScreen(
     val app = LocalContext.current.applicationContext as PocketAgentApp
     val repository = app.container.repository
     val allSessions by repository.sessions.collectAsState()
+    val sessionsLoaded by repository.sessionsLoaded.collectAsState()
     val connState by repository.connState.collectAsState()
     var refreshing by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
@@ -228,7 +232,16 @@ fun SessionListScreen(
                     .weight(1f),
             ) {
                 LaunchedEffect(allSessions) { refreshing = false }
-                if (allSessions.isEmpty()) {
+                if (!sessionsLoaded) {
+                    // Kaltstart: refreshSessions() ist noch unterwegs. Bis die
+                    // Antwort da ist, ist "leer" nicht bekannt — der Empty-State
+                    // mit CTA käme sonst auch Nutzern mit zehn Sessions unter
+                    // (Fund: "Falscher Leer-Zustand beim Kaltstart der
+                    // Session-Liste"). Derselbe Grundsatz wie im Session-Screen:
+                    // solange der Verlauf unterwegs ist, wird nicht behauptet,
+                    // er sei leer.
+                    LoadingSessions()
+                } else if (allSessions.isEmpty()) {
                     EmptySessions(onNewSession)
                 } else {
                     LazyColumn(
@@ -255,7 +268,6 @@ fun SessionListScreen(
                             SwipeableSessionRow(
                                 session = session,
                                 onArchiveSwipe = { setArchived(session, true) },
-                                onDeleteSwipe = { deleteFor = session.id },
                             ) {
                                 SessionCard(
                                     session = session,
@@ -280,7 +292,6 @@ fun SessionListScreen(
                                     SwipeableSessionRow(
                                         session = session,
                                         onArchiveSwipe = { setArchived(session, false) },
-                                        onDeleteSwipe = { deleteFor = session.id },
                                     ) {
                                         SessionCard(
                                             session = session,
@@ -357,24 +368,28 @@ fun SessionListScreen(
 /* ------------------------------------------------------------------ */
 
 /**
- * Eine Zeile mit beiden Wischrichtungen, wie in Samsung Mail:
+ * Eine Zeile mit genau einer Wischrichtung, wie in Samsung Mail:
  *
- * - **rechts nach links** archiviert (im Archiv: holt zurück). Das ist
- *   umkehrbar, passiert darum sofort und meldet sich per Snackbar mit
- *   „Rückgängig“.
- * - **links nach rechts** löscht. Weil dabei Verlauf und Arbeitsstand
- *   endgültig verschwinden, führt der Wisch die Aktion nicht aus, sondern
- *   fragt: die Zeile federt zurück, der Bestätigungsdialog kommt.
+ * **rechts nach links** archiviert (im Archiv: holt zurück). Das ist
+ * umkehrbar, passiert darum sofort und meldet sich per Snackbar mit
+ * „Rückgängig“.
+ *
+ * Der Löschen-Wisch (links nach rechts) ist entfallen (Fund: „Lösch-Wisch
+ * von links kollidiert mit der System-Zurück-Geste“) — genau dort, an der
+ * linken Bildschirmkante, beginnt bei Android-Gestennavigation die Zurück-
+ * Geste; ein Wisch, der einen Millimeter zu weit innen ansetzt, löste bisher
+ * den Bestätigungsdialog fürs Löschen statt „zurück“ aus. Löschen bleibt über
+ * Long-Press -> Aktions-Sheet erreichbar, mit Erklärtext ohnehin besser
+ * aufgehoben als in einer Wischgeste. Die verbleibende Archiv-Geste ist
+ * ungefährlich und reversibel — weniger, aber besser.
  */
 @Composable
 private fun SwipeableSessionRow(
     session: SessionInfo,
     onArchiveSwipe: () -> Unit,
-    onDeleteSwipe: () -> Unit,
     content: @Composable () -> Unit,
 ) {
     val archiveAction by rememberUpdatedState(onArchiveSwipe)
-    val deleteAction by rememberUpdatedState(onDeleteSwipe)
     val haptics = LocalHapticFeedback.current
     // confirmValueChange kann für denselben Zielwert mehrfach aufgerufen werden
     // (z. B. bei erneutem Layout) — ohne diese Sperre würde derselbe Wisch
@@ -392,14 +407,7 @@ private fun SwipeableSessionRow(
                     true
                 }
 
-                SwipeToDismissBoxValue.StartToEnd -> {
-                    if (lastHapticValue != value) {
-                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                        lastHapticValue = value
-                    }
-                    deleteAction()
-                    false
-                }
+                SwipeToDismissBoxValue.StartToEnd -> false
 
                 SwipeToDismissBoxValue.Settled -> {
                     lastHapticValue = null
@@ -411,6 +419,7 @@ private fun SwipeableSessionRow(
     )
     SwipeToDismissBox(
         state = state,
+        enableDismissFromStartToEnd = false,
         backgroundContent = {
             SwipeBackground(direction = state.dismissDirection, archived = session.archived)
         },
@@ -418,49 +427,26 @@ private fun SwipeableSessionRow(
     )
 }
 
-/**
- * Der Grund unter der Zeile: links das Löschen in der Fehlerfarbe, rechts
- * das Archivieren im ruhigen Primärton. Das Icon steht immer auf der
- * Seite, aus der gewischt wird.
- */
+/** Der Grund unter der Zeile: das Archivieren im ruhigen Primärton, von rechts. */
 @Composable
 private fun SwipeBackground(direction: SwipeToDismissBoxValue, archived: Boolean) {
-    if (direction == SwipeToDismissBoxValue.Settled) return
-    val deleting = direction == SwipeToDismissBoxValue.StartToEnd
-    val background = if (deleting) {
-        MaterialTheme.colorScheme.error
-    } else {
-        MaterialTheme.colorScheme.primaryContainer
-    }
-    val foreground = if (deleting) {
-        MaterialTheme.colorScheme.onError
-    } else {
-        MaterialTheme.colorScheme.onPrimaryContainer
-    }
-    val icon = when {
-        deleting -> Icons.Outlined.Delete
-        archiveSwipeArchives(archived) -> Icons.Outlined.Archive
-        else -> Icons.Outlined.Unarchive
-    }
-    val label = if (deleting) "Löschen" else archiveSwipeLabel(archived)
+    if (direction != SwipeToDismissBoxValue.EndToStart) return
+    val background = MaterialTheme.colorScheme.primaryContainer
+    val foreground = MaterialTheme.colorScheme.onPrimaryContainer
+    val icon = if (archiveSwipeArchives(archived)) Icons.Outlined.Archive else Icons.Outlined.Unarchive
+    val label = archiveSwipeLabel(archived)
     Box(
         modifier = Modifier
             .fillMaxSize()
             .clip(MaterialTheme.shapes.large)
             .background(background)
             .padding(horizontal = 22.dp),
-        contentAlignment = if (deleting) Alignment.CenterStart else Alignment.CenterEnd,
+        contentAlignment = Alignment.CenterEnd,
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            if (deleting) {
-                Icon(icon, contentDescription = label, tint = foreground, modifier = Modifier.size(22.dp))
-                Spacer(modifier = Modifier.width(10.dp))
-                SwipeLabel(label, foreground)
-            } else {
-                SwipeLabel(label, foreground)
-                Spacer(modifier = Modifier.width(10.dp))
-                Icon(icon, contentDescription = label, tint = foreground, modifier = Modifier.size(22.dp))
-            }
+            SwipeLabel(label, foreground)
+            Spacer(modifier = Modifier.width(10.dp))
+            Icon(icon, contentDescription = label, tint = foreground, modifier = Modifier.size(22.dp))
         }
     }
 }
@@ -479,12 +465,24 @@ private fun SwipeLabel(text: String, color: Color) {
 /* Liste                                                               */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Kaltstart: die erste `session.list`-Antwort ist unterwegs. Dezenter
+ * Spinner statt einer Behauptung über den Inhalt — der Empty-State mit CTA
+ * kommt erst, wenn der Server wirklich "leer" gemeldet hat.
+ */
+@Composable
+private fun LoadingSessions() {
+    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.size(20.dp))
+    }
+}
+
 @Composable
 private fun EmptySessions(onNewSession: () -> Unit) {
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(horizontal = 40.dp),
+            .padding(horizontal = EmptyStateInset),
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
@@ -542,14 +540,21 @@ private fun SessionCard(
     onLongClick: () -> Unit,
 ) {
     val haptics = LocalHapticFeedback.current
+    val uriHandler = LocalUriHandler.current
+    // Der Adapter steht als Wort in der Unterzeile statt als eigener Chip —
+    // "welches Harness in welchem Modus" beantwortet in einer Liste kaum
+    // eine Frage; "welche Session, was ist ihr Zustand" schon (Fund:
+    // "Session-Karte trägt bis zu 6 Metadaten-Elemente").
     val second = listOfNotNull(
         sessionSubtitle(session),
+        session.adapter.takeIf { it.isNotBlank() },
         if (session.status == SessionStatus.CREATING) {
             "Container wird gestartet …"
         } else {
             relativeTime(session.lastActiveAt)
         },
     ).joinToString(" · ")
+    val prUrl = session.prUrl?.takeIf { it.isNotBlank() }
     Surface(
         shape = MaterialTheme.shapes.large,
         color = MaterialTheme.colorScheme.surfaceContainer,
@@ -585,23 +590,43 @@ private fun SessionCard(
                 Spacer(modifier = Modifier.width(10.dp))
                 SessionStatusBadge(session = session)
             }
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                modifier = Modifier.padding(top = 10.dp),
-            ) {
-                InfoChip(session.adapter)
-                InfoChip(modeLabel(session.mode))
-                session.networkPolicy
-                    ?.takeIf { it != "allowlist" }
-                    ?.let { policy -> InfoChip(networkPolicyLabel(policy)) }
-            }
-            if (session.prUrl != null) {
-                Text(
-                    text = "Pull Request offen",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.padding(top = 10.dp),
-                )
+            // Ausnahmebasiert: nur eine Abweichung vom sicheren Netzwerk-
+            // Default verdient hier noch einen Chip — Adapter und Modus
+            // stehen bereits oben bzw. im Session-Screen.
+            session.networkPolicy
+                ?.takeIf { it != "allowlist" }
+                ?.let { policy ->
+                    Row(modifier = Modifier.padding(top = 10.dp)) {
+                        InfoChip(networkPolicyLabel(policy))
+                    }
+                }
+            if (prUrl != null) {
+                // Antippbar statt reiner Text (Fund: "PR-Erfolg ist eine
+                // Sackgasse" — dieselbe Karte, die den Erfolg meldet, führt
+                // jetzt auch direkt zu ihm, ohne Umweg über das Aktions-Sheet.
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .padding(top = 10.dp)
+                        .clickable(
+                            onClickLabel = "Pull Request öffnen",
+                            role = Role.Button,
+                            onClick = { uriHandler.openUri(prUrl) },
+                        ),
+                ) {
+                    Text(
+                        text = "Pull Request offen",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Icon(
+                        Icons.AutoMirrored.Outlined.OpenInNew,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(14.dp),
+                    )
+                }
             }
         }
     }

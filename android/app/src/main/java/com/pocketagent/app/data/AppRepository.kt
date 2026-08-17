@@ -38,6 +38,17 @@ class AppRepository(
     private val _sessions = MutableStateFlow<List<SessionInfo>>(emptyList())
     val sessions: StateFlow<List<SessionInfo>> = _sessions
 
+    /**
+     * True, sobald die erste `session.list`-Antwort da war — auch eine leere
+     * zählt. Unterscheidet „noch nicht geladen" von „wirklich leer" (Fund:
+     * falscher Leer-Zustand beim Kaltstart der Session-Liste): ohne dieses
+     * Flag zeigt die Liste beim App-Start kurz „Noch keine Session" samt CTA,
+     * selbst wenn zehn Sessions unterwegs sind. Bleibt danach für die
+     * Laufzeit der App true — ein Reconnect ist kein Kaltstart mehr.
+     */
+    private val _sessionsLoaded = MutableStateFlow(false)
+    val sessionsLoaded: StateFlow<Boolean> = _sessionsLoaded
+
     private val _repos = MutableStateFlow<List<RepoInfo>>(emptyList())
     val repos: StateFlow<List<RepoInfo>> = _repos
 
@@ -46,6 +57,19 @@ class AppRepository(
 
     private val _secrets = MutableStateFlow<List<SecretInfo>>(emptyList())
     val secrets: StateFlow<List<SecretInfo>> = _secrets
+
+    /**
+     * Modellkatalog je Adapter, aus früheren `session.models.get`-Antworten
+     * gesammelt. Vor dem Anlegen einer Session existiert noch kein Shim, der
+     * einen Katalog liefern könnte (`session.models.get` braucht eine
+     * `sessionId`) — dieser Cache ist die einzige Quelle, aus der der
+     * Anlege-Screen echte Modellnamen statt Freitext-Raten anbieten kann
+     * (Fund: "Modell beim Anlegen nur Freitext mit Format-Raten"). Nur ein
+     * Vorschlag aus einer früheren Session desselben Agenten — kein
+     * vollständiger, garantiert aktueller Katalog.
+     */
+    private val _modelsByAdapter = MutableStateFlow<Map<String, List<ModelInfo>>>(emptyMap())
+    val modelsByAdapter: StateFlow<Map<String, List<ModelInfo>>> = _modelsByAdapter
 
     private val _stats = MutableStateFlow<ServerStats?>(null)
     val stats: StateFlow<ServerStats?> = _stats
@@ -102,6 +126,7 @@ class AppRepository(
         when (msg) {
             is ServerMessage.SessionListMsg -> {
                 _sessions.value = msg.sessions
+                _sessionsLoaded.value = true
                 completePending(msg.requestId, msg)
             }
 
@@ -356,11 +381,24 @@ class AppRepository(
         }
     }
 
-    /** Modellkatalog des Session-Shims; leere Liste ist gültig. */
+    /**
+     * Modellkatalog des Session-Shims; leere Liste ist gültig.
+     *
+     * Ein nicht-leeres Ergebnis landet zusätzlich im [modelsByAdapter]-Cache,
+     * unter dem Adapter dieser Session — die einzige Quelle für Modell-
+     * vorschläge beim Anlegen einer neuen Session, wo noch kein Shim läuft.
+     */
     suspend fun loadModels(sessionId: String): Result<List<ModelInfo>> {
         val response = request { id -> encodeSessionModelsGet(id, sessionId) }
         return when (response) {
-            is ServerMessage.SessionModelsMsg -> Result.success(response.models)
+            is ServerMessage.SessionModelsMsg -> {
+                if (response.models.isNotEmpty()) {
+                    _sessions.value.firstOrNull { it.id == sessionId }?.adapter?.let { adapter ->
+                        _modelsByAdapter.value = _modelsByAdapter.value + (adapter to response.models)
+                    }
+                }
+                Result.success(response.models)
+            }
             is ServerMessage.ErrorMsg -> Result.failure(IllegalStateException(response.message))
             null -> Result.failure(IllegalStateException("Keine Verbindung"))
             else -> Result.success(emptyList())

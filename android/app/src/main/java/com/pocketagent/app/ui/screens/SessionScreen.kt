@@ -70,6 +70,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
@@ -126,6 +127,7 @@ import com.pocketagent.app.ui.theme.ChipSpacing
 import com.pocketagent.app.ui.theme.ChipValueMaxWidth
 import com.pocketagent.app.ui.theme.ComposerHeight
 import com.pocketagent.app.ui.theme.ContentInset
+import com.pocketagent.app.ui.theme.EmptyStateInset
 import com.pocketagent.app.ui.theme.MinTouchTarget
 import com.pocketagent.app.ui.theme.MonoMedium
 import com.pocketagent.app.ui.theme.MonoSmall
@@ -520,12 +522,15 @@ fun SessionScreen(
                         // Trägt die Session einen Titel, rutscht das Repository
                         // hier hinein — sonst stünde es nirgends mehr.
                         session?.let { s ->
+                            // Adapter und Autonomie stehen bereits als Chips unten,
+                            // dort auch änderbar (Fund: Adapter/Modus doppelt
+                            // sichtbar) — die StatusLine trägt nur noch, was die
+                            // Chips nicht tragen: Repository und eine Abweichung
+                            // vom sicheren Netzwerk-Default.
                             StatusLine(
                                 session = s,
                                 details = listOfNotNull(
                                     sessionSubtitle(s),
-                                    adapterLabel(adapters, s.adapter),
-                                    modeLabel(s.mode),
                                     s.networkPolicy?.takeIf { it != "allowlist" }?.let(::networkPolicyLabel),
                                 ),
                                 modifier = Modifier.padding(top = 2.dp),
@@ -663,7 +668,10 @@ fun SessionScreen(
                                     },
                                 )
                                 SettingChip(
-                                    label = "Modus",
+                                    // Derselbe Begriff wie beim Anlegen einer
+                                    // Session (Fund: "Autonomie" vs. "Modus"
+                                    // heißen dieselbe Einstellung anders).
+                                    label = "Autonomie",
                                     value = modeLabel(s.mode),
                                     enabled = chipsEnabled,
                                     onClick = { sheet = SessionSheet.MODE },
@@ -789,7 +797,7 @@ fun SessionScreen(
                 } else {
                     Column(
                         horizontalAlignment = Alignment.CenterHorizontally,
-                        modifier = Modifier.padding(horizontal = 40.dp),
+                        modifier = Modifier.padding(horizontal = EmptyStateInset),
                     ) {
                         Text(
                             text = "Woran soll gearbeitet werden?",
@@ -985,11 +993,17 @@ enum class SessionSheet { AGENT, MODE, MODEL, REASONING }
 fun adapterLabel(adapters: List<AdapterDescriptor>, id: String): String =
     adapters.firstOrNull { it.id == id }?.name ?: id
 
+/**
+ * Deutsche Labels statt englischem Jargon ('Yolo', 'Ask', 'Accept Edits') in
+ * einer sonst komplett deutschen Oberfläche — die Namen tragen jetzt selbst
+ * die Tragweite der Wahl, nicht nur die Untertitel im [ModeSheet]. Nur die
+ * technischen Wire-Werte (`AgentMode.wireName()`) bleiben unverändert.
+ */
 fun modeLabel(mode: AgentMode): String = when (mode) {
-    AgentMode.ASK -> "Ask"
-    AgentMode.ACCEPT_EDITS -> "Accept Edits"
-    AgentMode.AUTO -> "Auto"
-    AgentMode.YOLO -> "Yolo"
+    AgentMode.ASK -> "Nachfragen"
+    AgentMode.ACCEPT_EDITS -> "Edits frei"
+    AgentMode.AUTO -> "Automatisch"
+    AgentMode.YOLO -> "Vollautomatisch"
     // Ein neuerer Server kennt einen Modus, den diese App-Version noch nicht kennt.
     AgentMode.UNKNOWN -> "Unbekannt"
 }
@@ -1278,30 +1292,33 @@ private fun shortDescription(raw: String?): String? =
         ?.let { if (it.length > 64) it.take(63).trimEnd() + "…" else it }
 
 /**
- * Die Modusliste. Der Titel ist einstellbar, weil dieselbe Entscheidung in
- * der laufenden Session „Modus“ heißt und beim Anlegen „Autonomie“ — die
- * Einträge sind wortgleich dieselben und sollen es bleiben.
+ * Die Autonomieliste — dieselbe Einstellung, dieselbe Beschriftung an beiden
+ * Stellen, die sie anbieten (laufende Session und Anlegen). Der Titel ist
+ * bewusst kein Parameter mehr (Fund: "Autonomie" vs. "Modus" hießen dieselbe
+ * Sache verschieden) — ohne ihn kann kein Aufrufer mehr abweichen.
  */
 @Composable
 fun ModeSheet(
     current: AgentMode?,
     onDismiss: () -> Unit,
     onPick: (AgentMode) -> Unit,
-    title: String = "Modus",
 ) {
-    SettingSheet(title = title, onDismiss = onDismiss) {
+    SettingSheet(title = "Autonomie", onDismiss = onDismiss) {
         GroupCard {
             Column {
                 val entries = listOf(
-                    Triple(AgentMode.ASK, "Ask", "Jede Aktion wird vorher bestätigt"),
-                    Triple(AgentMode.ACCEPT_EDITS, "Accept Edits", "Datei-Änderungen laufen durch, alles andere wird gefragt"),
-                    Triple(AgentMode.AUTO, "Auto", "Agent entscheidet selbst, Push nur manuell"),
-                    Triple(AgentMode.YOLO, "Yolo", "Vollautomatisch inklusive Push und Draft-PR"),
+                    Pair(AgentMode.ASK, "Jede Aktion wird vorher bestätigt"),
+                    Pair(AgentMode.ACCEPT_EDITS, "Datei-Änderungen laufen durch, alles andere wird gefragt"),
+                    Pair(AgentMode.AUTO, "Agent entscheidet selbst, Push nur manuell"),
+                    Pair(AgentMode.YOLO, "Vollautomatisch inklusive Push und Draft-PR"),
                 )
-                entries.forEachIndexed { index, (mode, title, subtitle) ->
+                entries.forEachIndexed { index, (mode, subtitle) ->
                     if (index > 0) ListDivider(RadioRowDividerInset)
                     SelectableTile(
-                        title = title,
+                        // Dasselbe deutsche Label wie auf Chips und Karten
+                        // (modeLabel) — sonst hieße derselbe Modus im Sheet
+                        // anders als dort, wo er ausgewählt wird.
+                        title = modeLabel(mode),
                         subtitle = subtitle,
                         selected = current == mode,
                         titleColor = if (mode == AgentMode.YOLO && current == mode) {
@@ -1678,7 +1695,10 @@ private fun ToolCard(item: TimelineItem.Tool) {
                         maxLines = 1,
                     )
                     Text(
-                        text = "${item.tool} · $statusText",
+                        // Ohne eigenen Titel steht der Toolname schon in der
+                        // Zeile darüber (Fund: ToolCard nennt das Tool
+                        // doppelt) — die Unterzeile trägt dann nur den Status.
+                        text = if (item.title == null) statusText else "${item.tool} · $statusText",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -1787,9 +1807,14 @@ private fun ApprovalCard(item: TimelineItem.Approval, vm: SessionViewModel) {
                 }
             }
             when (item.resolved) {
-                // Ein Button-Stil pro Karte: nur "Erlauben" ist gefüllt, alles
-                // andere flacher TextButton. Die Rangfolge kommt aus Position
-                // und Farbe, nicht mehr aus drei verschiedenen Hintergründen.
+                // Rangfolge statt Gleichrang (Fund: "Immer" so groß wie
+                // "Erlauben", "Ablehnen" unauffällig darunter): "Erlauben"
+                // ist die gefüllte Hauptaktion, "Ablehnen" die sichere
+                // Alternative auf gleicher Höhe daneben — beide ein Tap.
+                // "Immer erlauben" ist die weitreichendste Entscheidung der
+                // Karte (gilt für alle künftigen gleichen Aktionen) und
+                // steht darum kleiner darunter: ein bewusster Zweit-Tap,
+                // kein bequemer Nachbar der Einmal-Erlaubnis.
                 null -> Column(modifier = Modifier.padding(top = 14.dp)) {
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(
@@ -1801,24 +1826,25 @@ private fun ApprovalCard(item: TimelineItem.Approval, vm: SessionViewModel) {
                         ) {
                             Text("Erlauben")
                         }
-                        TextButton(
+                        OutlinedButton(
                             shape = PillShape,
-                            onClick = { vm.decide(item.permissionId, PermissionDecision.ALWAYS) },
+                            onClick = { vm.decide(item.permissionId, PermissionDecision.REJECT) },
                             modifier = Modifier
                                 .weight(1f)
                                 .heightIn(min = MinTouchTarget),
                         ) {
-                            Text("Immer")
+                            Text("Ablehnen")
                         }
                     }
                     TextButton(
                         shape = PillShape,
-                        onClick = { vm.decide(item.permissionId, PermissionDecision.REJECT) },
+                        onClick = { vm.decide(item.permissionId, PermissionDecision.ALWAYS) },
+                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp),
                         modifier = Modifier
-                            .padding(top = 4.dp)
+                            .padding(top = 6.dp)
                             .heightIn(min = MinTouchTarget),
                     ) {
-                        Text("Ablehnen")
+                        Text("Immer erlauben", style = MaterialTheme.typography.labelMedium)
                     }
                 }
 

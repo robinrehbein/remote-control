@@ -1455,12 +1455,12 @@ async function shimClientStatusSmoke(): Promise<void> {
     );
 
     // Same failure even when the body happens to look like a valid ShimStatus.
-    respond = { status: 401, body: { adapter: 'opencode', mode: 'ask', busy: false } };
+    respond = { status: 401, body: { adapter: 'kilo', mode: 'ask', busy: false } };
     assert((await client.status()) === null, 'a 401 is rejected even with an otherwise well-shaped body');
 
-    respond = { status: 200, body: { adapter: 'opencode', mode: 'ask', busy: false } };
+    respond = { status: 200, body: { adapter: 'kilo', mode: 'ask', busy: false } };
     const ready = await client.status();
-    assert(ready?.adapter === 'opencode' && ready.busy === false, 'a 2xx response is still read normally');
+    assert(ready?.adapter === 'kilo' && ready.busy === false, 'a 2xx response is still read normally');
   } finally {
     server.close();
   }
@@ -1706,14 +1706,14 @@ async function adapterManifestSmoke(): Promise<void> {
     assert(ok?.providerEnv?.ok === 'OK_API_KEY', 'a valid providerEnv value is kept verbatim');
 
     // Precedence: ADAPTERS_DIR must win over the repo's own bundled manifest
-    // for a colliding id (here: the real "opencode" adapter).
+    // for a colliding id (here: the real "kilo" adapter).
     writeFileSync(
-      join(dir, 'opencode.json'),
+      join(dir, 'kilo.json'),
       JSON.stringify({
-        id: 'opencode',
-        name: 'Operator OpenCode Override',
+        id: 'kilo',
+        name: 'Operator Kilo Override',
         capabilities: {},
-        image: 'registry.example/opencode-shim@sha256:deadbeef',
+        image: 'registry.example/kilo-shim@sha256:deadbeef',
         defaults: { provider: 'operator-default' },
       }),
     );
@@ -1725,13 +1725,13 @@ async function adapterManifestSmoke(): Promise<void> {
     const list2 = adaptersMod.listAdapters();
     console.log = logBefore;
 
-    const opencode = list2.find((a) => a.id === 'opencode');
+    const kilo = list2.find((a) => a.id === 'kilo');
     assert(
-      opencode?.image === 'registry.example/opencode-shim@sha256:deadbeef',
+      kilo?.image === 'registry.example/kilo-shim@sha256:deadbeef',
       'ADAPTERS_DIR wins over the bundled/repo manifest for a colliding id',
     );
     assert(
-      logs.some((l) => l.includes('opencode') && l.includes('ignored')),
+      logs.some((l) => l.includes('kilo') && l.includes('ignored')),
       'the overridden lower-precedence manifest is logged, not silently discarded',
     );
   } finally {
@@ -1759,13 +1759,13 @@ async function linkEventInjectionSmoke(store: Store, wsBase: string): Promise<vo
 
   const linkA = new Client(wsBase);
   await linkA.opened;
-  linkA.send({ type: 'agent.hello', token: tokenA, adapter: 'opencode', name: 'link-a' });
+  linkA.send({ type: 'agent.hello', token: tokenA, adapter: 'kilo', name: 'link-a' });
   const readyA = await linkA.wait((m) => m.type === 'agent.ready');
   const sessionAId = readyA.type === 'agent.ready' ? readyA.sessionId : '';
 
   const linkB = new Client(wsBase);
   await linkB.opened;
-  linkB.send({ type: 'agent.hello', token: tokenB, adapter: 'opencode', name: 'link-b' });
+  linkB.send({ type: 'agent.hello', token: tokenB, adapter: 'kilo', name: 'link-b' });
   const readyB = await linkB.wait((m) => m.type === 'agent.ready');
   const sessionBId = readyB.type === 'agent.ready' ? readyB.sessionId : '';
 
@@ -1786,7 +1786,7 @@ async function linkEventInjectionSmoke(store: Store, wsBase: string): Promise<vo
     linkA.send({
       type: 'agent.event',
       sessionId: sessionBId,
-      event: { type: 'status', adapter: 'opencode', mode: 'ask', busy: false, sessionRef: 'attacker-injected-ref' },
+      event: { type: 'status', adapter: 'kilo', mode: 'ask', busy: false, sessionRef: 'attacker-injected-ref' },
     });
     // A legitimate event for its OWN session, sent right after on the same
     // socket: once this lands, the forged one (same socket, in-order
@@ -1794,7 +1794,7 @@ async function linkEventInjectionSmoke(store: Store, wsBase: string): Promise<vo
     linkA.send({
       type: 'agent.event',
       sessionId: sessionAId,
-      event: { type: 'status', adapter: 'opencode', mode: 'ask', busy: false, sessionRef: 'linka-legit-ref' },
+      event: { type: 'status', adapter: 'kilo', mode: 'ask', busy: false, sessionRef: 'linka-legit-ref' },
     });
     await waitUntil(
       () => store.getSession(sessionAId)?.session_ref === 'linka-legit-ref',

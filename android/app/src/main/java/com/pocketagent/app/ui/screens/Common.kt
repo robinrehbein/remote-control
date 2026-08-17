@@ -258,9 +258,12 @@ fun connectionLabel(state: WsClient.ConnState): String? = when (state) {
     is WsClient.ConnState.Disconnected -> "Getrennt – ${state.reason}"
     WsClient.ConnState.Idle -> "Nicht verbunden"
     // Kein "neuer Versuch in …" — der Server hat bewusst nein gesagt, das
-    // ist kein Netzflackern, das sich von selbst löst.
+    // ist kein Netzflackern, das sich von selbst löst. Der Hinweis nennt den
+    // Weg, den es wirklich gibt: In den Einstellungen liegt „Von diesem Gerät
+    // abmelden" (SettingsScreen), das Token und Server-URL löscht und damit
+    // zum Pairing zurückführt — ein Punkt „Neu koppeln" existiert nicht.
     WsClient.ConnState.Unauthorized ->
-        "Getrennt – Gerät nicht mehr gekoppelt. Bitte in den Einstellungen neu koppeln."
+        "Getrennt – Gerät nicht mehr gekoppelt. In den Einstellungen abmelden und neu koppeln."
 }
 
 /**

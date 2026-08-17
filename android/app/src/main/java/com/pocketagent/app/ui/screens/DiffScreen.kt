@@ -11,11 +11,15 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
+import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -23,14 +27,20 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -40,6 +50,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.pocketagent.app.PocketAgentApp
 import com.pocketagent.app.data.AppRepository
 import com.pocketagent.app.data.DiffEntry
+import com.pocketagent.app.data.SessionInfo
 import com.pocketagent.app.ui.theme.CardInset
 import com.pocketagent.app.ui.theme.MonoMedium
 import com.pocketagent.app.ui.theme.PillShape
@@ -62,10 +73,21 @@ class DiffViewModel : ViewModel() {
     private val _state = MutableStateFlow(UiState())
     val state: StateFlow<UiState> = _state
 
+    /**
+     * Die Session zu diesem Diff — für die Aktionsleiste. Sie entscheidet, ob
+     * gepusht werden darf (Modus/Status) und ob es schon einen PR gibt.
+     */
+    private val _session = MutableStateFlow<SessionInfo?>(null)
+    val session: StateFlow<SessionInfo?> = _session
+
     fun bind(id: String, repo: AppRepository) {
         if (sessionId == id) return
         sessionId = id
         repository = repo
+        viewModelScope.launch {
+            repository.sessions.collect { list -> _session.value = list.firstOrNull { it.id == id } }
+        }
+        viewModelScope.launch { repository.refreshSessions() }
         load()
     }
 
@@ -78,6 +100,9 @@ class DiffViewModel : ViewModel() {
             )
         }
     }
+
+    /** Pushen & Draft-PR direkt aus dem Diff. true, sobald der Auftrag raus ist. */
+    fun push(): Boolean = repository.sendPush(sessionId)
 }
 
 @Composable
@@ -91,6 +116,10 @@ fun DiffScreen(
         DiffViewModel().also { it.bind(sessionId, repository) }
     }
     val state by vm.state.collectAsState()
+    val session by vm.session.collectAsState()
+    val uriHandler = LocalUriHandler.current
+    val snackbarState = remember { SnackbarHostState() }
+    val scope = rememberCoroutineScope()
 
     OneUiScaffold(
         title = "Änderungen",
@@ -98,6 +127,32 @@ fun DiffScreen(
         actions = {
             IconButton(onClick = { vm.load() }) {
                 Icon(Icons.Outlined.Refresh, contentDescription = "Aktualisieren")
+            }
+        },
+        snackbarHost = { SnackbarHost(snackbarState) },
+        bottomBar = {
+            // Der Fluss endet nicht mit „geprüft": Pushen und PR öffnen liegen
+            // hier unten im Daumenbereich, statt im Overflow-Menü eines anderen
+            // Screens. Nur nach dem Laden und ohne Fehler — vorher gibt es nichts
+            // zu entscheiden.
+            if (!state.loading && state.error == null) {
+                DiffActionBar(
+                    session = session,
+                    hasChanges = state.entries.isNotEmpty(),
+                    onPush = {
+                        val sent = vm.push()
+                        scope.launch {
+                            snackbarState.showSnackbar(
+                                if (sent) {
+                                    "Wird gepusht … der Draft-PR erscheint gleich."
+                                } else {
+                                    "Keine Verbindung – Push nicht möglich."
+                                },
+                            )
+                        }
+                    },
+                    onOpenPr = { url -> uriHandler.openUri(url) },
+                )
             }
         },
     ) { padding ->
@@ -205,6 +260,83 @@ fun DiffScreen(
                 }
                 items(state.entries, key = { it.path }) { entry ->
                     DiffEntryCard(entry)
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Die untere Aktionsleiste des Diff-Screens — Diff → Push → PR als ein
+ * durchgehender, sichtbarer Fluss. Solange es Änderungen gibt und der Modus
+ * es zulässt, steht „Pushen & Draft-PR" bereit (siehe [diffPushAvailable]);
+ * sobald ein PR existiert, tritt „Pull Request öffnen" als gefüllte
+ * Hauptaktion nach vorn und das Pushen bleibt als leiser Zweitknopf für einen
+ * neuen Stand. Ist nichts davon möglich, zeigt die Leiste nichts.
+ */
+@Composable
+private fun DiffActionBar(
+    session: SessionInfo?,
+    hasChanges: Boolean,
+    onPush: () -> Unit,
+    onOpenPr: (String) -> Unit,
+) {
+    val canPush = diffPushAvailable(session, hasChanges)
+    val prUrl = session?.prUrl?.takeIf { it.isNotBlank() }
+    if (!canPush && prUrl == null) return
+
+    Surface(color = MaterialTheme.colorScheme.background, tonalElevation = 0.dp) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .navigationBarsPadding()
+                .padding(horizontal = ScreenGutter, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            if (prUrl != null) {
+                Button(
+                    onClick = { onOpenPr(prUrl) },
+                    shape = PillShape,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = PrimaryButtonHeight),
+                ) {
+                    Icon(
+                        Icons.AutoMirrored.Filled.OpenInNew,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp),
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Pull Request öffnen")
+                }
+                if (canPush) {
+                    // Der Agent könnte seit dem PR weitergearbeitet haben — ein
+                    // erneuter Push aktualisiert ihn. Leiser als die Hauptaktion.
+                    TextButton(
+                        onClick = onPush,
+                        shape = PillShape,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = PrimaryButtonHeight),
+                    ) {
+                        Text("Erneut pushen")
+                    }
+                }
+            } else if (canPush) {
+                Button(
+                    onClick = onPush,
+                    shape = PillShape,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = PrimaryButtonHeight),
+                ) {
+                    Icon(
+                        Icons.Filled.CloudUpload,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp),
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Pushen & Draft-PR")
                 }
             }
         }

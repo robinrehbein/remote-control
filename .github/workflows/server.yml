@@ -1,0 +1,87 @@
+name: Server & Shims CI
+
+# Bis hierher hatte nur android/** eine PR-CI. Änderungen am Orchestrator und an
+# den Shims wurden erst nach dem Merge gebaut (images.yml, push auf main) — ein
+# Fehler darin fiel also erst im Deployment auf. Genau so ist ein unbehandeltes
+# 'error' auf einem Socket im Egress-Proxy in Produktion gelandet und hat den
+# Prozess beendet, obwohl der Smoke-Test ihn lokal reproduziert.
+on:
+  pull_request:
+    paths:
+      - "server/**"
+      - "shims/**"
+      - "packages/protocol/**"
+      - "link/**"
+      - "cli/**"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/server.yml"
+  push:
+    branches: [main]
+    paths:
+      - "server/**"
+      - "shims/**"
+      - "packages/protocol/**"
+      - "link/**"
+      - "cli/**"
+      - ".github/workflows/server.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: typecheck & smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - run: npm ci
+
+      # Ein echtes NUL-Byte in einer Quelldatei lässt git sie als binär
+      # einordnen: kein Diff im Review, kein `git grep`, `--numstat` meldet
+      # `- -`. Das ist zweimal passiert (Timeline.kt, smoke.ts), beide Male
+      # unbemerkt bis jemand danach gesucht hat.
+      - name: no NUL bytes in tracked sources
+        run: |
+          python3 - <<'PY'
+          import subprocess, sys
+          exts = ('.ts', '.tsx', '.kt', '.kts', '.js', '.mjs', '.cjs', '.json',
+                  '.md', '.yml', '.yaml', '.gradle', '.xml', '.pro', '.sh',
+                  '.properties', '.txt')
+          listed = subprocess.run(['git', 'ls-files', '-z'],
+                                  capture_output=True, check=True).stdout.split(b'\0')
+          bad = []
+          for raw in listed:
+              path = raw.decode()
+              if not path or not path.endswith(exts):
+                  continue
+              with open(path, 'rb') as fh:
+                  if b'\x00' in fh.read():
+                      bad.append(path)
+          if bad:
+              print('NUL bytes found - git treats these files as binary:')
+              for path in bad:
+                  print(f'  {path}')
+              print('replace each byte with its escape sequence (\\u0000 / \\0).')
+              sys.exit(1)
+          print('no NUL bytes in tracked sources')
+          PY
+
+      - run: npm run typecheck
+
+      - name: smoke - orchestrator
+        run: npm run smoke:server
+
+      - name: smoke - shims
+        run: npm run smoke:shims
+
+      - name: smoke - link
+        run: npm run smoke:link

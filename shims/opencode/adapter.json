@@ -7,7 +7,7 @@
   "credentials": {},
   "providerEnv": {
     "openai": "OPENAI_API_KEY",
-    "zai": "ZAI_API_KEY",
+    "zai": "ZHIPU_API_KEY",
     "moonshot": "MOONSHOT_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
     "google": "GEMINI_API_KEY",

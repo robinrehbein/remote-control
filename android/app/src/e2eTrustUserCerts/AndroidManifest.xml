@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Wird nur eingehängt, wenn der Build mit -PtrustUserCerts=true läuft
+  (app/build.gradle.kts). Ohne den Schalter existiert dieses Sourceset für den
+  Build nicht, das Attribut steht dann in keinem Manifest, und es bleibt beim
+  System-Zertifikatsspeicher.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <application
+        android:networkSecurityConfig="@xml/network_security_config"
+        tools:ignore="UnusedAttribute" />
+
+</manifest>

@@ -1149,6 +1149,21 @@ async function main(): Promise<void> {
   const kilo = adapters.type === 'adapter.list' ? adapters.adapters.find((a) => a.id === 'kilo') : undefined;
   assert(kilo?.credentials?.kilo?.[0] === 'KILO_AUTH_CONTENT', 'kilo manifest carries credential mapping');
 
+  /*
+   * The Z.AI key reaches opencode/kilo only as ZHIPU_API_KEY - that is the env
+   * var models.dev lists for all four Z.AI providers (zai, zai-coding-plan,
+   * zhipuai, zhipuai-coding-plan), and both runtimes auto-configure providers
+   * from that catalog. Verified against opencode 1.18.18 and kilo 7.4.22: with
+   * ZAI_API_KEY set they expose *no* Z.AI provider at all (kilo is left with
+   * only its own gateway), so every zai model reads as "model not found" and
+   * the gateway fallback answers "Forbidden". pi is deliberately not covered
+   * here - its SDK documents ZAI_API_KEY as its own coding-plan variable, so
+   * that manifest keeps it.
+   */
+  const opencode = adapters.type === 'adapter.list' ? adapters.adapters.find((a) => a.id === 'opencode') : undefined;
+  assert(opencode?.providerEnv?.zai === 'ZHIPU_API_KEY', 'opencode manifest injects the Z.AI key as ZHIPU_API_KEY');
+  assert(kilo?.providerEnv?.zai === 'ZHIPU_API_KEY', 'kilo manifest injects the Z.AI key as ZHIPU_API_KEY');
+
   const badAdapter = await request(c2, {
     type: 'session.create',
     requestId: 'ses0',

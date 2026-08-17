@@ -31,10 +31,50 @@ android {
         }
     }
 
+    /*
+     * E2E gegen einen Emulator hinter einem TLS-terminierenden Proxy braucht
+     * eine App, die der Proxy-CA aus dem User-Zertifikatsspeicher vertraut.
+     * Das darf nur auf ausdrückliche Anforderung passieren: das Debug-APK ist
+     * laut README/RUNBOOK der Installationsweg für Endnutzer (CI-Artifact
+     * `pocketagent-debug-apk`), und dort wäre User-Store-Vertrauen eine offene
+     * Tür für jede eingetragene CA — MDM, VPN-App, Schadsoftware.
+     *
+     * Ohne den Schalter wird das Sourceset nicht eingehängt: das Manifest
+     * bekommt kein networkSecurityConfig, es bleibt beim System-Speicher.
+     * Weder `gradle :app:assembleDebug` noch .github/workflows/android.yml
+     * setzen ihn.
+     *
+     * Achtung: gradleProperty liest nicht nur `-PtrustUserCerts=true` von der
+     * Kommandozeile, sondern auch `gradle.properties` und
+     * ORG_GRADLE_PROJECT_trustUserCerts aus der Umgebung. Der Schalter lässt
+     * sich damit dauerhaft stellen — deshalb darf er nie in eine eingecheckte
+     * gradle.properties wandern, und der Build meldet ihn bei jedem Lauf.
+     * Als zweite, davon unabhängige Sperre liegt das User-Vertrauen in
+     * <debug-overrides> und greift nur in einem debuggable APK.
+     */
+    if (providers.gradleProperty("trustUserCerts").orNull == "true") {
+        sourceSets.getByName("debug") {
+            manifest.srcFile("src/e2eTrustUserCerts/AndroidManifest.xml")
+            res.srcDir("src/e2eTrustUserCerts/res")
+        }
+        logger.lifecycle(
+            "app: Debug-Build vertraut dem User-Zertifikatsspeicher (-PtrustUserCerts=true). " +
+                "applicationId com.pocketagent.app.usercatrust, versionName …-usercatrust — NICHT verteilen.",
+        )
+    }
+
     buildTypes {
         debug {
             isMinifyEnabled = false
             signingConfig = signingConfigs.getByName("shared")
+            // Das Ergebnis darf nicht mit dem verteilbaren Debug-APK
+            // verwechselbar sein: eigene applicationId (installiert sich neben
+            // der echten App statt sie zu ersetzen) und ein versionName, der
+            // in „App-Info" und `adb shell dumpsys package` sofort auffällt.
+            if (providers.gradleProperty("trustUserCerts").orNull == "true") {
+                applicationIdSuffix = ".usercatrust"
+                versionNameSuffix = "-usercatrust"
+            }
         }
         release {
             isMinifyEnabled = false

@@ -86,6 +86,12 @@ export class Store {
   }
 
   private migrate(): void {
+    // session_events(session_id) is scanned on every single event write
+    // (appendEvent's trim DELETE) and on every history read
+    // (listSessionEvents) - without an index both are full-table scans over
+    // every session's events, synchronous in the event loop.
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_session_events_sid ON session_events(session_id, id)');
+    this.migrateSecretsUnique();
     const sessionCols = this.db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>;
     if (!sessionCols.some((c) => c.name === 'shim_endpoint')) {
       this.db.exec('ALTER TABLE sessions ADD COLUMN shim_endpoint TEXT');
@@ -109,6 +115,40 @@ export class Store {
     if (!pairingCols.some((c) => c.name === 'attempts')) {
       this.db.exec('ALTER TABLE pairing_codes ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0');
     }
+  }
+
+  /**
+   * secrets used to have no uniqueness on (tenant_id, kind): every save
+   * inserted a new row, deleteSecret(id) only ever removed the newest one,
+   * and getSecretValue silently fell back to the next-newest (a leaked,
+   * "rotated away" key) the moment the current row was deleted. Runs once:
+   * the unique index below is the marker that this already happened, so a
+   * restart does not re-scan/re-dedupe an unbounded secrets table on every
+   * boot.
+   */
+  private migrateSecretsUnique(): void {
+    const indexes = this.db.prepare('PRAGMA index_list(secrets)').all() as Array<{
+      name: string;
+      unique: number;
+    }>;
+    if (indexes.some((i) => i.name === 'idx_secrets_tenant_kind')) return;
+    // Keep only the newest row per (tenant_id, kind); rowid (insertion order)
+    // breaks ties within the same created_at millisecond. Everything older
+    // is exactly the class of row the finding describes: an already-rotated
+    // key nobody can reach through the app any more.
+    this.db.exec(`
+      DELETE FROM secrets
+      WHERE rowid NOT IN (
+        SELECT rowid FROM (
+          SELECT rowid, ROW_NUMBER() OVER (
+            PARTITION BY tenant_id, kind ORDER BY created_at DESC, rowid DESC
+          ) AS rn
+          FROM secrets
+        )
+        WHERE rn = 1
+      )
+    `);
+    this.db.exec('CREATE UNIQUE INDEX idx_secrets_tenant_kind ON secrets(tenant_id, kind)');
   }
 
   close(): void {
@@ -199,9 +239,21 @@ export class Store {
       | undefined;
   }
 
+  /**
+   * Upsert on the UNIQUE(tenant_id, kind) index: a save for a kind that
+   * already has a row replaces it (id included) instead of inserting a
+   * second row. This is what makes deleteSecret's "delete the kind" and
+   * getSecretValue's "newest row" semantics actually hold - before this
+   * there was no uniqueness, and a rotated-then-deleted key could silently
+   * come back as the new "newest" row.
+   */
   saveSecret(id: string, tenant: string, kind: string, ciphertext: string, nonce: string): void {
     this.db
-      .prepare('INSERT INTO secrets (id, tenant_id, kind, ciphertext, nonce, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .prepare(
+        `INSERT INTO secrets (id, tenant_id, kind, ciphertext, nonce, created_at) VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(tenant_id, kind) DO UPDATE SET
+           id = excluded.id, ciphertext = excluded.ciphertext, nonce = excluded.nonce, created_at = excluded.created_at`,
+      )
       .run(id, tenant, kind, ciphertext, nonce, new Date().toISOString());
   }
 

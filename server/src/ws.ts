@@ -9,6 +9,7 @@ import { listAdapters } from './adapters.js';
 import type { SessionManager } from './sessions.js';
 import { encrypt } from './vault.js';
 import { validateSecret } from './secret-validate.js';
+import { isValidSecretKind } from './secrets-api.js';
 
 /** Security audit line (stdout-warn JSON; never log tokens). */
 function auditWarn(kind: string, fields: Record<string, unknown>): void {
@@ -22,6 +23,17 @@ const MAX_CONNS_PER_ADDRESS = 10;
 /** Heartbeat round; two rounds without a pong end a connection (~50s). */
 export const WS_HEARTBEAT_MS = 25_000;
 const MAX_MISSED_PONGS = 2;
+
+/**
+ * A socket that never sends `hello`/`agent.hello` after connecting is kept
+ * alive indefinitely by the heartbeat above (the ws library auto-answers
+ * protocol pings with pongs, so an idle-but-unauthenticated socket looks
+ * exactly as "alive" as a real device). Behind a proxy without TRUST_PROXY,
+ * every client shares the MAX_CONNS_PER_ADDRESS slots for that one address,
+ * so an attacker who never authenticates can hold them open forever. This
+ * timer closes what is still unauthenticated after the grace period.
+ */
+export const WS_AUTH_TIMEOUT_MS = 10_000;
 
 /**
  * Liveness check for every socket on /ws. A phone that loses its network (or a
@@ -93,7 +105,7 @@ export class Hub {
   private readonly linkSockets = new Map<string, WebSocket>();
   private readonly pendingLinkCalls = new Map<
     string,
-    { resolve: (v: { status: number; body?: unknown } | null) => void; timer: NodeJS.Timeout }
+    { linkId: string; resolve: (v: { status: number; body?: unknown } | null) => void; timer: NodeJS.Timeout }
   >();
 
   add(s: WebSocket, deviceId: string): void {
@@ -136,6 +148,24 @@ export class Hub {
     } catch {
       /* already closed */
     }
+    this.rejectPendingLinkCalls(linkId);
+  }
+
+  /**
+   * Reject every in-flight callLink() promise for a link whose socket just
+   * went away (close/error/revocation). Without this, the caller (a
+   * prompt/diff/permission request routed through a link session) sits on
+   * the full 20s callLink timeout despite the disconnect being known
+   * immediately - the user sees nothing for 20s, then a misleading "link
+   * call timed out" instead of an immediate "link agent disconnected".
+   */
+  private rejectPendingLinkCalls(linkId: string): void {
+    for (const [callId, pending] of [...this.pendingLinkCalls]) {
+      if (pending.linkId !== linkId) continue;
+      clearTimeout(pending.timer);
+      this.pendingLinkCalls.delete(callId);
+      pending.resolve(null);
+    }
   }
 
   broadcast(m: ServerMessage): void {
@@ -155,7 +185,9 @@ export class Hub {
   }
 
   dropLink(linkId: string, socket: WebSocket): void {
-    if (this.linkSockets.get(linkId) === socket) this.linkSockets.delete(linkId);
+    if (this.linkSockets.get(linkId) !== socket) return;
+    this.linkSockets.delete(linkId);
+    this.rejectPendingLinkCalls(linkId);
   }
 
   hasLink(linkId: string): boolean {
@@ -176,7 +208,7 @@ export class Hub {
         this.pendingLinkCalls.delete(callId);
         resolve(null);
       }, 20_000);
-      this.pendingLinkCalls.set(callId, { resolve, timer });
+      this.pendingLinkCalls.set(callId, { linkId, resolve, timer });
       try {
         socket.send(JSON.stringify({ type: 'agent.command', sessionId: linkId, callId, path, method, body }));
       } catch {
@@ -224,6 +256,7 @@ export function registerWs(
   manager: SessionManager,
   hub: Hub,
   heartbeat?: Heartbeat,
+  authTimeoutMs: number = WS_AUTH_TIMEOUT_MS,
 ): void {
   // maxPayload (1 MiB) is enforced at the websocket plugin registration in index.ts.
   app.get('/ws', { websocket: true }, (socket: WebSocket, request: FastifyRequest) => {
@@ -256,6 +289,16 @@ export function registerWs(
     let deviceId: string | null = null;
     let linkId: string | null = null;
 
+    // Neither hello variant arrived in time: close before the heartbeat ever
+    // gets a chance to keep this socket alive on protocol pongs alone.
+    const authTimer = setTimeout(() => {
+      if (authed) return;
+      auditWarn('ws.auth-timeout', { ip: addr });
+      socket.close(4001, 'auth timeout');
+    }, authTimeoutMs);
+    authTimer.unref?.();
+    socket.once('close', () => clearTimeout(authTimer));
+
     const send = (m: ServerMessage): void => {
       try {
         socket.send(JSON.stringify(m));
@@ -281,6 +324,7 @@ export function registerWs(
             return;
           }
           authed = true;
+          clearTimeout(authTimer);
           role = 'link';
           linkId = link.id;
           hub.registerLink(link.id, socket);
@@ -305,6 +349,7 @@ export function registerWs(
           return;
         }
         authed = true;
+        clearTimeout(authTimer);
         deviceId = dev.id;
         hub.add(socket, dev.id);
         send({ type: 'welcome', ok: true, serverVersion: SERVER_VERSION });
@@ -316,7 +361,24 @@ export function registerWs(
           return;
         }
         if (msg.type === 'agent.event') {
-          manager.handleLinkEvent(msg.sessionId, msg.event);
+          // Trust boundary: a link is bound to exactly one session
+          // (registerLinkSession / store.setLinkId), but msg.sessionId comes
+          // straight off the wire. Resolving the target from that binding -
+          // instead of taking the frame's claim - means an authenticated (or
+          // compromised) link host cannot forge events into a session it
+          // does not own (fake permission.request pushes, a turn.completed
+          // that flips a foreign session to idle, a status event that
+          // overwrites another session's session_ref, ...).
+          const bound = linkId ? store.getSessionByLink(linkId) : undefined;
+          if (!bound || bound.id !== msg.sessionId) {
+            auditWarn('ws.link-event-foreign-session', {
+              linkId,
+              claimedSessionId: msg.sessionId,
+              boundSessionId: bound?.id,
+            });
+            return;
+          }
+          manager.handleLinkEvent(bound.id, msg.event);
           return;
         }
         if (msg.type === 'agent.ping') {
@@ -514,6 +576,17 @@ export function registerWs(
           return;
         }
         case 'secret.set': {
+          // Same shape check as the REST path (secrets-api.ts KIND_RE): an
+          // unvalidated kind lands verbatim in the AAD string below, and a
+          // kind containing ':' makes that namespace ambiguous.
+          if (!isValidSecretKind(msg.kind)) {
+            send({
+              type: 'error',
+              requestId: msg.requestId,
+              message: 'invalid kind (expected lowercase [a-z0-9_-]{1,64})',
+            });
+            return;
+          }
           const id = randomUUID();
           const { ciphertext, nonce } = encrypt(msg.value, `secret:default:${msg.kind}`);
           store.saveSecret(id, 'default', msg.kind, ciphertext, nonce);

@@ -4,13 +4,16 @@
  * Lets a laptop/CI push a provider secret straight into the vault without a
  * paired device in the loop - e.g. `pocketagent-secret` (see cli/). Reuses
  * the exact same underlying primitives the WS handler uses (vault.encrypt +
- * store.saveSecret/getSecret), so both paths stay byte-for-byte identical in
- * how a secret ends up on disk.
+ * store.saveSecret/getSecret) *and* the same AAD binding (`secret:<tenant>:
+ * <kind>`, ws.ts:518), so both paths produce byte-for-byte the same shape of
+ * row on disk - including the kind/tenant binding that stops a ciphertext
+ * from being transplanted onto another kind's row without failing GCM
+ * verification.
  */
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { randomUUID } from 'node:crypto';
 import { encrypt } from './vault.js';
-import { adminTokenOk } from './pairing.js';
+import { adminTokenOk, SlidingWindowRateLimiter } from './pairing.js';
 import type { Store } from './db.js';
 
 const KIND_RE = /^[a-z0-9_-]{1,64}$/;
@@ -19,6 +22,16 @@ export function isValidSecretKind(kind: unknown): kind is string {
   return typeof kind === 'string' && KIND_RE.test(kind);
 }
 
+/**
+ * /api/secrets is, like /api/pairing/*, an admin-token consumer: whoever
+ * guesses PAIRING_ADMIN_TOKEN here gets write access to the vault, not just
+ * pairing rights. Same sliding-window shape as index.ts's pairingRateLimit
+ * (10 req/min/IP, 60 req/min globally) so the endpoint cannot be brute-forced
+ * at wire speed.
+ */
+const secretsIpLimiter = new SlidingWindowRateLimiter(60_000, 10);
+const secretsGlobalLimiter = new SlidingWindowRateLimiter(60_000, 60);
+
 export interface SavedSecretSummary {
   id: string;
   kind: string;
@@ -26,8 +39,9 @@ export interface SavedSecretSummary {
 }
 
 /**
- * Same codepath as the ws.ts `secret.set` case: encrypt(), store.saveSecret(),
- * re-read via store.getSecret() to return the DB-assigned createdAt.
+ * Same codepath as the ws.ts `secret.set` case: encrypt() with the same AAD
+ * (`secret:<tenant>:<kind>`, ws.ts:518), store.saveSecret(), re-read via
+ * store.getSecret() to return the DB-assigned createdAt.
  */
 export function saveSecretValue(
   store: Store,
@@ -36,7 +50,7 @@ export function saveSecretValue(
   value: string,
 ): SavedSecretSummary | null {
   const id = randomUUID();
-  const { ciphertext, nonce } = encrypt(value);
+  const { ciphertext, nonce } = encrypt(value, `secret:${tenant}:${kind}`);
   store.saveSecret(id, tenant, kind, ciphertext, nonce);
   const saved = store.getSecret(id);
   if (!saved) return null;
@@ -44,7 +58,13 @@ export function saveSecretValue(
 }
 
 export function registerSecretsApi(app: FastifyInstance, store: Store): void {
-  app.post('/api/secrets', async (req, reply) => {
+  const rateLimit = async (req: FastifyRequest, reply: FastifyReply): Promise<void> => {
+    if (!secretsIpLimiter.allow(req.ip) || !secretsGlobalLimiter.allow('global')) {
+      await reply.code(429).send({ ok: false, error: 'rate limited' });
+    }
+  };
+
+  app.post('/api/secrets', { preHandler: rateLimit }, async (req, reply) => {
     const token = (req.headers.authorization ?? '').replace(/^Bearer\s+/i, '');
     if (!adminTokenOk(token)) return reply.code(401).send({ ok: false, error: 'unauthorized' });
 

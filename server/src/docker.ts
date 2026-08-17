@@ -639,7 +639,7 @@ export async function createSessionContainer(
     const c = await d.createContainer({
       Image: image,
       Env: envArr(containerEnv),
-      Labels: { 'pocketagent.session': session.id },
+      Labels: { [SESSION_LABEL]: session.id },
       ...(remote ? { ExposedPorts: { '8080/tcp': {} } } : {}),
       HostConfig: {
         Memory: parseMem(config.sessionMemLimit),
@@ -808,6 +808,39 @@ export async function listRunning(): Promise<number | null> {
   }
 }
 
+/** Label des Session-Containers: der Wert ist die Session-Id (createSessionContainer/oneShotPush). */
+export const SESSION_LABEL = 'pocketagent.session';
+
+/** Ein vom Daemon gemeldeter Container mit SESSION_LABEL (laufend oder gestoppt). */
+export interface LabeledSessionContainer {
+  id: string;
+  /** Wert des Labels: die Session, zu der der Container gehört ('' wenn leer). */
+  sessionId: string;
+  /** Erstellzeitpunkt in ms - der Orphan-Reaper fasst nur Container an, die älter als der Prozess sind. */
+  createdMs: number;
+}
+
+/**
+ * Alle Container mit SESSION_LABEL, gestoppte eingeschlossen - die Datenbasis
+ * des Orphan-Reapers (sessions.ts). `null` heißt "der Daemon hat nicht
+ * geantwortet": ein Transportfehler darf nie als "alles verwaist" gelten.
+ */
+export async function listSessionContainers(): Promise<LabeledSessionContainer[] | null> {
+  const d = docker();
+  if (!d) return null;
+  try {
+    const list = await d.listContainers({ all: true, filters: { label: [SESSION_LABEL] } });
+    return (Array.isArray(list) ? list : []).map((c) => ({
+      id: c.Id,
+      sessionId: (c.Labels ?? {})[SESSION_LABEL] ?? '',
+      createdMs: typeof c.Created === 'number' ? c.Created * 1000 : 0,
+    }));
+  } catch (e) {
+    console.warn(`[docker] session container listing failed: ${String(e)}`);
+    return null;
+  }
+}
+
 export function pushScriptFor(adapter: string): string {
   return getAdapter(adapter)?.pushScript ?? `/app/shims/${adapter}/scripts/push.js`;
 }
@@ -821,6 +854,10 @@ export async function oneShotPush(
 ): Promise<boolean> {
   const d = docker();
   if (!d || !session.volume_name) return false;
+  // Der Wegwerf-Container gehört keiner Zeile in der DB: entfernt ihn ein
+  // Fehlerpfad nicht selbst, findet ihn danach niemand mehr (weder reapIdle
+  // noch gc kennen ihn) - deshalb das finally.
+  let pushContainer: Docker.Container | null = null;
   try {
     const image = await ensureAdapterImage(session.adapter, onNotice);
     const containerEnv = { ...env };
@@ -829,7 +866,7 @@ export async function oneShotPush(
       Image: image,
       Env: envArr(containerEnv),
       Cmd: ['node', pushScriptFor(session.adapter)],
-      Labels: { 'pocketagent.session': session.id },
+      Labels: { [SESSION_LABEL]: session.id },
       HostConfig: {
         Memory: parseMem(config.sessionMemLimit),
         Binds: [`${session.volume_name}:/work`],
@@ -843,15 +880,17 @@ export async function oneShotPush(
       },
       NetworkingConfig: networking,
     });
+    pushContainer = c;
     if (creds && Object.keys(creds).length > 0) await injectCredsFile(c.id, creds);
     await c.start();
     await primeSessionPeers(); // the push container pushes through the egress proxy too
     const res = await c.wait();
-    await c.remove().catch(() => {});
     return res.StatusCode === 0;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     console.error(`[docker] push failed for session ${session.id.slice(0, 8)}: ${msg}`);
     return false;
+  } finally {
+    if (pushContainer) await pushContainer.remove({ force: true }).catch(() => {});
   }
 }

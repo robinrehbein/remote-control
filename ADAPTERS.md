@@ -32,13 +32,22 @@ PocketAgent ist harness-agnostisch: Jeder Coding-Agent-Harness ist ein **Adapter
   },
   "providerEnv": {                   // Provider-Wahl der Session → Env-Var (Secret-Kind == Provider)
     "openai": "OPENAI_API_KEY",
-    "zai": "ZAI_API_KEY"
+    "zai": "ZHIPU_API_KEY"
   },
   "defaults": { "provider": "zai", "model": "" } // App-Defaults beim Session-Anlegen
 }
 ```
 
 Ungültige Manifeste werden beim Boot übersprungen (Log-Warnung), der Server startet weiter.
+
+**`providerEnv` muss die Variable nennen, die die Runtime wirklich liest** — nicht
+die, die nach dem Provider-Namen klingt. Beispiel Z.AI: opencode und kilo ziehen
+ihre Provider aus dem Models.dev-Katalog, und der schreibt für alle vier Z.AI-Einträge
+(`zai`, `zai-coding-plan`, `zhipuai`, `zhipuai-coding-plan`) `ZHIPU_API_KEY` vor.
+Mit `ZAI_API_KEY` taucht kein einziger davon auf; der Key ist dann faktisch nicht
+gesetzt, und jedes Modell endet in „model not found". pi ist der Gegenfall — dessen
+SDK dokumentiert `ZAI_API_KEY` für den Coding Plan, also steht das so in `shims/pi`.
+Im Zweifel: Runtime mit dem Key starten und ihren Provider-Katalog abfragen.
 
 ## Neuen Harness hinzufügen (5 Schritte)
 

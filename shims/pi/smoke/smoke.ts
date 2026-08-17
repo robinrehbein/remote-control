@@ -228,6 +228,20 @@ async function main(): Promise<void> {
     defaultModel.status !== 400,
     `provider with empty model must not be rejected, got ${defaultModel.status}`,
   );
+  // Dieser Prompt wird angenommen — er startet also einen echten Turn, nicht
+  // nur eine Validierung. Wird er nicht abgewartet, erfüllt sein
+  // `turn.completed` weiter unten das Prädikat für `completed2` (alles außer
+  // `completed1`). Die Runde danach gilt dann als fertig, obwohl sie noch
+  // läuft, und der nächste Prompt läuft in das 409 aus `POST /prompt`
+  // ("prompt already running"). Genau daran ist die Abbruch-Zusicherung auf
+  // ausgelasteten CI-Runnern gescheitert, während sie lokal durchlief: dort
+  // war der Turn zufällig schon vor der nächsten Runde fertig.
+  const completedDefault = await waitFor(
+    () => sse.events,
+    event => event.type === 'turn.completed' && event !== completed1,
+    5_000,
+    'turn.completed for the empty-model prompt',
+  );
 
   // --- model without provider stays an error ---
   // Umgekehrt bliebe das Modell unten wirkungslos liegen; das darf nicht
@@ -260,7 +274,7 @@ async function main(): Promise<void> {
   expect(prompt2.status === 200, 'second prompt accepted');
   const completed2 = await waitFor(
     () => sse.events,
-    event => event.type === 'turn.completed' && event !== completed1,
+    event => event.type === 'turn.completed' && event !== completed1 && event !== completedDefault,
     5_000,
     'turn.completed for allowlisted rerun',
   );

@@ -2351,6 +2351,127 @@ async function linkRelaySmoke(store: Store, wsBase: string, c2: Client): Promise
   assert((await linkA2Closed) === WS_CLOSE_UNAUTHORIZED, "a revoked link's live socket is closed with WS_CLOSE_UNAUTHORIZED");
 }
 
+/**
+ * Turn lifecycle (KILO-CLOUD-ANALYSE.md P1, W2.2): app-generated message ids
+ * make a re-sent prompt idempotent (no duplicate agent turn after an ambiguous
+ * admission), and the per-turn status resource carries queued -> running ->
+ * completed/failed/interrupted so a reconnecting client reconstructs a turn's
+ * fate instead of guessing it from the event stream. Runs against a fake shim
+ * only - no docker daemon needed, since a reachable shim endpoint is all the
+ * prompt path uses here.
+ */
+async function turnLifecycleSmoke(store: Store, manager: SessionManager, c2: Client, repoId: string): Promise<void> {
+  const http = await import('node:http');
+  const { clampTurnLimit, TURNS_DEFAULT_LIMIT, TURNS_MAX_LIMIT } = await import('./sessions.js');
+
+  /* ---- pure limit clamping, same contract as clampEventLimit ---- */
+  assert(clampTurnLimit(undefined) === TURNS_DEFAULT_LIMIT, 'a missing turn limit falls back to the default');
+  assert(clampTurnLimit(9_999) === TURNS_MAX_LIMIT, 'an oversized turn limit is capped');
+  assert(clampTurnLimit(0) === 1 && clampTurnLimit(-3) === 1, 'a turn limit below 1 becomes 1');
+
+  /* ---- a fake shim whose /prompt outcome and call count the test drives ---- */
+  let promptCalls = 0;
+  let promptMode: 'ok' | 'fail' = 'ok';
+  const shim = http.createServer((req, res) => {
+    const url = req.url ?? '';
+    req.resume();
+    if (url.startsWith('/prompt')) {
+      promptCalls++;
+      if (promptMode === 'fail') {
+        return void res.writeHead(200, { 'content-type': 'application/json' }).end('{"ok":false,"error":"boom"}');
+      }
+      return void res.writeHead(200, { 'content-type': 'application/json' }).end('{"ok":true}');
+    }
+    res.writeHead(200, { 'content-type': 'application/json' }).end('{"ok":true}');
+  });
+  const shimPort = await listen(shim);
+  const shimBase = `http://127.0.0.1:${shimPort}`;
+
+  const insertIdle = (): string => {
+    const id = randomUUID();
+    store.insertSession(
+      sessionRow(id, repoId, {
+        status: 'idle',
+        network_policy: 'open',
+        shim_token: `token-${id.slice(0, 8)}`,
+        shim_endpoint: shimBase,
+      }),
+    );
+    return id;
+  };
+
+  try {
+    /* ---- (a) idempotency: the same messageId twice is one agent turn ---- */
+    const idA = insertIdle();
+    promptMode = 'ok';
+    promptCalls = 0;
+    await manager.prompt(idA, 'bau den login um', undefined, 'msg_dup');
+    await manager.prompt(idA, 'bau den login um', undefined, 'msg_dup'); // resend after an ambiguous ack
+    const dupCalls = promptCalls; // snapshot: assert narrows the closure-mutated let otherwise
+    assert(dupCalls === 1, `a prompt re-sent with the same messageId hits the shim once (got ${dupCalls})`);
+    const turnsA = manager.turns(idA);
+    assert(turnsA.length === 1, `the duplicate prompt created exactly one turn (got ${turnsA.length})`);
+    assert(turnsA[0]!.messageId === 'msg_dup', 'the turn carries the app-generated messageId');
+    assert(turnsA[0]!.state === 'running', 'the admitted turn is running after the shim accepted it');
+
+    // A *different* messageId is a genuine second turn, not a duplicate.
+    await manager.prompt(idA, 'und jetzt die tests', undefined, 'msg_two');
+    const twoCalls = promptCalls;
+    assert(twoCalls === 2, `a different messageId is admitted as its own turn (got ${twoCalls})`);
+    assert(manager.turns(idA).length === 2, 'the second messageId adds a second turn');
+
+    /* ---- (b) queued -> running -> completed, queryable after a reconnect ---- */
+    const idB = insertIdle();
+    promptCalls = 0;
+    // Watch the live turn.status push arrive on the device socket.
+    await manager.prompt(idB, 'lauf los', undefined, 'msg_b');
+    const runningPush = await c2.wait(
+      (m) => m.type === 'turn.status' && m.sessionId === idB && m.turn.state === 'running',
+      5_000,
+    );
+    assert(runningPush.type === 'turn.status' && runningPush.turn.messageId === 'msg_b', 'the running turn is pushed live');
+    assert(store.getSession(idB)?.status === 'running', 'admitting a turn puts the session into running');
+
+    // The shim reports the turn finished (as it would over its SSE stream).
+    manager.handleLinkEvent(idB, { type: 'turn.completed' });
+    assert(store.getSession(idB)?.status === 'idle', 'a completed turn returns the session to idle');
+
+    // "Reconnect": a fresh client asks for the turns and reads the terminal
+    // state instead of replaying the whole event stream.
+    const turnsB = manager.turns(idB);
+    assert(turnsB.length === 1 && turnsB[0]!.state === 'completed', 'the turn is completed and queryable after a reconnect');
+
+    // And the same over the WS resource the app actually uses.
+    const answered = await request(c2, { type: 'session.turns.get', requestId: 'turns-b', sessionId: idB });
+    assert(
+      answered.type === 'session.turns' &&
+        answered.turns.length === 1 &&
+        answered.turns[0]!.state === 'completed' &&
+        answered.turns[0]!.messageId === 'msg_b',
+      'session.turns.get returns the completed turn',
+    );
+
+    /* ---- (c) a failed turn carries failed + a structured reason ---- */
+    const idC = insertIdle();
+    promptMode = 'fail';
+    await manager.prompt(idC, 'das geht schief', undefined, 'msg_c');
+    const turnsC = manager.turns(idC);
+    assert(turnsC.length === 1 && turnsC[0]!.state === 'failed', 'a prompt the shim rejects ends as a failed turn');
+    assert(turnsC[0]!.reason?.message === 'boom', 'the failed turn carries the shim error as its reason');
+    assert(turnsC[0]!.reason?.stage === 'transport', 'the failure reason names the stage it broke at');
+    assert(store.getSession(idC)?.status === 'error', 'a failed prompt leaves the session in error');
+
+    store.deleteSession(idA);
+    assert(
+      store.getTurnByMessageId(idA, 'msg_dup') === undefined,
+      'deleting a session takes its turns with it (no orphaned turn rows)',
+    );
+    for (const id of [idB, idC]) store.deleteSession(id);
+  } finally {
+    shim.close();
+  }
+}
+
 async function main(): Promise<void> {
   await protocolLoadsOnPlainNode();
   const { app, store, manager } = await buildApp();
@@ -2915,6 +3036,7 @@ async function main(): Promise<void> {
   await lifecycleSmoke(store, manager, c2, added.repo.id);
   await historySmoke(store, manager, c2, added.repo.id);
   await eventReplaySmoke(store, manager, c2, added.repo.id);
+  await turnLifecycleSmoke(store, manager, c2, added.repo.id);
   await heartbeatSmoke();
 
   const models = await request(c2, { type: 'session.models.get', requestId: 'mod1', sessionId });

@@ -16,9 +16,11 @@ import type {
   ServerMessage,
   SessionInfo,
   SessionStatus,
+  TurnFailureReason,
+  TurnInfo,
 } from '@pocketagent/protocol';
 import { SERVER_VERSION, config, isNetworkPolicy } from './config.js';
-import type { LinkRow, RepoRow, SessionRow, Store } from './db.js';
+import type { LinkRow, RepoRow, SessionRow, Store, TurnRow } from './db.js';
 import * as docker from './docker.js';
 import type { NoticeFn } from './docker.js';
 import {
@@ -92,6 +94,16 @@ export const RESYNC_STALE_MS = 90_000;
 /** `session.events.get`: youngest events, chronological; the client may ask for fewer. */
 export const EVENTS_DEFAULT_LIMIT = 200;
 export const EVENTS_MAX_LIMIT = 1000;
+
+/** `session.turns.get`: youngest turns, chronological; a session has far fewer turns than events. */
+export const TURNS_DEFAULT_LIMIT = 50;
+export const TURNS_MAX_LIMIT = 500;
+
+/** Same clamping contract as clampEventLimit: unusable -> default, otherwise into [1, max]. */
+export function clampTurnLimit(v: unknown): number {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return TURNS_DEFAULT_LIMIT;
+  return Math.min(Math.max(Math.floor(v), 1), TURNS_MAX_LIMIT);
+}
 
 /**
  * Event limit of a history request. Anything unusable (missing, not a finite
@@ -769,6 +781,12 @@ export class SessionManager {
     if (ev.type === 'status' && ev.sessionRef) this.store.setSessionRef(sessionId, ev.sessionRef);
     else if (ev.type === 'permission.request') void this.notifyPermission(sessionId, ev.title);
     else if (ev.type === 'turn.completed' || ev.type === 'turn.failed') {
+      // Close the per-turn resource from the shim's own terminal signal: the
+      // in-flight turn reaches 'completed' or 'failed' (carrying the shim's
+      // error as the reason) so a reconnecting app reads its fate instead of
+      // guessing it from the stream.
+      if (ev.type === 'turn.completed') this.finishTurn(sessionId, 'completed');
+      else this.finishTurn(sessionId, 'failed', { message: ev.error, stage: 'agent' });
       if (this.store.getSession(sessionId)?.status === 'running') this.setStatus(sessionId, 'idle');
     } else if (ev.type === 'pushed' && ev.prUrl) this.store.setPrUrl(sessionId, ev.prUrl);
   }
@@ -787,6 +805,80 @@ export class SessionManager {
   private emitEvent(sessionId: string, ev: AgentEvent): void {
     this.persistEvent(sessionId, ev);
     this.broadcast({ type: 'session.event', sessionId, event: ev });
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Per-turn lifecycle (KILO-CLOUD-ANALYSE.md P1)                       */
+  /* ------------------------------------------------------------------ */
+
+  private toTurnInfo(row: TurnRow): TurnInfo {
+    let reason: TurnFailureReason | undefined;
+    if (row.reason) {
+      try {
+        reason = JSON.parse(row.reason) as TurnFailureReason;
+      } catch {
+        reason = { message: row.reason };
+      }
+    }
+    return {
+      turnId: row.id,
+      sessionId: row.session_id,
+      ...(row.message_id ? { messageId: row.message_id } : {}),
+      state: row.state as TurnInfo['state'],
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      ...(reason ? { reason } : {}),
+    };
+  }
+
+  /** Push a turn transition to every device (the live half of the turn resource). */
+  private broadcastTurn(row: TurnRow): void {
+    this.broadcast({ type: 'turn.status', sessionId: row.session_id, turn: this.toTurnInfo(row) });
+  }
+
+  /**
+   * Admit a new turn (state 'queued') and announce it. `messageId` is the
+   * app-generated id that admitted it; it is what getTurnByMessageId dedupes on.
+   */
+  private startTurn(sessionId: string, messageId?: string): TurnRow {
+    const now = new Date().toISOString();
+    const row: TurnRow = {
+      id: randomUUID(),
+      session_id: sessionId,
+      message_id: messageId ?? null,
+      state: 'queued',
+      reason: null,
+      created_at: now,
+      updated_at: now,
+    };
+    this.store.insertTurn(row);
+    this.broadcastTurn(row);
+    return row;
+  }
+
+  /** Transition a turn to a new state (with a failure reason for 'failed') and announce it. */
+  private setTurnState(turnId: string, state: TurnInfo['state'], reason?: TurnFailureReason): void {
+    this.store.updateTurnState(turnId, state, reason ? JSON.stringify(reason) : null);
+    const row = this.store.getTurn(turnId);
+    if (row) this.broadcastTurn(row);
+  }
+
+  /**
+   * Move a session's current (queued/running) turn to a terminal state, if it
+   * has one. Used when a terminal signal arrives without a turn id of its own:
+   * a shim `turn.completed`/`.failed`, an abort, or a restart that dropped the
+   * turn. A no-op when nothing is in flight (e.g. a stray completed event).
+   */
+  private finishTurn(sessionId: string, state: 'completed' | 'failed' | 'interrupted', reason?: TurnFailureReason): void {
+    const active = this.store.latestActiveTurn(sessionId);
+    if (!active) return;
+    this.setTurnState(active.id, state, reason);
+  }
+
+  /** Turns of a session, oldest first (see Store.listTurns). */
+  turns(id: string, limit?: number): TurnInfo[] {
+    this.requireSession(id);
+    return this.store.listTurns(id, clampTurnLimit(limit)).map((r) => this.toTurnInfo(r));
   }
 
   private setStatus(id: string, status: SessionStatus): void {
@@ -891,10 +983,23 @@ export class SessionManager {
     }
   }
 
-  async prompt(id: string, text: string, mode?: AgentMode): Promise<void> {
+  /**
+   * Send a prompt, admitting exactly one turn per app-generated `messageId`
+   * (KILO-CLOUD-ANALYSE.md P1). The messageId is stable across a resend, so a
+   * prompt the app repeats after an ambiguous admission (a radio hole swallowed
+   * the ack) is recognised as the same turn and is NOT run a second time - no
+   * duplicate agent turn on flaky mobile links. A prompt without a messageId
+   * (older client) keeps the old behaviour, just without dedup.
+   */
+  async prompt(id: string, text: string, mode?: AgentMode, messageId?: string): Promise<void> {
     const row = this.requireSession(id);
     this.assertPromptable(row);
-    const body = buildPromptBody(row, text, mode);
+    // Idempotent admission: the same messageId, seen again, is the resend of an
+    // already-accepted turn. Do nothing but let the caller re-ack it - starting
+    // a second agent turn is exactly the failure this rule exists to prevent.
+    if (messageId && this.store.getTurnByMessageId(id, messageId) !== undefined) return;
+    const body: PromptRequest = { ...buildPromptBody(row, text, mode), ...(messageId ? { messageId } : {}) };
+    const turn = this.startTurn(id, messageId);
     // The prompt itself, so a reloaded timeline shows the user's own message:
     // no shim reports it back, and without this line the history would start
     // at the agent's answer. Stored only, never broadcast - the sending client
@@ -903,20 +1008,29 @@ export class SessionManager {
     if (row.link_id) {
       const res = await this.linkCall(row, '/prompt', 'POST', body);
       if (!res.ok) {
+        this.setTurnState(turn.id, 'failed', { message: res.error, stage: 'transport', retryable: true });
         this.emitEvent(id, { type: 'error', message: res.error, fatal: true });
         throw new Error(res.error);
       }
+      this.setTurnState(turn.id, 'running');
       this.setStatus(id, 'running');
       return;
     }
-    if (!row.shim_token) throw new Error('session not provisioned'); // before any status change
+    if (!row.shim_token) {
+      // before any status change; the turn was already admitted, so mark it
+      this.setTurnState(turn.id, 'failed', { message: 'session not provisioned', stage: 'provision' });
+      throw new Error('session not provisioned');
+    }
     this.setStatus(id, 'running');
     const res = await this.withShim(id, (c) => c.prompt(body));
     if (!res || !res.ok) {
       const message = res && !res.ok ? res.error : await this.unreachableMessage(id);
+      this.setTurnState(turn.id, 'failed', { message, stage: 'transport', retryable: true });
       this.setStatus(id, 'error');
       this.emitEvent(id, { type: 'error', message, fatal: true });
+      return;
     }
+    this.setTurnState(turn.id, 'running');
   }
 
   /**
@@ -1078,10 +1192,14 @@ export class SessionManager {
     if (row.link_id) {
       const res = await this.linkCall(row, '/abort', 'POST');
       if (!res.ok) throw new Error(res.error);
+      this.finishTurn(id, 'interrupted');
       return;
     }
     const res = await this.withShim(id, (c) => c.abort());
     if (!res?.ok) throw new Error(res && !res.ok ? res.error : await this.unreachableMessage(id));
+    // The turn was cut short from outside; its terminal state is 'interrupted',
+    // not 'completed' - the app can tell "I stopped it" from "it finished".
+    this.finishTurn(id, 'interrupted');
   }
 
   async diff(id: string): Promise<DiffEntry[]> {
@@ -1499,7 +1617,12 @@ export class SessionManager {
         ? 'Server wurde neu gestartet – die Verbindung zu diesem Agenten wurde wiederhergestellt. Der laufende Turn wurde dabei abgebrochen.'
         : 'Server wurde neu gestartet – die Verbindung zu diesem Agenten wurde wiederhergestellt.',
     });
-    if (interrupted) this.setStatus(row.id, 'idle');
+    if (interrupted) {
+      // Close the dropped turn so the reconnecting app reads 'interrupted'
+      // instead of a turn that is forever 'running'.
+      this.finishTurn(row.id, 'interrupted', { message: 'Server-Neustart während des Turns', stage: 'restart', retryable: true });
+      this.setStatus(row.id, 'idle');
+    }
     console.log(`[sessions] reconciled ${row.id.slice(0, 8)} (${row.status} -> ${interrupted ? 'idle' : row.status})`);
   }
 
@@ -1556,6 +1679,10 @@ export class SessionManager {
       const current = this.store.getSession(row.id);
       if (!current || current.status !== 'running') continue;
       if (Date.parse(current.last_active_at) >= staleBefore) continue;
+      // The shim reports not busy, so the turn is over; a lost turn.completed
+      // never closed it. Complete the in-flight turn to match the corrected
+      // session status.
+      this.finishTurn(row.id, 'completed');
       this.setStatus(row.id, 'idle');
       this.emitEvent(row.id, {
         type: 'notice',

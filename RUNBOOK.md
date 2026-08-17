@@ -11,11 +11,11 @@ Alle Befehle vom Monorepo-Root ausführen.
 npm install --no-audit --no-fund
 npm run typecheck          # erwartete Ausgabe: kein Fehler, Exit 0
 npm run smoke:server       # erwartete letzte Zeile: SMOKE OK
-npm run smoke:shims        # erwartete Ausgabe: 5x SMOKE OK (opencode, kilo, claude, pi, junie)
+npm run smoke:shims        # erwartete Ausgabe: 4x SMOKE OK (kilo, claude, pi, junie)
 ```
 
 Falls `typecheck` an einer Stelle fehlschlägt: Die letzten Änderungen (Event-Normalizer
-für echte opencode/kilo-Wire-Formate, claude-Busy-Fix, real-check-Skripte) wurden ohne
+für echte kilo-Wire-Formate, claude-Busy-Fix, real-check-Skripte) wurden ohne
 Compiler-Durchlauf geschrieben und manuell reviewed — kleine Tippfehler sind unwahrscheinlich,
 aber nicht ausgeschlossen. Fixen und committen.
 
@@ -25,10 +25,6 @@ aber nicht ausgeschlossen. Fixen und committen.
 npm run smoke:real
 ```
 
-- `shims/opencode`: bootet echtes `opencode serve` (1.18.18) + Shim dagegen.
-  Erwartung: `REAL CHECK OK`. Ohne API-Key muss der Prompt-Turn als sauberes
-  `turn.failed`/`error`-Event enden (kein Crash, Shim überlebt). Druckt am Ende
-  5 echte `/event`-Bus-Frames zur Kontrolle.
 - `shims/pi`: bootet echtes pi-SDK (0.84.2) inkl. Permission-Gate-Extension.
   Erwartung: `REAL CHECK OK`; ohne Key kommt `No API key found …` als `turn.failed`.
 - `shims/claude`: echtes Agent-SDK (0.3.233). WICHTIG: zuerst einmal
@@ -53,7 +49,6 @@ cmdline-tools + `platforms;android-35` + `build-tools;34.0.0`, Gradle 8.11, dann
 ```bash
 # Images (Build-Kontext ist IMMER der Repo-Root!)
 docker build -f server/Dockerfile         -t pocketagent/orchestrator:latest .
-docker build -f shims/opencode/Dockerfile -t pocketagent/opencode-shim:latest .
 docker build -f shims/kilo/Dockerfile     -t pocketagent/kilo-shim:latest .
 docker build -f shims/claude/Dockerfile   -t pocketagent/claude-shim:latest .
 docker build -f shims/pi/Dockerfile       -t pocketagent/pi-shim:latest .
@@ -107,7 +102,7 @@ Pull requests R/W je Repo), danach pro Adapter siehe README-Tabelle
 ## 5. Erste echte Session (E2E)
 
 1. Repo in Settings hinzufügen (z. B. ein Test-Repo)
-2. Neue Session: Adapter `opencode`, Provider mit vorhandenem Key, Mode `ask`
+2. Neue Session: Adapter `kilo`, Provider mit vorhandenem Key, Mode `ask`
 3. Prompt senden → Approval-Karte in der App bestätigen
 4. Diff öffnen → Push-Button → Draft-PR auf GitHub prüfen
 5. Container-Kill-Test: `docker kill <session-container>` → in App „Resume" →

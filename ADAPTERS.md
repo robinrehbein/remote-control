@@ -6,7 +6,6 @@ PocketAgent ist harness-agnostisch: Jeder Coding-Agent-Harness ist ein **Adapter
 
 | id | Harness | Auth | Approvals | Resume |
 |---|---|---|---|---|
-| `opencode` | OpenCode (`opencode serve`) | Provider-API-Keys | ja | ja |
 | `kilo` | Kilo CLI (`kilo serve`, OpenCode-Fork) | Provider-API-Keys oder `kilo`-Secret (Gateway `auth.json`-Inhalt → `KILO_AUTH_CONTENT`) | ja | ja |
 | `claude` | Claude Code (Agent SDK) | `claude_oauth` (setup-token, Pro/Max) oder `anthropic` API-Key | ja | ja |
 | `pi` | pi (SDK-Embedding) | Provider-API-Keys (ZAI/Kimi/Qwen-Kataloge) | ja (`tool_call`-Hook) | ja |
@@ -41,8 +40,8 @@ PocketAgent ist harness-agnostisch: Jeder Coding-Agent-Harness ist ein **Adapter
 Ungültige Manifeste werden beim Boot übersprungen (Log-Warnung), der Server startet weiter.
 
 **`providerEnv` muss die Variable nennen, die die Runtime wirklich liest** — nicht
-die, die nach dem Provider-Namen klingt. Beispiel Z.AI: opencode und kilo ziehen
-ihre Provider aus dem Models.dev-Katalog, und der schreibt für alle vier Z.AI-Einträge
+die, die nach dem Provider-Namen klingt. Beispiel Z.AI: kilo (ein OpenCode-Fork)
+zieht seine Provider aus dem Models.dev-Katalog, und der schreibt für alle vier Z.AI-Einträge
 (`zai`, `zai-coding-plan`, `zhipuai`, `zhipuai-coding-plan`) `ZHIPU_API_KEY` vor.
 Mit `ZAI_API_KEY` taucht kein einziger davon auf; der Key ist dann faktisch nicht
 gesetzt, und jedes Modell endet in „model not found". pi ist der Gegenfall — dessen

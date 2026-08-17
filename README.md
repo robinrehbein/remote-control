@@ -1,6 +1,6 @@
 # PocketAgent
 
-Provider-agnostische Mobile-Agent-Plattform: Steuerung von Coding-Agenten (**OpenCode, Kilo Code, Claude Code, pi, Junie** — und jedem weiteren Harness als Plugin, siehe `ADAPTERS.md`) per Android-App; die Agenten arbeiten isoliert in Docker-Containern auf deinem Server (z. B. Coolify-VPS) direkt auf deinen GitHub-Repos. Wie Claude Remote Sessions / Kilo Cloud Sessions — aber harness- und provider-agnostisch.
+Provider-agnostische Mobile-Agent-Plattform: Steuerung von Coding-Agenten (**Kilo Code, Claude Code, pi, Junie** — und jedem weiteren Harness als Plugin, siehe `ADAPTERS.md`) per Android-App; die Agenten arbeiten isoliert in Docker-Containern auf deinem Server (z. B. Coolify-VPS) direkt auf deinen GitHub-Repos. Wie Claude Remote Sessions / Kilo Cloud Sessions — aber harness- und provider-agnostisch.
 
 ```
 Android (Kotlin/Compose, WS + FCM)
@@ -9,8 +9,7 @@ Orchestrator (Node/TS auf deinem Server, docker.sock)
    ├─ Adapter-Registry: lädt shims/*/adapter.json Manifeste (Plugins!)
    ↕ HTTP/SSE pro Session (Random-Token)
 Adapter-Shims in Session-Containern (einheitliches Protokoll)
-   ├─ opencode-shim  → opencode serve (75+ Provider)
-   ├─ kilo-shim      → kilo serve (Kilo CLI, OpenCode-Fork)
+   ├─ kilo-shim      → kilo serve (Kilo CLI, OpenCode-Fork, 75+ Provider via Models.dev)
    ├─ claude-shim    → Claude Agent SDK (Pro/Max-Subscription via setup-token)
    ├─ pi-shim        → pi SDK (ZAI/Kimi/Qwen-Kataloge, Remote-Approvals)
    └─ junie-shim     → Junie CLI headless (BYOK)
@@ -22,8 +21,7 @@ Adapter-Shims in Session-Containern (einheitliches Protokoll)
 |---|---|
 | `packages/protocol/` | Geteilter Contract: Shim-REST-API, normierter Event-Stream, WS-Nachrichten, Pairing, Adapter-Manifest-Typen (pure TS-Typen) |
 | `server/` | Orchestrator: SQLite, Vault (AES-256-GCM), **Adapter-Registry (Manifest-Plugins)**, Docker-Lifecycle, SSE→WS-Weiterleitung, Pairing, FCM, Idle-Reaper, GC |
-| `shims/opencode/` | OpenCode-Adapter (Proxy auf `opencode serve`) |
-| `shims/kilo/` | Kilo-CLI-Adapter (Proxy auf `kilo serve`, OpenCode-kompatibel) |
+| `shims/kilo/` | Kilo-CLI-Adapter (Proxy auf `kilo serve`, OpenCode-kompatibler Fork) |
 | `shims/claude/` | Claude-Code-Adapter (Agent SDK, `CLAUDE_CODE_OAUTH_TOKEN`) |
 | `shims/pi/` | pi-Adapter (SDK-Embedding, Approvals via `tool_call`-Hook) |
 | `shims/junie/` | Junie-Adapter (CLI-Spawn pro Prompt, JSON-Output) |
@@ -38,8 +36,8 @@ Jeder Shim implementiert dasselbe Protokoll: `POST /prompt`, `POST /abort`, `POS
 | Modus | Verhalten |
 |---|---|
 | Yolo | Keine Gates; Auto-Push + Draft-PR pro Turn |
-| Auto | OpenCode `--auto`, Claude `auto`, pi: nur risky Bash gegated, Junie: ohne Gates |
-| AcceptEdits | Edits frei, Bash fragt (opencode/claude/pi; Junie: Warnbanner, ohne Gates) |
+| Auto | Kilo `--auto`, Claude `auto`, pi: nur risky Bash gegated, Junie: ohne Gates |
+| AcceptEdits | Edits frei, Bash fragt (kilo/claude/pi; Junie: Warnbanner, ohne Gates) |
 | Ask | Alles Wichtige fragt → Approval-Karte in der App (Junie: Warnbanner, ohne Gates) |
 
 ## Deployment (Coolify / Docker-Host)
@@ -65,7 +63,7 @@ Wichtig: Build-Kontext ist immer der Repo-Root (`.`), weil die Shims und der Ser
 Quellen, siehe `.env.example`). Für reproduzierbare Deploys zwei Möglichkeiten:
 
 - global per Env: `ADAPTER_IMAGE_TAG=2026-08-15` (oder ein CI-Build-Tag) pinnen
-- pro Adapter per Manifest: `"image": "ghcr.io/owner/opencode-shim@sha256:<digest>"`
+- pro Adapter per Manifest: `"image": "ghcr.io/owner/kilo-shim@sha256:<digest>"`
   in `shims/<id>/adapter.json` — ein Digest überschreibt Prefix/Tag komplett
   (Registry-Modus, Images werden dann automatisch gepullt).
 
@@ -108,8 +106,7 @@ Ohne Wert-Argument und ohne Pipe fragt die CLI interaktiv (Eingabe versteckt). `
 
 | Adapter | Secret | Hinweis |
 |---|---|---|
-| opencode | je Provider API-Key (`zai`, `openai`, `moonshot`, ...) | 75+ Provider via Models.dev |
-| kilo | Provider-API-Keys oder `kilo`-Secret (Inhalt der Gateway-`auth.json` → `KILO_AUTH_CONTENT`) | OpenCode-kompatibler Fork mit eigenem Serve-Mode |
+| kilo | Provider-API-Keys oder `kilo`-Secret (Inhalt der Gateway-`auth.json` → `KILO_AUTH_CONTENT`) | OpenCode-kompatibler Fork; 75+ Provider via Models.dev |
 | claude | `claude_oauth` = `claude setup-token` (Pro/Max, ~1 Jahr gültig) oder `anthropic` API-Key | Token-Erneuerung auf dem Laptop, dann Secret updaten |
 | pi | Provider API-Keys; ZAI/Kimi/Qwen-Subscription-OAuth post-MVP | |
 | junie | `junie` API-Key (usage-based) oder BYOK-Keys (openai/anthropic/...) | Headless one-shot; keine Remote-Approvals (App zeigt Banner) |
@@ -126,7 +123,7 @@ Anzeigenamen, Key-Seiten und Einrichtungshinweise stehen im Manifest (`providers
 npm install                 # workspaces
 npm run typecheck           # alle TS-Pakete
 npm run smoke -w server
-npm run smoke -w shims/opencode && npm run smoke -w shims/claude && npm run smoke -w shims/pi && npm run smoke -w shims/junie
+npm run smoke -w shims/kilo && npm run smoke -w shims/claude && npm run smoke -w shims/pi && npm run smoke -w shims/junie
 ```
 
 Alle Smokes laufen ohne Docker/Credentials (Fake-Runtimes). Server-Dev: `npm run dev -w server` (DOCKER_ENABLED=0 erlaubt Pairing/Secrets/Repo-Verwaltung ohne Container).
@@ -164,8 +161,8 @@ done
 
 ## Status / Verifikation
 
-- Alle 7 TS-Pakete strict-getyped; Fake-Smokes (ohne Docker/Credentials) decken Auth, Event-Normalisierung, Permission-Flow, Auto-Commit, Diff, Abort, Push-Scripte und die Adapter-Registry ab
-- **Echte Wire-Formate verifiziert**: opencode 1.18.18 und kilo 7.4.22 Event-/HTTP-Protokolle wurden gegen den Runtime-Quellcode verifiziert und die Normalizer entsprechend gebaut (`{id,type,properties}`-Envelopes, `message.part.delta`, `session.error`/`session.status`, `permission.asked/replied`, `time.completed`, `?directory=`-Routing, `/prompt_async`, Diff-`file`-Key, verschachtelte kilo-Permission-Patterns)
-- **Real-Check-Skripte** (`npm run smoke:real`): opencode (echtes `opencode serve`), pi (echtes SDK + Gate-Extension), claude (echtes SDK, deterministischer Fehlerweg ohne Credentials) — Anleitung im `RUNBOOK.md`
+- Alle 8 TS-Pakete strict-getyped; Fake-Smokes (ohne Docker/Credentials) decken Auth, Event-Normalisierung, Permission-Flow, Auto-Commit, Diff, Abort, Push-Scripte und die Adapter-Registry ab
+- **Echte Wire-Formate verifiziert**: kilo 7.4.22 Event-/HTTP-Protokolle (OpenCode-kompatibler Fork) wurden gegen den Runtime-Quellcode verifiziert und die Normalizer entsprechend gebaut (`{id,type,properties}`-Envelopes, `message.part.delta`, `session.error`/`session.status`, `permission.asked/replied`, `time.completed`, `?directory=`-Routing, `/prompt_async`, Diff-`file`-Key, verschachtelte kilo-Permission-Patterns)
+- **Real-Check-Skripte** (`npm run smoke:real`): pi (echtes SDK + Gate-Extension), claude (echtes SDK, deterministischer Fehlerweg ohne Credentials) — Anleitung im `RUNBOOK.md`
 - Claude-SDK: Plattform-Binaries (`linux-x64`/`linux-arm64`, 0.3.233) sind als `optionalDependencies` gepinnt und im Lockfile verankert
 - Offen: ein finaler `npm run typecheck` + Smoke-Durchlauf in einer Shell (die Ausbau-Session hatte keine Command-Rechte) — exakte Schritte in `RUNBOOK.md` Schritt 1–2; Android-Kompilierung via GitHub-Actions beim ersten Push

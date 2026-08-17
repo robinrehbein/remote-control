@@ -35,7 +35,7 @@ Android-App
 ORCHESTRATOR (Coolify/Fly/PC)
    ↕ outbound WebSocket (vom Agenten initiiert!)
 LINK-AGENT in deinem Devcontainer
-   └─ Adapter-Shim (opencode/kilo/claude/pi/junie) auf deinem Workspace
+   └─ Adapter-Shim (kilo/claude/pi/junie) auf deinem Workspace
 ```
 
 ### Setup (einmalig, auf dem Server)
@@ -51,7 +51,7 @@ npm run link:token -w server -- --name devcontainer
 git clone https://github.com/robinrehbein/remote-control && cd remote-control && npm install
 PA_SERVER=wss://dein-orchestrator.example.com \
 PA_TOKEN=<token> \
-PA_ADAPTER=opencode \
+PA_ADAPTER=kilo \
 PA_MODE=ask \
 PA_WORKDIR=/workspaces/mein-projekt \
 npm run start -w link
@@ -61,8 +61,8 @@ Die Session erscheint automatisch in der App (Name `link:devcontainer`), Events,
 
 ### Hinweise zu Variante C
 
-- **Provider-Keys** kommen aus der Env des Devcontainers (`OPENAI_API_KEY`, `ZHIPU_API_KEY`, `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `JUNIE_API_KEY` …) bzw. aus `~/.opencode/auth.json` etc. – der Server-Vault injiziert hier nichts (deine Keys bleiben komplett lokal).
-  Der Z.AI-Key heißt für opencode und kilo `ZHIPU_API_KEY`; unter `ZAI_API_KEY` sehen beide ihn nicht und jedes GLM-Modell endet in „model not found". Nur `PA_ADAPTER=pi` liest `ZAI_API_KEY`.
+- **Provider-Keys** kommen aus der Env des Devcontainers (`OPENAI_API_KEY`, `ZHIPU_API_KEY`, `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `JUNIE_API_KEY` …) bzw. aus `~/.config/kilo/auth.json` etc. – der Server-Vault injiziert hier nichts (deine Keys bleiben komplett lokal).
+  Der Z.AI-Key heißt für kilo (OpenCode-kompatibler Fork) `ZHIPU_API_KEY`; unter `ZAI_API_KEY` sieht es ihn nicht und jedes GLM-Modell endet in „model not found". Nur `PA_ADAPTER=pi` liest `ZAI_API_KEY`.
 - **Branch**: Der Shim arbeitet auf `agent/<PA_NAME>` (Default: Hostname). Vorhandenen Checkout-Branch behalten? Der Shim checkt `agent/<name>` aus deinem Workspace aus – commite vorher oder setze `PA_NAME` passend.
 - **Auto-Push**: Nur im Yolo-Modus (pusht + Draft-PR, braucht `GITHUB_PAT` in der Devcontainer-Env). Tap-Push aus der App ist für Link-Sessions nicht verfügbar.
 - **Reconnect**: Link-Agent verbindet sich automatisch neu (Netzwechsel, Server-Restart). Die Session geht dabei auf `stopped` → `idle` – Verlauf bleibt.

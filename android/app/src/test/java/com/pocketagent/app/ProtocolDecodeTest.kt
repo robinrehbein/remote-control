@@ -72,7 +72,7 @@ class ProtocolDecodeTest {
                   "id": "s1",
                   "repoId": "r1",
                   "repoFullName": "acme/api",
-                  "adapter": "opencode",
+                  "adapter": "kilo",
                   "provider": "zai",
                   "model": "glm-4.6",
                   "mode": "acceptEdits",
@@ -93,7 +93,7 @@ class ProtocolDecodeTest {
         assertEquals(1, list.size)
         val session = list.first()
         assertEquals("acme/api", session.repoFullName)
-        assertEquals("opencode", session.adapter)
+        assertEquals("kilo", session.adapter)
         assertEquals(com.pocketagent.app.data.AgentMode.ACCEPT_EDITS, session.mode)
         assertEquals(com.pocketagent.app.data.SessionStatus.RUNNING, session.status)
     }
@@ -508,7 +508,7 @@ class ProtocolDecodeTest {
               "sessions": [
                 {
                   "id": "s1", "repoId": "", "repoFullName": "link:devbox (/work/app)",
-                  "adapter": "opencode", "provider": "", "model": "",
+                  "adapter": "kilo", "provider": "", "model": "",
                   "mode": "ask", "status": "stopped", "branch": "local",
                   "createdAt": "2026-01-01T10:00:00Z", "lastActiveAt": "2026-01-01T11:00:00Z",
                   "linked": true

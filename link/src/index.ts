@@ -8,7 +8,7 @@
  *
  * Usage:
  *   PA_SERVER=wss://orch.example.com PA_TOKEN=... npm run start -w link -- \
- *     --adapter opencode --mode ask --workdir /workspaces/myproject
+ *     --adapter kilo --mode ask --workdir /workspaces/myproject
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
@@ -43,7 +43,7 @@ function arg(name: string, fallback: string): string {
 const args: Args = {
   server: arg('server', process.env.PA_SERVER ?? ''),
   token: arg('token', process.env.PA_TOKEN ?? ''),
-  adapter: arg('adapter', process.env.PA_ADAPTER ?? 'opencode'),
+  adapter: arg('adapter', process.env.PA_ADAPTER ?? 'kilo'),
   mode: (['yolo', 'auto', 'acceptEdits', 'ask'] as const).includes(arg('mode', process.env.PA_MODE ?? 'ask') as AgentMode)
     ? (arg('mode', process.env.PA_MODE ?? 'ask') as AgentMode)
     : 'ask',
@@ -53,11 +53,11 @@ const args: Args = {
 };
 
 if (!args.server || !args.token) {
-  console.error('usage: PA_SERVER=wss://... PA_TOKEN=... npm run start -w link -- [--adapter opencode] [--mode ask] [--workdir /path]');
+  console.error('usage: PA_SERVER=wss://... PA_TOKEN=... npm run start -w link -- [--adapter kilo] [--mode ask] [--workdir /path]');
   process.exit(1);
 }
 
-const ADAPTERS = ['opencode', 'kilo', 'claude', 'pi', 'junie'] as const;
+const ADAPTERS = ['kilo', 'claude', 'pi', 'junie'] as const;
 if (!ADAPTERS.includes(args.adapter as (typeof ADAPTERS)[number])) {
   console.error(`unknown adapter "${args.adapter}" (supported: ${ADAPTERS.join(', ')})`);
   process.exit(1);

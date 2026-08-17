@@ -31,6 +31,27 @@ android {
         }
     }
 
+    /*
+     * E2E gegen einen Emulator hinter einem TLS-terminierenden Proxy braucht
+     * eine App, die der Proxy-CA aus dem User-Zertifikatsspeicher vertraut.
+     * Das darf nur auf ausdrückliche Anforderung passieren: das Debug-APK ist
+     * laut README/RUNBOOK der Installationsweg für Endnutzer (CI-Artifact
+     * `pocketagent-debug-apk`), und dort wäre User-Store-Vertrauen eine offene
+     * Tür für jede eingetragene CA — MDM, VPN-App, Schadsoftware.
+     *
+     * Ohne -PtrustUserCerts=true wird das Sourceset nicht eingehängt: das
+     * Manifest bekommt kein networkSecurityConfig, es bleibt beim
+     * System-Speicher. Weder `gradle :app:assembleDebug` noch
+     * .github/workflows/android.yml setzen den Schalter.
+     */
+    if (providers.gradleProperty("trustUserCerts").orNull == "true") {
+        sourceSets.getByName("debug") {
+            manifest.srcFile("src/e2eTrustUserCerts/AndroidManifest.xml")
+            res.srcDir("src/e2eTrustUserCerts/res")
+        }
+        logger.lifecycle("app: debug build trusts user CAs (-PtrustUserCerts=true) — nicht verteilen")
+    }
+
     buildTypes {
         debug {
             isMinifyEnabled = false

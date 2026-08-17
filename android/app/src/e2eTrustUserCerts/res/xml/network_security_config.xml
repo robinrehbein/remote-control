@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  NUR für lokale E2E-Läufe, und nur wenn der Build ausdrücklich mit
+  -PtrustUserCerts=true angefordert wurde (siehe app/build.gradle.kts).
+
+  Hintergrund: ab Android 7 vertrauen Apps ausschließlich dem System-
+  Zertifikatsspeicher. Auf einem Emulator hinter einem TLS-terminierenden Proxy
+  — CI, Firmen-Proxy, Testumgebung — lässt sich die Proxy-CA ohne
+  beschreibbare /system-Partition nur in den User-Store legen; die App ignoriert
+  sie dann und der Fehler liest sich wie ein kaputter Server statt wie eine
+  fehlende CA.
+
+  Das darf NICHT in ein APK, das jemand benutzt: das Debug-APK ist laut
+  README/RUNBOOK der Installationsweg für Endnutzer (CI-Artifact
+  `pocketagent-debug-apk`). Mit User-Store-Vertrauen könnte jede dort
+  eingetragene CA — MDM-Profil, VPN-App, Schadsoftware — den Device-Token aus
+  dem Pairing und den gesamten wss://-Verkehr mitlesen. Deshalb hängt dieses
+  Sourceset an einem Schalter, den weder `gradle :app:assembleDebug` noch der
+  CI-Workflow setzen.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

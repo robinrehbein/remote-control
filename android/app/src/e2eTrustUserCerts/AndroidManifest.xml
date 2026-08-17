@@ -1,8 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Debug-Overlay: hängt nur die Network-Security-Config an die Anwendung, die
-  im Release-Build fehlt (siehe res/xml/network_security_config.xml). Der
-  Manifest-Merger übernimmt daraus ausschließlich dieses Attribut.
+  Wird nur eingehängt, wenn der Build mit -PtrustUserCerts=true läuft
+  (app/build.gradle.kts). Ohne den Schalter existiert dieses Sourceset für den
+  Build nicht, das Attribut steht dann in keinem Manifest, und es bleibt beim
+  System-Zertifikatsspeicher.
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">

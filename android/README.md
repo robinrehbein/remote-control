@@ -49,6 +49,27 @@ gradle :app:testDebugUnitTest --no-daemon    # Unit-Tests (Protocol- & Pairing-D
 
 Release-Build ist unsigned (`assembleRelease`), Signing muss selbst ergänzt werden.
 
+#### E2E hinter einem TLS-terminierenden Proxy
+
+Ab Android 7 vertrauen Apps nur dem System-Zertifikatsspeicher. Wer auf einem
+Emulator hinter einem abfangenden Proxy testet (CI, Firmen-Proxy), bekommt die
+Proxy-CA ohne beschreibbare `/system`-Partition nur in den User-Store — und die
+App ignoriert sie, was sich wie ein kaputter Server liest.
+
+```bash
+gradle :app:assembleDebug --no-daemon -PtrustUserCerts=true
+```
+
+Nur dann hängt sich `app/src/e2eTrustUserCerts/` in den Debug-Build und die App
+vertraut zusätzlich dem User-Store.
+
+**Dieses APK nie verteilen.** Das gewöhnliche Debug-APK ist der
+Installationsweg für Endnutzer (CI-Artifact `pocketagent-debug-apk`); mit
+User-Store-Vertrauen könnte dort jede eingetragene CA — MDM-Profil, VPN-App,
+Schadsoftware — den Device-Token aus dem Pairing und den gesamten
+`wss://`-Verkehr mitlesen. Ohne den Schalter existiert das Sourceset für den
+Build nicht, weder lokal noch in `.github/workflows/android.yml`.
+
 ### CI (GitHub Actions)
 
 Der Workflow liegt im Repo-Root unter `.github/workflows/android.yml` und ist direkt aktiv.

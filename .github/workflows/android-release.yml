@@ -1,7 +1,13 @@
 name: Android Release
 
+# Drei Wege zum selben Ergebnis:
+#   - Push auf main: releast, sobald versionName eine Nummer trägt, für die es
+#     noch keinen Tag gibt. Der Versions-Bump ist damit der Release-Knopf.
+#   - Tag-Push: releast genau diesen Tag.
+#   - Manuell: releast den eingegebenen Tag und setzt ihn auf den Commit.
 on:
   push:
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
     inputs:
@@ -24,43 +30,89 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Volle Historie samt Tags: ohne sie lässt sich nicht feststellen, ob
+          # diese Version schon einmal veröffentlicht wurde.
+          fetch-depth: 0
 
-      # The tag is user input on a contents:write job, so it is passed through
-      # env (never interpolated into the shell) and format-checked first.
-      - name: Point tag at the built commit
-        if: github.event_name == 'workflow_dispatch'
+      # Der Tag ist teils Nutzereingabe auf einem contents:write-Job. Er wird
+      # deshalb ausschließlich über die Umgebung gereicht, nie in die Shell
+      # interpoliert, und vor jeder Verwendung auf Form geprüft.
+      - name: Resolve release tag
+        id: resolve
         env:
-          TAG: ${{ inputs.tag }}
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
+          set -euo pipefail
+          if [[ "$EVENT" == "workflow_dispatch" ]]; then
+            TAG="$INPUT_TAG"
+          elif [[ "$REF_TYPE" == "tag" ]]; then
+            TAG="$REF_NAME"
+          else
+            # Push auf main: die Version im Build ist die Wahrheit.
+            VERSION="$(sed -n 's/.*versionName = "\(.*\)".*/\1/p' app/build.gradle.kts | head -1)"
+            [[ -n "$VERSION" ]] || { echo "versionName not found in app/build.gradle.kts" >&2; exit 1; }
+            TAG="v$VERSION"
+          fi
           [[ "$TAG" =~ ^v[0-9A-Za-z._-]+$ ]] || { echo "invalid tag: $TAG" >&2; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          # Ein gewöhnlicher Commit auf main ist kein Release. Nur eine Version,
+          # für die es noch keinen Tag gibt, löst einen aus — sonst versuchte
+          # jeder Merge, denselben Tag erneut zu veröffentlichen.
+          if [[ "$EVENT" == "push" && "$REF_TYPE" == "branch" ]] \
+             && git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$TAG existiert bereits – kein Release."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Release $TAG"
+          fi
+
+      # Bei einem Tag-Push zeigt der Tag bereits auf diesen Commit.
+      - name: Point tag at the built commit
+        if: steps.resolve.outputs.skip != 'true' && github.ref_type != 'tag'
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
           git tag -f "$TAG"
           git push -f origin "refs/tags/$TAG"
 
       - name: Set up JDK 17
+        if: steps.resolve.outputs.skip != 'true'
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
       - name: Set up Gradle 8.11
+        if: steps.resolve.outputs.skip != 'true'
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.11"
 
       - name: Unit tests
+        if: steps.resolve.outputs.skip != 'true'
         run: gradle :app:testReleaseUnitTest --stacktrace --no-daemon
 
       - name: Build release APK
+        if: steps.resolve.outputs.skip != 'true'
         run: gradle :app:assembleRelease --stacktrace --no-daemon
 
       - name: Rename APK
+        if: steps.resolve.outputs.skip != 'true'
         env:
-          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          RELEASE_TAG: ${{ steps.resolve.outputs.tag }}
         run: cp app/build/outputs/apk/release/app-release.apk "pocketagent-${RELEASE_TAG}.apk"
 
       - name: Create GitHub Release
+        if: steps.resolve.outputs.skip != 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ steps.resolve.outputs.tag }}
           files: android/pocketagent-*.apk
           generate_release_notes: true

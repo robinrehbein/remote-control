@@ -60,15 +60,26 @@ App ignoriert sie, was sich wie ein kaputter Server liest.
 gradle :app:assembleDebug --no-daemon -PtrustUserCerts=true
 ```
 
-Nur dann hängt sich `app/src/e2eTrustUserCerts/` in den Debug-Build und die App
-vertraut zusätzlich dem User-Store.
+Nur dann hängt sich `app/src/e2eTrustUserCerts/` in den Debug-Build ein. Das
+Ergebnis ist absichtlich unterscheidbar: applicationId
+`com.pocketagent.app.usercatrust`, versionName mit Suffix `-usercatrust`, und
+der Build sagt es bei jedem Lauf in der Konsole.
 
 **Dieses APK nie verteilen.** Das gewöhnliche Debug-APK ist der
 Installationsweg für Endnutzer (CI-Artifact `pocketagent-debug-apk`); mit
 User-Store-Vertrauen könnte dort jede eingetragene CA — MDM-Profil, VPN-App,
 Schadsoftware — den Device-Token aus dem Pairing und den gesamten
-`wss://`-Verkehr mitlesen. Ohne den Schalter existiert das Sourceset für den
-Build nicht, weder lokal noch in `.github/workflows/android.yml`.
+`wss://`-Verkehr mitlesen.
+
+Zwei unabhängige Sperren verhindern das:
+
+1. Ohne den Schalter existiert das Sourceset für den Build nicht — weder lokal
+   noch in `.github/workflows/android.yml`. Der Schalter wirkt allerdings auch
+   aus `gradle.properties` oder `ORG_GRADLE_PROJECT_trustUserCerts`, gehört
+   also **nie** in eine eingecheckte Datei.
+2. Das User-Vertrauen steht in `<debug-overrides>`. Diesen Block wertet Android
+   nur in einem APK mit `android:debuggable="true"` aus — in einem
+   Release-Build wäre die Datei wirkungslos statt gefährlich.
 
 ### CI (GitHub Actions)
 

@@ -128,7 +128,7 @@ function sessionRow(id: string, repoId: string, patch: Partial<import('./db.js')
     tenant_id: 'default',
     repo_id: repoId,
     repo_full_name: 'acme/demo',
-    adapter: 'opencode',
+    adapter: 'kilo',
     provider: 'zai',
     model: 'glm-4.6',
     mode: 'ask',

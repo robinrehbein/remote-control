@@ -970,10 +970,12 @@ private fun SecretDialog(
         onDismissRequest = onDismiss,
         title = if (initialKind != null && initialKind != CUSTOM_KIND) "Zugang aktualisieren" else "Zugang hinzufügen",
         text = {
-            Column(
-                verticalArrangement = Arrangement.spacedBy(10.dp),
-                modifier = Modifier.verticalScroll(rememberScrollState()),
-            ) {
+            // Kein eigenes verticalScroll mehr: OneUiDialog scrollt seinen
+            // Textteil selbst und begrenzt ihn dabei auf den Platz, der neben
+            // Titel und Aktionszeile übrig bleibt. Hier war es genau
+            // andersherum — die Scrollfläche nahm sich die volle Dialoghöhe
+            // und schob „Abbrechen"/„Speichern" darunter hinaus.
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 ExposedDropdownMenuBox(
                     expanded = expanded,
                     onExpandedChange = { expanded = it },

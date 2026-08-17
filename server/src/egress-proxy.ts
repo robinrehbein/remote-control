@@ -212,10 +212,29 @@ export function createEgressProxyServer(
       if (!res.headersSent) res.writeHead(502);
       res.end('upstream error');
     });
+    /*
+     * pipe() does not forward errors, so a caller that disappears mid-body
+     * leaves req's 'error' unlistened - fatal for the process, same as on the
+     * CONNECT path. Tearing the upstream request down is also the only way the
+     * half-finished connection gets released.
+     */
+    req.on('error', () => upstream.destroy());
+    res.on('error', () => upstream.destroy());
     req.pipe(upstream);
   });
 
   server.on('connect', (req: http.IncomingMessage, socket: net.Socket, head: Buffer) => {
+    /*
+     * Node hands the socket over on 'connect' and removes its own listeners
+     * first, so from here on nothing but this handler guards it. Without a
+     * listener an 'error' event is fatal for the whole process, and the
+     * likeliest moment for one is right after a denial: the client gets its
+     * 403 and resets the connection while the proxy is still writing, which
+     * surfaces as ECONNRESET. A single refused CONNECT out of one session
+     * container must not take the orchestrator down with it - hence the guard
+     * before any gate, not after.
+     */
+    socket.on('error', () => socket.destroy());
     const url = String(req.url ?? '');
     const idx = url.lastIndexOf(':');
     const host = idx === -1 ? url : url.slice(0, idx);

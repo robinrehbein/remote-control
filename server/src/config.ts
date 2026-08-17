@@ -72,6 +72,10 @@ const DEFAULT_NETWORK_ALLOWLIST = [
   'api.moonshot.cn',
   'open.bigmodel.cn',
   'api.z.ai',
+  // opencode builds its provider/model catalog from models.dev/api.json at
+  // startup; blocked, GET /config/providers answers with an empty list and the
+  // app has no models to offer for that adapter. Public read-only JSON.
+  'models.dev',
   'registry.npmjs.org',
   'proxy.golang.org',
   'pypi.org',

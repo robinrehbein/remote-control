@@ -101,6 +101,21 @@ function listen(server: import('node:http').Server): Promise<number> {
   });
 }
 
+/**
+ * A loopback port with nothing behind it: bind to 0, read what the kernel
+ * assigned, close again. Lets a test say "this daemon is unreachable" in a way
+ * that holds on a machine that does have a docker socket.
+ */
+async function closedPort(): Promise<number> {
+  const net = await import('node:net');
+  const probe = net.createServer();
+  const port = await new Promise<number>((res) => {
+    probe.listen(0, '127.0.0.1', () => res((probe.address() as AddressInfo).port));
+  });
+  await new Promise<void>((res) => probe.close(() => res()));
+  return port;
+}
+
 /** Raw request against a forward proxy: request-target is the absolute URI. */
 function proxyGet(
   http: typeof import('node:http'),
@@ -164,6 +179,28 @@ function proxyConnect(
       clearTimeout(timer);
       reject(e);
     });
+  });
+}
+
+/**
+ * A CONNECT whose caller vanishes before the answer is written: the request
+ * goes out, then the connection is reset instead of closed. That is what a
+ * client does when it gives up on a refused tunnel, and it leaves the proxy
+ * holding a socket whose next read fails with ECONNRESET.
+ */
+function proxyConnectAndReset(
+  net: typeof import('node:net'),
+  proxyPort: number,
+  hostPort: string,
+): Promise<void> {
+  return new Promise((resolve) => {
+    const sock = net.connect(proxyPort, '127.0.0.1', () => {
+      sock.write(`CONNECT ${hostPort} HTTP/1.1\r\nHost: ${hostPort}\r\n\r\n`);
+      // RST, not FIN - a clean close is the case that always worked.
+      sock.resetAndDestroy();
+      resolve();
+    });
+    sock.on('error', () => resolve());
   });
 }
 
@@ -277,6 +314,22 @@ async function gatewaySmoke(): Promise<void> {
   assert(unauthed.status === 407, 'egress proxy answers 407 (not 403) without credentials');
   const staleToken = await proxyGet(http, gatedPort, `http://127.0.0.1:${upstreamPort}/ping`, 'not-a-session');
   assert(staleToken.status === 407, 'egress proxy rejects an unknown token');
+
+  // A refused CONNECT followed by a reset used to end the whole orchestrator:
+  // node hands the socket to the 'connect' handler without its own error
+  // listener, so the ECONNRESET arriving while the 403 is written became an
+  // unhandled 'error' event. The proxy has to stay usable afterwards - and if
+  // it does not survive at all, this smoke run dies with it, which is the
+  // assertion. Repeated because the reset has to race the write.
+  const net = await import('node:net');
+  for (let i = 0; i < 20; i++) {
+    await proxyConnectAndReset(net, egressPort, 'blocked.example:443');
+    await proxyConnectAndReset(net, egressPort, `127.0.0.1:${upstreamPort}`);
+  }
+  await new Promise((r) => setTimeout(r, 100));
+  const afterReset = await proxyGet(http, egressPort, `http://127.0.0.1:${upstreamPort}/ping`);
+  assert(afterReset.status === 200, 'the egress proxy still serves after a reset CONNECT');
+
   gated.close();
 
   for (const s of [shim, ingress, upstream, egress]) s.close();
@@ -834,7 +887,7 @@ async function historySmoke(store: Store, manager: SessionManager, c2: Client, r
   assert(clampEventLimit(10.7) === 10, 'a fractional limit is floored');
 
   assert(sanitizeSessionTitle('  Mein  Feature  ') === 'Mein Feature', 'a title is trimmed and collapsed');
-  assert(sanitizeSessionTitle('a\nb\tc d') === 'a b c d', 'control characters never survive a title');
+  assert(sanitizeSessionTitle('a\nb\tc\u0000d') === 'a b c d', 'control characters never survive a title');
   assert(sanitizeSessionTitle('   ') === null, 'a blank title clears the title');
   const long = sanitizeSessionTitle('x'.repeat(200));
   assert(long !== null && long.length === MAX_TITLE_LEN, `a title is cut to ${MAX_TITLE_LEN} chars`);
@@ -1291,7 +1344,13 @@ async function main(): Promise<void> {
 
   const imageBuild = await import('./image-build.js');
   const adapters2 = await import('./adapters.js');
-  const cfg = config as unknown as { dockerEnabled: boolean; adapterImageTagPinned: boolean };
+  const dockerMod2 = await import('./docker.js');
+  const cfg = config as unknown as {
+    dockerEnabled: boolean;
+    adapterImageTagPinned: boolean;
+    dockerHost: string | null;
+    dockerHostIsLocal: boolean;
+  };
 
   const ctxRoot = imageBuild.shimContextRoot();
   assert(typeof ctxRoot === 'string', 'shim build context bundled with the server');
@@ -1482,6 +1541,20 @@ async function main(): Promise<void> {
   store.setSessionRef(sessionId, 'runtime-session-ref');
   store.updateSessionStatus(sessionId, 'idle');
   cfg.dockerEnabled = true;
+  /*
+   * "no daemon here" must not depend on the machine. A developer box without
+   * docker and a GitHub runner - which does have a daemon on
+   * /var/run/docker.sock - take different paths through the same code: with a
+   * real daemon the switch below starts an actual `docker build` of the kilo
+   * image, which runs for minutes while the assertions wait 30s, so the run
+   * ends in "timeout waiting for message" instead of the error event it
+   * describes. A closed TCP port is unreachable everywhere.
+   */
+  const dockerHostBefore = cfg.dockerHost;
+  const dockerHostIsLocalBefore = cfg.dockerHostIsLocal;
+  cfg.dockerHost = `tcp://127.0.0.1:${await closedPort()}`;
+  cfg.dockerHostIsLocal = true;
+  dockerMod2.resetDockerClient();
   // The orchestrator identifies its own container by HOSTNAME to join session
   // networks; docker always sets it, this run has to emulate that.
   const hostnameBefore = process.env.HOSTNAME;
@@ -1556,6 +1629,9 @@ async function main(): Promise<void> {
     );
   } finally {
     cfg.dockerEnabled = false;
+    cfg.dockerHost = dockerHostBefore;
+    cfg.dockerHostIsLocal = dockerHostIsLocalBefore;
+    dockerMod2.resetDockerClient();
     if (hostnameBefore === undefined) delete process.env.HOSTNAME;
     else process.env.HOSTNAME = hostnameBefore;
   }

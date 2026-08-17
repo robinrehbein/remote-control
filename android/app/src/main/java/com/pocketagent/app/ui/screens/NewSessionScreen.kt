@@ -70,6 +70,7 @@ import com.pocketagent.app.data.ModelInfo
 import com.pocketagent.app.data.ReasoningEffort
 import com.pocketagent.app.data.RepoInfo
 import com.pocketagent.app.data.WsClient
+import com.pocketagent.app.ui.sheetPickListMaxHeight
 import com.pocketagent.app.ui.theme.CardInset
 import com.pocketagent.app.ui.theme.ChipSpacing
 import com.pocketagent.app.ui.theme.ComposerHeight
@@ -778,11 +779,30 @@ private fun ModelAccessSheet(
     val effectiveProvider = (if (custom) typed else picked).trim()
     val keyMissing = effectiveProvider.isBlank() || effectiveProvider !in secretKinds
 
-    SettingSheet(title = "Modell", onDismiss = onDismiss) {
+    SettingSheet(
+        title = "Modell",
+        onDismiss = onDismiss,
+        // „Übernehmen" schließt das Sheet und ist damit die einzige Aktion,
+        // ohne die die Eingaben verfallen. Sie gehört an den festen Rand, nicht
+        // ans Ende einer Scrollfläche unter zwei Listen und zwei Textfeldern.
+        actions = {
+            Button(
+                onClick = { onApply(effectiveProvider, modelInput, effort) },
+                enabled = effectiveProvider.isNotBlank(),
+                shape = PillShape,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = ScreenGutter, vertical = 10.dp)
+                    .heightIn(min = PrimaryButtonHeight),
+            ) {
+                Text("Übernehmen")
+            }
+        },
+    ) {
         GroupCard {
             Column(
                 modifier = Modifier
-                    .heightIn(max = 320.dp)
+                    .heightIn(max = sheetPickListMaxHeight())
                     .verticalScroll(rememberScrollState()),
             ) {
                 known.forEach { key ->
@@ -840,8 +860,11 @@ private fun ModelAccessSheet(
         if (knownModels.isNotEmpty()) {
             GroupCard {
                 Column(
+                    // Etwas knapper als die Provider-Liste darüber: zwei
+                    // Listen mit voller Höhe im selben Sheet ließen für den
+                    // Rest nichts übrig.
                     modifier = Modifier
-                        .heightIn(max = 260.dp)
+                        .heightIn(max = sheetPickListMaxHeight(preferred = 260.dp))
                         .verticalScroll(rememberScrollState()),
                 ) {
                     SelectableTile(
@@ -930,18 +953,6 @@ private fun ModelAccessSheet(
             ) {
                 Text("Zugang in Einstellungen hinterlegen")
             }
-        }
-
-        Button(
-            onClick = { onApply(effectiveProvider, modelInput, effort) },
-            enabled = effectiveProvider.isNotBlank(),
-            shape = PillShape,
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = ScreenGutter, vertical = 10.dp)
-                .heightIn(min = PrimaryButtonHeight),
-        ) {
-            Text("Übernehmen")
         }
     }
 }
@@ -1075,7 +1086,7 @@ private fun RepoSelector(
             GroupCard {
                 Column(
                     modifier = Modifier
-                        .heightIn(max = 320.dp)
+                        .heightIn(max = sheetPickListMaxHeight())
                         .verticalScroll(rememberScrollState()),
                 ) {
                     if (repos.isEmpty()) {

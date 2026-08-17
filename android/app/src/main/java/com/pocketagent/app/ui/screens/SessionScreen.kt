@@ -14,28 +14,21 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.isImeVisible
-import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.horizontalScroll
@@ -69,7 +62,6 @@ import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
@@ -80,7 +72,6 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.minimumInteractiveComponentSize
-import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -121,6 +112,7 @@ import com.pocketagent.app.data.SessionStatus
 import com.pocketagent.app.data.StartPhase
 import com.pocketagent.app.data.WsClient
 import com.pocketagent.app.ui.components.MarkdownText
+import com.pocketagent.app.ui.sheetPickListMaxHeight
 import com.pocketagent.app.ui.theme.CardInset
 import com.pocketagent.app.ui.theme.ChipHeight
 import com.pocketagent.app.ui.theme.ChipSpacing
@@ -1140,51 +1132,6 @@ fun SettingIconChip(
 }
 
 /**
- * Gemeinsame Hülle aller Einstell-Sheets: Titel + One-UI-Gruppenkarte.
- * Auch der New-Session-Screen baut sein Modell-Sheet hierauf.
- *
- * Das Sheet öffnet immer ganz — lange Listen und Textfelder brauchen die
- * volle Höhe. Der Inhalt weicht der Tastatur aus (Insets werden vereinigt,
- * damit Navigationsleiste und IME nicht doppelt zählen).
- */
-@Composable
-fun SettingSheet(
-    title: String,
-    onDismiss: () -> Unit,
-    content: @Composable ColumnScope.() -> Unit,
-) {
-    ModalBottomSheet(
-        onDismissRequest = onDismiss,
-        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
-        containerColor = MaterialTheme.colorScheme.background,
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars))
-                // Der Inhalt scrollt. Ohne das ist alles unerreichbar, was
-                // unter die Bildschirmkante rutscht — beim Modell-Sheet war
-                // das der „Übernehmen“-Knopf, also die einzige Möglichkeit,
-                // die Auswahl überhaupt zu bestätigen.
-                //
-                // Die Listen darin haben ihre eigene Begrenzung per
-                // heightIn(max = …). Das ist hier keine Doppelung, sondern
-                // Bedingung: eine scrollbare Fläche ohne Höhengrenze in einer
-                // scrollbaren Fläche wirft zur Laufzeit.
-                .verticalScroll(rememberScrollState())
-                .padding(bottom = 12.dp),
-        ) {
-            Text(
-                text = title,
-                style = MaterialTheme.typography.titleMedium,
-                modifier = Modifier.padding(start = ContentInset, end = ContentInset, bottom = 12.dp),
-            )
-            content()
-        }
-    }
-}
-
-/**
  * Agent der laufenden Session wechseln. Die Liste ist dieselbe wie beim
  * Anlegen einer Session; der Hinweis darunter sagt, was der Wechsel kostet.
  */
@@ -1197,7 +1144,24 @@ private fun AgentSheet(
     onSwitch: (String) -> Unit,
 ) {
     var picked by remember(current) { mutableStateOf(current) }
-    SettingSheet(title = "Agent", onDismiss = onDismiss) {
+    SettingSheet(
+        title = "Agent",
+        onDismiss = onDismiss,
+        // Steht fest über der Unterkante, statt mit der Liste wegzuscrollen.
+        actions = {
+            Button(
+                onClick = { onSwitch(picked) },
+                enabled = picked.isNotBlank() && picked != current,
+                shape = PillShape,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = ScreenGutter, vertical = 10.dp)
+                    .heightIn(min = PrimaryButtonHeight),
+            ) {
+                Text("Agent wechseln")
+            }
+        },
+    ) {
         AgentPickList(
             adapters = adapters,
             picked = picked,
@@ -1209,17 +1173,6 @@ private fun AgentSheet(
                 "Der bisherige Gesprächskontext des Agenten geht verloren; der Verlauf hier " +
                 "bleibt sichtbar.",
         )
-        Button(
-            onClick = { onSwitch(picked) },
-            enabled = picked.isNotBlank() && picked != current,
-            shape = PillShape,
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = ScreenGutter, vertical = 10.dp)
-                .heightIn(min = PrimaryButtonHeight),
-        ) {
-            Text("Agent wechseln")
-        }
     }
 }
 
@@ -1243,8 +1196,14 @@ fun AgentPickList(
 ) {
     GroupCard {
         Column(
+            // Eigene Höhengrenze, weil diese Liste in einer scrollbaren
+            // Fläche steckt: eine unbegrenzte scrollbare Fläche in einer
+            // scrollbaren Fläche hat keine sinnvolle Höhe. Die Grenze richtet
+            // sich nach dem Platz, der wirklich da ist (siehe
+            // pickListMaxHeight) — quer und mit offener Tastatur ist das
+            // weniger als hochkant.
             modifier = Modifier
-                .heightIn(max = 320.dp)
+                .heightIn(max = sheetPickListMaxHeight())
                 .verticalScroll(rememberScrollState()),
         ) {
             adapters.forEachIndexed { index, descriptor ->
@@ -1513,7 +1472,7 @@ private fun ModelSheet(
                 val visible = if (searchable) filterModels(state.models, query) else state.models
                 // Mit offener Tastatur bleibt weniger Platz: die Liste gibt
                 // ihn her, damit Suchfeld und Treffer sichtbar bleiben.
-                val listMaxHeight = if (WindowInsets.isImeVisible) 200.dp else 320.dp
+                val listMaxHeight = sheetPickListMaxHeight()
                 if (visible.isEmpty()) {
                     Text(
                         text = "Kein Modell gefunden",

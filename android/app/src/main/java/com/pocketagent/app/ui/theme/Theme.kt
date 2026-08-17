@@ -17,6 +17,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.pocketagent.app.ui.ProvideAppInsets
 
 /* ------------------------------------------------------------------ */
 /* One UI (Samsung) design language: signature blue accent, grouped    */
@@ -300,6 +301,19 @@ val ContentMaxWidth = 640.dp
 val SectionSpacing = 20.dp
 
 /**
+ * Luft unter einer unten verankerten Fläche — Dialog oder Sheet — zusätzlich
+ * zu dem Platz, den Gestenleiste bzw. Tastatur ohnehin schon beanspruchen.
+ *
+ * Der [ScreenGutter] allein reicht dort nicht: er ist der Abstand zwischen
+ * zwei Karten, nicht der zwischen einer Aktionszeile und einer Leiste, die auf
+ * eine Wischgeste wartet. One UI verlangt Tippflächen, die „large enough to be
+ * touched easily" sind — ein „Abbrechen", das 10 dp über dem Gestenbalken
+ * endet, ist das nicht: der untere Rand seiner Tippfläche liegt dann schon im
+ * Bereich, in dem das System die Geste abfängt.
+ */
+val BottomSurfaceGap = 16.dp
+
+/**
  * Seitlicher Einzug eines zentrierten Leer-/Fehler-Zustands (Liste ohne
  * Sessions, Session ohne Verlauf, Diff ohne Änderungen oder mit Fehler).
  * War an allen vier Stellen dieselbe hartkodierte Zahl ohne Token — der
@@ -368,8 +382,13 @@ fun PocketAgentTheme(
             colorScheme = if (darkTheme) DarkColors else LightColors,
             typography = AppTypography,
             shapes = AppShapes,
-            content = content,
-        )
+        ) {
+            // Hier — und nur hier — sind die Fenster-Insets die des App-Fensters.
+            // Dialoge und Sheets bekommen sie von hier gereicht (siehe
+            // ProvideAppInsets), weil ihr eigenes Fenster sie nicht verlässlich
+            // meldet.
+            ProvideAppInsets(content)
+        }
     }
 }
 

@@ -16,16 +16,19 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
@@ -35,6 +38,7 @@ import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.BasicAlertDialog
@@ -44,12 +48,14 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LargeTopAppBar
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.rememberTopAppBarState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -71,6 +77,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.DialogProperties
 import com.pocketagent.app.data.SessionStatus
 import com.pocketagent.app.data.WsClient
+import com.pocketagent.app.ui.KeepWindowStillForIme
+import com.pocketagent.app.ui.bottomSurfacePadding
+import com.pocketagent.app.ui.surfaceSafeInsets
 import com.pocketagent.app.ui.theme.CardInset
 import com.pocketagent.app.ui.theme.ContentInset
 import com.pocketagent.app.ui.theme.ContentMaxWidth
@@ -519,6 +528,12 @@ fun ListDivider(startInset: Dp = IconRowDividerInset) {
  *
  * Ansonsten verhält sie sich wie ein AlertDialog: Titel, Text, bestätigende
  * und abweisende Aktion, Schließen per Rückwärtstaste oder Tippen daneben.
+ *
+ * Titel und Aktionszeile sind fest; nur [text] scrollt. Das ist die
+ * Bedingung dafür, dass „Abbrechen" und „Speichern" erreichbar bleiben:
+ * vorher maß der Textteil sich gegen die volle Dialoghöhe, nahm sie sich bei
+ * mehreren Eingabefeldern ganz und schob die Knöpfe darunter aus der Fläche
+ * heraus — bei offener Tastatur schon bei einem einzigen Feld.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -534,23 +549,30 @@ fun OneUiDialog(
         onDismissRequest = onDismissRequest,
         properties = DialogProperties(
             usePlatformDefaultWidth = false,
-            // Ohne das meldet das Dialogfenster keine Insets: der Rahmen
-            // rechnet sie selbst heraus, `safeDrawing` unten ist dann null,
-            // und die Knöpfe liegen unter der Gestenleiste.
+            // Unterhalb von API 31 nimmt Compose dem Dialogfenster damit das
+            // „floating": es liegt dann wirklich randlos, und die Polsterung
+            // unten trifft genau. Darüber ignoriert Compose den Schalter für
+            // das Fensterthema — deshalb reicht er allein nicht und die
+            // Insets kommen aus dem App-Fenster (siehe bottomSurfacePadding).
             decorFitsSystemWindows = false,
         ),
         modifier = Modifier.fillMaxSize(),
     ) {
+        KeepWindowStillForIme()
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .windowInsetsPadding(WindowInsets.safeDrawing),
+                // Nach oben nur der Vollständigkeit halber: ein Dialog mit viel
+                // Text wächst bis dorthin, und auf einem randlos ausgelegten
+                // Fenster liegt dort die Statusleiste.
+                .windowInsetsPadding(surfaceSafeInsets().only(WindowInsetsSides.Top))
+                .bottomSurfacePadding(),
             contentAlignment = Alignment.BottomCenter,
         ) {
             Surface(
                 modifier = modifier
                     .fillMaxWidth()
-                    .padding(horizontal = ScreenGutter, vertical = ScreenGutter),
+                    .padding(start = ScreenGutter, end = ScreenGutter, top = ScreenGutter),
                 shape = MaterialTheme.shapes.large,
                 color = MaterialTheme.colorScheme.surfaceContainerHigh,
                 tonalElevation = 0.dp,
@@ -562,7 +584,16 @@ fun OneUiDialog(
                         modifier = Modifier.padding(bottom = if (text != null) 8.dp else 12.dp),
                     )
                     text?.let {
-                        it()
+                        Column(
+                            // fill = false, damit ein kurzer Dialog kurz
+                            // bleibt: die Fläche nimmt nur, was sie braucht,
+                            // und erst bei Platzmangel scrollt sie.
+                            modifier = Modifier
+                                .weight(1f, fill = false)
+                                .verticalScroll(rememberScrollState()),
+                        ) {
+                            it()
+                        }
                         Spacer(modifier = Modifier.height(12.dp))
                     }
                     Row(
@@ -577,6 +608,61 @@ fun OneUiDialog(
                         confirmButton()
                     }
                 }
+            }
+        }
+    }
+}
+
+/**
+ * Gemeinsame Hülle aller Einstell-Sheets: Titel, scrollender Inhalt und eine
+ * feste Aktionszeile. Auch der New-Session-Screen baut seine Sheets hierauf.
+ *
+ * Das Sheet öffnet immer ganz — lange Listen und Textfelder brauchen die volle
+ * Höhe. Titel und [actions] bleiben stehen, während [content] scrollt: sonst
+ * wandert der Knopf, der die Auswahl übernimmt, mit dem Inhalt aus dem Bild,
+ * und mit offener Tastatur ist er von dort kaum zurückzuholen.
+ *
+ * Steht bewusst neben [OneUiDialog]: Dialog und Sheet sind dieselbe Form —
+ * unten verankert, Aktion ganz unten — und teilen deshalb dieselbe
+ * Inset-Behandlung ([bottomSurfacePadding], [KeepWindowStillForIme]).
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun SettingSheet(
+    title: String,
+    onDismiss: () -> Unit,
+    actions: (@Composable ColumnScope.() -> Unit)? = null,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+        containerColor = MaterialTheme.colorScheme.background,
+        // Das Sheet polstert sonst selbst nach seinen eigenen Fenster-Insets
+        // und „verbraucht" sie dabei — die Polsterung unten fiele danach auf
+        // null zurück. Die Insets kommen hier vom App-Fenster, also nimmt das
+        // Sheet keine mehr vorweg.
+        contentWindowInsets = { WindowInsets(0, 0, 0, 0) },
+    ) {
+        KeepWindowStillForIme()
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .bottomSurfacePadding(),
+        ) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.padding(start = ContentInset, end = ContentInset, bottom = 12.dp),
+            )
+            Column(
+                modifier = Modifier
+                    .weight(1f, fill = false)
+                    .verticalScroll(rememberScrollState()),
+                content = content,
+            )
+            actions?.let {
+                Column(modifier = Modifier.fillMaxWidth(), content = it)
             }
         }
     }

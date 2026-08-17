@@ -125,6 +125,43 @@ export function buildPromptBody(row: SessionRow, text: string, mode?: AgentMode)
   };
 }
 
+/**
+ * GC-Kriterium einer Session. Der Cutoff zählt ab der letzten *Aktivität*, nicht
+ * ab der Erstellung: eine täglich benutzte Session ist am Tag 14 nicht alt,
+ * sondern mitten in der Arbeit - ihr Volume zu löschen kostet jeden ungepushten
+ * Commit auf `agent/<id>`. Weggeräumt wird deshalb nur, was der Nutzer
+ * erkennbar liegen gelassen hat: eine gestoppte oder fehlgeschlagene Session,
+ * die seit dem Cutoff nichts mehr getan hat.
+ *
+ * Link-Sessions bleiben grundsätzlich stehen. Sie sind bewusst langlebig (siehe
+ * reapIdle) und überschreiten den Cutoff garantiert; ein deleteSession würde
+ * ihnen zusätzlich `agent.bye` schicken und damit den Agenten auf dem Rechner
+ * des Nutzers herunterfahren.
+ *
+ * Ein unlesbares last_active_at fällt auf created_at zurück, damit eine kaputte
+ * Zeile nicht unsterblich wird.
+ */
+export function isCollectableSession(row: SessionRow, cutoffMs: number): boolean {
+  if (row.link_id) return false;
+  if (row.status !== 'stopped' && row.status !== 'error') return false;
+  const lastActive = Date.parse(row.last_active_at);
+  const reference = Number.isFinite(lastActive) ? lastActive : Date.parse(row.created_at);
+  return Number.isFinite(reference) && reference < cutoffMs;
+}
+
+/**
+ * Ein Lifecycle-Lauf (provision/reprovision/resume) wurde überholt: die Session
+ * ist gelöscht oder gestoppt worden, oder ein neuerer Lauf hat übernommen. Kein
+ * Fehler der Session - der abgebrochene Lauf räumt nur sein eigenes Werk ab und
+ * meldet nichts an die App.
+ */
+class LifecycleAborted extends Error {
+  constructor(sessionId: string) {
+    super(`lifecycle run for ${sessionId} was superseded`);
+    this.name = 'LifecycleAborted';
+  }
+}
+
 type CreateMsg = Extract<ClientMessage, { type: 'session.create' }>;
 type UpdateMsg = Extract<ClientMessage, { type: 'session.update' }>;
 type LinkHello = Extract<ClientMessage, { type: 'agent.hello' }>;
@@ -140,6 +177,15 @@ export class SessionManager {
   private readonly clients = new Map<string, ShimClient>();
   private readonly timers: NodeJS.Timeout[] = [];
   private linkTransport: LinkTransport | null = null;
+  /**
+   * Generation pro Session: jede Aktion, die einen laufenden Start ungültig
+   * macht (Stop, Delete, Resume, Adapter-Wechsel), zählt sie hoch. Ein
+   * Lifecycle-Lauf merkt sich seine eigene Generation und prüft sie nach jedem
+   * `await` - siehe checkpoint().
+   */
+  private readonly generations = new Map<string, number>();
+  /** Laufende Resumes pro Session (Doppel-Tap/zweites Gerät teilen sich einen Lauf). */
+  private readonly resuming = new Map<string, Promise<void>>();
   readonly startedAt = Date.now();
 
   constructor(
@@ -299,17 +345,75 @@ export class SessionManager {
       });
   }
 
+  /**
+   * Beginn eines Lifecycle-Laufs: die neue Generation macht jeden älteren Lauf
+   * derselben Session ungültig (dessen nächster checkpoint bricht ab).
+   */
+  private nextGeneration(id: string): number {
+    const gen = (this.generations.get(id) ?? 0) + 1;
+    this.generations.set(id, gen);
+    return gen;
+  }
+
+  /**
+   * Abbruchprüfung nach jedem `await` eines Lifecycle-Laufs: existiert die
+   * Session noch und ist die eigene Generation noch die aktuelle? Sonst räumt
+   * der Lauf den eben erstellten Container selbst ab (niemand sonst kennt ihn -
+   * eine gelöschte Zeile führt keine Container-Id mehr) und bricht ab.
+   */
+  private async checkpoint(id: string, gen: number, containerId: string | null = null): Promise<void> {
+    const row = this.store.getSession(id);
+    if (row !== undefined && this.generations.get(id) === gen) return;
+    await this.discardRun(id, containerId);
+    throw new LifecycleAborted(id);
+  }
+
+  /**
+   * Aufräumen eines überholten Lifecycle-Laufs. Der eben erstellte Container
+   * wird immer gestoppt; entfernt wird er nur, wenn die Zeile ihn nicht (mehr)
+   * kennt - sonst nähme man dem Nachfolger seinen eigenen Container weg. Ist
+   * die Zeile ganz verschwunden (Delete während des Starts), gehören auch
+   * Volume und Netz niemandem mehr.
+   */
+  private async discardRun(id: string, containerId: string | null): Promise<void> {
+    const short = id.slice(0, 8);
+    if (containerId) {
+      await docker.stopContainer(containerId).catch(() => {});
+      const row = this.store.getSession(id);
+      if (!row || row.container_id !== containerId) await docker.removeContainer(containerId).catch(() => {});
+    }
+    if (this.store.getSession(id) === undefined) {
+      this.clients.get(id)?.stop();
+      this.clients.delete(id);
+      this.generations.delete(id);
+      // Same derivation as provision(): the row is gone, so the volume name is
+      // no longer readable from it.
+      await docker.removeVolume(`pocketagent-sess-${id}`).catch(() => {});
+      await docker.removeSessionNetwork(id).catch(() => {});
+      await docker.refreshSessionPeers().catch(() => {});
+      console.log(`[sessions] start of ${short} aborted - session was deleted, its container was cleaned up`);
+      return;
+    }
+    console.log(`[sessions] start of ${short} aborted - superseded by a newer lifecycle action`);
+  }
+
   private async provision(row: SessionRow, repo: RepoRow, baseBranch: string): Promise<void> {
     const notice = this.noticeFor(row.id);
+    const gen = this.nextGeneration(row.id);
+    let cid: string | null = null;
     try {
       if (!config.dockerEnabled) throw new Error('docker is disabled on this server');
       await docker.ensureNetwork();
+      await this.checkpoint(row.id, gen);
       const shimToken = randomBytes(24).toString('hex');
       const staged: SessionRow = { ...row, volume_name: `pocketagent-sess-${row.id}`, shim_token: shimToken };
       const env = this.buildEnv(staged, repo, shimToken, baseBranch);
-      const cid = await docker.createSessionContainer(staged, env, notice);
+      cid = await docker.createSessionContainer(staged, env, notice);
+      // From here on every abort has a container to clean up.
+      await this.checkpoint(row.id, gen, cid);
       const pat = this.githubPatFor(row);
       if (pat) await docker.injectCredsFile(cid, { githubPat: pat });
+      await this.checkpoint(row.id, gen, cid);
       // Persist BEFORE the start: the egress proxy authorizes a session by its
       // stored shim_token (egressTokenAllowed), and an 'allowlist' shim clones
       // through that proxy the moment its container runs - a token that is
@@ -318,22 +422,44 @@ export class SessionManager {
       this.store.setProvisioned(row.id, cid, staged.volume_name as string, shimToken);
       notice('Container startet', { phase: 'container-start' });
       if (!(await docker.startContainer(cid))) throw new Error('failed to start session container');
+      await this.checkpoint(row.id, gen, cid);
       const endpoint = await docker.shimEndpoint(cid, row.id);
+      await this.checkpoint(row.id, gen, cid);
       this.store.setShimEndpoint(row.id, endpoint);
       const base = this.shimBase(row.id, endpoint);
       await this.waitForShim(base, shimToken, 60_000, cid, notice);
+      // The last gate before the session is declared ready: a stop during the
+      // shim wait must not be overwritten with 'idle' seconds later.
+      await this.checkpoint(row.id, gen, cid);
       notice('Bereit', { phase: 'ready' });
       this.connectEvents(row.id, base, shimToken);
       this.setStatus(row.id, 'idle');
     } catch (err) {
+      if (err instanceof LifecycleAborted) return; // discardRun already logged and cleaned up
       const message = err instanceof Error ? err.message : String(err);
       // Also on the server log: the app is not always in reach when a session
       // dies, and provisioning failures were previously invisible in `docker logs`.
       console.error(`[sessions] provisioning failed for ${row.id.slice(0, 8)} (${row.adapter}): ${message}`);
+      // A container that never became ready keeps its memory reservation and
+      // may burn CPU in a crash loop; reapIdle never touches 'error' sessions.
+      await this.stopFailedContainer(row.id, cid);
       this.store.updateSessionStatus(row.id, 'error');
       this.emitEvent(row.id, { type: 'error', message, fatal: true });
       this.broadcastStatus(row.id, 'error');
     }
+  }
+
+  /**
+   * Container einer fehlgeschlagenen Provisionierung anhalten (best effort):
+   * er bleibt bestehen, damit `session.resume` ihn wieder starten kann, frisst
+   * aber bis dahin keine Ressourcen mehr.
+   */
+  private async stopFailedContainer(id: string, containerId: string | null): Promise<void> {
+    const cid = containerId ?? this.store.getSession(id)?.container_id ?? null;
+    if (!cid) return;
+    await docker.stopContainer(cid).catch((e: unknown) => {
+      console.warn(`[sessions] stopping the failed container of ${id.slice(0, 8)} failed: ${e instanceof Error ? e.message : String(e)}`);
+    });
   }
 
   private shimBase(id: string, endpoint?: string | null): string {
@@ -552,8 +678,30 @@ export class SessionManager {
     return { ok: true, body: res.body };
   }
 
+  /**
+   * Status-Gate für Prompts. Eine Session, die noch startet, hat schon einen
+   * shim_token, aber noch keinen antwortenden Shim: ein Prompt in diesem
+   * Fenster (zweites Gerät kennt die Session aus dem 'creating'-Broadcast)
+   * setzte 'running', lief in den Transport-Timeout, meldete 'error' - und die
+   * weiterlaufende Provisionierung setzte Sekunden später 'idle'. Die App sah
+   * creating → running → error(fatal) → idle für eine gesunde Session.
+   *
+   * Eine gestoppte Session hat gar keinen laufenden Container; sie muss erst
+   * fortgesetzt werden. 'running' bleibt bewusst erlaubt: mehrere Turns
+   * hintereinander sind Sache des Shims, nicht des Orchestrators.
+   */
+  private assertPromptable(row: SessionRow): void {
+    if (row.status === 'creating') {
+      throw new Error('Die Session startet noch – bitte warten, bis der Agent bereit ist.');
+    }
+    if (row.status === 'stopped') {
+      throw new Error('Die Session ist gestoppt – bitte zuerst fortsetzen.');
+    }
+  }
+
   async prompt(id: string, text: string, mode?: AgentMode): Promise<void> {
     const row = this.requireSession(id);
+    this.assertPromptable(row);
     const body = buildPromptBody(row, text, mode);
     // The prompt itself, so a reloaded timeline shows the user's own message:
     // no shim reports it back, and without this line the history would start
@@ -662,6 +810,8 @@ export class SessionManager {
    */
   private async reprovisionAdapter(id: string): Promise<void> {
     const notice = this.noticeFor(id);
+    const gen = this.nextGeneration(id);
+    let cid: string | null = null;
     try {
       const row = this.requireSession(id);
       if (!row.shim_token || !row.volume_name) throw new Error('Session ist nicht provisioniert.');
@@ -674,26 +824,34 @@ export class SessionManager {
         await docker.removeContainer(row.container_id); // volume survives on purpose
       }
       await docker.ensureNetwork();
+      await this.checkpoint(id, gen);
       const env = this.buildEnv(row, repo, row.shim_token, repo.default_branch);
-      const cid = await docker.createSessionContainer(row, env, notice);
+      cid = await docker.createSessionContainer(row, env, notice);
+      await this.checkpoint(id, gen, cid);
       const pat = this.githubPatFor(row);
       if (pat) await docker.injectCredsFile(cid, { githubPat: pat });
+      await this.checkpoint(id, gen, cid);
       // shim_token is already stored (the session keeps it across the switch),
       // so only the container id has to be recorded before the start - see
       // provision(): a container the row does not know cannot be cleaned up.
       this.store.setContainer(id, cid);
       notice('Container startet', { phase: 'container-start' });
       if (!(await docker.startContainer(cid))) throw new Error('failed to start session container');
+      await this.checkpoint(id, gen, cid);
       const endpoint = await docker.shimEndpoint(cid, id);
+      await this.checkpoint(id, gen, cid);
       this.store.setShimEndpoint(id, endpoint);
       const base = this.shimBase(id, endpoint);
       await this.waitForShim(base, row.shim_token, 60_000, cid, notice);
+      await this.checkpoint(id, gen, cid);
       notice('Bereit', { phase: 'ready' });
       this.connectEvents(id, base, row.shim_token);
       this.setStatus(id, 'idle');
     } catch (err) {
+      if (err instanceof LifecycleAborted) return;
       const message = err instanceof Error ? err.message : String(err);
       console.error(`[sessions] adapter switch failed for ${id.slice(0, 8)}: ${message}`);
+      await this.stopFailedContainer(id, cid);
       this.store.updateSessionStatus(id, 'error');
       this.emitEvent(id, { type: 'error', message, fatal: true });
       this.broadcastStatus(id, 'error');
@@ -748,6 +906,10 @@ export class SessionManager {
 
   async stopSession(id: string): Promise<void> {
     const row = this.requireSession(id);
+    // Invalidates a start that may still be running: without this a stop during
+    // 'creating' was overwritten with 'idle' when provision() finished, and the
+    // explicitly stopped container ran on.
+    this.nextGeneration(id);
     if (row.link_id) {
       this.linkTransport?.bye(row.link_id);
       this.setStatus(id, 'stopped');
@@ -759,7 +921,27 @@ export class SessionManager {
     this.setStatus(id, 'stopped');
   }
 
+  /**
+   * Fortsetzen einer Session. Re-Entrancy-Schutz: ein zweiter Aufruf (Doppel-Tap,
+   * zweites Gerät) wartet auf den laufenden Resume, statt einen zweiten
+   * Container zu erzeugen - Session-Container tragen keinen festen Namen, der
+   * Verlierer des Rennens würde also unbemerkt weiterlaufen.
+   */
   async resumeSession(id: string): Promise<void> {
+    const running = this.resuming.get(id);
+    if (running) return running;
+    const run = (async () => {
+      try {
+        await this.runResume(id);
+      } finally {
+        this.resuming.delete(id);
+      }
+    })();
+    this.resuming.set(id, run);
+    return run;
+  }
+
+  private async runResume(id: string): Promise<void> {
     const row = this.requireSession(id);
     if (row.link_id) {
       if (!this.linkTransport?.isConnected(row.link_id)) {
@@ -768,45 +950,71 @@ export class SessionManager {
       this.setStatus(id, 'idle');
       return;
     }
-    if (!row.shim_token || !row.volume_name) throw new Error('session not provisioned');
     if (!config.dockerEnabled) throw new Error('docker is disabled on this server');
-    const notice = this.noticeFor(id);
-    // The session's own network, not just the shared one: an 'allowlist'/
-    // 'isolated' container is reachable only through pocketagent-s-<id>, and a
-    // resume after a redeploy starts out attached to neither.
-    const attachFailure = await docker.attachOrchestratorTo(row);
-    if (attachFailure !== null) throw new Error(attachFailure);
-    let cid = row.container_id;
-    notice('Container startet', { phase: 'container-start' });
-    let started = cid ? await docker.startContainer(cid) : false;
-    if (!started) {
+    if (!row.shim_token || !row.volume_name) {
+      // Never fully provisioned (the orchestrator died during the first start,
+      // see reconcile): the session is built from scratch on its own id instead
+      // of being refused forever with 'session not provisioned'.
       const repo = this.store.getRepo(row.repo_id);
       if (!repo) throw new Error('repo missing');
-      cid = await docker.createSessionContainer(
-        row,
-        this.buildEnv(row, repo, row.shim_token, repo.default_branch),
-        notice,
-      );
-      const pat = this.githubPatFor(row);
-      if (pat) await docker.injectCredsFile(cid, { githubPat: pat });
-      // recorded before the start, like in provision()
-      this.store.setContainer(id, cid);
-      started = await docker.startContainer(cid);
-      if (!started) throw new Error('failed to start session container');
+      this.setStatus(id, 'creating');
+      await this.provision(row, repo, repo.default_branch);
+      return;
     }
-    if (cid && cid !== row.container_id) this.store.setContainer(id, cid);
-    // remote mode assigns a new published port per (re)created container
-    const endpoint = cid ? await docker.shimEndpoint(cid, id) : row.shim_endpoint;
-    this.store.setShimEndpoint(id, endpoint);
-    const base = this.shimBase(id, endpoint);
-    await this.waitForShim(base, row.shim_token, 60_000, cid, notice);
-    if (row.session_ref) {
-      const res = await this.shimClient(base, row.shim_token).resume(row.session_ref);
-      if (!res?.ok) throw new Error(res && !res.ok ? res.error : 'resume failed');
+    const gen = this.nextGeneration(id);
+    const notice = this.noticeFor(id);
+    let created: string | null = null;
+    try {
+      // The session's own network, not just the shared one: an 'allowlist'/
+      // 'isolated' container is reachable only through pocketagent-s-<id>, and a
+      // resume after a redeploy starts out attached to neither.
+      const attachFailure = await docker.attachOrchestratorTo(row);
+      if (attachFailure !== null) throw new Error(attachFailure);
+      await this.checkpoint(id, gen);
+      let cid = row.container_id;
+      notice('Container startet', { phase: 'container-start' });
+      let started = cid ? await docker.startContainer(cid) : false;
+      await this.checkpoint(id, gen);
+      if (!started) {
+        const repo = this.store.getRepo(row.repo_id);
+        if (!repo) throw new Error('repo missing');
+        cid = await docker.createSessionContainer(
+          row,
+          this.buildEnv(row, repo, row.shim_token, repo.default_branch),
+          notice,
+        );
+        created = cid;
+        await this.checkpoint(id, gen, created);
+        const pat = this.githubPatFor(row);
+        if (pat) await docker.injectCredsFile(cid, { githubPat: pat });
+        await this.checkpoint(id, gen, created);
+        // recorded before the start, like in provision()
+        this.store.setContainer(id, cid);
+        started = await docker.startContainer(cid);
+        if (!started) throw new Error('failed to start session container');
+        await this.checkpoint(id, gen, created);
+      }
+      if (cid && cid !== row.container_id) this.store.setContainer(id, cid);
+      // remote mode assigns a new published port per (re)created container
+      const endpoint = cid ? await docker.shimEndpoint(cid, id) : row.shim_endpoint;
+      await this.checkpoint(id, gen, created);
+      this.store.setShimEndpoint(id, endpoint);
+      const base = this.shimBase(id, endpoint);
+      await this.waitForShim(base, row.shim_token, 60_000, cid, notice);
+      await this.checkpoint(id, gen, created);
+      if (row.session_ref) {
+        const res = await this.shimClient(base, row.shim_token).resume(row.session_ref);
+        if (!res?.ok) throw new Error(res && !res.ok ? res.error : 'resume failed');
+        await this.checkpoint(id, gen, created);
+      }
+      notice('Bereit', { phase: 'ready' });
+      this.connectEvents(id, base, row.shim_token);
+      this.setStatus(id, 'idle');
+    } catch (err) {
+      if (err instanceof LifecycleAborted) return; // stop/delete won, nothing to report
+      await this.stopFailedContainer(id, created);
+      throw err;
     }
-    notice('Bereit', { phase: 'ready' });
-    this.connectEvents(id, base, row.shim_token);
-    this.setStatus(id, 'idle');
   }
 
   async push(id: string): Promise<void> {
@@ -880,11 +1088,16 @@ export class SessionManager {
 
   async deleteSession(id: string): Promise<void> {
     const row = this.store.getSession(id);
+    // A start still running for this session has to notice that its session is
+    // gone: its next checkpoint aborts and removes the container it created,
+    // which the deleted row could not have named any more.
+    this.nextGeneration(id);
     this.clients.get(id)?.stop();
     this.clients.delete(id);
     if (row?.link_id) {
       this.linkTransport?.bye(row.link_id);
       this.store.deleteSession(id);
+      this.generations.delete(id);
       return;
     }
     if (row) {
@@ -904,6 +1117,9 @@ export class SessionManager {
     }
     // deletes the stored events with the row (see Store.deleteSession)
     this.store.deleteSession(id);
+    // A start that is still running aborts on the missing row alone (see
+    // checkpoint), so the counter may go with the session.
+    this.generations.delete(id);
   }
 
   listSessions(tenant: string = TENANT): SessionInfo[] {
@@ -966,16 +1182,78 @@ export class SessionManager {
     // runs, so their IPs have to be known before the first of those requests.
     await docker.refreshSessionPeers().catch(() => {});
     for (const row of this.store.listSessions(tenant)) {
-      // link agents redial by themselves; rows without a container have nothing
-      // to reconnect to, and stopped/error sessions are resumed explicitly.
-      if (row.link_id || !row.container_id) continue;
-      if (row.status === 'stopped' || row.status === 'error') continue;
+      if (row.link_id) continue; // link agents redial by themselves
+      if (!row.container_id) {
+        this.recoverUnprovisioned(row);
+        continue;
+      }
+      if (row.status === 'stopped' || row.status === 'error') continue; // resumed explicitly
       try {
         await this.reconcileSession(row);
       } catch (e) {
         console.error(`[sessions] reconcile failed for ${row.id.slice(0, 8)}: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
+    await this.reapOrphanContainers();
+  }
+
+  /**
+   * Eine Zeile ohne Container-Id, die trotzdem 'creating'/'running' meldet: der
+   * Orchestrator ist während der Provisionierung gestorben, bevor der Container
+   * überhaupt angelegt wurde (der erste Image-Build dauert Minuten). Ohne diese
+   * Behandlung zeigt die App für immer 'creating' - reconcileSession sieht die
+   * Zeile mangels Container gar nicht.
+   *
+   * Der erholbare Zustand ist 'error': `session.resume` baut eine nie fertig
+   * provisionierte Session danach von vorn auf (siehe runResume).
+   */
+  private recoverUnprovisioned(row: SessionRow): void {
+    if (row.status !== 'creating' && row.status !== 'running') return;
+    this.emitEvent(row.id, {
+      type: 'error',
+      message:
+        'Der Start dieser Session wurde durch einen Server-Neustart unterbrochen, bevor der Agent-Container existierte. ' +
+        'Die Session kann neu gestartet werden.',
+      fatal: true,
+    });
+    this.setStatus(row.id, 'error');
+    console.log(`[sessions] recovered ${row.id.slice(0, 8)} from an interrupted start (${row.status} -> error)`);
+  }
+
+  /**
+   * Label-basierter Orphan-Reaper beim Serverstart: Container mit dem Label
+   * `pocketagent.session`, zu denen die DB nichts (mehr) sagt, werden gestoppt
+   * und entfernt. Das fängt genau die Container ein, die kein anderer Pfad je
+   * findet - reapIdle, gc und reconcile arbeiten alle über `row.container_id`:
+   * ein Start, der vor dem Persistieren der Id abstürzte oder abgebrochen
+   * wurde; der Verlierer eines Resume-Rennens; ein liegengebliebener
+   * Push-Container.
+   *
+   * Verwaist ist ein Container, dessen Session-Label auf keine Zeile zeigt oder
+   * dessen Zeile einen anderen Container führt. Container, die *nach* dem Start
+   * dieses Prozesses entstanden sind, bleiben unangetastet - sie gehören einem
+   * laufenden Start. Antwortet der Daemon nicht, passiert gar nichts.
+   */
+  async reapOrphanContainers(): Promise<number> {
+    if (!config.dockerEnabled) return 0;
+    const containers = await docker.listSessionContainers();
+    if (containers === null) return 0;
+    let removed = 0;
+    for (const c of containers) {
+      if (c.createdMs >= this.startedAt) continue;
+      const row = c.sessionId ? this.store.getSession(c.sessionId) : undefined;
+      if (row && row.container_id === c.id) continue;
+      await docker.stopContainer(c.id).catch(() => {});
+      await docker.removeContainer(c.id).catch(() => {});
+      removed++;
+      console.warn(
+        `[sessions] orphan container ${c.id.slice(0, 12)} removed (session ${c.sessionId ? c.sessionId.slice(0, 8) : '?'}: ${
+          row ? 'row points at another container' : 'no session row'
+        })`,
+      );
+    }
+    if (removed > 0) await docker.refreshSessionPeers().catch(() => {});
+    return removed;
   }
 
   private async reconcileSession(row: SessionRow): Promise<void> {
@@ -1040,10 +1318,16 @@ export class SessionManager {
     }
   }
 
-  private async gc(): Promise<void> {
+  /**
+   * Aufräumen alter Sessions (Kriterium: isCollectableSession). Öffentlich,
+   * damit der Lauf testbar ist - regulär feuert ihn nur der Timer aus start().
+   */
+  async gc(): Promise<void> {
     const cutoff = Date.now() - config.gcDays * 86_400_000;
     for (const row of this.store.listSessions(TENANT)) {
-      if (Date.parse(row.created_at) < cutoff) await this.deleteSession(row.id).catch(() => {});
+      if (!isCollectableSession(row, cutoff)) continue;
+      console.log(`[sessions] gc: removing ${row.id.slice(0, 8)} (status=${row.status}, last active ${row.last_active_at})`);
+      await this.deleteSession(row.id).catch(() => {});
     }
   }
 

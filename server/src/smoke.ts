@@ -409,7 +409,7 @@ async function startProgressSmoke(store: Store, manager: SessionManager, c2: Cli
       type: 'session.create',
       requestId: 'prog1',
       repoId,
-      adapter: 'opencode',
+      adapter: 'kilo',
       provider: 'zai',
       model: 'glm-4.6',
       mode: 'ask',
@@ -528,7 +528,7 @@ async function egressPeerSmoke(store: Store, manager: SessionManager, repoId: st
     tenant_id: 'default',
     repo_id: repoId,
     repo_full_name: 'acme/demo',
-    adapter: 'opencode',
+    adapter: 'kilo',
     provider: 'zai',
     model: 'glm-4.6',
     mode: 'ask',
@@ -626,7 +626,7 @@ async function reconcileSmoke(store: Store, manager: SessionManager, c2: Client,
     tenant_id: 'default',
     repo_id: repoId,
     repo_full_name: 'acme/demo',
-    adapter: 'opencode',
+    adapter: 'kilo',
     provider: 'zai',
     model: 'glm-4.6',
     mode: 'ask',
@@ -752,11 +752,18 @@ async function reconcileSmoke(store: Store, manager: SessionManager, c2: Client,
   const idle = randomUUID(); // open, idle
   const gone = randomUUID(); // container removed behind our back
   const stopped = randomUUID(); // container still there, but not running
+  const neverStarted = randomUUID(); // crashed during provisioning, before the container existed
   try {
     store.insertSession({ ...rowFor(running, 'allowlist', 'running', 'cid-run-a'), shim_endpoint: shimBase });
     store.insertSession({ ...rowFor(idle, 'open', 'idle', 'cid-run-b'), shim_endpoint: shimBase });
     store.insertSession(rowFor(gone, 'allowlist', 'running', 'cid-gone'));
     store.insertSession(rowFor(stopped, 'open', 'idle', 'cid-stopped'));
+    store.insertSession({
+      ...rowFor(neverStarted, 'allowlist', 'creating', ''),
+      container_id: null,
+      shim_token: null,
+      volume_name: null,
+    });
 
     await manager.reconcile();
 
@@ -773,6 +780,20 @@ async function reconcileSmoke(store: Store, manager: SessionManager, c2: Client,
     assert(store.getSession(idle)?.status === 'idle', 'an idle session with a live container stays idle');
     assert(store.getSession(gone)?.status === 'error', 'a session whose container vanished ends in error');
     assert(store.getSession(stopped)?.status === 'stopped', 'a session with a stopped container ends as stopped');
+    assert(
+      store.getSession(neverStarted)?.status === 'error',
+      "a start interrupted before the container existed does not stay in 'creating' forever",
+    );
+    const neverStartedErr = await c2.wait(
+      (m) => m.type === 'session.event' && m.sessionId === neverStarted && m.event.type === 'error',
+      5_000,
+    );
+    assert(
+      neverStartedErr.type === 'session.event' &&
+        neverStartedErr.event.type === 'error' &&
+        neverStartedErr.event.message.includes('neu gestartet werden'),
+      'the interrupted start is reported as recoverable',
+    );
 
     const goneErr = await c2.wait(
       (m) => m.type === 'session.event' && m.sessionId === gone && m.event.type === 'error',
@@ -832,7 +853,7 @@ async function reconcileSmoke(store: Store, manager: SessionManager, c2: Client,
     assert(failMsg.includes('Container: running') && failMsg.includes('[shim] listening'), 'the message carries the container diagnostics');
     assert(store.getSession(idle)?.status === 'error', 'a failed prompt leaves the session in error');
   } finally {
-    for (const id of [running, idle, gone, stopped]) await manager.deleteSession(id).catch(() => {});
+    for (const id of [running, idle, gone, stopped, neverStarted]) await manager.deleteSession(id).catch(() => {});
     cfg.dockerEnabled = false;
     cfg.dockerHost = null;
     cfg.dockerHostIsLocal = false;
@@ -840,6 +861,309 @@ async function reconcileSmoke(store: Store, manager: SessionManager, c2: Client,
     if (hostnameBefore === undefined) delete process.env.HOSTNAME;
     else process.env.HOSTNAME = hostnameBefore;
     shim.close();
+    daemon.close();
+  }
+}
+
+/** A promise plus its resolver - lets a test step wait for the fake daemon. */
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => (resolve = r));
+  return { promise, resolve };
+}
+
+/** Poll until `pred` holds; fails the run instead of hanging forever. */
+async function waitUntil(pred: () => boolean, what: string, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (pred()) return;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  assert(false, `timeout waiting for ${what}`);
+}
+
+/**
+ * Session lifecycle: what happens when a start is overtaken (delete/stop during
+ * provisioning), what the GC is allowed to delete, which containers the startup
+ * reaper removes, and the two guards around prompt/resume. Everything runs
+ * against a fake docker daemon - the exact scenarios of the APP-REVIEW findings
+ * "provision() nicht abbrechbar", "GC loescht nach created_at" and "kein
+ * Label-basierter Orphan-Reaper".
+ */
+async function lifecycleSmoke(store: Store, manager: SessionManager, c2: Client, repoId: string): Promise<void> {
+  const http = await import('node:http');
+  const dockerMod = await import('./docker.js');
+  const { isCollectableSession } = await import('./sessions.js');
+  const cfg = config as unknown as { dockerEnabled: boolean; dockerHost: string | null; dockerHostIsLocal: boolean };
+
+  const DAY = 86_400_000;
+  const iso = (ms: number): string => new Date(ms).toISOString();
+  const rowFor = (id: string, patch: Partial<import('./db.js').SessionRow> = {}): import('./db.js').SessionRow => ({
+    id,
+    tenant_id: 'default',
+    repo_id: repoId,
+    repo_full_name: 'acme/demo',
+    adapter: 'kilo',
+    provider: 'zai',
+    model: 'glm-4.6',
+    mode: 'ask',
+    status: 'idle',
+    branch: `agent/${id}`,
+    session_ref: null,
+    container_id: null,
+    volume_name: `pocketagent-sess-${id}`,
+    shim_token: `token-${id.slice(0, 8)}`,
+    pr_url: null,
+    shim_endpoint: null,
+    link_id: null,
+    network_policy: 'allowlist',
+    reasoning_effort: null,
+    title: null,
+    archived: 0,
+    created_at: iso(Date.now()),
+    last_active_at: iso(Date.now()),
+    ...patch,
+  });
+
+  /* ---- GC criterion: activity decides, not the creation date (pure) ---- */
+
+  const cutoff = Date.now() - 14 * DAY;
+  const born = iso(Date.now() - 60 * DAY);
+  const longAgo = iso(Date.now() - 40 * DAY);
+  const probe = rowFor(randomUUID(), { created_at: born });
+  assert(
+    !isCollectableSession({ ...probe, status: 'idle', last_active_at: iso(Date.now()) }, cutoff),
+    'a session used today survives its 14th day (the created_at regression)',
+  );
+  assert(
+    !isCollectableSession({ ...probe, status: 'stopped', last_active_at: iso(Date.now() - DAY) }, cutoff),
+    'a session stopped yesterday is not old enough',
+  );
+  assert(
+    isCollectableSession({ ...probe, status: 'stopped', last_active_at: longAgo }, cutoff),
+    'a session stopped 40 days ago is collected',
+  );
+  assert(
+    isCollectableSession({ ...probe, status: 'error', last_active_at: longAgo }, cutoff),
+    'a failed session that was never touched again is collected',
+  );
+  assert(
+    !isCollectableSession({ ...probe, status: 'idle', last_active_at: longAgo }, cutoff),
+    'an idle session is never collected - only stop/error sessions are',
+  );
+  assert(
+    !isCollectableSession({ ...probe, status: 'stopped', last_active_at: longAgo, link_id: 'link-1' }, cutoff),
+    'link sessions are never collected (delete would shut the agent on the users machine down)',
+  );
+  assert(
+    !isCollectableSession({ ...probe, status: 'stopped', last_active_at: 'kaputt', created_at: iso(Date.now()) }, cutoff),
+    'an unreadable last_active_at falls back to created_at',
+  );
+
+  /* ---- GC over the real store ---- */
+
+  const activeOld = randomUUID();
+  const staleStopped = randomUUID();
+  const linkOld = randomUUID();
+  store.insertSession(rowFor(activeOld, { status: 'idle', created_at: born, last_active_at: iso(Date.now()) }));
+  store.insertSession(rowFor(staleStopped, { status: 'stopped', created_at: born, last_active_at: longAgo }));
+  store.insertSession(rowFor(linkOld, { status: 'stopped', created_at: born, last_active_at: longAgo }));
+  store.setLinkId(linkOld, 'smoke-link-gc');
+
+  await manager.gc();
+  assert(store.getSession(activeOld) !== undefined, 'gc keeps a session that was active today, however old it is');
+  assert(store.getSession(staleStopped) === undefined, 'gc removes a session that has been stopped for 40 days');
+  assert(store.getSession(linkOld) !== undefined, 'gc keeps a long-lived link session');
+  store.deleteSession(activeOld);
+  store.deleteSession(linkOld);
+
+  /* ---- prompt status gate ---- */
+
+  const booting = randomUUID();
+  store.insertSession(rowFor(booting, { status: 'creating' }));
+  let promptErr = '';
+  await manager.prompt(booting, 'schon mal loslegen').catch((e: unknown) => {
+    promptErr = e instanceof Error ? e.message : String(e);
+  });
+  assert(promptErr.includes('startet noch'), `a prompt during 'creating' is refused with a reason: ${promptErr}`);
+  const stored = store.db
+    .prepare('SELECT COUNT(*) AS c FROM session_events WHERE session_id = ?')
+    .get(booting) as { c: number };
+  assert(stored.c === 0, 'a refused prompt never reaches the timeline');
+  assert(store.getSession(booting)?.status === 'creating', 'a refused prompt leaves the status alone');
+  store.updateSessionStatus(booting, 'stopped');
+  promptErr = '';
+  await manager.prompt(booting, 'weiter').catch((e: unknown) => {
+    promptErr = e instanceof Error ? e.message : String(e);
+  });
+  assert(promptErr.includes('gestoppt'), `a prompt on a stopped session is refused with a reason: ${promptErr}`);
+  store.deleteSession(booting);
+
+  /* ---- fake daemon: records every call, can hold back a container create ---- */
+
+  const calls: string[] = [];
+  let nextContainerId = 'cid-unused';
+  let createCalls = 0;
+  let createSeen: { promise: Promise<void>; resolve: () => void } | null = null;
+  let createGate: { promise: Promise<void>; resolve: () => void } | null = null;
+  let startFails = false;
+  let listBroken = false;
+  let listBody: unknown[] = [];
+
+  const daemon = http.createServer((req, res) => {
+    const url = req.url ?? '';
+    const method = req.method ?? 'GET';
+    const path = url.split('?')[0] ?? '';
+    calls.push(`${method} ${path}`);
+    const send = (code: number, body: string): void => {
+      res.writeHead(code, { 'content-type': 'application/json' }).end(body);
+    };
+    req.resume();
+    if (method === 'POST' && path === '/containers/create') {
+      createCalls++;
+      const id = nextContainerId;
+      createSeen?.resolve();
+      const answer = (): void => send(201, JSON.stringify({ Id: id, Warnings: [] }));
+      if (createGate) void createGate.promise.then(answer);
+      else answer();
+      return;
+    }
+    if (method === 'POST' && /^\/containers\/[^/]+\/start$/.test(path)) {
+      if (startFails) return send(500, '{"message":"start refused by the smoke daemon"}');
+      return void res.writeHead(204).end();
+    }
+    if (method === 'GET' && path === '/containers/json') {
+      if (listBroken) return send(500, '{"message":"daemon down"}');
+      return send(200, JSON.stringify(listBody));
+    }
+    if (method === 'POST' && path.startsWith('/volumes/create')) return send(201, '{"Name":"v"}');
+    send(200, '{}'); // network/image inspect, connects, removals, everything else
+  });
+  const daemonPort = await listen(daemon);
+
+  const hostnameBefore = process.env.HOSTNAME;
+  process.env.HOSTNAME = 'smoke-orchestrator';
+  cfg.dockerHost = `http://127.0.0.1:${daemonPort}`;
+  cfg.dockerHostIsLocal = true;
+  cfg.dockerEnabled = true;
+  dockerMod.resetDockerClient();
+
+  const startSession = async (requestId: string): Promise<string> => {
+    const created = await request(c2, {
+      type: 'session.create',
+      requestId,
+      repoId,
+      adapter: 'kilo',
+      provider: 'zai',
+      model: 'glm-4.6',
+      mode: 'ask',
+    });
+    assert(created.type === 'request.ok', `${requestId}: session created`);
+    return (created.payload as { sessionId: string }).sessionId;
+  };
+
+  try {
+    /* ---- delete while the container is being created ---- */
+
+    nextContainerId = 'cid-abort-delete';
+    createSeen = deferred();
+    createGate = deferred();
+    const deleted = await startSession('lc-del');
+    await createSeen.promise; // the daemon holds the create, provisioning is mid-await
+    await manager.deleteSession(deleted);
+    createGate.resolve(); // ...and only now does the container id come back
+    await waitUntil(() => calls.includes('DELETE /containers/cid-abort-delete'), 'the orphaned container to be removed');
+    assert(
+      !calls.includes('POST /containers/cid-abort-delete/start'),
+      'a start whose session was deleted never starts its container',
+    );
+    assert(store.getSession(deleted) === undefined, 'the deleted session stays deleted');
+    assert(
+      !calls.includes('POST /containers/cid-abort-delete/stop') ||
+        calls.includes('DELETE /containers/cid-abort-delete'),
+      'the container of a deleted session is removed, not just stopped',
+    );
+
+    /* ---- stop while the session is still 'creating' ---- */
+
+    nextContainerId = 'cid-abort-stop';
+    createSeen = deferred();
+    createGate = deferred();
+    const stopped = await startSession('lc-stop');
+    await createSeen.promise;
+    await manager.stopSession(stopped);
+    createGate.resolve();
+    await waitUntil(
+      () => calls.includes('POST /containers/cid-abort-stop/stop'),
+      'the container of the stopped session to be stopped',
+    );
+    await new Promise((r) => setTimeout(r, 100)); // let a (wrongly) continuing provision finish
+    assert(
+      store.getSession(stopped)?.status === 'stopped',
+      `a stop during 'creating' is not overwritten with idle (got ${String(store.getSession(stopped)?.status)})`,
+    );
+    assert(!calls.includes('POST /containers/cid-abort-stop/start'), 'the stopped session does not start its container');
+    await manager.deleteSession(stopped);
+
+    /* ---- resume re-entrancy: two taps share one run ---- */
+
+    createGate = null;
+    createSeen = null;
+    startFails = true;
+    nextContainerId = 'cid-resume-new';
+    const resumed = randomUUID();
+    store.insertSession(rowFor(resumed, { status: 'stopped', container_id: 'cid-resume-old' }));
+    createCalls = 0;
+    const results = await Promise.allSettled([manager.resumeSession(resumed), manager.resumeSession(resumed)]);
+    assert(createCalls === 1, `two parallel resumes create exactly one container (got ${createCalls})`);
+    assert(
+      results.every((r) => r.status === 'rejected'),
+      'both callers of a failing resume learn that it failed',
+    );
+    await manager.deleteSession(resumed);
+    startFails = false;
+
+    /* ---- label based orphan reaper ---- */
+
+    const kept = randomUUID();
+    store.insertSession(rowFor(kept, { status: 'idle', container_id: 'cid-keep' }));
+    const old = Math.floor((manager.startedAt - 3_600_000) / 1000);
+    const young = Math.floor((Date.now() + 60_000) / 1000);
+    listBody = [
+      { Id: 'cid-keep', Created: old, Labels: { 'pocketagent.session': kept } },
+      { Id: 'cid-orphan', Created: old, Labels: { 'pocketagent.session': randomUUID() } },
+      { Id: 'cid-push-leftover', Created: old, Labels: { 'pocketagent.session': kept } },
+      { Id: 'cid-nolabel', Created: old, Labels: { 'pocketagent.session': '' } },
+      { Id: 'cid-young', Created: young, Labels: { 'pocketagent.session': randomUUID() } },
+    ];
+
+    const removed = await manager.reapOrphanContainers();
+    assert(removed === 3, `the reaper removes exactly the orphans (got ${removed})`);
+    assert(!calls.includes('DELETE /containers/cid-keep'), 'the container a live session points at is kept');
+    assert(calls.includes('DELETE /containers/cid-orphan'), 'a container without a session row is removed');
+    assert(
+      calls.includes('DELETE /containers/cid-push-leftover'),
+      'a leftover container of a live session (push/resume race) is removed',
+    );
+    assert(calls.includes('DELETE /containers/cid-nolabel'), 'a container with an empty session label is removed');
+    assert(!calls.includes('DELETE /containers/cid-young'), 'a container younger than the server start belongs to a live start');
+
+    listBroken = true;
+    const beforeBroken = calls.length;
+    assert((await manager.reapOrphanContainers()) === 0, 'a daemon that does not answer makes the reaper do nothing');
+    assert(
+      !calls.slice(beforeBroken).some((c) => c.startsWith('DELETE /containers/')),
+      'a failing listing never turns live containers into orphans',
+    );
+    listBroken = false;
+    await manager.deleteSession(kept);
+  } finally {
+    cfg.dockerEnabled = false;
+    cfg.dockerHost = null;
+    cfg.dockerHostIsLocal = false;
+    dockerMod.resetDockerClient();
+    if (hostnameBefore === undefined) delete process.env.HOSTNAME;
+    else process.env.HOSTNAME = hostnameBefore;
     daemon.close();
   }
 }
@@ -901,7 +1225,7 @@ async function historySmoke(store: Store, manager: SessionManager, c2: Client, r
     tenant_id: 'default',
     repo_id: repoId,
     repo_full_name: 'acme/demo',
-    adapter: 'opencode',
+    adapter: 'kilo',
     provider: 'zai',
     model: 'glm-4.6',
     mode: 'ask',
@@ -1141,27 +1465,25 @@ async function main(): Promise<void> {
   assert(welcome.type === 'welcome' && welcome.ok, 'authenticated hello gets welcome');
 
   const adapters = await request(c2, { type: 'adapter.list', requestId: 'adp1' });
-  assert(adapters.type === 'adapter.list' && adapters.adapters.length >= 5, 'adapter.list returns at least 5 adapters');
+  assert(adapters.type === 'adapter.list' && adapters.adapters.length >= 4, 'adapter.list returns at least 4 adapters');
   const adapterIds = adapters.type === 'adapter.list' ? adapters.adapters.map((a) => a.id) : [];
-  for (const expected of ['opencode', 'kilo', 'claude', 'pi', 'junie']) {
+  for (const expected of ['kilo', 'claude', 'pi', 'junie']) {
     assert(adapterIds.includes(expected), `adapter.list includes "${expected}"`);
   }
   const kilo = adapters.type === 'adapter.list' ? adapters.adapters.find((a) => a.id === 'kilo') : undefined;
   assert(kilo?.credentials?.kilo?.[0] === 'KILO_AUTH_CONTENT', 'kilo manifest carries credential mapping');
 
   /*
-   * The Z.AI key reaches opencode/kilo only as ZHIPU_API_KEY - that is the env
-   * var models.dev lists for all four Z.AI providers (zai, zai-coding-plan,
-   * zhipuai, zhipuai-coding-plan), and both runtimes auto-configure providers
-   * from that catalog. Verified against opencode 1.18.18 and kilo 7.4.22: with
-   * ZAI_API_KEY set they expose *no* Z.AI provider at all (kilo is left with
-   * only its own gateway), so every zai model reads as "model not found" and
-   * the gateway fallback answers "Forbidden". pi is deliberately not covered
-   * here - its SDK documents ZAI_API_KEY as its own coding-plan variable, so
-   * that manifest keeps it.
+   * The Z.AI key reaches kilo only as ZHIPU_API_KEY - that is the env var
+   * models.dev lists for all four Z.AI providers (zai, zai-coding-plan,
+   * zhipuai, zhipuai-coding-plan), and kilo (an OpenCode fork) auto-configures
+   * providers from that catalog. Verified against kilo 7.4.22: with
+   * ZAI_API_KEY set instead it exposes *no* Z.AI provider at all (kilo is left
+   * with only its own gateway), so every zai model reads as "model not found"
+   * and the gateway fallback answers "Forbidden". pi is deliberately not
+   * covered here - its SDK documents ZAI_API_KEY as its own coding-plan
+   * variable, so that manifest keeps it.
    */
-  const opencode = adapters.type === 'adapter.list' ? adapters.adapters.find((a) => a.id === 'opencode') : undefined;
-  assert(opencode?.providerEnv?.zai === 'ZHIPU_API_KEY', 'opencode manifest injects the Z.AI key as ZHIPU_API_KEY');
   assert(kilo?.providerEnv?.zai === 'ZHIPU_API_KEY', 'kilo manifest injects the Z.AI key as ZHIPU_API_KEY');
 
   const badAdapter = await request(c2, {
@@ -1273,7 +1595,7 @@ async function main(): Promise<void> {
     type: 'session.create',
     requestId: 'ses1',
     repoId: added.repo.id,
-    adapter: 'opencode',
+    adapter: 'claude',
     provider: 'zai',
     model: 'glm-4.6',
     mode: 'yolo',
@@ -1545,12 +1867,12 @@ async function main(): Promise<void> {
     noDocker.type === 'error' && noDocker.message.includes('Docker'),
     'adapter switch is refused (not half-applied) when docker is disabled',
   );
-  assert(store.getSession(sessionId)?.adapter === 'opencode', 'refused switch left the row untouched');
+  assert(store.getSession(sessionId)?.adapter === 'claude', 'refused switch left the row untouched');
 
   // link sessions carry no container: the switch must be refused with a reason
   const linkSessionId = randomUUID();
-  const opencodeRow = store.getSession(sessionId)!;
-  store.insertSession({ ...opencodeRow, id: linkSessionId, status: 'idle' });
+  const baseRow = store.getSession(sessionId)!;
+  store.insertSession({ ...baseRow, id: linkSessionId, status: 'idle' });
   store.setLinkId(linkSessionId, 'smoke-link');
   let linkRefused = '';
   try {
@@ -1603,7 +1925,7 @@ async function main(): Promise<void> {
     assert(swRow?.reasoning_effort === null, 'reasoning effort reset');
     assert(swRow?.provider === 'zai', 'provider reset to the new adapter default');
     assert(swRow?.volume_name === 'pocketagent-sess-smoke', 'volume kept across the switch');
-    assert(swRow?.branch === opencodeRow.branch, 'session branch kept across the switch');
+    assert(swRow?.branch === baseRow.branch, 'session branch kept across the switch');
 
     const notice = await c2.wait(
       (m) => m.type === 'session.event' && m.sessionId === sessionId && m.event.type === 'notice',
@@ -1638,7 +1960,7 @@ async function main(): Promise<void> {
       type: 'session.update',
       requestId: 'sw3',
       sessionId,
-      adapter: 'opencode',
+      adapter: 'claude',
     });
     assert(switchedAgain.type === 'request.ok', 'switch back is acked');
     const hostnameErr = await c2.wait(
@@ -1665,6 +1987,7 @@ async function main(): Promise<void> {
   await startProgressSmoke(store, manager, c2, added.repo.id);
   await egressPeerSmoke(store, manager, added.repo.id);
   await reconcileSmoke(store, manager, c2, added.repo.id);
+  await lifecycleSmoke(store, manager, c2, added.repo.id);
   await historySmoke(store, manager, c2, added.repo.id);
   await heartbeatSmoke();
 

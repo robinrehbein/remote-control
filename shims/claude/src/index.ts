@@ -40,7 +40,7 @@ export interface ShimConfig {
   github: { pat?: string; repoFullName?: string; base?: string };
 }
 
-/** Constant-time bearer-token comparison (same approach as shims/opencode). */
+/** Constant-time bearer-token comparison (same approach as shims/kilo). */
 function tokenOk(header: string | undefined, expected: string): boolean {
   if (header === undefined) return false;
   const a = Buffer.from(header);

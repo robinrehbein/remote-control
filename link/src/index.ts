@@ -8,7 +8,7 @@
  *
  * Usage:
  *   PA_SERVER=wss://orch.example.com PA_TOKEN=... npm run start -w link -- \
- *     --adapter opencode --mode ask --workdir /workspaces/myproject
+ *     --adapter kilo --mode ask --workdir /workspaces/myproject
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
@@ -19,6 +19,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 import type { AgentEvent, AgentMode, ServerMessage } from '@pocketagent/protocol';
+import { resolveWsUrl } from './ws-url.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, '../..');
@@ -42,7 +43,7 @@ function arg(name: string, fallback: string): string {
 const args: Args = {
   server: arg('server', process.env.PA_SERVER ?? ''),
   token: arg('token', process.env.PA_TOKEN ?? ''),
-  adapter: arg('adapter', process.env.PA_ADAPTER ?? 'opencode'),
+  adapter: arg('adapter', process.env.PA_ADAPTER ?? 'kilo'),
   mode: (['yolo', 'auto', 'acceptEdits', 'ask'] as const).includes(arg('mode', process.env.PA_MODE ?? 'ask') as AgentMode)
     ? (arg('mode', process.env.PA_MODE ?? 'ask') as AgentMode)
     : 'ask',
@@ -52,11 +53,11 @@ const args: Args = {
 };
 
 if (!args.server || !args.token) {
-  console.error('usage: PA_SERVER=wss://... PA_TOKEN=... npm run start -w link -- [--adapter opencode] [--mode ask] [--workdir /path]');
+  console.error('usage: PA_SERVER=wss://... PA_TOKEN=... npm run start -w link -- [--adapter kilo] [--mode ask] [--workdir /path]');
   process.exit(1);
 }
 
-const ADAPTERS = ['opencode', 'kilo', 'claude', 'pi', 'junie'] as const;
+const ADAPTERS = ['kilo', 'claude', 'pi', 'junie'] as const;
 if (!ADAPTERS.includes(args.adapter as (typeof ADAPTERS)[number])) {
   console.error(`unknown adapter "${args.adapter}" (supported: ${ADAPTERS.join(', ')})`);
   process.exit(1);
@@ -147,10 +148,20 @@ async function spawnShim(): Promise<ShimProcess> {
 
 let shim: ShimProcess | null = null;
 let shimRestarting = false;
+let restartPending = false;
 let stopped = false;
 
 async function restart(): Promise<void> {
-  if (stopped || shimRestarting) return;
+  if (stopped) return;
+  if (shimRestarting) {
+    // A restart is already spawning/health-polling (e.g. still inside the
+    // 90s health wait after an earlier crash). Don't drop this request on
+    // the floor - the in-flight restart's `finally` below picks it back up
+    // once it settles, so a crash-during-health-wait always gets a follow-up
+    // attempt instead of leaving the shim dead forever.
+    restartPending = true;
+    return;
+  }
   shimRestarting = true;
   try {
     shim = await spawnShim();
@@ -159,6 +170,10 @@ async function restart(): Promise<void> {
     console.error(`[link] ${e instanceof Error ? e.message : String(e)}`);
   } finally {
     shimRestarting = false;
+    if (!stopped && restartPending) {
+      restartPending = false;
+      void restart();
+    }
   }
 }
 
@@ -168,12 +183,26 @@ let ws: WebSocket | null = null;
 let sessionId: string | null = null;
 let lastServerMsgAt = Date.now();
 const eventQueue: AgentEvent[] = [];
+/** Cap on eventQueue so a long orchestrator outage (or a bad token loop) can't grow it forever. */
+const MAX_QUEUED_EVENTS = 1000;
+let droppedEventCount = 0;
+
+function queueEvent(ev: AgentEvent): void {
+  // Pings are pure heartbeats - by the time a delayed reconnect would flush
+  // them they no longer mean anything, so don't waste queue budget on them.
+  if (ev.type === 'ping') return;
+  eventQueue.push(ev);
+  if (eventQueue.length > MAX_QUEUED_EVENTS) {
+    eventQueue.shift();
+    droppedEventCount++;
+    if (droppedEventCount === 1 || droppedEventCount % 100 === 0) {
+      log(`event queue at cap (${MAX_QUEUED_EVENTS}) - dropped ${droppedEventCount} oldest event(s) so far (no orchestrator connection)`);
+    }
+  }
+}
 
 function wsUrl(): string {
-  const u = new URL(args.server);
-  u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
-  u.pathname = '/ws';
-  return u.toString();
+  return resolveWsUrl(args.server);
 }
 
 function send(m: unknown): void {
@@ -213,11 +242,20 @@ async function proxyCommand(callId: string, path: string, method: 'GET' | 'POST'
 }
 
 function startEventStream(): void {
-  if (!shim) return;
-  const base = `http://127.0.0.1:${shim.port}`;
   void (async () => {
     for (;;) {
-      if (stopped || !shim) return;
+      if (stopped) return;
+      // Re-resolve the shim on every (re)connect attempt, never once outside
+      // the loop: a shim restart lands on a brand-new random port
+      // (freePort()), and a stale base URL here means every future /events
+      // fetch 404s/ECONNREFUSEDs forever even though proxyCommand() (which
+      // reads shim.port live) keeps working fine.
+      const current = shim;
+      if (!current) {
+        await new Promise((r) => setTimeout(r, 1000));
+        continue;
+      }
+      const base = `http://127.0.0.1:${current.port}`;
       try {
         const res = await fetch(`${base}/events`, {
           headers: { authorization: `Bearer ${shimToken}`, accept: 'text/event-stream' },
@@ -227,6 +265,11 @@ function startEventStream(): void {
         const decoder = new TextDecoder();
         let buf = '';
         for (;;) {
+          // Bail out of a still-open stream as soon as the shim has been
+          // swapped out from under it, so the outer loop reconnects against
+          // the new port immediately instead of reading from a shim that is
+          // no longer the active one.
+          if (stopped || shim !== current) break;
           const { done, value } = await reader.read();
           if (done) break;
           buf += decoder.decode(value, { stream: true });
@@ -239,7 +282,7 @@ function startEventStream(): void {
               try {
                 const ev = JSON.parse(line.slice(5).trim()) as AgentEvent;
                 if (sessionId && !stopped) send({ type: 'agent.event', sessionId, event: ev });
-                else if (!stopped) eventQueue.push(ev);
+                else if (!stopped) queueEvent(ev);
               } catch {
                 /* malformed */
               }

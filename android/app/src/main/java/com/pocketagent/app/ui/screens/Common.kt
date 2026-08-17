@@ -507,7 +507,13 @@ fun OneUiDialog(
 ) {
     BasicAlertDialog(
         onDismissRequest = onDismissRequest,
-        properties = DialogProperties(usePlatformDefaultWidth = false),
+        properties = DialogProperties(
+            usePlatformDefaultWidth = false,
+            // Ohne das meldet das Dialogfenster keine Insets: der Rahmen
+            // rechnet sie selbst heraus, `safeDrawing` unten ist dann null,
+            // und die Knöpfe liegen unter der Gestenleiste.
+            decorFitsSystemWindows = false,
+        ),
         modifier = Modifier.fillMaxSize(),
     ) {
         Box(

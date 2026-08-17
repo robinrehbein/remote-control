@@ -158,4 +158,67 @@ class TimelineMergeTest {
         // Und ohne Verlauf bleibt der Live-Rest vollständig erhalten
         assertEquals(history, mergeEvents(emptyList(), history))
     }
+
+    /* ---------------- seq (W2.1-Folgepunkt: seq-Dedup nach Reconnect) ---------------- */
+
+    @Test
+    fun `a seq is the preferred identity over content when present`() {
+        // Zwei textgleiche Ereignisse mit derselben seq sind serverseitig
+        // garantiert dasselbe Ereignis — die seq entscheidet, bevor der
+        // Inhalt überhaupt geprüft wird.
+        val a = user("hallo").copy(seq = 5L)
+        val b = user("hallo").copy(seq = 5L)
+        assertEquals(eventIdentity(a), eventIdentity(b))
+        // Dieselbe seq auf inhaltlich verschiedenen Ereignissen des gleichen
+        // Typs matcht ebenso – die seq allein entscheidet.
+        assertEquals(eventIdentity(user("hallo").copy(seq = 9L)), eventIdentity(user("andere Frage").copy(seq = 9L)))
+    }
+
+    @Test
+    fun `events without an own line stay undeduplicated even with a seq`() {
+        // Status/Delta/Ping tragen in Produktion ebenfalls eine seq (der
+        // Broadcaster sequenziert alles außer ping) - das Merkmal bleibt
+        // trotzdem null, weil diese Typen nie eine eigene Zeile stellen.
+        assertNull(
+            eventIdentity(AgentEvent.Status("claude", null, null, null, AgentMode.AUTO, busy = false, seq = 3L)),
+        )
+        assertNull(eventIdentity(AgentEvent.MessageDelta("assistant", "x", seq = 4L)))
+    }
+
+    @Test
+    fun `reconnect after a resent history drops the live duplicate by seq`() {
+        // Genau das W2.1-Folgepunkt-Szenario: nach einem Reconnect liefert
+        // der geladene Verlauf ein Ereignis erneut, das der Live-Puffer
+        // schon hatte (gleiche seq) - dazu kommt ein echt neues mit
+        // höherer seq, das bleiben muss.
+        val history = listOf(user("Los geht's").copy(seq = 1L), assistant("Fertig.").copy(seq = 2L))
+        val live = listOf(assistant("Fertig.").copy(seq = 2L), user("Und jetzt die Tests").copy(seq = 3L))
+
+        val merged = mergeEvents(history, live)
+        assertEquals(3, merged.size)
+        assertEquals(user("Und jetzt die Tests").copy(seq = 3L), merged[2])
+        assertEquals(1, buildTimeline(merged).count { it is TimelineItem.Chat && it.text == "Fertig." })
+    }
+
+    @Test
+    fun `seq disambiguates identical content more precisely than the content fallback`() {
+        // Zwei textgleiche Nachrichten mit unterschiedlicher seq sind zwei
+        // echte Ereignisse, auch wenn der Content-Fallback sie nicht
+        // auseinanderhalten könnte.
+        val history = listOf(user("ok").copy(seq = 10L))
+        val live = listOf(user("ok").copy(seq = 10L), user("ok").copy(seq = 11L))
+
+        val merged = mergeEvents(history, live)
+        assertEquals(2, merged.size)
+        assertEquals(10L, merged[0].seq)
+        assertEquals(11L, merged[1].seq)
+    }
+
+    @Test
+    fun `events without a seq keep deduplicating by content as before`() {
+        // Älterer Server ohne seq: unverändertes Verhalten.
+        val history = listOf(user("ok"), user("ok"))
+        val live = listOf(user("ok"))
+        assertEquals(2, buildTimeline(mergeEvents(history, live)).size)
+    }
 }

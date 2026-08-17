@@ -11,7 +11,6 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
@@ -32,11 +31,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -70,6 +66,7 @@ import com.pocketagent.app.PocketAgentApp
 import com.pocketagent.app.data.AdapterDescriptor
 import com.pocketagent.app.data.AgentMode
 import com.pocketagent.app.data.AppRepository
+import com.pocketagent.app.data.ModelInfo
 import com.pocketagent.app.data.ReasoningEffort
 import com.pocketagent.app.data.RepoInfo
 import com.pocketagent.app.data.WsClient
@@ -430,7 +427,16 @@ fun modelChipValue(model: String, reasoning: ReasoningEffort?, canReason: Boolea
 }
 
 /** Welches Sheet gerade über dem Anlege-Screen liegt. */
-enum class NewSessionSheet { AGENT, MODEL, MODE, NETWORK, ADVANCED }
+enum class NewSessionSheet { AGENT, MODEL, MODE, ADVANCED }
+
+/**
+ * Was auf dem "Erweitert"-Chip steht: "Standard", solange Netzwerk und
+ * Basis-Branch beim jeweiligen Default liegen, sonst "Angepasst" — derselbe
+ * Grundsatz wie bei der Session-Karte, die eine Netzwerk-Abweichung nur
+ * zeigt, wenn es wirklich eine gibt (Fund: Netzwerk als Dauerpräsenz).
+ */
+fun advancedSummary(networkPolicy: String, branch: String): String =
+    if (networkPolicy == "allowlist" && branch.isBlank()) "Standard" else "Angepasst"
 
 /**
  * Sichert das offene Sheet als seinen Namen statt als Enum-Wert — ein
@@ -455,6 +461,7 @@ fun NewSessionScreen(
     val repos by repository.repos.collectAsState()
     val adapters by repository.adapters.collectAsState()
     val secrets by repository.secrets.collectAsState()
+    val modelsByAdapter by repository.modelsByAdapter.collectAsState()
     val connState by repository.connState.collectAsState()
 
     // Ohne Verbindung kann der Startknopf sein Versprechen nicht halten —
@@ -624,14 +631,15 @@ fun NewSessionScreen(
                     value = modeLabel(state.mode),
                     onClick = { sheet = NewSessionSheet.MODE },
                 )
+                // Netzwerk und Basis-Branch sind sicherheitsrelevant, aber
+                // ihr Default ist der empfohlene Fall — sie stehen darum
+                // nicht mehr gleichrangig neben Agent/Modell/Autonomie,
+                // sondern hinter einem benannten Chip statt einem anonymen
+                // Zahnrad (Fund: "'Erweitert' hinter anonymem Icon-Chip").
+                // Weicht die Wahl vom Default ab, sagt der Wert das.
                 SettingChip(
-                    label = "Netzwerk",
-                    value = networkLabel(state.networkPolicy),
-                    onClick = { sheet = NewSessionSheet.NETWORK },
-                )
-                SettingIconChip(
-                    icon = Icons.Filled.Settings,
-                    contentDescription = "Erweitert",
+                    label = "Erweitert",
+                    value = advancedSummary(state.networkPolicy, state.branch),
                     onClick = { sheet = NewSessionSheet.ADVANCED },
                 )
             }
@@ -697,6 +705,7 @@ fun NewSessionScreen(
                 model = state.model,
                 reasoning = state.reasoning,
                 secretKinds = secretKinds,
+                knownModels = modelsByAdapter[descriptor.id].orEmpty(),
                 onDismiss = { sheet = null },
                 onOpenSettings = onOpenSettings,
                 onApply = { provider, model, reasoning ->
@@ -708,30 +717,19 @@ fun NewSessionScreen(
 
         NewSessionSheet.MODE -> ModeSheet(
             current = state.mode,
-            title = "Autonomie",
             onDismiss = { sheet = null },
             onPick = { mode -> sheet = null; vm.update { it.copy(mode = mode) } },
-        )
-
-        NewSessionSheet.NETWORK -> NetworkSheet(
-            current = state.networkPolicy,
-            onDismiss = { sheet = null },
-            onPick = { policy -> sheet = null; vm.update { it.copy(networkPolicy = policy) } },
         )
 
         NewSessionSheet.ADVANCED -> AdvancedSheet(
             branch = state.branch,
             defaultBranch = repos.firstOrNull { it.id == state.repoId }?.defaultBranch.orEmpty(),
             onBranchChange = { v -> vm.update { it.copy(branch = v) } },
+            networkPolicy = state.networkPolicy,
+            onNetworkChange = { policy -> vm.update { it.copy(networkPolicy = policy) } },
             onDismiss = { sheet = null },
         )
     }
-}
-
-private fun networkLabel(policy: String): String = when (policy) {
-    "isolated" -> "Isoliert"
-    "open" -> "Offen"
-    else -> "Allowlist"
 }
 
 /* ------------------------------------------------------------------ */
@@ -743,9 +741,14 @@ private fun networkLabel(policy: String): String = when (policy) {
  * was am Modell hängt, in einem Sheet. Für dieselbe Entscheidung soll es
  * keine zweite Stelle geben.
  *
- * Eine durchsuchbare Modell-Liste gibt es hier bewusst nicht: der Katalog
- * kommt über `session.models.get` aus dem laufenden Shim, und der existiert
- * vor dem Anlegen noch nicht. Gesucht wird im Modell-Sheet der Session.
+ * Der echte Modell-Katalog kommt erst über `session.models.get` aus dem
+ * laufenden Shim, und der existiert vor dem Anlegen noch nicht — [knownModels]
+ * ist darum kein vollständiger, garantiert aktueller Katalog, sondern ein
+ * Cache aus der letzten Session desselben Agenten (Fund: "Modell beim
+ * Anlegen nur Freitext mit Format-Raten"). Gibt es noch keinen (erster
+ * Agent-Start überhaupt), bleibt es beim Freitext — bewusst ohne eine
+ * konkrete Modell-Id als Beispiel, die im nächsten Adapter-Release schon
+ * veraltet wäre.
  */
 @Composable
 private fun ModelAccessSheet(
@@ -754,6 +757,7 @@ private fun ModelAccessSheet(
     model: String,
     reasoning: ReasoningEffort?,
     secretKinds: Set<String>,
+    knownModels: List<ModelInfo>,
     onDismiss: () -> Unit,
     onOpenSettings: () -> Unit,
     onApply: (provider: String, model: String, reasoning: ReasoningEffort?) -> Unit,
@@ -764,6 +768,11 @@ private fun ModelAccessSheet(
     var picked by remember(provider) { mutableStateOf(provider.takeIf { it in known }.orEmpty()) }
     var typed by remember(provider) { mutableStateOf(if (provider in known) "" else provider) }
     var modelInput by remember(model) { mutableStateOf(model) }
+    // "Eigenes Modell" ist gewählt, sobald der aktuelle Wert nicht aus dem
+    // Cache stammt — genau wie beim Zugang oben (custom/picked/typed).
+    var modelCustom by remember(model, knownModels) {
+        mutableStateOf(model.isNotBlank() && knownModels.none { it.id == model })
+    }
     var effort by remember(reasoning) { mutableStateOf(reasoning) }
 
     val effectiveProvider = (if (custom) typed else picked).trim()
@@ -827,25 +836,78 @@ private fun ModelAccessSheet(
         }
 
         Spacer(modifier = Modifier.height(SectionSpacing))
-        OutlinedTextField(
-            value = modelInput,
-            onValueChange = { modelInput = it },
-            label = { Text("Modell (optional)") },
-            placeholder = { Text("Standard des Agenten") },
-            supportingText = {
-                Text("Leer lassen für den Standard. Format je nach Agent, z. B. zai-coding/glm-5.3")
-            },
-            singleLine = true,
-            shape = MaterialTheme.shapes.small,
-            keyboardOptions = KeyboardOptions(
-                autoCorrectEnabled = false,
-                keyboardType = KeyboardType.Ascii,
-                imeAction = ImeAction.Done,
-            ),
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = ScreenGutter),
-        )
+        SectionHeader("Modell")
+        if (knownModels.isNotEmpty()) {
+            GroupCard {
+                Column(
+                    modifier = Modifier
+                        .heightIn(max = 260.dp)
+                        .verticalScroll(rememberScrollState()),
+                ) {
+                    SelectableTile(
+                        title = "Standard des Agenten",
+                        subtitle = "Modellwahl dem Agenten überlassen",
+                        selected = !modelCustom && modelInput.isBlank(),
+                        onClick = { modelCustom = false; modelInput = "" },
+                    )
+                    knownModels.forEach { m ->
+                        ListDivider(RadioRowDividerInset)
+                        SelectableTile(
+                            title = m.name ?: m.id,
+                            subtitle = m.id,
+                            selected = !modelCustom && modelInput == m.id,
+                            onClick = { modelCustom = false; modelInput = m.id },
+                        )
+                    }
+                    ListDivider(RadioRowDividerInset)
+                    SelectableTile(
+                        title = "Eigenes Modell …",
+                        subtitle = null,
+                        selected = modelCustom,
+                        onClick = { modelCustom = true },
+                    )
+                }
+            }
+            SectionNote(
+                "Vorschläge aus einer früheren Session mit diesem Agenten – " +
+                    "nicht zwingend vollständig oder aktuell.",
+            )
+        } else {
+            SectionNote(
+                "Noch keine Modell-Vorschläge für diesen Agenten – sie erscheinen nach der " +
+                    "ersten Session. Leer lassen für den Standard des Agenten.",
+            )
+        }
+        AnimatedVisibility(
+            visible = modelCustom || knownModels.isEmpty(),
+            enter = expandVertically(tween(MotionMedium, easing = OneUiEasing)) +
+                fadeIn(tween(MotionShort, easing = LinearEasing)),
+            exit = shrinkVertically(tween(MotionMedium, easing = OneUiEasing)) +
+                fadeOut(tween(MotionShort, easing = LinearEasing)),
+        ) {
+            Column {
+                OutlinedTextField(
+                    value = modelInput,
+                    onValueChange = { modelInput = it },
+                    label = { Text("Eigenes Modell") },
+                    // Bewusst keine konkrete Modell-Id als Beispiel (Fund:
+                    // "keine Modell-IDs hart in den Code schreiben") — die
+                    // Vorschlagsliste oben zeigt echte, wenn welche da sind.
+                    placeholder = { Text("z. B. anbieter/modell") },
+                    singleLine = true,
+                    shape = MaterialTheme.shapes.small,
+                    keyboardOptions = KeyboardOptions(
+                        autoCorrectEnabled = false,
+                        keyboardType = KeyboardType.Ascii,
+                        imeAction = ImeAction.Done,
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = ScreenGutter, vertical = 4.dp),
+                )
+                SectionNote("Leer lassen für den Standard. Format je nach Agent unterschiedlich.")
+            }
+        }
 
         if (descriptor.capabilities.reasoning) {
             SectionHeader("Reasoning")
@@ -889,17 +951,24 @@ private fun ModelAccessSheet(
 /* ------------------------------------------------------------------ */
 
 /**
- * Dieselben drei Regeln wie bisher auf dem Screen, Wort für Wort. Sie sind
- * sicherheitsrelevant, deshalb steht der gewählte Wert weiter sichtbar auf
- * einem Chip und nicht hinter dem Zahnrad.
+ * Was selten anders sein soll als der Standard: Netzwerk und Basis-Branch,
+ * seit diesem Fund gemeinsam hinter „Erweitert" statt Netzwerk gleichrangig
+ * neben Agent/Modell/Autonomie zu zeigen (Fund: „Netzwerk als
+ * Dauerpräsenz"). Beide wirken sofort, keine Bestätigung nötig — der
+ * Erweitert-Chip selbst sagt schon, ob von einem Default abgewichen wurde
+ * (siehe [advancedSummary]).
  */
 @Composable
-private fun NetworkSheet(
-    current: String,
+private fun AdvancedSheet(
+    branch: String,
+    defaultBranch: String,
+    onBranchChange: (String) -> Unit,
+    networkPolicy: String,
+    onNetworkChange: (String) -> Unit,
     onDismiss: () -> Unit,
-    onPick: (String) -> Unit,
 ) {
-    SettingSheet(title = "Netzwerk", onDismiss = onDismiss) {
+    SettingSheet(title = "Erweitert", onDismiss = onDismiss) {
+        SectionHeader("Netzwerk")
         GroupCard {
             Column {
                 val entries = listOf(
@@ -912,28 +981,14 @@ private fun NetworkSheet(
                     SelectableTile(
                         title = title,
                         subtitle = subtitle,
-                        selected = current == policy,
-                        onClick = { onPick(policy) },
+                        selected = networkPolicy == policy,
+                        onClick = { onNetworkChange(policy) },
                     )
                 }
             }
         }
-    }
-}
-
-/**
- * Was selten anders sein soll als der Standard. Der Branch wirkt sofort —
- * am Repository-Feld steht er als Untertitel, also braucht es hier keine
- * Bestätigung, die man auch vergessen könnte.
- */
-@Composable
-private fun AdvancedSheet(
-    branch: String,
-    defaultBranch: String,
-    onBranchChange: (String) -> Unit,
-    onDismiss: () -> Unit,
-) {
-    SettingSheet(title = "Erweitert", onDismiss = onDismiss) {
+        Spacer(modifier = Modifier.height(SectionSpacing))
+        SectionHeader("Basis-Branch")
         OutlinedTextField(
             value = branch,
             onValueChange = onBranchChange,
@@ -966,76 +1021,106 @@ private fun RepoSelector(
     onSelect: (String) -> Unit,
     onAddRepo: () -> Unit,
 ) {
-    var expanded by remember { mutableStateOf(false) }
+    // Bottom Sheet statt Dropdown (Fund: "Repository-Auswahl als DropdownMenu
+    // bricht das Sheet-Idiom") — dasselbe Muster wie jede andere Auswahl der
+    // App (Agent, Modell, Autonomie, Netzwerk): GroupCard + SelectableTile,
+    // auf großen Displays erreichbar statt als schmales Menü am oberen Rand.
+    var sheetOpen by rememberSaveable { mutableStateOf(false) }
     val selected = repos.firstOrNull { it.id == selectedId }
 
-    Box {
-        GroupCard {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clickable { expanded = true }
-                    .heightIn(min = TileMinHeight)
-                    .padding(start = CardInset, end = 10.dp),
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
+    GroupCard {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { sheetOpen = true }
+                .heightIn(min = TileMinHeight)
+                .padding(start = CardInset, end = 10.dp),
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = selected?.fullName ?: "Repository wählen",
+                    style = ListItemTitle,
+                    color = if (selected == null) {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    } else {
+                        MaterialTheme.colorScheme.onSurface
+                    },
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                selected?.let {
+                    // Der Basis-Branch steht hier und nur hier. Wer ihn
+                    // unter „Erweitert“ überschreibt, muss das Ergebnis
+                    // sehen — sonst wäre die Eingabe unsichtbar.
                     Text(
-                        text = selected?.fullName ?: "Repository wählen",
-                        style = ListItemTitle,
-                        color = if (selected == null) {
-                            MaterialTheme.colorScheme.onSurfaceVariant
-                        } else {
-                            MaterialTheme.colorScheme.onSurface
-                        },
+                        text = "Basis: ${branchOverride.trim().ifBlank { it.defaultBranch }}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
-                    selected?.let {
-                        // Der Basis-Branch steht hier und nur hier. Wer ihn
-                        // unter „Erweitert“ überschreibt, muss das Ergebnis
-                        // sehen — sonst wäre die Eingabe unsichtbar.
+                }
+            }
+            Icon(
+                Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+
+    if (sheetOpen) {
+        SettingSheet(title = "Repository", onDismiss = { sheetOpen = false }) {
+            GroupCard {
+                Column(
+                    modifier = Modifier
+                        .heightIn(max = 320.dp)
+                        .verticalScroll(rememberScrollState()),
+                ) {
+                    if (repos.isEmpty()) {
                         Text(
-                            text = "Basis: ${branchOverride.trim().ifBlank { it.defaultBranch }}",
-                            style = MaterialTheme.typography.bodySmall,
+                            text = "Noch keine Repositories",
+                            style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.padding(horizontal = CardInset, vertical = 12.dp),
+                        )
+                        ListDivider(RadioRowDividerInset)
+                    }
+                    repos.forEachIndexed { index, repo ->
+                        if (index > 0) ListDivider(RadioRowDividerInset)
+                        SelectableTile(
+                            title = repo.fullName,
+                            subtitle = "Basis: ${repo.defaultBranch}",
+                            selected = repo.id == selectedId,
+                            onClick = { onSelect(repo.id); sheetOpen = false },
+                        )
+                    }
+                    // Repository hinzufügen als AddRow im Sheet, statt als
+                    // letzter Menüpunkt eines Dropdowns.
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { sheetOpen = false; onAddRepo() }
+                            .heightIn(min = TileMinHeight)
+                            .padding(start = CardInset, end = CardInset),
+                    ) {
+                        Icon(
+                            Icons.Filled.Add,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(20.dp),
+                        )
+                        Spacer(modifier = Modifier.width(14.dp))
+                        Text(
+                            text = "Repository hinzufügen",
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = MaterialTheme.colorScheme.primary,
                         )
                     }
                 }
-                Icon(
-                    Icons.AutoMirrored.Filled.KeyboardArrowRight,
-                    contentDescription = null,
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
             }
-        }
-        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-            if (repos.isEmpty()) {
-                DropdownMenuItem(
-                    text = { Text("Noch keine Repositories") },
-                    enabled = false,
-                    onClick = {},
-                )
-            }
-            repos.forEach { repo ->
-                DropdownMenuItem(
-                    text = { Text(repo.fullName) },
-                    onClick = { onSelect(repo.id); expanded = false },
-                )
-            }
-            DropdownMenuItem(
-                text = { Text("Repository hinzufügen", color = MaterialTheme.colorScheme.primary) },
-                leadingIcon = {
-                    Icon(
-                        Icons.Filled.Add,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.primary,
-                    )
-                },
-                onClick = { expanded = false; onAddRepo() },
-            )
         }
     }
 }

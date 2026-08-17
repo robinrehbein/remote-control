@@ -52,6 +52,7 @@ import com.pocketagent.app.data.AppRepository
 import com.pocketagent.app.data.DiffEntry
 import com.pocketagent.app.data.SessionInfo
 import com.pocketagent.app.ui.theme.CardInset
+import com.pocketagent.app.ui.theme.EmptyStateInset
 import com.pocketagent.app.ui.theme.MonoMedium
 import com.pocketagent.app.ui.theme.PillShape
 import com.pocketagent.app.ui.theme.PrimaryButtonHeight
@@ -170,7 +171,7 @@ fun DiffScreen(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(padding)
-                    .padding(horizontal = 40.dp),
+                    .padding(horizontal = EmptyStateInset),
                 verticalArrangement = Arrangement.Center,
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
@@ -206,7 +207,7 @@ fun DiffScreen(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(padding)
-                    .padding(horizontal = 40.dp),
+                    .padding(horizontal = EmptyStateInset),
                 verticalArrangement = Arrangement.Center,
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {

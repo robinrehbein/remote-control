@@ -299,6 +299,15 @@ val ContentMaxWidth = 640.dp
 /** Vertical air between one section's card and the next section header. */
 val SectionSpacing = 20.dp
 
+/**
+ * Seitlicher Einzug eines zentrierten Leer-/Fehler-Zustands (Liste ohne
+ * Sessions, Session ohne Verlauf, Diff ohne Änderungen oder mit Fehler).
+ * War an allen vier Stellen dieselbe hartkodierte Zahl ohne Token — der
+ * einzige wiederkehrende Wert im Spacing-System, der eine Grid-Änderung
+ * vergessen hätte.
+ */
+val EmptyStateInset = 40.dp
+
 /* ------------------------------------------------------------------ */
 /* Bewegung                                                            */
 /*                                                                     */

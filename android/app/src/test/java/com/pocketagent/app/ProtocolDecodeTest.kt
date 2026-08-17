@@ -40,6 +40,53 @@ class ProtocolDecodeTest {
         assertEquals("bash", tool.tool)
         assertEquals("bash: npm test", tool.title)
         assertEquals("""{"command":"npm test"}""", tool.input.toString())
+        // W2.1 (Event-Replay) fügte diese seq erst nachträglich hinzu — ohne
+        // sie im Payload bleibt sie null statt das Dekodieren zu verwerfen.
+        assertNull(tool.seq)
+    }
+
+    /**
+     * W2.1 (Event-Replay) prägt jedem sequenzierten Ereignis eine `seq` auf
+     * (`SequencedSseBroadcaster`, packages/protocol). Fund W2.1-Folgepunkt:
+     * die Kotlin-Seite muss sie mitnehmen, damit der Merge zwischen Live-
+     * Strom und Verlauf nach einem Reconnect darauf zurückgreifen kann.
+     */
+    @Test
+    fun `decodes the seq a sequenced server stamps onto an event`() {
+        val raw = """
+            {
+              "type": "session.event",
+              "sessionId": "sess-1",
+              "event": {
+                "type": "message.completed",
+                "role": "assistant",
+                "text": "Fertig.",
+                "seq": 42,
+                "ts": 1755000000000
+              }
+            }
+        """.trimIndent()
+
+        val msg = parseServerMessage(raw) as ServerMessage.SessionEventMsg
+        val completed = msg.event as AgentEvent.MessageCompleted
+        assertEquals(42L, completed.seq)
+    }
+
+    /** `ping` wird nie sequenziert (siehe AgentEvent.Ping-KDoc) — auch mit einer seq im Payload bleibt sie ignoriert. */
+    @Test
+    fun `ping never carries a seq, even if one is sent`() {
+        val raw = """
+            {
+              "type": "session.event",
+              "sessionId": "sess-1",
+              "event": { "type": "ping", "ts": 123, "seq": 7 }
+            }
+        """.trimIndent()
+
+        val msg = parseServerMessage(raw) as ServerMessage.SessionEventMsg
+        val ping = msg.event as AgentEvent.Ping
+        assertEquals(123L, ping.ts)
+        assertNull(ping.seq)
     }
 
     @Test

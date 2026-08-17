@@ -272,6 +272,17 @@ data class ServerStats(
 /* ------------------------------------------------------------------ */
 
 sealed interface AgentEvent {
+    /**
+     * Per-Session, per-Stream monotone Sequenznummer, die ein sequenzierender
+     * Broadcaster (`SequencedSseBroadcaster`, `packages/protocol`) einem
+     * Ereignis aufprägt — dieselbe Zahl, die serverseitig für Replay und
+     * Persistenz-Dedup dient. Optional für Abwärtskompatibilität: ein
+     * älterer Server (oder ein `ping`, der nie sequenziert wird) liefert sie
+     * nicht mit. Grundlage für die clientseitige Dedup zwischen Live-Strom
+     * und geladenem Verlauf nach einem Reconnect (siehe [eventIdentity]).
+     */
+    val seq: Long?
+
     data class Status(
         val adapter: String,
         val sessionRef: String? = null,
@@ -279,15 +290,17 @@ sealed interface AgentEvent {
         val model: String? = null,
         val mode: AgentMode,
         val busy: Boolean,
+        override val seq: Long? = null,
     ) : AgentEvent
 
-    data class MessageDelta(val role: String, val delta: String) : AgentEvent
-    data class MessageCompleted(val role: String, val text: String) : AgentEvent
+    data class MessageDelta(val role: String, val delta: String, override val seq: Long? = null) : AgentEvent
+    data class MessageCompleted(val role: String, val text: String, override val seq: Long? = null) : AgentEvent
     data class ToolCall(
         val id: String,
         val tool: String,
         val input: JsonElement? = null,
         val title: String? = null,
+        override val seq: Long? = null,
     ) : AgentEvent
 
     data class ToolResult(
@@ -295,6 +308,7 @@ sealed interface AgentEvent {
         val tool: String,
         val output: String,
         val isError: Boolean? = null,
+        override val seq: Long? = null,
     ) : AgentEvent
 
     data class PermissionRequest(
@@ -304,18 +318,31 @@ sealed interface AgentEvent {
         val detail: String? = null,
         val diff: String? = null,
         val patterns: List<String> = emptyList(),
+        override val seq: Long? = null,
     ) : AgentEvent
 
-    data class PermissionResolved(val permissionId: String, val decision: PermissionDecision) : AgentEvent
+    data class PermissionResolved(
+        val permissionId: String,
+        val decision: PermissionDecision,
+        override val seq: Long? = null,
+    ) : AgentEvent
+
     data class TurnCompleted(
         val summary: String? = null,
         val usage: TokenUsage? = null,
         val commitSha: String? = null,
+        override val seq: Long? = null,
     ) : AgentEvent
 
-    data class TurnFailed(val error: String) : AgentEvent
-    data class Pushed(val branch: String, val prUrl: String? = null, val auto: Boolean) : AgentEvent
-    data class ErrorEvent(val message: String, val fatal: Boolean? = null) : AgentEvent
+    data class TurnFailed(val error: String, override val seq: Long? = null) : AgentEvent
+    data class Pushed(
+        val branch: String,
+        val prUrl: String? = null,
+        val auto: Boolean,
+        override val seq: Long? = null,
+    ) : AgentEvent
+
+    data class ErrorEvent(val message: String, val fatal: Boolean? = null, override val seq: Long? = null) : AgentEvent
 
     /**
      * Systemhinweis des Servers (Image-Build, Agent-Wechsel) — kein Agent-Output.
@@ -329,9 +356,11 @@ sealed interface AgentEvent {
         val message: String,
         val phase: String? = null,
         val detail: String? = null,
+        override val seq: Long? = null,
     ) : AgentEvent
 
-    data class Ping(val ts: Long) : AgentEvent
+    /** `ping` wird nie sequenziert (siehe [SequencedSseBroadcaster] in packages/protocol) — [seq] bleibt immer null. */
+    data class Ping(val ts: Long, override val seq: Long? = null) : AgentEvent
 }
 
 /* ------------------------------------------------------------------ */
@@ -511,6 +540,9 @@ private fun JsonObject.optStringList(key: String): List<String> =
 
 fun parseAgentEvent(obj: JsonObject): AgentEvent? {
     val type = obj.optString("type") ?: return null
+    // Vom sequenzierenden Broadcaster aufgeprägt (siehe AgentEvent.seq); fehlt
+    // bei einem älteren Server oder bei `ping` und bleibt dann null.
+    val seq = obj["seq"]?.jsonPrimitive?.longOrNull
     return try {
         when (type) {
             "status" -> AgentEvent.Status(
@@ -520,16 +552,19 @@ fun parseAgentEvent(obj: JsonObject): AgentEvent? {
                 model = obj.optString("model"),
                 mode = AgentMode.fromRaw(obj.optString("mode") ?: ""),
                 busy = obj["busy"]?.jsonPrimitive?.booleanOrNullCompat() ?: false,
+                seq = seq,
             )
 
             "message.delta" -> AgentEvent.MessageDelta(
                 role = obj.optString("role") ?: "assistant",
                 delta = obj.optString("delta") ?: "",
+                seq = seq,
             )
 
             "message.completed" -> AgentEvent.MessageCompleted(
                 role = obj.optString("role") ?: "assistant",
                 text = obj.optString("text") ?: "",
+                seq = seq,
             )
 
             "tool.call" -> AgentEvent.ToolCall(
@@ -537,6 +572,7 @@ fun parseAgentEvent(obj: JsonObject): AgentEvent? {
                 tool = obj.optString("tool") ?: "",
                 input = obj["input"],
                 title = obj.optString("title"),
+                seq = seq,
             )
 
             "tool.result" -> AgentEvent.ToolResult(
@@ -544,6 +580,7 @@ fun parseAgentEvent(obj: JsonObject): AgentEvent? {
                 tool = obj.optString("tool") ?: "",
                 output = obj.optString("output") ?: "",
                 isError = obj["isError"]?.jsonPrimitive?.booleanOrNullCompat(),
+                seq = seq,
             )
 
             "permission.request" -> AgentEvent.PermissionRequest(
@@ -553,11 +590,13 @@ fun parseAgentEvent(obj: JsonObject): AgentEvent? {
                 detail = obj.optString("detail"),
                 diff = obj.optString("diff"),
                 patterns = obj.optStringList("patterns"),
+                seq = seq,
             )
 
             "permission.resolved" -> AgentEvent.PermissionResolved(
                 permissionId = obj.optString("permissionId") ?: "",
                 decision = PermissionDecision.fromRaw(obj.optString("decision") ?: "") ?: return null,
+                seq = seq,
             )
 
             "turn.completed" -> AgentEvent.TurnCompleted(
@@ -570,25 +609,29 @@ fun parseAgentEvent(obj: JsonObject): AgentEvent? {
                     )
                 },
                 commitSha = obj.optString("commitSha"),
+                seq = seq,
             )
 
-            "turn.failed" -> AgentEvent.TurnFailed(error = obj.optString("error") ?: "unknown error")
+            "turn.failed" -> AgentEvent.TurnFailed(error = obj.optString("error") ?: "unknown error", seq = seq)
 
             "pushed" -> AgentEvent.Pushed(
                 branch = obj.optString("branch") ?: "",
                 prUrl = obj.optString("prUrl"),
                 auto = obj["auto"]?.jsonPrimitive?.booleanOrNullCompat() ?: false,
+                seq = seq,
             )
 
             "error" -> AgentEvent.ErrorEvent(
                 message = obj.optString("message") ?: "unknown error",
                 fatal = obj["fatal"]?.jsonPrimitive?.booleanOrNullCompat(),
+                seq = seq,
             )
 
             "notice" -> AgentEvent.Notice(
                 message = obj.optString("message") ?: return null,
                 phase = obj.optString("phase"),
                 detail = obj.optString("detail"),
+                seq = seq,
             )
 
             "ping" -> AgentEvent.Ping(ts = obj["ts"]?.jsonPrimitive?.longOrNull ?: 0L)

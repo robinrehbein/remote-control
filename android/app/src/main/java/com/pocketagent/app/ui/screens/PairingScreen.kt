@@ -19,8 +19,11 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.SmartToy
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
@@ -133,10 +136,15 @@ fun PairingScreen(onPaired: () -> Unit) {
             modifier = Modifier.size(88.dp),
         ) {
             Box(contentAlignment = Alignment.Center) {
-                Text(
-                    text = "⌘",
-                    style = MaterialTheme.typography.displaySmall,
-                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                // War das Mac-Befehlssymbol "⌘" — auf Android ein geliehenes
+                // Plattformzeichen statt eigener Identität (Fund: "Pairing-
+                // Logo ist das Mac-Befehlssymbol"). Dasselbe Motiv wie
+                // EmptySessions und die NavRail: ein Symbol, überall dasselbe.
+                Icon(
+                    Icons.Outlined.SmartToy,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                    modifier = Modifier.size(40.dp),
                 )
             }
         }

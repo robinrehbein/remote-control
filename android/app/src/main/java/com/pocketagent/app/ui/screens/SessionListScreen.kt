@@ -583,7 +583,7 @@ private fun SessionCard(
                     )
                 }
                 Spacer(modifier = Modifier.width(10.dp))
-                StatusBadge(status = session.status)
+                SessionStatusBadge(session = session)
             }
             Row(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -696,7 +696,7 @@ private fun SessionActionRow(action: SessionAction, onClick: () -> Unit) {
     } else {
         MaterialTheme.colorScheme.onSurface
     }
-    val note = sessionActionNote(action)
+    val note = sessionActionNote(action, session)
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier

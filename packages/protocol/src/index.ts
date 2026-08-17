@@ -333,6 +333,12 @@ export interface SessionInfo {
   title?: string;
   /** Absent => false. Archived sessions stay in `session.list`; the client filters. */
   archived?: boolean;
+  /**
+   * True for link-agent sessions: the agent runs on the user's own machine
+   * (outbound WS, no container). Absent => false; the status semantics of a
+   * linked session differ ('stopped' means "agent host currently offline").
+   */
+  linked?: boolean;
 }
 
 export interface RepoInfo {

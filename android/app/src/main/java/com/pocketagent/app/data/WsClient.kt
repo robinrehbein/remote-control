@@ -144,7 +144,7 @@ class WsClient(private val client: OkHttpClient) {
      * Reisst eine als „Connected“ gemeldete, aber tatsächlich tote Verbindung
      * hart ab und baut sofort neu auf. Für den Fall, dass ein Socket still
      * gestorben ist (Netzwechsel, Doze) und OkHttp das noch nicht bemerkt hat
-     * — das dauert bis zu ~40s (Ping alle 20s + Pong-Wartezeit). [connect]
+     * — das dauert bis zu ~20s (Ping alle 10s + Pong-Wartezeit). [connect]
      * allein hilft hier nicht: sein Connected-Guard würde sofort zurückkehren,
      * ohne etwas zu tun.
      */

@@ -10,6 +10,9 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
@@ -146,11 +149,18 @@ class AppRepository(
 
             is ServerMessage.SessionStatusMsg -> {
                 val info = msg.session
-                _sessions.value = _sessions.value.map { existing ->
-                    when {
-                        info != null && existing.id == info.id -> info
-                        existing.id == msg.sessionId -> existing.copy(status = msg.status)
-                        else -> existing
+                _sessions.value = when {
+                    // Eine unbekannte Session (gerade angelegt, auch von einem
+                    // anderen Gerät) wird eingefügt statt still ignoriert —
+                    // sonst müsste jeder Aufrufer die Liste diffen, um sie zu
+                    // finden.
+                    info != null && _sessions.value.none { it.id == info.id } -> _sessions.value + info
+                    else -> _sessions.value.map { existing ->
+                        when {
+                            info != null && existing.id == info.id -> info
+                            existing.id == msg.sessionId -> existing.copy(status = msg.status)
+                            else -> existing
+                        }
                     }
                 }
             }
@@ -231,6 +241,13 @@ class AppRepository(
         refreshSecretsQuiet()
     }
 
+    /**
+     * Session anlegen. Bei Erfolg trägt das Ergebnis die Id aus der
+     * Server-Bestätigung (`request.ok.payload.sessionId`) — der einzige
+     * verlässliche Weg, „die gerade angelegte Session“ zu meinen. null heißt:
+     * angelegt, aber ein älterer Server nannte die Id nicht (Aufrufer fällt
+     * auf den Listen-Diff zurück).
+     */
     suspend fun createSession(
         repoId: String,
         adapter: String,
@@ -239,18 +256,30 @@ class AppRepository(
         mode: AgentMode,
         branch: String?,
         networkPolicy: String? = null,
-    ): Result<Unit> {
+    ): Result<String?> {
         val response = request { id ->
             encodeSessionCreate(id, repoId, adapter, provider, model, mode, branch, networkPolicy)
         }
         return when (response) {
             is ServerMessage.ErrorMsg -> Result.failure(IllegalStateException(response.message))
             null -> Result.failure(IllegalStateException("Keine Verbindung"))
+            is ServerMessage.RequestOk -> {
+                refreshSessions()
+                Result.success(ackedSessionId(response))
+            }
+
             else -> {
                 refreshSessions()
-                Result.success(Unit)
+                Result.success(null)
             }
         }
+    }
+
+    /** `sessionId` aus dem Payload einer `request.ok`-Bestätigung, falls vorhanden. */
+    private fun ackedSessionId(msg: ServerMessage.RequestOk): String? {
+        val payload = msg.payload as? JsonObject ?: return null
+        val value = payload["sessionId"] as? JsonPrimitive ?: return null
+        return value.takeIf { it !is JsonNull }?.content?.takeIf { it.isNotBlank() }
     }
 
     /**
@@ -421,7 +450,7 @@ class AppRepository(
     /**
      * Sicherstellen, dass die Verbindung wirklich lebt — nicht nur laut
      * Zustand „Connected". Ein still gestorbener Socket (Netzwechsel, Doze)
-     * meldet sich bei OkHttp erst nach bis zu ~40s (Ping 20s + Pong-Wartezeit);
+     * meldet sich bei OkHttp erst nach bis zu ~20s (Ping 10s + Pong-Wartezeit);
      * bis dahin sieht alles gut aus, obwohl nichts mehr ankommt.
      *
      * Nicht suspend, damit Netz-Callback und Vordergrund-Wechsel sie ohne

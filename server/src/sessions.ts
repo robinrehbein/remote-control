@@ -274,6 +274,12 @@ export class SessionManager {
       last_active_at: now,
     };
     this.store.insertSession(row);
+    // Announce the session to every device the moment it exists - not only
+    // when provisioning finishes. Clients insert unknown sessions from this
+    // broadcast, so the creating phone finds its own session deterministically
+    // (by the acked id) instead of diffing the session list, and a second
+    // device sees it right away.
+    this.broadcastStatus(row.id, 'creating');
     void this.provision(row, repo, msg.branch ?? repo.default_branch);
     return row;
   }
@@ -923,6 +929,7 @@ export class SessionManager {
       // both additive: an older app ignores them, and "absent" is the default
       ...(row.title ? { title: row.title } : {}),
       ...(row.archived ? { archived: true } : {}),
+      ...(row.link_id ? { linked: true } : {}),
     };
   }
 

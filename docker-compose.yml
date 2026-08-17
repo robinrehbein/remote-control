@@ -21,6 +21,10 @@ services:
       SESSION_MEM_LIMIT: ${SESSION_MEM_LIMIT:-2g}
       IDLE_STOP_SEC: ${IDLE_STOP_SEC:-900}
       GC_DAYS: ${GC_DAYS:-14}
+      # Hinter Coolify/Traefik auf 1 setzen (.env): req.ip löst dann den
+      # echten Client aus X-Forwarded-For auf — sonst teilen sich alle Geräte
+      # die Proxy-Adresse und der WS-Verbindungslimit (10/IP) trifft Unbeteiligte.
+      TRUST_PROXY: ${TRUST_PROXY:-}
       ADAPTER_IMAGE_PREFIX: pocketagent
       # Shim image tag. UNGESETZT lassen (empfohlen): der Orchestrator taggt
       # dann mit einem Content-Hash der mitgelieferten Shim-Quellen und baut

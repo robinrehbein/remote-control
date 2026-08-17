@@ -90,6 +90,23 @@ data class ProviderDescriptor(
     val hint: String? = null,
 )
 
+/**
+ * Wie sich ein Adapter anmelden lässt (CODEX-OAUTH.md §5). Aus dem Manifest, damit
+ * die App die richtige Login-Fläche generisch rendert statt eine Adapter-Tabelle
+ * fest zu verdrahten. `type` ist ein offener String; unbekannte Typen ignoriert
+ * die App einfach. Fehlt das Feld (alter Server), bleibt nur der Zugang-Einfügen-Weg.
+ */
+@Serializable
+data class AuthFlow(
+    val type: String,
+    /** oauth-loopback: erlaubte localhost-Ports der Redirect-Allowlist (Codex: 1455/1457). */
+    val ports: List<Int> = emptyList(),
+    /** token-paste: Name des CLI-Befehls, der den Token erzeugt. */
+    val hint: String? = null,
+    /** api-key: Seite zum Erstellen des Keys. */
+    val keyUrl: String? = null,
+)
+
 @Serializable
 data class AdapterDescriptor(
     val id: String,
@@ -100,6 +117,8 @@ data class AdapterDescriptor(
     val credentials: Map<String, List<String>> = emptyMap(),
     @SerialName("providerEnv") val providerEnv: Map<String, String> = emptyMap(),
     val providers: List<ProviderDescriptor> = emptyList(),
+    /** Login-Verfahren des Adapters; leer bei älteren Servern (nur Zugang-Einfügen). */
+    val authFlows: List<AuthFlow> = emptyList(),
     val defaults: AdapterDefaults = AdapterDefaults(),
 )
 
@@ -420,6 +439,32 @@ sealed interface ServerMessage {
     data class ServerStatsMsg(val requestId: String, val stats: ServerStats) : ServerMessage {
         override val type: String get() = "server.stats"
     }
+
+    /**
+     * Antwort auf `auth.start` (CODEX-OAUTH.md): die im Browser zu öffnende
+     * Login-URL und der Loopback-Port, auf dem der Redirect landet — die App
+     * muss ihren Loopback-Listener auf genau diesem Port betreiben. Bei einem
+     * Device-Code-Flow ist [port] 0 (kein Listener) und [userCode] der Code.
+     */
+    data class AuthUrlMsg(
+        val requestId: String,
+        val url: String,
+        val port: Int,
+        val flow: String? = null,
+        val userCode: String? = null,
+    ) : ServerMessage {
+        override val type: String get() = "auth.url"
+    }
+
+    /** Endergebnis eines Auth-Flows: ok (+ optional Account-Label) oder ein Fehler. */
+    data class AuthDoneMsg(
+        val requestId: String,
+        val ok: Boolean,
+        val account: String? = null,
+        val error: String? = null,
+    ) : ServerMessage {
+        override val type: String get() = "auth.done"
+    }
 }
 
 fun requestIdOf(msg: ServerMessage): String? = when (msg) {
@@ -438,6 +483,8 @@ fun requestIdOf(msg: ServerMessage): String? = when (msg) {
     is ServerMessage.SecretDeletedMsg -> msg.requestId
     is ServerMessage.SecretValidatedMsg -> msg.requestId
     is ServerMessage.ServerStatsMsg -> msg.requestId
+    is ServerMessage.AuthUrlMsg -> msg.requestId
+    is ServerMessage.AuthDoneMsg -> msg.requestId
     else -> null
 }
 
@@ -678,6 +725,21 @@ fun parseServerMessage(raw: String): ServerMessage? {
                 unverified = root["unverified"]?.jsonPrimitive?.booleanOrNullCompat() ?: false,
             )
 
+            "auth.url" -> ServerMessage.AuthUrlMsg(
+                requestId = root.optString("requestId") ?: return null,
+                url = root.optString("url") ?: return null,
+                port = root["port"]?.jsonPrimitive?.intOrNull ?: 0,
+                flow = root.optString("flow"),
+                userCode = root.optString("userCode"),
+            )
+
+            "auth.done" -> ServerMessage.AuthDoneMsg(
+                requestId = root.optString("requestId") ?: return null,
+                ok = root["ok"]?.jsonPrimitive?.booleanOrNullCompat() ?: false,
+                account = root.optString("account"),
+                error = root.optString("error"),
+            )
+
             "server.stats" -> ServerMessage.ServerStatsMsg(
                 requestId = root.optString("requestId") ?: return null,
                 stats = (root["stats"] as? JsonObject)?.let { s ->
@@ -900,4 +962,37 @@ fun encodeSecretDelete(requestId: String, id: String): String = buildJsonObject 
 fun encodeFcmRegister(token: String): String = buildJsonObject {
     put("type", "fcm.register")
     put("token", token)
+}.toString()
+
+/* ------------------------------------------------------------------ */
+/* In-App-Login (CODEX-OAUTH.md): auth.start / auth.callback / auth.cancel */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Startet den In-App-Login für [adapter] (heute nur codex). [flow] wählt das
+ * Manifest-Verfahren (oauth-loopback vs. device-code); ohne Angabe entscheidet
+ * der Server. [requestId] korreliert den ganzen Austausch (auth.url/callback/done).
+ */
+fun encodeAuthStart(requestId: String, adapter: String, flow: String? = null): String = buildJsonObject {
+    put("type", "auth.start")
+    put("requestId", requestId)
+    put("adapter", adapter)
+    flow?.let { put("flow", it) }
+}.toString()
+
+/**
+ * Reicht den vom Loopback-Listener abgefangenen OAuth-Callback (code+state) an
+ * den Login-Server im Auth-Container weiter. Werte sind einmalig verwendbar und
+ * laufen über den ohnehin Device-Token-authentifizierten WSS.
+ */
+fun encodeAuthCallback(requestId: String, code: String, state: String): String = buildJsonObject {
+    put("type", "auth.callback")
+    put("requestId", requestId)
+    put("code", code)
+    put("state", state)
+}.toString()
+
+fun encodeAuthCancel(requestId: String): String = buildJsonObject {
+    put("type", "auth.cancel")
+    put("requestId", requestId)
 }.toString()

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Nur für den Debug-Build. Ab Android 7 vertrauen Apps ausschließlich dem
+  System-Zertifikatsspeicher; ein von Hand installiertes CA-Zertifikat wird
+  ignoriert. Auf einem Emulator hinter einem TLS-terminierenden Proxy — CI,
+  Firmen-Proxy, Testumgebung — kommt die App damit nie an den Server, und der
+  Fehler liest sich wie ein kaputter Server, nicht wie eine fehlende CA.
+
+  Deshalb vertraut der Debug-Build zusätzlich dem User-Store. Der Release-Build
+  hat diese Datei nicht: dort bleibt es beim System-Store, und mitgebrachte
+  Zertifikate zählen weiterhin nicht.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Debug-Overlay: hängt nur die Network-Security-Config an die Anwendung, die
+  im Release-Build fehlt (siehe res/xml/network_security_config.xml). Der
+  Manifest-Merger übernimmt daraus ausschließlich dieses Attribut.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <application
+        android:networkSecurityConfig="@xml/network_security_config"
+        tools:ignore="UnusedAttribute" />
+
+</manifest>

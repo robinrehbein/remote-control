@@ -1,7 +1,7 @@
 /**
  * Integration smoke for the link agent path:
  *   device (WS) <-> orchestrator (HTTP+WS) <-> link agent (outbound WS)
- *                                               -> local opencode shim -> real `opencode serve`
+ *                                               -> local kilo shim -> real `kilo serve`
  *
  * Verifies: link registration creates a session, device sees it, prompt is
  * proxied through the outbound WS, events flow back, diff works, stop sends
@@ -155,14 +155,14 @@ async function main(): Promise<void> {
     const empty = await device.wait((m) => m.type === 'session.list' && m.requestId === 'r1', 'empty session.list');
     expect(empty.type === 'session.list' && empty.sessions.length === 0, 'no sessions before link connects');
 
-    // link agent (spawns the opencode shim + real `opencode serve`)
+    // link agent (spawns the kilo shim + real `kilo serve`)
     link = spawn(process.execPath, [tsx, 'link/src/index.ts'], {
       cwd: repoRoot,
       env: {
         ...process.env,
         PA_SERVER: wsUrl,
         PA_TOKEN: LINK_TOKEN,
-        PA_ADAPTER: 'opencode',
+        PA_ADAPTER: 'kilo',
         PA_MODE: 'ask',
         PA_NAME: 'smoke-link',
         PA_WORKDIR: workDir,
@@ -182,7 +182,7 @@ async function main(): Promise<void> {
     expect(linkSessionId.length > 0, 'link sessionId present');
     const sessionRow = statusMsg.type === 'session.status' ? statusMsg.session : undefined;
     expect(sessionRow?.status === 'idle', 'link session idle');
-    expect(sessionRow?.adapter === 'opencode', 'link session adapter opencode');
+    expect(sessionRow?.adapter === 'kilo', 'link session adapter kilo');
 
     // prompt through the outbound link
     device.send({ type: 'session.prompt', sessionId: linkSessionId, text: 'say hi' });

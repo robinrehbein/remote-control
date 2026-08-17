@@ -8,8 +8,8 @@
  *  - Pairing REST types
  *
  * Pure TypeScript types, zero runtime dependencies, and at the end of this file
- * the one deliberate exception: pure helpers shared verbatim by the opencode
- * and kilo shims.
+ * the one deliberate exception: pure helpers used verbatim by the kilo shim
+ * (kilo is an OpenCode fork and speaks the same wire format).
  *
  * This package MUST stay a single file. Shim containers run compiled JS on
  * plain node and load this package as TypeScript source via node's type
@@ -23,9 +23,9 @@
 /* ------------------------------------------------------------------ */
 
 /**
- * Adapter ids are open-ended: built-in ids are 'opencode' | 'kilo' | 'claude'
- * | 'pi' | 'junie', but the server loads adapters from manifests at boot, so
- * any harness plugin can register additional ids.
+ * Adapter ids are open-ended: built-in ids are 'kilo' | 'claude' | 'pi' |
+ * 'junie', but the server loads adapters from manifests at boot, so any
+ * harness plugin can register additional ids.
  */
 export type AdapterId = (string & {});
 
@@ -190,7 +190,7 @@ export interface PermissionReplyBody {
 /** GET /status */
 export interface ShimStatus {
   adapter: AdapterId;
-  /** Runtime-native session reference (opencode session id, claude session_id, pi session file). */
+  /** Runtime-native session reference (kilo session id, claude session_id, pi session file). */
   sessionRef?: string;
   provider?: string;
   model?: string;
@@ -552,12 +552,12 @@ export interface FcmPushPayload {
 }
 
 /* ------------------------------------------------------------------ */
-/* Shared opencode-wire helpers (opencode + kilo shims)                */
+/* Shared opencode-wire helpers (used by the kilo shim)                */
 /*                                                                     */
-/* kilo is an OpenCode fork, so both shims speak the same              */
-/* `/config/providers` catalog format and the same `provider/model` id */
-/* form. The logic is pure, synchronous and dependency-free, so it     */
-/* stays as portable as the type declarations above.                   */
+/* kilo is an OpenCode fork, so it speaks the same `/config/providers` */
+/* catalog format and the same `provider/model` id form OpenCode does. */
+/* The logic is pure, synchronous and dependency-free, so it stays as  */
+/* portable as the type declarations above.                            */
 /* ------------------------------------------------------------------ */
 /**
  * Flatten opencode's `GET /config/providers` catalog into `provider/model` ids

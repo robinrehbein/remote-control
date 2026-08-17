@@ -57,7 +57,6 @@ ist alles identisch zur Selfhost-Variante.
    laufen dort!). Auf dem Coolify-Server, im Repo:
    ```bash
    docker build -f server/Dockerfile         -t pocketagent/orchestrator:latest .   # Pflicht für den Gateway-Modus (siehe unten)
-   docker build -f shims/opencode/Dockerfile -t pocketagent/opencode-shim:latest .
    docker build -f shims/kilo/Dockerfile     -t pocketagent/kilo-shim:latest .
    docker build -f shims/claude/Dockerfile   -t pocketagent/claude-shim:latest .
    docker build -f shims/pi/Dockerfile       -t pocketagent/pi-shim:latest .

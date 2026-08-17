@@ -23,10 +23,22 @@ import kotlinx.serialization.json.put
 /* ------------------------------------------------------------------ */
 
 @Serializable
-enum class AgentMode { @SerialName("yolo") YOLO, @SerialName("auto") AUTO, @SerialName("acceptEdits") ACCEPT_EDITS, @SerialName("ask") ASK;
+enum class AgentMode {
+    @SerialName("yolo") YOLO, @SerialName("auto") AUTO, @SerialName("acceptEdits") ACCEPT_EDITS, @SerialName("ask") ASK,
+
+    /** Ein neuerer Server kennt einen Modus, den diese App-Version noch nicht kennt. */
+    @SerialName("unknown") UNKNOWN;
 
     companion object {
-        fun fromRaw(raw: String): AgentMode? = entries.firstOrNull { it.name.equals(raw, ignoreCase = true) }
+        // Explizite Zuordnung statt Namensvergleich: ACCEPT_EDITS vs. "acceptEdits"
+        // stimmen wegen des Unterstrichs nie überein, auch nicht ignoreCase.
+        fun fromRaw(raw: String): AgentMode = when (raw) {
+            "yolo" -> YOLO
+            "auto" -> AUTO
+            "acceptEdits" -> ACCEPT_EDITS
+            "ask" -> ASK
+            else -> UNKNOWN
+        }
     }
 }
 
@@ -98,12 +110,15 @@ enum class SessionStatus {
     @SerialName("running") RUNNING,
     @SerialName("idle") IDLE,
     @SerialName("stopped") STOPPED,
-    @SerialName("error") ERROR;
+    @SerialName("error") ERROR,
+
+    /** Ein neuerer Server kennt einen Status, den diese App-Version noch nicht kennt. */
+    @SerialName("unknown") UNKNOWN;
 
     companion object {
-        fun fromRaw(raw: String): SessionStatus? = when {
+        fun fromRaw(raw: String): SessionStatus = when {
             raw.equals("starting", ignoreCase = true) -> CREATING
-            else -> entries.firstOrNull { it.name.equals(raw, ignoreCase = true) }
+            else -> entries.firstOrNull { it.name.equals(raw, ignoreCase = true) } ?: UNKNOWN
         }
     }
 }
@@ -175,8 +190,12 @@ data class SessionInfo(
     val adapter: String,
     val provider: String,
     val model: String,
-    val mode: AgentMode,
-    val status: SessionStatus,
+    // Default statt Pflichtfeld: nur so kann coerceInputValues (ProtocolJson)
+    // einen unbekannten Enum-Wert eines neueren Servers auf UNKNOWN abbilden,
+    // statt beim Dekodieren zu werfen und die ganze Session zu verwerfen
+    // (Fund: unbekannte Enum-Werte lassen Sessions still verschwinden).
+    val mode: AgentMode = AgentMode.UNKNOWN,
+    val status: SessionStatus = SessionStatus.UNKNOWN,
     val branch: String,
     val createdAt: String,
     val lastActiveAt: String,
@@ -430,6 +449,11 @@ val ProtocolJson: Json = Json {
     ignoreUnknownKeys = true
     isLenient = true
     explicitNulls = false
+    // Zusammen mit den UNKNOWN-Fallback-Werten und Defaults auf mode/status:
+    // ein Enum-Wert eines neueren Servers, den diese Version nicht kennt,
+    // wird auf den Property-Default gemappt statt die Dekodierung (und damit
+    // die ganze Session) scheitern zu lassen.
+    coerceInputValues = true
 }
 
 private fun JsonObject.optString(key: String): String? =
@@ -447,7 +471,7 @@ fun parseAgentEvent(obj: JsonObject): AgentEvent? {
                 sessionRef = obj.optString("sessionRef"),
                 provider = obj.optString("provider"),
                 model = obj.optString("model"),
-                mode = AgentMode.fromRaw(obj.optString("mode") ?: "") ?: return null,
+                mode = AgentMode.fromRaw(obj.optString("mode") ?: ""),
                 busy = obj["busy"]?.jsonPrimitive?.booleanOrNullCompat() ?: false,
             )
 
@@ -591,7 +615,7 @@ fun parseServerMessage(raw: String): ServerMessage? {
 
             "session.status" -> ServerMessage.SessionStatusMsg(
                 sessionId = root.optString("sessionId") ?: return null,
-                status = SessionStatus.fromRaw(root.optString("status") ?: "") ?: return null,
+                status = SessionStatus.fromRaw(root.optString("status") ?: ""),
                 session = (root["session"] as? JsonObject)?.let {
                     runCatching { ProtocolJson.decodeFromJsonElement(SessionInfo.serializer(), it) }.getOrNull()
                 },
@@ -685,6 +709,11 @@ fun AgentMode.wireName(): String = when (this) {
     AgentMode.AUTO -> "auto"
     AgentMode.ACCEPT_EDITS -> "acceptEdits"
     AgentMode.ASK -> "ask"
+    // Nie ein Nutzer-gewählter Wert (UI bietet nur die vier oberen Modi an) —
+    // nur erreichbar, falls ein empfangener, unbekannter Modus je unverändert
+    // zurückgeschickt würde. Kein gültiger Vertragswert, aber besser als ein
+    // beim Compilieren erzwungener, irreführender Default wie "auto".
+    AgentMode.UNKNOWN -> "unknown"
 }
 
 fun encodeHello(deviceId: String, token: String): String = buildJsonObject {

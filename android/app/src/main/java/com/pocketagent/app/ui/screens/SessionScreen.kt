@@ -973,6 +973,8 @@ fun modeLabel(mode: AgentMode): String = when (mode) {
     AgentMode.ACCEPT_EDITS -> "Accept Edits"
     AgentMode.AUTO -> "Auto"
     AgentMode.YOLO -> "Yolo"
+    // Ein neuerer Server kennt einen Modus, den diese App-Version noch nicht kennt.
+    AgentMode.UNKNOWN -> "Unbekannt"
 }
 
 fun reasoningLabel(effort: ReasoningEffort?): String = when (effort) {

@@ -8,13 +8,17 @@ import com.pocketagent.app.data.ConnectivityWatcher
 import com.pocketagent.app.data.PairingApi
 import com.pocketagent.app.data.TokenStore
 import com.pocketagent.app.data.WsClient
+import com.pocketagent.app.fcm.PocketFcmService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 
 class AppContainer(app: Application, scope: CoroutineScope) {
     val tokenStore = TokenStore(app)
-    val pairingApi = PairingApi(PairingApi.default())
+    // Eigener, endlich getimter Client für den synchronen Pairing-HTTP-Call —
+    // PairingApi.default() ist auf den WebSocket getunt (readTimeout 0 =
+    // unendlich) und würde einen hängenden Reverse-Proxy nie abbrechen.
+    val pairingApi = PairingApi(PairingApi.httpClient())
     val wsClient = WsClient(PairingApi.default())
     val repository = AppRepository(wsClient, tokenStore, scope)
 
@@ -51,6 +55,11 @@ class PocketAgentApp : Application() {
         super.onCreate()
         container = AppContainer(this, appScope)
         initFirebase()
+        // Vor der ersten möglichen Push anlegen: kommt die App-Zustellung bei
+        // getötetem Prozess an, rendert ausschließlich das FCM-SDK selbst
+        // (unser Code läuft dann gar nicht) — ohne existierenden Kanal würde
+        // Android 8+ diese erste Notification kommentarlos verwerfen.
+        PocketFcmService.ensureChannel(this)
         container.repository.start()
         container.connectivity.attach()
     }

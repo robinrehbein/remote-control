@@ -113,12 +113,7 @@ services:
   # Wer sie hier vorbaut, muss ADAPTER_IMAGE_TAG=latest setzen, damit die
   # Sessions genau diese Tags benutzen (sonst gilt der Content-Hash-Tag).
   # Build all:  docker compose --profile shims build
-  # Rebuild one: docker compose --profile shims build --no-cache opencode-shim
-  opencode-shim:
-    profiles: ["shims"]
-    build: { context: ., dockerfile: shims/opencode/Dockerfile }
-    image: pocketagent/opencode-shim:latest
-    entrypoint: ["true"]
+  # Rebuild one: docker compose --profile shims build --no-cache kilo-shim
   kilo-shim:
     profiles: ["shims"]
     build: { context: ., dockerfile: shims/kilo/Dockerfile }

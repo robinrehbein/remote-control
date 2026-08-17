@@ -105,6 +105,16 @@ class WsClient(private val client: OkHttpClient) {
     @Synchronized
     private fun doConnect(url: String) {
         manualClose = false
+        // Ohne dieses Aufräumen kann ein zweiter Aufruf (z.B. eine fremde
+        // DataStore-Re-Emission, die tokens.setup erneut auslöst, während
+        // ein Waiting-Countdown läuft) den laufenden reconnectJob überleben
+        // lassen und einen alten, noch offenen Socket verwaisen: der Job
+        // überschreibt den Zustand am Ende seines Countdowns weiter und ruft
+        // selbst noch einmal connect() — zwei parallele Verbindungen sind die
+        // Folge (jedes Event doppelt, serverseitiges Verbindungslimit droht).
+        reconnectJob?.cancel()
+        reconnectJob = null
+        socket?.cancel()
         lastAttemptAt = System.currentTimeMillis()
         _state.value = ConnState.Connecting
         val request = Request.Builder().url(url).build()
@@ -126,11 +136,19 @@ class WsClient(private val client: OkHttpClient) {
      * Sofort neu verbinden, ohne den Backoff abzuwarten — für den Tap auf die
      * Statuszeile, den Wechsel in den Vordergrund und „Netz ist wieder da“.
      * Läuft bereits eine Verbindung, passiert nichts.
+     *
+     * [manual] unterscheidet den bewussten Nutzer-Tap von automatischen
+     * Auslösern (Netz zurück, Vordergrund): im Zustand [ConnState.Unauthorized]
+     * hat der Server das Gerät explizit abgelehnt — das ist keine Netzstörung,
+     * die von selbst wieder gut wird. Automatische Auslöser dürfen dort nicht
+     * erneut anklopfen, nur ein echter Tap darf es versuchen (z.B. nach
+     * erneutem Koppeln mit einem neuen Token).
      */
     @Synchronized
-    fun reconnectNow() {
+    fun reconnectNow(manual: Boolean = true) {
         if (wsUrl == null || credentials == null) return
         if (_state.value is ConnState.Connected || _state.value is ConnState.Connecting) return
+        if (!manual && _state.value is ConnState.Unauthorized) return
         // Mehrere Anstöße kurz hintereinander (zwei Netze werden gleichzeitig
         // verfügbar, dazu der Vordergrund-Wechsel) sind ein einziger Versuch.
         if (System.currentTimeMillis() - lastAttemptAt < MIN_ATTEMPT_GAP_MS) return
@@ -172,7 +190,7 @@ class WsClient(private val client: OkHttpClient) {
     fun onNetworkAvailable() {
         networkAvailable = true
         if (manualClose) return
-        reconnectNow()
+        reconnectNow(manual = false)
     }
 
     /** Android meldet, dass kein Netz mehr da ist. */
@@ -217,10 +235,34 @@ class WsClient(private val client: OkHttpClient) {
             handleDisconnect(webSocket, t.message ?: "Verbindung abgebrochen")
         }
 
+        /**
+         * OkHttp ruft [onClosed] nur auf, wenn der Client den Close-Handshake
+         * selbst abschliesst (also nach einem eigenen `close()`-Aufruf). Ein
+         * vom Server initiierter Close — genau der Fall bei Code 4001 — löst
+         * beim Client zunächst nur [onClosing] aus; ohne diese Überschreibung
+         * bliebe die Unauthorized-Erkennung toter Code (der Server-Close
+         * hängt, bis der nächste Ping-Timeout generisch retryt). Deshalb wird
+         * hier geprüft und bestätigt, statt auf [onClosed] zu warten.
+         */
+        override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+            if (isUnauthorizedClose(code, reason)) {
+                handleUnauthorized(webSocket)
+            }
+            // Handshake in jedem Fall abschliessen, damit OkHttp den Socket
+            // sauber beendet und (für den Nicht-Unauthorized-Fall) onClosed
+            // regulär nachläuft.
+            webSocket.close(code, null)
+        }
+
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
             // Der Server lehnt das Gerät endgültig ab (unbekanntes oder
             // entzogenes Token) — das ist kein Netzflackern, also gehört es
-            // nicht in den generischen Retry-Loop von handleDisconnect.
+            // nicht in den generischen Retry-Loop von handleDisconnect. Der
+            // Normalfall dafür läuft schon über onClosing (s.o.); dieser Zweig
+            // bleibt als zweite Absicherung stehen (z.B. wenn eine künftige
+            // OkHttp-Version doch direkt onClosed für einen Server-Close
+            // aufruft) — handleUnauthorized ignoriert einen bereits
+            // erledigten Socket über den Referenz-Check.
             if (isUnauthorizedClose(code, reason)) {
                 handleUnauthorized(webSocket)
                 return

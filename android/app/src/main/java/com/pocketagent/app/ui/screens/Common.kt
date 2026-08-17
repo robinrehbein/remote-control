@@ -110,8 +110,10 @@ fun statusColor(status: SessionStatus): Color {
         SessionStatus.RUNNING -> s.success
         SessionStatus.CREATING -> s.warning
         SessionStatus.ERROR -> MaterialTheme.colorScheme.error
-        // Idle and stopped are both "nothing is happening" — one quiet grey.
-        SessionStatus.IDLE, SessionStatus.STOPPED -> MaterialTheme.colorScheme.onSurfaceVariant
+        // Idle, stopped and an unrecognized future status are all "nothing to
+        // alarm about" — one quiet grey.
+        SessionStatus.IDLE, SessionStatus.STOPPED, SessionStatus.UNKNOWN ->
+            MaterialTheme.colorScheme.onSurfaceVariant
     }
 }
 
@@ -121,6 +123,9 @@ fun statusLabel(status: SessionStatus): String = when (status) {
     SessionStatus.IDLE -> "Bereit"
     SessionStatus.STOPPED -> "Gestoppt"
     SessionStatus.ERROR -> "Fehler"
+    // Ein neuerer Server kennt einen Status, den diese App-Version noch nicht
+    // versteht — die Session bleibt sichtbar statt kommentarlos zu verschwinden.
+    SessionStatus.UNKNOWN -> "Unbekannt"
 }
 
 /**

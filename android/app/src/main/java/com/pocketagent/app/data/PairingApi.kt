@@ -80,11 +80,28 @@ class PairingApi(private val client: OkHttpClient) {
          * ein Pong ausbleibt): mit 10s ist der schlimmste Fall ~20s statt
          * ~40s, und genau diese Lücke ist die als „ewig“ empfundene Zeit
          * zwischen Netzwechsel und Wiederanschluss.
+         *
+         * Nur für den WebSocket gedacht (daher `readTimeout(0)` — unendlich,
+         * eine offene Verbindung soll nie deswegen abreißen). Für gewöhnliche
+         * synchrone HTTP-Calls (Pairing) ist das falsch getunt: ein
+         * hängender Reverse-Proxy nach dem TCP-Connect würde diese Anfrage
+         * unbegrenzt blockieren. Dafür gibt es [httpClient].
          */
         fun default(): OkHttpClient = OkHttpClient.Builder()
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(0, TimeUnit.MILLISECONDS)
             .pingInterval(10, TimeUnit.SECONDS)
+            .build()
+
+        /**
+         * Für synchrone HTTP-Requests (aktuell nur [confirm]): endliche
+         * Timeouts, damit ein Server, der nach dem TCP-Connect nie antwortet,
+         * den Pairing-Screen nicht auf unbegrenzte Zeit im Ladezustand hält.
+         */
+        fun httpClient(): OkHttpClient = OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(20, TimeUnit.SECONDS)
+            .callTimeout(20, TimeUnit.SECONDS)
             .build()
     }
 }

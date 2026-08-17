@@ -1,5 +1,6 @@
 package com.pocketagent.app.data
 
+import com.google.firebase.messaging.FirebaseMessaging
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
@@ -67,6 +68,7 @@ class AppRepository(
     val tokenStore: TokenStore = tokens
 
     fun start() {
+        fetchFcmToken()
         scope.launch {
             tokens.setup.collect { setup ->
                 if (setup == null) {
@@ -467,7 +469,10 @@ class AppRepository(
         lastProbeAt = now
         scope.launch {
             if (ws.state.value !is WsClient.ConnState.Connected) {
-                ws.reconnectNow()
+                // Automatischer Auslöser (Netz/Vordergrund) — im Unauthorized-
+                // Zustand darf das nicht erneut anklopfen (Fund: kein
+                // Auto-Reconnect nach Server-Ablehnung).
+                ws.reconnectNow(manual = false)
                 return@launch
             }
             // Laut Zustand verbunden — das beweist nicht, dass der Socket
@@ -487,6 +492,25 @@ class AppRepository(
         fcmToken = token
         if (ws.state.value is WsClient.ConnState.Connected) {
             ws.send(encodeFcmRegister(token))
+        }
+    }
+
+    /**
+     * Aktiv abholen statt nur auf PocketFcmService.onNewToken zu warten — der
+     * feuert nur bei Erst-Generierung/Rotation. Ohne das bleibt [fcmToken]
+     * nach einem Prozess-Neustart zwischen Token-Generierung und Pairing oder
+     * nach einem Re-Pairing (neues Gerät, Server-Reset) leer, und der
+     * Connected-Hook oben registriert nie einen Token — Push bleibt still
+     * tot, bis FCM zufällig rotiert (kann praktisch nie passieren).
+     * Wird bei jedem Start aufgerufen (deckt auch Re-Pairing nach einem
+     * Prozess-Neustart ab); Fehler werden stillschweigend geschluckt, wenn
+     * Firebase nur mit Platzhaltern konfiguriert ist (PocketAgentApp.initFirebase).
+     */
+    private fun fetchFcmToken() {
+        runCatching {
+            FirebaseMessaging.getInstance().token
+                .addOnSuccessListener { token -> onFcmToken(token) }
+                .addOnFailureListener { /* kein Firebase / kein Netz — onNewToken holt es notfalls nach */ }
         }
     }
 

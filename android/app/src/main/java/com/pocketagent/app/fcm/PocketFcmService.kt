@@ -29,15 +29,7 @@ class PocketFcmService : FirebaseMessagingService() {
     }
 
     private fun showNotification(sessionId: String, title: String, body: String) {
-        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        manager.getNotificationChannel(CHANNEL_ID) ?: run {
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                getString(R.string.notification_channel_sessions),
-                NotificationManager.IMPORTANCE_HIGH,
-            )
-            manager.createNotificationChannel(channel)
-        }
+        ensureChannel(this)
 
         val deepLink = Uri.parse("pocketagent://session/$sessionId")
         val intent = Intent(this, MainActivity::class.java).apply {
@@ -61,10 +53,32 @@ class PocketFcmService : FirebaseMessagingService() {
             .setContentIntent(pendingIntent)
             .build()
 
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         manager.notify(sessionId.hashCode(), notification)
     }
 
     companion object {
         const val CHANNEL_ID = "sessions"
+
+        /**
+         * Wird sowohl hier (Nachricht kam bei laufendem Prozess an) als auch
+         * eager in PocketAgentApp.onCreate aufgerufen: der Kanal muss schon
+         * existieren, bevor die erste Push überhaupt eintrifft — sonst würde
+         * das manifestierte `default_notification_channel_id` (für den Fall,
+         * dass FCM je an onMessageReceived vorbei selbst rendert) auf einen
+         * nicht existierenden Kanal zeigen, und Android 8+ verwirft die
+         * Notification dann kommentarlos.
+         */
+        fun ensureChannel(context: Context) {
+            val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            manager.getNotificationChannel(CHANNEL_ID) ?: run {
+                val channel = NotificationChannel(
+                    CHANNEL_ID,
+                    context.getString(R.string.notification_channel_sessions),
+                    NotificationManager.IMPORTANCE_HIGH,
+                )
+                manager.createNotificationChannel(channel)
+            }
+        }
     }
 }

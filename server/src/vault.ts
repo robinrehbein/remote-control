@@ -54,6 +54,14 @@ export function decryptStrict(enc: Encrypted, aad?: string): string {
  * Decrypt with optional AAD. When `aad` is provided and verification fails,
  * retry once WITHOUT aad: rows written before AAD binding was introduced have
  * no AAD; returning normally lets the caller transparently re-encrypt them.
+ *
+ * Both writers of secret rows (ws.ts `secret.set` and secrets-api.ts
+ * `saveSecretValue`) now always encrypt with AAD, so no *new* AAD-less row
+ * can be created any more - this fallback exists only to heal rows that
+ * predate that change (or were written directly against the DB). Do not
+ * widen it into a general "AAD is optional" path; once every legacy row has
+ * been touched once by Store.getSecretValue's transparent re-encrypt, it can
+ * be removed.
  */
 export function decrypt(enc: Encrypted, aad?: string): string {
   if (aad === undefined) return cryptBack(enc, undefined);

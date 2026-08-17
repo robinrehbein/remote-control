@@ -264,6 +264,8 @@ function flushQueuedEvents(): void {
 }
 
 let backoff = 1000;
+/** Cooldown after being displaced by another link agent (close 4000 'replaced'). */
+const REPLACED_RETRY_MS = 5 * 60_000;
 
 function dial(): void {
   if (stopped) return;
@@ -305,9 +307,22 @@ function dial(): void {
       shutdown(0);
     }
   });
-  sock.on('close', () => {
+  sock.on('close', (code, reason) => {
     if (stopped) return;
     sessionId = null;
+    // Another process registered with the same link token and displaced us.
+    // Redialing immediately would start a replace war (each side kicking the
+    // other, the session flapping stopped/idle in the app), so back off long
+    // enough that the misconfiguration becomes visible in this process's log
+    // instead of manifesting as "connection keeps dropping".
+    if (code === 4000 && String(reason) === 'replaced') {
+      log(
+        'displaced by another link agent using the same PA_TOKEN - retrying in 5 min. ' +
+          'Stop the other process or give each checkout its own token.',
+      );
+      setTimeout(() => dial(), REPLACED_RETRY_MS);
+      return;
+    }
     log(`connection lost - retrying in ${Math.round(backoff / 1000)}s`);
     setTimeout(() => dial(), backoff);
     backoff = Math.min(backoff * 2, 30_000);

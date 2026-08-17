@@ -190,6 +190,13 @@ data class SessionInfo(
     val title: String? = null,
     /** Aus der Hauptliste ausgeblendet. Fehlt das Feld, ist die Session aktiv. */
     val archived: Boolean = false,
+    /**
+     * Link-Session: der Agent läuft auf dem eigenen Rechner (outbound WS,
+     * kein Container). „Gestoppt“ heißt hier: der Agenten-Host ist gerade
+     * offline — nicht, dass jemand die Session angehalten hat.
+     * Fehlt das Feld (alter Server), ist es keine Link-Session.
+     */
+    val linked: Boolean = false,
 )
 
 @Serializable

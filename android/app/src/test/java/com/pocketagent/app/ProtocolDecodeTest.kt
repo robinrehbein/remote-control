@@ -496,6 +496,38 @@ class ProtocolDecodeTest {
         assertFalse(sessions[1].archived)
     }
 
+    /* -------------------- Link-Sessions -------------------- */
+
+    @Test
+    fun `decodes the linked flag and defaults it to false`() {
+        val msg = parseServerMessage(
+            """
+            {
+              "type": "session.list",
+              "requestId": "req-l",
+              "sessions": [
+                {
+                  "id": "s1", "repoId": "", "repoFullName": "link:devbox (/work/app)",
+                  "adapter": "opencode", "provider": "", "model": "",
+                  "mode": "ask", "status": "stopped", "branch": "local",
+                  "createdAt": "2026-01-01T10:00:00Z", "lastActiveAt": "2026-01-01T11:00:00Z",
+                  "linked": true
+                },
+                {
+                  "id": "s2", "repoId": "r1", "adapter": "claude", "provider": "anthropic",
+                  "model": "", "mode": "auto", "status": "idle", "branch": "agent/s2",
+                  "createdAt": "2026-01-01T10:00:00Z", "lastActiveAt": "2026-01-01T11:00:00Z"
+                }
+              ]
+            }
+            """.trimIndent(),
+        )
+        val sessions = (msg as ServerMessage.SessionListMsg).sessions
+        assertTrue(sessions[0].linked)
+        // Alter Server ohne das Feld: keine Link-Session
+        assertFalse(sessions[1].linked)
+    }
+
     /* -------------------- Neue Client-Nachrichten -------------------- */
 
     @Test

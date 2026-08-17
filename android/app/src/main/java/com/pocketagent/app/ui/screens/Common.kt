@@ -123,6 +123,34 @@ fun statusLabel(status: SessionStatus): String = when (status) {
     SessionStatus.ERROR -> "Fehler"
 }
 
+/**
+ * Status-Text mit Blick für Link-Sessions: „gestoppt“ hieße dort, jemand
+ * hätte die Session angehalten — in Wahrheit ist nur der Agenten-Host
+ * gerade nicht verbunden. Ein eigener Begriff sagt das, ohne einen neuen
+ * Session-Status zu erfinden.
+ */
+fun sessionStatusLabel(session: com.pocketagent.app.data.SessionInfo): String =
+    if (session.linked && session.status == SessionStatus.STOPPED) "Host offline" else statusLabel(session.status)
+
+/** Farbe zum sessionbewussten Status-Text (siehe [sessionStatusLabel]). */
+@Composable
+fun sessionStatusColor(session: com.pocketagent.app.data.SessionInfo): Color {
+    if (session.linked && session.status == SessionStatus.STOPPED) return semantic().warning
+    return statusColor(session.status)
+}
+
+/** Tinted pill for list rows, aware of link sessions (see [sessionStatusLabel]). */
+@Composable
+fun SessionStatusBadge(session: com.pocketagent.app.data.SessionInfo, modifier: Modifier = Modifier) {
+    DotLabel(
+        color = sessionStatusColor(session),
+        label = sessionStatusLabel(session),
+        modifier = modifier,
+        pulse = session.status.isLive(),
+        tinted = true,
+    )
+}
+
 /** True while the session is doing something — the only case that earns motion. */
 fun SessionStatus.isLive(): Boolean =
     this == SessionStatus.RUNNING || this == SessionStatus.CREATING
@@ -186,27 +214,16 @@ fun DotLabel(
     }
 }
 
-/** Tinted pill for list rows. */
-@Composable
-fun StatusBadge(status: SessionStatus, modifier: Modifier = Modifier) {
-    DotLabel(
-        color = statusColor(status),
-        label = statusLabel(status),
-        modifier = modifier,
-        pulse = status.isLive(),
-        tinted = true,
-    )
-}
-
 /**
  * Untinted one-liner for app-bar subtitles: colored dot, then the status
- * and any facts worth carrying, separated by middots.
+ * and any facts worth carrying, separated by middots. Link-aware: der erste
+ * Begriff kommt aus [sessionStatusLabel].
  */
 @Composable
-fun StatusLine(status: SessionStatus, details: List<String>, modifier: Modifier = Modifier) {
-    val text = (listOf(statusLabel(status)) + details.filter { it.isNotBlank() }).joinToString(" · ")
+fun StatusLine(session: com.pocketagent.app.data.SessionInfo, details: List<String>, modifier: Modifier = Modifier) {
+    val text = (listOf(sessionStatusLabel(session)) + details.filter { it.isNotBlank() }).joinToString(" · ")
     Row(verticalAlignment = Alignment.CenterVertically, modifier = modifier) {
-        PulsingDot(color = statusColor(status), pulse = status.isLive(), size = 6.dp)
+        PulsingDot(color = sessionStatusColor(session), pulse = session.status.isLive(), size = 6.dp)
         Spacer(modifier = Modifier.width(6.dp))
         Text(
             text = text,

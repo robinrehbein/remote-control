@@ -72,6 +72,7 @@ import com.pocketagent.app.data.AgentMode
 import com.pocketagent.app.data.AppRepository
 import com.pocketagent.app.data.ReasoningEffort
 import com.pocketagent.app.data.RepoInfo
+import com.pocketagent.app.data.WsClient
 import com.pocketagent.app.ui.theme.CardInset
 import com.pocketagent.app.ui.theme.ChipSpacing
 import com.pocketagent.app.ui.theme.ComposerHeight
@@ -221,9 +222,10 @@ class NewSessionViewModel : ViewModel() {
         }
         _state.value = s.copy(busy = true, error = null)
         viewModelScope.launch {
-            // Vorher merken, was es schon gibt: so ist die neue Session die,
-            // die vorher nicht da war — und nicht irgendeine mit demselben
-            // Repo und Agenten.
+            // Vorher merken, was es schon gibt: Fällt die Id aus der
+            // Bestätigung weg (alter Server), ist die neue Session die, die
+            // vorher nicht da war — und nicht irgendeine mit demselben Repo
+            // und Agenten.
             val known = repository.sessions.value.map { it.id }.toSet()
             val result = repository.createSession(
                 repoId = repoId,
@@ -237,6 +239,11 @@ class NewSessionViewModel : ViewModel() {
             val failure = result.exceptionOrNull()
             if (failure != null) {
                 _state.value = _state.value.copy(busy = false, error = failure.message ?: "Fehler")
+                return@launch
+            }
+            // Der reguläre Weg: die Bestätigung nennt die Id der neuen Session.
+            result.getOrNull()?.let { sessionId ->
+                finish(sessionId)
                 return@launch
             }
             val matching = repository.sessions.value.filter { sess ->
@@ -448,6 +455,13 @@ fun NewSessionScreen(
     val repos by repository.repos.collectAsState()
     val adapters by repository.adapters.collectAsState()
     val secrets by repository.secrets.collectAsState()
+    val connState by repository.connState.collectAsState()
+
+    // Ohne Verbindung kann der Startknopf sein Versprechen nicht halten —
+    // „Session starten“, das dann nach 15 Sekunden in „Keine Verbindung“
+    // endet, ist schlechter als ein ehrlich deaktivierter Knopf plus die
+    // Verbindungszeile, die sagt, was gerade los ist (und neu verbindet).
+    val connected = connState is WsClient.ConnState.Connected
 
     // Halb getippter Repo-Name oder ein offenes Sheet darf ein Falten/Drehen
     // nicht verlieren — genau der Fall, den die One-UI-Foldable-Richtlinie
@@ -514,7 +528,7 @@ fun NewSessionScreen(
                     )
                     Button(
                         onClick = { vm.create() },
-                        enabled = !state.busy && state.repoId != null,
+                        enabled = !state.busy && state.repoId != null && connected,
                         shape = PillShape,
                         modifier = Modifier
                             .fillMaxWidth()
@@ -535,6 +549,7 @@ fun NewSessionScreen(
                         Text(
                             text = when {
                                 state.busy -> "Session startet …"
+                                !connected -> "Warte auf Verbindung …"
                                 // Die Session steht schon; ein zweiter Tap
                                 // holt nur nach, was nicht durchkam.
                                 state.pendingSessionId != null -> "Erneut versuchen"
@@ -553,6 +568,16 @@ fun NewSessionScreen(
                 .padding(padding)
                 .verticalScroll(rememberScrollState()),
         ) {
+            // Dieselbe ehrliche Verbindungszeile wie auf der Liste — hier
+            // steht sie direkt über dem, was sie betrifft: den Startknopf.
+            AnimatedVisibility(
+                visible = !connected,
+                enter = fadeIn(),
+                exit = fadeOut(),
+            ) {
+                ConnectionLine(state = connState, onReconnect = { repository.reconnectNow() })
+            }
+
             /* -------- Chip-Zeile -------- */
             // Jede Einstellung ist ein Chip: der Wert steht drauf, die Auswahl
             // steckt im Sheet. Vier Listen à sechs Zeilen werden so zu zwei

@@ -1213,6 +1213,17 @@ async function main(): Promise<void> {
   assert(created.type === 'request.ok', 'session.create -> request.ok immediately');
   const sessionId = (created.payload as { sessionId?: string } | undefined)?.sessionId;
   assert(typeof sessionId === 'string' && sessionId.length > 0, 'request.ok carries sessionId');
+
+  // The new session is announced the moment it exists (status 'creating'),
+  // so clients can insert it by id instead of diffing the session list.
+  const creatingStatus = await c2.wait(
+    (m) => m.type === 'session.status' && m.sessionId === sessionId && m.status === 'creating',
+    5_000,
+  );
+  assert(
+    creatingStatus.type === 'session.status' && creatingStatus.session !== undefined,
+    'session.create broadcasts the new session immediately',
+  );
   const errorStatus = await c2.wait(
     (m) => m.type === 'session.status' && m.sessionId === sessionId && m.status === 'error',
     20_000,

@@ -518,7 +518,7 @@ fun SessionScreen(
                         // hier hinein — sonst stünde es nirgends mehr.
                         session?.let { s ->
                             StatusLine(
-                                status = s.status,
+                                session = s,
                                 details = listOfNotNull(
                                     sessionSubtitle(s),
                                     adapterLabel(adapters, s.adapter),

@@ -99,6 +99,11 @@ class NewSessionViewModel : ViewModel() {
         val repoId: String? = null,
         val adapter: String = "",
         val provider: String = "",
+        /**
+         * Hat der Nutzer den Zugang selbst gewählt? Nur dann darf die
+         * Vorauswahl ihn nicht mehr überschreiben, wenn Zugänge nachladen.
+         */
+        val providerTouched: Boolean = false,
         val model: String = "",
         val reasoning: ReasoningEffort? = null,
         val mode: AgentMode = AgentMode.AUTO,
@@ -128,19 +133,37 @@ class NewSessionViewModel : ViewModel() {
         _state.value = _state.value.copy(prompt = text)
     }
 
-    fun syncAdapterDefaults(adapters: List<AdapterDescriptor>) {
+    /**
+     * Erstauswahl und Nachziehen der Vorauswahl.
+     *
+     * Die Zugänge kommen asynchron nach. Solange der Nutzer selbst keinen
+     * gewählt hat, darf die Vorauswahl sich noch korrigieren — sonst bliebe
+     * ein Provider ohne Zugang stehen, nur weil die Liste der Zugänge einen
+     * Wimpernschlag später eintraf.
+     */
+    fun syncAdapterDefaults(adapters: List<AdapterDescriptor>, secretKinds: Set<String>) {
+        if (adapters.isEmpty()) return
         val s = _state.value
-        if (s.adapter.isBlank() && adapters.isNotEmpty()) {
+        if (s.adapter.isBlank()) {
             val first = adapters.first()
-            _state.value = s.copy(adapter = first.id, provider = defaultProviderFor(first))
+            _state.value = s.copy(
+                adapter = first.id,
+                provider = preselectedProvider(first, secretKinds),
+            )
+            return
         }
+        if (s.providerTouched || s.provider in secretKinds) return
+        val current = adapters.firstOrNull { it.id == s.adapter } ?: return
+        val better = preselectedProvider(current, secretKinds)
+        if (better != s.provider) _state.value = s.copy(provider = better)
     }
 
     /** Agentwechsel setzt Zugang und Modell auf den Standard des Adapters zurück. */
-    fun onAdapterSelected(adapter: AdapterDescriptor) {
+    fun onAdapterSelected(adapter: AdapterDescriptor, secretKinds: Set<String>) {
         _state.value = _state.value.copy(
             adapter = adapter.id,
-            provider = defaultProviderFor(adapter),
+            provider = preselectedProvider(adapter, secretKinds),
+            providerTouched = false,
             model = "",
             // Kann der neue Agent kein Reasoning, ist eine gewählte Stufe
             // gegenstandslos — sie darf nicht unsichtbar weiterwirken.
@@ -152,13 +175,12 @@ class NewSessionViewModel : ViewModel() {
     fun onModelPicked(provider: String, model: String, reasoning: ReasoningEffort?) {
         _state.value = _state.value.copy(
             provider = provider.trim(),
+            providerTouched = true,
             model = model.trim(),
             reasoning = reasoning,
         )
     }
 
-    private fun defaultProviderFor(adapter: AdapterDescriptor): String =
-        adapter.defaults.provider.ifBlank { adapter.providerEnv.keys.firstOrNull().orEmpty() }
 
     fun addRepo(fullName: String, defaultBranch: String) {
         viewModelScope.launch {
@@ -331,6 +353,27 @@ private fun orderedProviderKeys(descriptor: AdapterDescriptor): List<String> {
 }
 
 /**
+ * Welcher Zugang beim Anlegen vorgewählt wird.
+ *
+ * Der Server spielt nur den Schlüssel des **einen** gewählten Providers in
+ * den Container (`sessions.ts`: `providerEnv[row.provider]`). Ein Provider,
+ * für den kein Zugang hinterlegt ist, führt damit zu einer Session, die ohne
+ * Schlüssel startet — auch wenn für einen anderen Provider desselben Agenten
+ * längst einer da ist. Genau das passierte bei pi: das Manifest nennt
+ * `openai` als Default, hinterlegt war aber Z.AI, und im Container fehlte
+ * `ZAI_API_KEY`.
+ *
+ * Ein vorhandener Zugang schlägt deshalb den Default aus dem Manifest. Die
+ * Reihenfolge bleibt sonst die des Manifests, damit die Wahl vorhersagbar
+ * ist; gibt es nirgends einen Zugang, bleibt es beim Default.
+ */
+fun preselectedProvider(adapter: AdapterDescriptor, secretKinds: Set<String>): String {
+    val ordered = orderedProviderKeys(adapter)
+    return ordered.firstOrNull { it in secretKinds }
+        ?: adapter.defaults.provider.ifBlank { ordered.firstOrNull().orEmpty() }
+}
+
+/**
  * True when a usable secret for this adapter exists (card-level status).
  * Auch der Agent-Wechsel im SessionScreen fragt hierüber.
  */
@@ -412,13 +455,17 @@ fun NewSessionScreen(
     var showAddRepo by rememberSaveable { mutableStateOf(false) }
     var sheet by rememberSaveable(stateSaver = NewSessionSheetSaver) { mutableStateOf<NewSessionSheet?>(null) }
 
+    // Vor den Effekten: die Vorauswahl des Zugangs hängt davon ab, welche
+    // Zugänge es gibt, und die laden asynchron nach.
+    val secretKinds = remember(secrets) { secrets.map { it.kind }.toSet() }
+
     LaunchedEffect(Unit) {
         repository.refreshRepos()
         repository.refreshSessions()
         repository.refreshAdapters()
         repository.loadSecrets()
     }
-    LaunchedEffect(adapters) { vm.syncAdapterDefaults(adapters) }
+    LaunchedEffect(adapters, secretKinds) { vm.syncAdapterDefaults(adapters, secretKinds) }
     LaunchedEffect(state.createdSessionId) { state.createdSessionId?.let { onCreated(it) } }
     LaunchedEffect(repos) {
         if (repos.isNotEmpty() && state.repoId == null && repos.none { it.id == state.repoId }) {
@@ -426,7 +473,6 @@ fun NewSessionScreen(
         }
     }
 
-    val secretKinds = remember(secrets) { secrets.map { it.kind }.toSet() }
     val selectedDescriptor = adapters.firstOrNull { it.id == state.adapter }
     val accessMissing = state.provider.trim().let { it.isNotBlank() && it !in secretKinds }
 
@@ -613,7 +659,7 @@ fun NewSessionScreen(
                 secretKinds = secretKinds,
                 compact = false,
                 onPick = { id ->
-                    adapters.firstOrNull { it.id == id }?.let { vm.onAdapterSelected(it) }
+                    adapters.firstOrNull { it.id == id }?.let { vm.onAdapterSelected(it, secretKinds) }
                     sheet = null
                 },
             )

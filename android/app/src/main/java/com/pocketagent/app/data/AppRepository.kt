@@ -83,6 +83,23 @@ class AppRepository(
     private val _lastError = MutableStateFlow<String?>(null)
     val lastError: StateFlow<String?> = _lastError
 
+    /**
+     * In-App-Login-Ereignisse (auth.url/auth.done, CODEX-OAUTH.md). Passt nicht
+     * ins Request/Response-Muster von [pending] — es ist ein mehrstufiger
+     * Austausch (start → url → callback → done) —, deshalb ein eigener Fluss,
+     * den [CodexOAuthController] nach requestId filtert.
+     */
+    private val _authEvents = MutableSharedFlow<CodexAuthEvent>(
+        // Kleiner Replay-Puffer: der Controller abonniert per scope.launch (mit
+        // Dispatch-Verzögerung), das erste auth.url könnte sonst vor dem Abo
+        // eintreffen. Replay ist gefahrlos — der Controller filtert nach der pro
+        // Flow eindeutigen requestId, alte Ereignisse passen nie.
+        replay = 4,
+        extraBufferCapacity = 16,
+        onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST,
+    )
+    val authEvents: SharedFlow<CodexAuthEvent> = _authEvents
+
     private val pending = ConcurrentHashMap<String, CompletableDeferred<ServerMessage>>()
 
     @Volatile
@@ -211,6 +228,15 @@ class AppRepository(
             is ServerMessage.ErrorMsg -> {
                 _lastError.value = msg.message
                 msg.requestId?.let { completePending(it, msg) }
+            }
+
+            is ServerMessage.AuthUrlMsg -> _authEvents.tryEmit(
+                CodexAuthEvent.Url(msg.requestId, msg.url, msg.port, msg.flow, msg.userCode),
+            )
+
+            is ServerMessage.AuthDoneMsg -> {
+                _authEvents.tryEmit(CodexAuthEvent.Done(msg.requestId, msg.ok, msg.account, msg.error))
+                if (msg.ok) scope.launch { refreshSecretsQuiet() }
             }
 
             is ServerMessage.RequestOk -> completePending(msg.requestId, msg)
@@ -516,6 +542,20 @@ class AppRepository(
 
     suspend fun deleteSecret(id: String): Boolean =
         request { requestId -> encodeSecretDelete(requestId, id) } is ServerMessage.SecretDeletedMsg
+
+    /* ---------------- In-App-Login (CODEX-OAUTH.md) ---------------- */
+
+    /** Startet einen Codex-Login; die Antworten kommen als [authEvents]. */
+    fun startCodexAuth(requestId: String, flow: String?): Boolean =
+        ws.send(encodeAuthStart(requestId, "codex", flow))
+
+    /** Reicht den abgefangenen Loopback-Callback (code+state) durch. */
+    fun sendAuthCallback(requestId: String, code: String, state: String): Boolean =
+        ws.send(encodeAuthCallback(requestId, code, state))
+
+    /** Bricht einen laufenden Login-Flow ab. */
+    fun cancelCodexAuth(requestId: String): Boolean =
+        ws.send(encodeAuthCancel(requestId))
 
     suspend fun addRepo(fullName: String, defaultBranch: String): Result<RepoInfo> {
         val response = request { id -> encodeRepoAdd(id, fullName, defaultBranch) }

@@ -10,7 +10,8 @@ import { Heartbeat, Hub, registerWs } from './ws.js';
 import { confirmPairing, generatePairingCode, adminTokenOk, SlidingWindowRateLimiter } from './pairing.js';
 import { registerSecretsApi } from './secrets-api.js';
 import { startEgressProxy } from './egress-proxy.js';
-import { setEgressSessionProvider } from './docker.js';
+import { DockerCodexAuthTransport, setEgressSessionProvider } from './docker.js';
+import { CodexAuthManager, type CodexAuthTransport } from './codex-auth.js';
 
 export interface App {
   app: ReturnType<typeof Fastify>;
@@ -18,6 +19,16 @@ export interface App {
   manager: SessionManager;
   hub: Hub;
   heartbeat: Heartbeat;
+  codexAuth: CodexAuthManager;
+}
+
+export interface BuildAppOptions {
+  /**
+   * Override the codex auth transport (CODEX-OAUTH.md). Defaults to the
+   * docker-backed one; the smoke test injects a fake app-server transport so
+   * the whole auth.* WS flow runs without a daemon or the real codex binary.
+   */
+  codexAuthTransport?: CodexAuthTransport;
 }
 
 /** Security audit line (stdout-warn JSON; never log full pairing codes or tokens). */
@@ -25,7 +36,7 @@ export function auditWarn(kind: string, fields: Record<string, unknown>): void {
   console.warn(JSON.stringify({ ts: new Date().toISOString(), ev: 'auth.fail', kind, ...fields }));
 }
 
-export async function buildApp(): Promise<App> {
+export async function buildApp(options: BuildAppOptions = {}): Promise<App> {
   // trustProxy: only honour X-Forwarded-For when TRUST_PROXY=1 (behind
   // Coolify/Traefik) - it makes req.ip (WS conn cap, pairing rate limiter)
   // resolve the real client instead of the proxy's single shared address.
@@ -80,9 +91,13 @@ export async function buildApp(): Promise<App> {
 
   registerSecretsApi(app, store);
 
+  // In-app codex OAuth (CODEX-OAUTH.md): drives `codex app-server` login in a
+  // short-lived auth container and backs the resulting auth.json up to the vault.
+  const codexAuth = new CodexAuthManager(store, options.codexAuthTransport ?? new DockerCodexAuthTransport());
+
   // maxPayload: reject WS frames larger than 1 MiB at the protocol level.
   await app.register(websocket, { options: { maxPayload: 1048576 } });
-  registerWs(app, store, manager, hub, heartbeat);
+  registerWs(app, store, manager, hub, heartbeat, codexAuth);
 
   // A redeploy starts a fresh orchestrator container next to the still running
   // session containers: reconnect it to their networks and event streams.
@@ -91,7 +106,7 @@ export async function buildApp(): Promise<App> {
     console.error(`[orchestrator] session reconcile failed: ${e instanceof Error ? e.message : String(e)}`);
   });
 
-  return { app, store, manager, hub, heartbeat };
+  return { app, store, manager, hub, heartbeat, codexAuth };
 }
 
 export async function main(): Promise<void> {

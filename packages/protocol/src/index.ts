@@ -96,7 +96,40 @@ export interface AdapterDescriptor {
    * table then.
    */
   providers?: ProviderDescriptor[];
+  /**
+   * How a user signs this adapter in, declared by the manifest so the app can
+   * render the right login affordance generically instead of hard-coding a
+   * per-adapter table (CODEX-OAUTH.md §5). Absent on older manifests — the app
+   * then offers only the plain secret-paste flow it always had.
+   */
+  authFlows?: AuthFlow[];
   defaults: { provider: string; model?: string };
+}
+
+/**
+ * One sign-in method an adapter supports (AdapterDescriptor.authFlows):
+ *  - `oauth-loopback`: browser login whose provider redirects to a localhost
+ *    callback (codex: 127.0.0.1:1455, fallback 1457). `ports` lists the ports
+ *    the provider's redirect allowlist permits; the app opens the auth URL and
+ *    runs a matching loopback listener (see the `auth.*` messages below).
+ *  - `device-code`: the provider shows a verification URL + a short user code
+ *    the user enters on any device; no loopback listener needed.
+ *  - `token-paste`: the user pastes a long-lived token from a CLI (`hint`
+ *    names it, e.g. "claude setup-token").
+ *  - `api-key`: a plain provider API key (`keyUrl` links the create-key page).
+ * The type stays open so a new flow needs no protocol change; an app that does
+ * not know a type simply skips it.
+ */
+export type AuthFlowType = 'oauth-loopback' | 'device-code' | 'token-paste' | 'api-key' | (string & {});
+
+export interface AuthFlow {
+  type: AuthFlowType;
+  /** oauth-loopback: the localhost ports the provider's redirect allowlist permits. */
+  ports?: number[];
+  /** token-paste: names the CLI command that mints the token. */
+  hint?: string;
+  /** api-key: page where the user creates/copies the key. */
+  keyUrl?: string;
 }
 
 export type AgentMode = 'yolo' | 'auto' | 'acceptEdits' | 'ask';
@@ -184,6 +217,14 @@ export type SecretKind =
   | 'anthropic'
   | 'github'
   | 'claude_oauth'
+  /**
+   * ChatGPT OAuth backup for codex (CODEX-OAUTH.md §4). The canonical copy of
+   * codex `auth.json` lives in the shared CODEX_HOME volume; this vault entry
+   * is an encrypted backup so a volume loss does not force a re-login. The
+   * refresh token rotates and is single-use, so a *stale* backup may already be
+   * dead — validate on restore and re-login if needed.
+   */
+  | 'codex_oauth'
   | 'junie'
   | (string & {});
 
@@ -641,6 +682,25 @@ export type ClientMessage =
   | { type: 'secret.validate'; requestId: string; kind: SecretKind; value: string }
   | { type: 'secret.list'; requestId: string }
   | { type: 'secret.delete'; requestId: string; id: string }
+  /**
+   * Start an in-app browser/device sign-in for an adapter (CODEX-OAUTH.md
+   * Variante A). The orchestrator starts a short-lived auth container, drives
+   * the runtime's login (codex `login_chatgpt`), and answers with `auth.url`.
+   * `flow` selects the manifest `AuthFlow.type` to use (default: the adapter's
+   * first oauth-loopback flow, falling back to device-code). `requestId`
+   * correlates the whole exchange (`auth.url`/`auth.callback`/`auth.done`).
+   */
+  | { type: 'auth.start'; requestId: string; adapter: AdapterId; flow?: AuthFlowType }
+  /**
+   * Forward a loopback OAuth callback the app captured (browser redirected to
+   * `http://localhost:<port>/auth/callback?code&state` on the phone) to the
+   * login server inside the auth container. The orchestrator never inspects
+   * `code`/`state` — the runtime's own login server validates the state. They
+   * are single-use and travel over the already device-authenticated WSS.
+   */
+  | { type: 'auth.callback'; requestId: string; code: string; state: string }
+  /** Abort an in-flight auth flow (app closed the sheet / user cancelled). */
+  | { type: 'auth.cancel'; requestId: string }
   | { type: 'device.list'; requestId: string }
   | { type: 'device.revoke'; requestId: string; deviceId: string }
   | { type: 'link.list'; requestId: string }
@@ -712,6 +772,21 @@ export type ServerMessage =
       unverified?: boolean;
     }
   | { type: 'secret.deleted'; requestId: string; id: string }
+  /**
+   * Answer to `auth.start`: the runtime's login URL to open in the browser and
+   * the loopback `port` its redirect will target — the app must run its
+   * loopback listener on exactly this port (codex binds 1455, fallback 1457,
+   * and the server reports whichever it actually got). For a `device-code`
+   * flow `userCode` carries the code to show and `port` is 0 (no listener).
+   */
+  | { type: 'auth.url'; requestId: string; url: string; port: number; flow?: AuthFlowType; userCode?: string }
+  /**
+   * Terminal result of an auth flow. `ok` with an optional `account` label
+   * (e.g. "ChatGPT Plus, user@example.com") on success; `error` describes the
+   * failure otherwise. After `ok` the orchestrator has written the vault backup
+   * (secret kind `codex_oauth`) from the shared CODEX_HOME volume.
+   */
+  | { type: 'auth.done'; requestId: string; ok: boolean; account?: string; error?: string }
   | { type: 'device.list'; requestId: string; devices: DeviceInfo[] }
   | { type: 'device.revoked'; requestId: string; deviceId: string }
   | { type: 'link.list'; requestId: string; links: LinkInfo[] }

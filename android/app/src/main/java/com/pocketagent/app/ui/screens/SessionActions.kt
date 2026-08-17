@@ -109,12 +109,27 @@ fun sessionActionLabel(action: SessionAction): String = when (action) {
 
 /**
  * Der Text unter dem Menüeintrag, wo eine Erklärung nötig ist. Alles
- * andere erklärt sich selbst und bleibt einzeilig.
+ * andere erklärt sich selbst und bleibt einzeilig. Für Link-Sessions sagen
+ * die Erklärungen, was auf dem Agenten-Host passiert — „Container“ gäbe es
+ * dort nicht.
  */
-fun sessionActionNote(action: SessionAction): String? = when (action) {
-    SessionAction.ARCHIVE -> "Container wird gestoppt, der Arbeitsstand bleibt erhalten"
-    SessionAction.UNARCHIVE -> "Zurück in die Liste; Fortsetzen startet den Container neu"
-    SessionAction.STOP -> "Der Container wird beendet; Fortsetzen startet ihn neu"
+fun sessionActionNote(action: SessionAction, session: SessionInfo): String? = when (action) {
+    SessionAction.ARCHIVE ->
+        if (session.linked) "Der Agent auf dem Host läuft weiter"
+        else "Container wird gestoppt, der Arbeitsstand bleibt erhalten"
+
+    SessionAction.UNARCHIVE ->
+        if (session.linked) "Zurück in die Liste"
+        else "Zurück in die Liste; Fortsetzen startet den Container neu"
+
+    SessionAction.STOP ->
+        if (session.linked) "Beendet den Agenten-Prozess auf dem Host – dort neu starten"
+        else "Der Container wird beendet; Fortsetzen startet ihn neu"
+
+    SessionAction.RESUME ->
+        if (session.linked) "Klappt erst, wenn der Agenten-Host wieder verbunden ist"
+        else null
+
     SessionAction.DELETE -> "Endgültig – mit Verlauf und Arbeitsstand"
     else -> null
 }

@@ -583,7 +583,7 @@ private fun SessionCard(
                     )
                 }
                 Spacer(modifier = Modifier.width(10.dp))
-                StatusBadge(status = session.status)
+                SessionStatusBadge(session = session)
             }
             Row(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -681,7 +681,7 @@ private fun SessionActionSheet(
             Column {
                 sessionActions(session).forEachIndexed { index, action ->
                     if (index > 0) ListDivider(startInset = SheetRowDividerInset)
-                    SessionActionRow(action = action, onClick = { onAction(action) })
+                    SessionActionRow(action = action, session = session, onClick = { onAction(action) })
                 }
             }
         }
@@ -689,14 +689,14 @@ private fun SessionActionSheet(
 }
 
 @Composable
-private fun SessionActionRow(action: SessionAction, onClick: () -> Unit) {
+private fun SessionActionRow(action: SessionAction, session: SessionInfo, onClick: () -> Unit) {
     val destructive = action == SessionAction.DELETE
     val tint = if (destructive) {
         MaterialTheme.colorScheme.error
     } else {
         MaterialTheme.colorScheme.onSurface
     }
-    val note = sessionActionNote(action)
+    val note = sessionActionNote(action, session)
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier

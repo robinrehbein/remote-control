@@ -340,15 +340,20 @@ export function registerWs(
     socket.on('close', () => {
       hub.remove(socket);
       if (role === 'link' && linkId) {
+        // dropLink is identity-guarded; only report the link as gone when no
+        // other socket has taken over in the meantime. The displaced socket's
+        // close arrives AFTER its replacement registered - without this
+        // guard, that stale close would flip a freshly reconnected link
+        // session back to 'stopped' ("Host offline" in the app).
         hub.dropLink(linkId, socket);
-        manager.linkDisconnected(linkId);
+        if (!hub.hasLink(linkId)) manager.linkDisconnected(linkId);
       }
     });
     socket.on('error', () => {
       hub.remove(socket);
       if (role === 'link' && linkId) {
         hub.dropLink(linkId, socket);
-        manager.linkDisconnected(linkId);
+        if (!hub.hasLink(linkId)) manager.linkDisconnected(linkId);
       }
     });
 

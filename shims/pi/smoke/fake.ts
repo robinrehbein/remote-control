@@ -67,10 +67,17 @@ export class FakeRunner implements PiRunner {
 
   async init(): Promise<void> {}
 
+  // Spiegelt PiRunner.validateModel. Diese Nachbildung trug lange dieselbe
+  // Regel wie das Original — beide verlangten Provider und Modell gemeinsam.
+  // Dadurch hätte der Smoke-Test den Fehler auch dann nicht gefunden, wenn er
+  // den richtigen Fall geprüft hätte: er hätte die Nachbildung bestätigt.
   async validateModel(provider?: string, model?: string): Promise<void> {
-    if (provider === undefined && model === undefined) return;
+    if (model === undefined) return;
+    if (!provider) {
+      throw new PromptError('provider and model must be set together');
+    }
     if (provider !== 'fake-provider' || model !== 'fake-model') {
-      throw new PromptError(`unknown model ${provider ?? '?'}/${model ?? '?'}`);
+      throw new PromptError(`unknown model ${provider}/${model}`);
     }
   }
 

@@ -12,6 +12,7 @@ import type {
   ReasoningEffort,
   ShimStatus,
 } from '@pocketagent/protocol';
+import { parseLastEventId } from '@pocketagent/protocol';
 import { EventBroadcaster } from './events.js';
 import {
   commitTurn,
@@ -277,7 +278,9 @@ export function buildApp(deps: AppDeps): FastifyInstance {
     });
     raw.write('retry: 5000\n\n');
     raw.write(': connected\n\n');
-    bus.add(raw);
+    // On a reconnect the orchestrator sends the last seq it saw; the ring
+    // replays everything after it so no event is lost across the gap.
+    bus.add(raw, parseLastEventId(request.headers['last-event-id']));
     request.raw.on('close', () => {
       bus.remove(raw);
     });

@@ -85,6 +85,45 @@ function openSse(base: string, token: string): SseClient {
   };
 }
 
+/**
+ * Open a fresh SSE connection (optionally with a Last-Event-ID header, as the
+ * orchestrator sends on a reconnect), collect the AgentEvents that arrive for
+ * `ms`, then close. Used to prove the ring buffer replays a reconnect gap.
+ */
+function collectSse(base: string, token: string, lastEventId: number | undefined, ms: number): Promise<AgentEvent[]> {
+  return new Promise(resolve => {
+    const events: AgentEvent[] = [];
+    const headers: Record<string, string> = { authorization: `Bearer ${token}` };
+    if (lastEventId !== undefined) headers['last-event-id'] = String(lastEventId);
+    const req = http.get(`${base}/events`, { headers }, (res: IncomingMessage) => {
+      let buffer = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk: string) => {
+        buffer += chunk;
+        let index = buffer.indexOf('\n\n');
+        while (index !== -1) {
+          const frame = buffer.slice(0, index);
+          buffer = buffer.slice(index + 2);
+          for (const line of frame.split('\n')) {
+            if (!line.startsWith('data: ')) continue;
+            try {
+              events.push(JSON.parse(line.slice(6)) as AgentEvent);
+            } catch {
+              /* ignore malformed frame */
+            }
+          }
+          index = buffer.indexOf('\n\n');
+        }
+      });
+    });
+    req.on('error', () => resolve(events));
+    setTimeout(() => {
+      req.destroy();
+      resolve(events);
+    }, ms);
+  });
+}
+
 async function main(): Promise<void> {
   const workDir = await mkdtemp(join(tmpdir(), 'pi-shim-smoke-work-'));
   const agentDir = await mkdtemp(join(tmpdir(), 'pi-shim-smoke-agent-'));
@@ -187,6 +226,24 @@ async function main(): Promise<void> {
     'turn.completed after permission grant',
   );
   expect(completed1.type === 'turn.completed' && typeof completed1.commitSha === 'string', 'turn.completed has commitSha');
+
+  // --- Ringpuffer + Last-Event-ID replay (Event-Verlust-Fix) ---
+  // Every sequenced event is buffered, so a reconnect that presents the last
+  // seq it saw is replayed exactly the events after it - no turn.completed lost
+  // in a gap. A fresh connection (no Last-Event-ID) replays no history.
+  // Settle first so the post-turn status event is counted before we snapshot.
+  await new Promise(resolve => setTimeout(resolve, 150));
+  const lastId = bus.lastId;
+  expect(lastId >= 3, `the shim has sequenced several events by now (lastId=${lastId})`);
+  const from = Math.max(0, lastId - 3);
+  const replayed = (await collectSse(base, config.token, from, 800)).filter(e => e.type !== 'ping');
+  expect(replayed.length === lastId - from, `Last-Event-ID replays exactly the buffered tail (${lastId - from} events, got ${replayed.length})`);
+  expect(
+    replayed.every(e => typeof (e as { seq?: number }).seq === 'number' && (e as { seq: number }).seq > from),
+    'every replayed event carries a seq greater than the Last-Event-ID',
+  );
+  const fresh = (await collectSse(base, config.token, undefined, 500)).filter(e => e.type !== 'ping');
+  expect(fresh.length === 0, 'a fresh connection without Last-Event-ID replays no history');
   expect(
     sse.events.some(event => event.type === 'permission.resolved' && event.decision === 'always'),
     'permission.resolved always',

@@ -1,38 +1,19 @@
-import type { ServerResponse } from 'node:http';
 import type { AgentEvent } from '@pocketagent/protocol';
+import { SequencedSseBroadcaster } from '@pocketagent/protocol';
 
-/** Fan-out for normalized AgentEvents to all connected SSE clients. */
-export class EventBroadcaster {
-  private readonly clients = new Set<ServerResponse>();
+/**
+ * Fan-out for normalized AgentEvents to all connected SSE clients.
+ *
+ * The sequencing, replay ring and Last-Event-ID handling live in the shared
+ * SequencedSseBroadcaster (every shim uses the same one, so a reconnect gap
+ * loses no event); this subclass only adds the pi-specific keepalive timer.
+ */
+export class EventBroadcaster extends SequencedSseBroadcaster {
   private timer: NodeJS.Timeout | undefined;
-
-  add(client: ServerResponse): void {
-    this.clients.add(client);
-  }
-
-  remove(client: ServerResponse): void {
-    this.clients.delete(client);
-  }
-
-  get clientCount(): number {
-    return this.clients.size;
-  }
-
-  publish(event: AgentEvent): void {
-    if (this.clients.size === 0) return;
-    const frame = `event: agent\ndata: ${JSON.stringify(event)}\n\n`;
-    for (const client of this.clients) {
-      try {
-        client.write(frame);
-      } catch {
-        this.clients.delete(client);
-      }
-    }
-  }
 
   startHeartbeat(intervalMs: number): void {
     this.stop();
-    this.timer = setInterval(() => this.publish({ type: 'ping', ts: Date.now() }), intervalMs);
+    this.timer = setInterval(() => this.publish({ type: 'ping', ts: Date.now() } satisfies AgentEvent), intervalMs);
   }
 
   stop(): void {

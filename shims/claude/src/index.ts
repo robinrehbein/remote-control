@@ -25,6 +25,7 @@ import {
   writeClaudeAuthBootstrap,
 } from './claude.ts';
 import type { RunnerFactory } from './claude.ts';
+import { parseLastEventId } from '@pocketagent/protocol';
 import { EventBroadcaster } from './events.ts';
 import { commitTurn, ensureRepo, getDiff, pushAndCreatePr, readGithubPat } from './gitops.ts';
 
@@ -180,7 +181,9 @@ export function buildServer(cfg: ShimConfig, runnerFactory?: RunnerFactory): Fas
       connection: 'keep-alive',
       'x-accel-buffering': 'no',
     });
-    broadcaster.add(reply.raw);
+    // On a reconnect the orchestrator sends the last seq it saw; the ring
+    // replays everything after it so no event is lost across the gap.
+    broadcaster.addClient(reply.raw, parseLastEventId(req.headers['last-event-id']));
   });
 
   app.setNotFoundHandler(async (req, reply) => {

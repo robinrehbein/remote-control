@@ -101,6 +101,21 @@ function listen(server: import('node:http').Server): Promise<number> {
   });
 }
 
+/**
+ * A loopback port with nothing behind it: bind to 0, read what the kernel
+ * assigned, close again. Lets a test say "this daemon is unreachable" in a way
+ * that holds on a machine that does have a docker socket.
+ */
+async function closedPort(): Promise<number> {
+  const net = await import('node:net');
+  const probe = net.createServer();
+  const port = await new Promise<number>((res) => {
+    probe.listen(0, '127.0.0.1', () => res((probe.address() as AddressInfo).port));
+  });
+  await new Promise<void>((res) => probe.close(() => res()));
+  return port;
+}
+
 /** Raw request against a forward proxy: request-target is the absolute URI. */
 function proxyGet(
   http: typeof import('node:http'),
@@ -1329,7 +1344,13 @@ async function main(): Promise<void> {
 
   const imageBuild = await import('./image-build.js');
   const adapters2 = await import('./adapters.js');
-  const cfg = config as unknown as { dockerEnabled: boolean; adapterImageTagPinned: boolean };
+  const dockerMod2 = await import('./docker.js');
+  const cfg = config as unknown as {
+    dockerEnabled: boolean;
+    adapterImageTagPinned: boolean;
+    dockerHost: string | null;
+    dockerHostIsLocal: boolean;
+  };
 
   const ctxRoot = imageBuild.shimContextRoot();
   assert(typeof ctxRoot === 'string', 'shim build context bundled with the server');
@@ -1520,6 +1541,20 @@ async function main(): Promise<void> {
   store.setSessionRef(sessionId, 'runtime-session-ref');
   store.updateSessionStatus(sessionId, 'idle');
   cfg.dockerEnabled = true;
+  /*
+   * "no daemon here" must not depend on the machine. A developer box without
+   * docker and a GitHub runner - which does have a daemon on
+   * /var/run/docker.sock - take different paths through the same code: with a
+   * real daemon the switch below starts an actual `docker build` of the kilo
+   * image, which runs for minutes while the assertions wait 30s, so the run
+   * ends in "timeout waiting for message" instead of the error event it
+   * describes. A closed TCP port is unreachable everywhere.
+   */
+  const dockerHostBefore = cfg.dockerHost;
+  const dockerHostIsLocalBefore = cfg.dockerHostIsLocal;
+  cfg.dockerHost = `tcp://127.0.0.1:${await closedPort()}`;
+  cfg.dockerHostIsLocal = true;
+  dockerMod2.resetDockerClient();
   // The orchestrator identifies its own container by HOSTNAME to join session
   // networks; docker always sets it, this run has to emulate that.
   const hostnameBefore = process.env.HOSTNAME;
@@ -1594,6 +1629,9 @@ async function main(): Promise<void> {
     );
   } finally {
     cfg.dockerEnabled = false;
+    cfg.dockerHost = dockerHostBefore;
+    cfg.dockerHostIsLocal = dockerHostIsLocalBefore;
+    dockerMod2.resetDockerClient();
     if (hostnameBefore === undefined) delete process.env.HOSTNAME;
     else process.env.HOSTNAME = hostnameBefore;
   }

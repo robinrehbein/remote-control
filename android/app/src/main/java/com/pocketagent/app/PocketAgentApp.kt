@@ -15,7 +15,10 @@ import kotlinx.coroutines.SupervisorJob
 
 class AppContainer(app: Application, scope: CoroutineScope) {
     val tokenStore = TokenStore(app)
-    val pairingApi = PairingApi(PairingApi.default())
+    // Eigener, endlich getimter Client für den synchronen Pairing-HTTP-Call —
+    // PairingApi.default() ist auf den WebSocket getunt (readTimeout 0 =
+    // unendlich) und würde einen hängenden Reverse-Proxy nie abbrechen.
+    val pairingApi = PairingApi(PairingApi.httpClient())
     val wsClient = WsClient(PairingApi.default())
     val repository = AppRepository(wsClient, tokenStore, scope)
 

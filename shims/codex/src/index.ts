@@ -11,6 +11,7 @@ import type {
   PromptRequest,
   ShimStatus,
 } from '@pocketagent/protocol';
+import { parseLastEventId } from '@pocketagent/protocol';
 import { EventBroadcaster } from './events.js';
 import {
   commitTurn,
@@ -255,10 +256,10 @@ export function buildApp(deps: AppDeps): FastifyInstance {
     });
     raw.write('retry: 5000\n\n');
     raw.write(': connected\n\n');
-    bus.add(raw);
-    request.raw.on('close', () => {
-      bus.remove(raw);
-    });
+    // Last-Event-ID replay: on a reconnect the orchestrator's shim client sends
+    // the id it last saw and the ring resends everything after it (W2.1), so a
+    // dropped SSE connection no longer loses codex events.
+    bus.add(raw, parseLastEventId(request.headers['last-event-id']));
   });
 
   function publishStatus(): void {

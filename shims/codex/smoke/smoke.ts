@@ -131,6 +131,40 @@ function unitChecks(): void {
 }
 
 /* ------------------------------------------------------------------ */
+/* Sequenced broadcaster: seq ids + Last-Event-ID replay (W2.1)        */
+/* ------------------------------------------------------------------ */
+
+function broadcasterReplayCheck(): void {
+  const bus = new EventBroadcaster();
+  const seqOf = (event: AgentEvent): number | undefined => bus.publish(event);
+
+  const s1 = seqOf({ type: 'notice', message: 'e1' });
+  const s2 = seqOf({ type: 'notice', message: 'e2' });
+  const s3 = seqOf({ type: 'notice', message: 'e3' });
+  expect(s1 === 1 && s2 === 2 && s3 === 3, 'publish stamps monotone seq ids');
+  expect(bus.publish({ type: 'ping', ts: 1 }) === undefined, 'ping is unsequenced (consumes no id)');
+
+  // A reconnecting client with Last-Event-ID=1 replays only e2 + e3.
+  const frames: string[] = [];
+  const sink = { write: (s: string) => frames.push(s), writableEnded: false, on: () => {} };
+  bus.add(sink as unknown as import('node:http').ServerResponse, 1);
+  expect(frames.length === 2, 'reconnect replays exactly the events after the cursor');
+  expect(frames[0]?.includes('id: 2') === true && frames[0]?.includes('e2') === true, 'first replayed frame is e2 with its id');
+  expect(frames[1]?.includes('id: 3') === true && frames[1]?.includes('e3') === true, 'second replayed frame is e3 with its id');
+
+  // A live event after the reconnect reaches the same client.
+  bus.publish({ type: 'notice', message: 'e4' });
+  expect(frames.some((f) => f.includes('e4') && f.includes('id: 4')), 'live event after replay keeps the sequence going');
+  expect(bus.lastId === 4, 'lastId tracks the highest sequenced event');
+
+  // A fresh client (no cursor) gets no replay, only future events.
+  const fresh: string[] = [];
+  const freshSink = { write: (s: string) => fresh.push(s), writableEnded: false, on: () => {} };
+  bus.add(freshSink as unknown as import('node:http').ServerResponse);
+  expect(fresh.length === 0, 'a fresh client without Last-Event-ID replays nothing');
+}
+
+/* ------------------------------------------------------------------ */
 /* JSON-RPC overload backoff (-32001) unit check                       */
 /* ------------------------------------------------------------------ */
 
@@ -171,6 +205,7 @@ async function overloadCheck(): Promise<void> {
 
 async function main(): Promise<void> {
   unitChecks();
+  broadcasterReplayCheck();
   await overloadCheck();
 
   const workDir = await mkdtemp(join(tmpdir(), 'codex-shim-smoke-work-'));

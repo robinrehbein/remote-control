@@ -1129,6 +1129,16 @@ fun SettingSheet(
             modifier = Modifier
                 .fillMaxWidth()
                 .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars))
+                // Der Inhalt scrollt. Ohne das ist alles unerreichbar, was
+                // unter die Bildschirmkante rutscht — beim Modell-Sheet war
+                // das der „Übernehmen“-Knopf, also die einzige Möglichkeit,
+                // die Auswahl überhaupt zu bestätigen.
+                //
+                // Die Listen darin haben ihre eigene Begrenzung per
+                // heightIn(max = …). Das ist hier keine Doppelung, sondern
+                // Bedingung: eine scrollbare Fläche ohne Höhengrenze in einer
+                // scrollbaren Fläche wirft zur Laufzeit.
+                .verticalScroll(rememberScrollState())
                 .padding(bottom = 12.dp),
         ) {
             Text(

@@ -168,6 +168,28 @@ function proxyConnect(
 }
 
 /**
+ * A CONNECT whose caller vanishes before the answer is written: the request
+ * goes out, then the connection is reset instead of closed. That is what a
+ * client does when it gives up on a refused tunnel, and it leaves the proxy
+ * holding a socket whose next read fails with ECONNRESET.
+ */
+function proxyConnectAndReset(
+  net: typeof import('node:net'),
+  proxyPort: number,
+  hostPort: string,
+): Promise<void> {
+  return new Promise((resolve) => {
+    const sock = net.connect(proxyPort, '127.0.0.1', () => {
+      sock.write(`CONNECT ${hostPort} HTTP/1.1\r\nHost: ${hostPort}\r\n\r\n`);
+      // RST, not FIN - a clean close is the case that always worked.
+      sock.resetAndDestroy();
+      resolve();
+    });
+    sock.on('error', () => resolve());
+  });
+}
+
+/**
  * Remote-runner gateway: pure routing/auth logic plus the two servers it runs,
  * all without a docker daemon. Session ids are plain DNS labels, so '127.0.0.1'
  * is a valid one and lets us point the ingress at a local fake shim.
@@ -277,6 +299,22 @@ async function gatewaySmoke(): Promise<void> {
   assert(unauthed.status === 407, 'egress proxy answers 407 (not 403) without credentials');
   const staleToken = await proxyGet(http, gatedPort, `http://127.0.0.1:${upstreamPort}/ping`, 'not-a-session');
   assert(staleToken.status === 407, 'egress proxy rejects an unknown token');
+
+  // A refused CONNECT followed by a reset used to end the whole orchestrator:
+  // node hands the socket to the 'connect' handler without its own error
+  // listener, so the ECONNRESET arriving while the 403 is written became an
+  // unhandled 'error' event. The proxy has to stay usable afterwards - and if
+  // it does not survive at all, this smoke run dies with it, which is the
+  // assertion. Repeated because the reset has to race the write.
+  const net = await import('node:net');
+  for (let i = 0; i < 20; i++) {
+    await proxyConnectAndReset(net, egressPort, 'blocked.example:443');
+    await proxyConnectAndReset(net, egressPort, `127.0.0.1:${upstreamPort}`);
+  }
+  await new Promise((r) => setTimeout(r, 100));
+  const afterReset = await proxyGet(http, egressPort, `http://127.0.0.1:${upstreamPort}/ping`);
+  assert(afterReset.status === 200, 'the egress proxy still serves after a reset CONNECT');
+
   gated.close();
 
   for (const s of [shim, ingress, upstream, egress]) s.close();

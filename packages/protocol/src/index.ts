@@ -124,6 +124,50 @@ export type SessionStatus =
   | 'stopped'    // container stopped, volume retained (resumable)
   | 'error';
 
+/**
+ * Per-turn lifecycle (KILO-CLOUD-ANALYSE.md P1, "Message-Status als eigene
+ * Ressource"). Distinct from `SessionStatus`: a session is a long-lived
+ * container, a turn is one prompt-to-answer round inside it. The states are a
+ * linear machine — `queued` (admitted, persisted, not yet handed to the
+ * shim/agent) → `running` (the agent is working) → one terminal state:
+ *  - `completed`   : the agent finished the turn (`turn.completed`).
+ *  - `failed`      : the turn ended in an error, see `TurnFailureReason`.
+ *  - `interrupted` : cut short from outside (user abort, or a server restart
+ *                    that dropped the in-flight turn).
+ * After a reconnect the app reads the turns of a session instead of guessing a
+ * turn's fate from the event stream.
+ */
+export type TurnState = 'queued' | 'running' | 'completed' | 'failed' | 'interrupted';
+
+/**
+ * Structured reason a turn reached `failed`, modelled on Kilo's failure object.
+ * `stage` names where it broke (e.g. 'transport', 'shim', 'provision'), `code`
+ * is an optional machine-readable tag, `retryable` tells the app whether a
+ * fresh attempt could succeed. Only `message` is guaranteed.
+ */
+export interface TurnFailureReason {
+  message: string;
+  stage?: string;
+  code?: string;
+  retryable?: boolean;
+}
+
+/**
+ * One turn as the orchestrator persists and reports it. `turnId` is the
+ * orchestrator's own id; `messageId` is the app-generated id that admitted it
+ * (absent for a prompt from an older client that sent none).
+ */
+export interface TurnInfo {
+  turnId: string;
+  sessionId: string;
+  messageId?: string;
+  state: TurnState;
+  createdAt: string;
+  updatedAt: string;
+  /** Present only in the `failed` state. */
+  reason?: TurnFailureReason;
+}
+
 export type PermissionDecision = 'once' | 'always' | 'reject';
 
 export type PermissionKind = 'bash' | 'edit' | 'webfetch' | 'external' | 'other';
@@ -152,6 +196,14 @@ export interface PromptRequest {
   text: string;
   /** May override the mode the container was started with. */
   mode?: AgentMode;
+  /**
+   * App-generated, per-turn message id (`msg_<random>`), echoed end to end
+   * (KILO-CLOUD-ANALYSE.md P1). Optional for backwards compatibility: a prompt
+   * without one behaves exactly as before. The orchestrator uses it to make a
+   * re-sent prompt idempotent (no duplicate agent turn after a radio-hole
+   * reconnect); shims may echo it but are not required to.
+   */
+  messageId?: string;
   provider?: string;
   /**
    * May override the model for this and following turns. Adapters whose runtime
@@ -518,7 +570,15 @@ export type ClientMessage =
    * (or `error` on failure) carrying the same id; without it the call stays
    * fire-and-forget as before, for older clients.
    */
-  | { type: 'session.prompt'; sessionId: string; text: string; mode?: AgentMode; requestId?: string }
+  /**
+   * `requestId` acks this one WS request (see above). `messageId` is the
+   * app-generated, per-turn id (`msg_<random>`) that is stable across a resend:
+   * the server admits a given messageId exactly once (idempotent), and echoes
+   * it in the `request.ok` payload so the app can match the ack to the turn it
+   * sent. Both are optional — a client that sends neither keeps the old
+   * fire-and-forget, no-dedup behaviour.
+   */
+  | { type: 'session.prompt'; sessionId: string; text: string; mode?: AgentMode; requestId?: string; messageId?: string }
   /**
    * Change mode / model / reasoning effort / harness of a live session. Every
    * field is optional; the server persists what is set and answers with
@@ -558,6 +618,13 @@ export type ClientMessage =
    * carries them in chronological order, oldest first.
    */
   | { type: 'session.events.get'; requestId: string; sessionId: string; limit?: number }
+  /**
+   * Per-turn lifecycle of a session (KILO-CLOUD-ANALYSE.md P1). Lets a client
+   * that reconnected reconstruct every turn's fate (`TurnState`) instead of
+   * inferring it from the event stream. `limit` counts the most recent turns
+   * (default 50, max 500); the answer carries them oldest first.
+   */
+  | { type: 'session.turns.get'; requestId: string; sessionId: string; limit?: number }
   /** Rename a session; an empty title removes it (client derives a name again). */
   | { type: 'session.rename'; requestId: string; sessionId: string; title: string }
   | { type: 'session.archive'; requestId: string; sessionId: string; archived: boolean }
@@ -613,6 +680,14 @@ export type ServerMessage =
   | { type: 'session.event'; sessionId: string; event: AgentEvent }
   /** Answer to `session.events.get`: chronological, oldest first. */
   | { type: 'session.events'; requestId: string; sessionId: string; events: AgentEvent[] }
+  /** Answer to `session.turns.get`: chronological, oldest first. */
+  | { type: 'session.turns'; requestId: string; sessionId: string; turns: TurnInfo[] }
+  /**
+   * Live push on every turn-state transition (queued/running/terminal). Purely
+   * additive: a client that predates the turn resource ignores this type and
+   * keeps working off `session.status`/`session.event` as before.
+   */
+  | { type: 'turn.status'; sessionId: string; turn: TurnInfo }
   | { type: 'session.diff'; requestId: string; sessionId: string; diff: DiffEntry[] }
   | { type: 'session.status'; sessionId: string; status: SessionStatus; session?: SessionInfo }
   | { type: 'session.models'; requestId: string; sessionId: string; models: ModelInfo[] }

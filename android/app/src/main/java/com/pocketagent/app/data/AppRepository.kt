@@ -467,7 +467,10 @@ class AppRepository(
         lastProbeAt = now
         scope.launch {
             if (ws.state.value !is WsClient.ConnState.Connected) {
-                ws.reconnectNow()
+                // Automatischer Auslöser (Netz/Vordergrund) — im Unauthorized-
+                // Zustand darf das nicht erneut anklopfen (Fund: kein
+                // Auto-Reconnect nach Server-Ablehnung).
+                ws.reconnectNow(manual = false)
                 return@launch
             }
             // Laut Zustand verbunden — das beweist nicht, dass der Socket

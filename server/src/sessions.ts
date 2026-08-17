@@ -5,6 +5,8 @@ import type {
   AgentMode,
   ClientMessage,
   DiffEntry,
+  LinkSessionState,
+  LinkSessionStatus,
   ModelInfo,
   NetworkPolicy,
   NoticePhase,
@@ -38,6 +40,7 @@ const TENANT = 'default';
 const AGENT_MODES: readonly AgentMode[] = ['yolo', 'auto', 'acceptEdits', 'ask'];
 const REASONING_EFFORTS: readonly ReasoningEffort[] = ['low', 'medium', 'high'];
 const NOTICE_PHASES: readonly NoticePhase[] = ['image-build', 'container-start', 'shim-start', 'ready'];
+const LINK_SESSION_STATUSES: readonly LinkSessionStatus[] = ['idle', 'busy', 'question', 'permission'];
 
 export function isAgentMode(v: unknown): v is AgentMode {
   return typeof v === 'string' && (AGENT_MODES as readonly string[]).includes(v);
@@ -49,6 +52,22 @@ export function isReasoningEffort(v: unknown): v is ReasoningEffort {
 
 export function isNoticePhase(v: unknown): v is NoticePhase {
   return typeof v === 'string' && (NOTICE_PHASES as readonly string[]).includes(v);
+}
+
+export function isLinkSessionStatus(v: unknown): v is LinkSessionStatus {
+  return typeof v === 'string' && (LINK_SESSION_STATUSES as readonly string[]).includes(v);
+}
+
+/**
+ * Maps a link agent's heartbeat status onto ours. `SessionStatus` has no
+ * counterpart for "mid-turn, waiting on the user" (question/permission) -
+ * the shim's own `busy` flag already collapses those into one boolean, and
+ * `permission.request`/`.resolved` events carry the finer detail
+ * separately - so both fold into 'running', same as everything else that is
+ * not 'idle'.
+ */
+export function statusFromLinkHeartbeat(status: LinkSessionStatus): SessionStatus {
+  return status === 'idle' ? 'idle' : 'running';
 }
 
 /**
@@ -345,6 +364,46 @@ export class SessionManager {
   /** Normalized event arriving from a link agent (same pipeline as shim SSE). */
   handleLinkEvent(sessionId: string, ev: AgentEvent): void {
     this.onEvent(sessionId, ev);
+  }
+
+  /**
+   * Link agent's periodic full-state heartbeat (Kilo P2, KILO-CLOUD-ANALYSE.md
+   * "Heartbeat als Vollzustand"). Reconciles the linked session's status from
+   * the complete snapshot instead of depending on every individual
+   * `agent.event` having arrived - a `turn.completed`/`.failed` lost to a
+   * flaky connection no longer leaves a session 'running' forever, and a
+   * reconnect is trivially correct because the next heartbeat re-states the
+   * whole truth rather than a delta.
+   *
+   * `sessions` is untrusted wire input (JSON off the socket), so it is
+   * re-validated here rather than trusted as `LinkSessionState[]`; a
+   * malformed frame degrades to "no entries", never a crash. A link is bound
+   * to exactly one orchestrator session (registerLinkSession), so only the
+   * entry matching that session id is ever acted on - extra ids in the array
+   * (a future link agent hosting more than one session) are accepted on the
+   * wire but ignored today, not an error.
+   *
+   * Absent from the list = gone, the same conclusion `linkDisconnected` draws
+   * from a closed socket: today that only happens on disconnect (the link
+   * agent's own process manages exactly one session), but the server honours
+   * it either way so a future multi-session link agent that drops a session
+   * without closing its socket is handled correctly from day one.
+   */
+  handleLinkHeartbeat(linkId: string, sessions: unknown): void {
+    const row = this.store.getSessionByLink(linkId);
+    if (!row) return;
+    const list = Array.isArray(sessions) ? sessions : [];
+    const mine = list.find((s): s is LinkSessionState => {
+      if (typeof s !== 'object' || s === null) return false;
+      const rec = s as { sessionId?: unknown; status?: unknown };
+      return rec.sessionId === row.id && isLinkSessionStatus(rec.status);
+    });
+    if (!mine) {
+      if (row.status !== 'stopped') this.setStatus(row.id, 'stopped');
+      return;
+    }
+    const next = statusFromLinkHeartbeat(mine.status);
+    if (row.status !== next) this.setStatus(row.id, next);
   }
 
   createSession(msg: CreateMsg, tenant: string = TENANT): SessionRow {

@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import type { RawData, WebSocket } from 'ws';
 import type { ClientMessage, ServerMessage } from '@pocketagent/protocol';
+import { WS_CLOSE_REPLACED, WS_CLOSE_TOO_MANY_CONNECTIONS, WS_CLOSE_UNAUTHORIZED } from '@pocketagent/protocol';
 import { SERVER_VERSION } from './config.js';
 import { sha256 } from './db.js';
 import type { Store } from './db.js';
@@ -131,7 +132,7 @@ export class Hub {
       if (id !== deviceId) continue;
       this.remove(s);
       try {
-        s.close(4001, 'revoked');
+        s.close(WS_CLOSE_UNAUTHORIZED, 'revoked');
       } catch {
         /* already closed */
       }
@@ -144,7 +145,7 @@ export class Hub {
     if (!s) return;
     this.linkSockets.delete(linkId);
     try {
-      s.close(4001, 'revoked');
+      s.close(WS_CLOSE_UNAUTHORIZED, 'revoked');
     } catch {
       /* already closed */
     }
@@ -180,7 +181,7 @@ export class Hub {
   }
 
   registerLink(linkId: string, socket: WebSocket): void {
-    this.linkSockets.get(linkId)?.close(4000, 'replaced');
+    this.linkSockets.get(linkId)?.close(WS_CLOSE_REPLACED, 'replaced');
     this.linkSockets.set(linkId, socket);
   }
 
@@ -243,7 +244,7 @@ type AppClientMessage = ClientMessage | FcmRegisterMessage;
 /** Incoming frames on a link socket (link -> server uses ServerMessage variants). */
 type LinkInMessage = Extract<
   ServerMessage,
-  { type: 'agent.response' | 'agent.event' | 'agent.ping' | 'agent.pong' }
+  { type: 'agent.response' | 'agent.event' | 'agent.ping' | 'agent.pong' | 'agent.heartbeat' }
 >;
 type SocketInMessage = AppClientMessage | LinkInMessage;
 
@@ -275,9 +276,10 @@ export function registerWs(
     });
     if (conns > MAX_CONNS_PER_ADDRESS) {
       auditWarn('ws.conn-limit', { ip: addr });
-      // 4002, not 4001: 4001 is reserved for auth failure/revocation so a
-      // client can tell "too many conns" apart from "credentials rejected".
-      socket.close(4002, 'too many connections');
+      // WS_CLOSE_TOO_MANY_CONNECTIONS, not WS_CLOSE_UNAUTHORIZED: a client
+      // can tell "too many conns" (transient, keep reconnecting) apart from
+      // "credentials rejected" (terminal) - see isTerminalLinkCloseCode.
+      socket.close(WS_CLOSE_TOO_MANY_CONNECTIONS, 'too many connections');
       return;
     }
     // every accepted socket, device and link agent alike - a half-dead
@@ -294,7 +296,7 @@ export function registerWs(
     const authTimer = setTimeout(() => {
       if (authed) return;
       auditWarn('ws.auth-timeout', { ip: addr });
-      socket.close(4001, 'auth timeout');
+      socket.close(WS_CLOSE_UNAUTHORIZED, 'auth timeout');
     }, authTimeoutMs);
     authTimer.unref?.();
     socket.once('close', () => clearTimeout(authTimer));
@@ -320,7 +322,7 @@ export function registerWs(
           const link = store.getLinkByTokenHash(sha256(msg.token));
           if (!link) {
             auditWarn('ws.link-unauthorized', { ip: addr });
-            socket.close(4001, 'unauthorized');
+            socket.close(WS_CLOSE_UNAUTHORIZED, 'unauthorized');
             return;
           }
           authed = true;
@@ -333,19 +335,19 @@ export function registerWs(
           return;
         }
         if (msg.type !== 'hello') {
-          socket.close(4001, 'unauthorized');
+          socket.close(WS_CLOSE_UNAUTHORIZED, 'unauthorized');
           return;
         }
         const dev = store.getDevice(msg.deviceId);
         if (!dev) {
           // Row gone => device was revoked (or never enrolled).
           auditWarn('ws.revoked-device', { ip: addr, deviceId: msg.deviceId });
-          socket.close(4001, 'unauthorized');
+          socket.close(WS_CLOSE_UNAUTHORIZED, 'unauthorized');
           return;
         }
         if (dev.token_hash !== sha256(msg.token)) {
           auditWarn('ws.unauthorized', { ip: addr, deviceId: msg.deviceId });
-          socket.close(4001, 'unauthorized');
+          socket.close(WS_CLOSE_UNAUTHORIZED, 'unauthorized');
           return;
         }
         authed = true;
@@ -385,6 +387,17 @@ export function registerWs(
           send({ type: 'agent.pong', ts: msg.ts });
           return;
         }
+        if (msg.type === 'agent.heartbeat') {
+          // Same trust boundary as agent.event above: handleLinkHeartbeat
+          // resolves the target from the link's own binding, so a session id
+          // in msg.sessions that is not this link's bound session is simply
+          // never matched - it cannot affect a foreign session.
+          // protocolVersion/capabilities are accepted but not required (see
+          // LinkCapabilities): a heartbeat missing them is handled exactly
+          // like one that carries them.
+          if (linkId) manager.handleLinkHeartbeat(linkId, msg.sessions);
+          return;
+        }
         return;
       }
       if (
@@ -392,6 +405,7 @@ export function registerWs(
         msg.type === 'agent.event' ||
         msg.type === 'agent.ping' ||
         msg.type === 'agent.pong' ||
+        msg.type === 'agent.heartbeat' ||
         msg.type === 'agent.hello'
       ) {
         return;

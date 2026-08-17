@@ -18,8 +18,10 @@ import net from 'node:net';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
-import type { AgentEvent, AgentMode, ServerMessage } from '@pocketagent/protocol';
+import type { AgentEvent, AgentMode, LinkSessionStatus, ServerMessage } from '@pocketagent/protocol';
+import { LINK_PROTOCOL_VERSION, WS_CLOSE_UNAUTHORIZED, isTerminalLinkCloseCode } from '@pocketagent/protocol';
 import { resolveWsUrl } from './ws-url.js';
+import { INITIAL_LINK_SESSION_STATUS, nextLinkSessionStatus } from './link-status.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, '../..');
@@ -182,6 +184,8 @@ async function restart(): Promise<void> {
 let ws: WebSocket | null = null;
 let sessionId: string | null = null;
 let lastServerMsgAt = Date.now();
+/** Current status for the `agent.heartbeat` full-state snapshot (Kilo P2), see link-status.ts. */
+let linkSessionStatus: LinkSessionStatus = INITIAL_LINK_SESSION_STATUS;
 const eventQueue: AgentEvent[] = [];
 /** Cap on eventQueue so a long orchestrator outage (or a bad token loop) can't grow it forever. */
 const MAX_QUEUED_EVENTS = 1000;
@@ -281,6 +285,10 @@ function startEventStream(): void {
               if (!line.startsWith('data:')) continue;
               try {
                 const ev = JSON.parse(line.slice(5).trim()) as AgentEvent;
+                // Reflects local truth regardless of orchestrator
+                // connectivity - the next heartbeat (once reconnected)
+                // reports whatever the shim actually did while offline.
+                linkSessionStatus = nextLinkSessionStatus(linkSessionStatus, ev);
                 if (sessionId && !stopped) send({ type: 'agent.event', sessionId, event: ev });
                 else if (!stopped) queueEvent(ev);
               } catch {
@@ -307,8 +315,6 @@ function flushQueuedEvents(): void {
 }
 
 let backoff = 1000;
-/** Cooldown after being displaced by another link agent (close 4000 'replaced'). */
-const REPLACED_RETRY_MS = 5 * 60_000;
 
 function dial(): void {
   if (stopped) return;
@@ -324,6 +330,8 @@ function dial(): void {
       mode: args.mode,
       branch: args.branch || undefined,
       workDir: args.workDir,
+      protocolVersion: LINK_PROTOCOL_VERSION,
+      capabilities: { heartbeat: true },
     });
   });
   sock.on('message', (raw) => {
@@ -353,17 +361,19 @@ function dial(): void {
   sock.on('close', (code, reason) => {
     if (stopped) return;
     sessionId = null;
-    // Another process registered with the same link token and displaced us.
-    // Redialing immediately would start a replace war (each side kicking the
-    // other, the session flapping stopped/idle in the app), so back off long
-    // enough that the misconfiguration becomes visible in this process's log
-    // instead of manifesting as "connection keeps dropping".
-    if (code === 4000 && String(reason) === 'replaced') {
-      log(
-        'displaced by another link agent using the same PA_TOKEN - retrying in 5 min. ' +
-          'Stop the other process or give each checkout its own token.',
-      );
-      setTimeout(() => dial(), REPLACED_RETRY_MS);
+    // Terminal close codes (bad/revoked token, or another link agent already
+    // holding this token's slot): redialing cannot succeed - the same
+    // credentials/registration produced the rejection - and for a replace in
+    // particular, redialing would just re-trigger the same close on whichever
+    // side reconnects second (or flap forever if both keep retrying). Stop
+    // the loop for good; see isTerminalLinkCloseCode.
+    if (isTerminalLinkCloseCode(code)) {
+      const why =
+        code === WS_CLOSE_UNAUTHORIZED
+          ? 'the orchestrator rejected this token (invalid or revoked) - fix PA_TOKEN, then restart this process'
+          : 'another link agent is already registered with this PA_TOKEN - stop it or give this checkout its own token, then restart this process';
+      console.error(`[link] connection closed permanently (code=${code} reason=${String(reason) || '-'}): ${why}`);
+      shutdown(1);
       return;
     }
     log(`connection lost - retrying in ${Math.round(backoff / 1000)}s`);
@@ -382,6 +392,23 @@ setInterval(() => {
     ws?.terminate();
   }
 }, 20_000);
+
+/**
+ * Full-state heartbeat (Kilo P2), separate cadence from the plain
+ * agent.ping keepalive above: every session this link agent manages, with
+ * its current status, so the orchestrator can reconcile without depending on
+ * having received every individual agent.event. Today that is always at
+ * most the one session bound in `agent.ready` - an empty array before
+ * registration is itself meaningful ("no sessions"), not an omission.
+ */
+setInterval(() => {
+  send({
+    type: 'agent.heartbeat',
+    sessions: sessionId ? [{ sessionId, status: linkSessionStatus }] : [],
+    protocolVersion: LINK_PROTOCOL_VERSION,
+    capabilities: { heartbeat: true },
+  });
+}, 10_000);
 
 function shutdown(code: number): void {
   stopped = true;

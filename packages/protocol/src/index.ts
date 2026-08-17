@@ -368,6 +368,94 @@ export interface SecretInfo {
   /** Never contains the plaintext value. */
 }
 
+/* ------------------------------------------------------------------ */
+/* Link-agent relay (Kilo "remote connections" pattern, see            */
+/* KILO-CLOUD-ANALYSE.md P2)                                           */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Wire protocol version a link agent speaks, carried on `agent.hello` and
+ * `agent.heartbeat`. Bump only for a breaking change to the link<->server
+ * wire format; additive features (new optional fields, new
+ * `LinkCapabilities` flags) never need a bump. Absent on the wire means
+ * version 1 - a pre-W2.4 link agent that predates heartbeats/capabilities
+ * entirely; the server treats that exactly like version 1 explicitly.
+ */
+export const LINK_PROTOCOL_VERSION = 2;
+
+/**
+ * Feature flags a link agent advertises on `agent.hello`/`agent.heartbeat`.
+ * Every flag is optional and MUST be treated as `false` when absent, so an
+ * older link agent (which sends none of this) keeps working unchanged
+ * against a newer server, and a newer link agent talking to an older server
+ * (which just ignores fields it does not read) degrades to the old
+ * behaviour instead of breaking. New flags are additive-only: never repurpose
+ * or remove one, add another instead.
+ */
+export interface LinkCapabilities {
+  /**
+   * Sends periodic `agent.heartbeat` frames carrying the link's complete
+   * session list (see `LinkSessionState`) instead of relying solely on
+   * `agent.event`/connect-disconnect for status. Purely informational today
+   * (the server reconciles from any `agent.heartbeat` it receives regardless
+   * of this flag - the message itself is the capability signal); kept as an
+   * explicit flag for parity with Kilo's advertisement pattern and so a
+   * future capability that truly changes server behaviour has a precedent to
+   * follow.
+   */
+  heartbeat?: boolean;
+}
+
+/**
+ * Per-session status a link agent reports in its heartbeat, modelled on
+ * Kilo's `idle|busy|question|permission`. PocketAgent's shim event stream
+ * has no distinct "waiting for a free-text answer" signal today (only
+ * `permission.request`), so no link agent currently emits `'question'` - it
+ * exists for wire parity with Kilo and so a future adapter can use it
+ * without a protocol change.
+ */
+export type LinkSessionStatus = 'idle' | 'busy' | 'question' | 'permission';
+
+/** One session a link agent currently manages, as carried by `agent.heartbeat`. */
+export interface LinkSessionState {
+  /** Orchestrator-assigned id, i.e. the `sessionId` from `agent.ready`. */
+  sessionId: string;
+  status: LinkSessionStatus;
+}
+
+/**
+ * WebSocket close codes the app<->orchestrator and link<->orchestrator
+ * connections use (the 4000-4999 range is private-use per RFC 6455).
+ * Centralized here so `server/` (which sends them) and `link/` (which reacts
+ * to them) cannot drift apart; `android/` mirrors `WS_CLOSE_UNAUTHORIZED` as
+ * a literal in `WsClient.kt` since Kotlin cannot import this package.
+ */
+/** Another connection already registered with this link's token; this socket lost the race. */
+export const WS_CLOSE_REPLACED = 4000;
+/** Bad/missing/revoked token, or no `hello`/`agent.hello` within the auth timeout. */
+export const WS_CLOSE_UNAUTHORIZED = 4001;
+/** Per-source-address connection cap (coarse DoS guard), see ws.ts MAX_CONNS_PER_ADDRESS. */
+export const WS_CLOSE_TOO_MANY_CONNECTIONS = 4002;
+
+/**
+ * Terminal in the sense Kilo's 4401/4403/4409 are: retrying with the same
+ * registration can never succeed, so a link agent stops its reconnect loop
+ * for good instead of retrying with backoff.
+ *  - `WS_CLOSE_UNAUTHORIZED`: the token is wrong or revoked - it stays wrong
+ *    until a human changes it.
+ *  - `WS_CLOSE_REPLACED`: another process already holds this link's slot.
+ *    Reconnecting would just re-trigger the same replace on the other side
+ *    (or flap forever if both sides keep retrying), so this side backs off
+ *    for good and leaves it to whatever supervises the process (systemd,
+ *    Docker's restart policy, a human) to decide about a restart.
+ * Every other code - including `WS_CLOSE_TOO_MANY_CONNECTIONS`, a transient
+ * resource cap, and any ordinary network drop or server restart - keeps
+ * reconnecting with the existing exponential backoff.
+ */
+export function isTerminalLinkCloseCode(code: number): boolean {
+  return code === WS_CLOSE_UNAUTHORIZED || code === WS_CLOSE_REPLACED;
+}
+
 export type ClientMessage =
   | { type: 'hello'; deviceId: string; token: string }
   | {
@@ -380,6 +468,9 @@ export type ClientMessage =
       branch?: string;
       workDir?: string;
       sessionRef?: string;
+      /** Absent => version 1 (pre-W2.4 link agent), no known capabilities. */
+      protocolVersion?: number;
+      capabilities?: LinkCapabilities;
     }
   | {
       type: 'session.create';
@@ -472,6 +563,18 @@ export type ServerMessage =
   /** link agent -> server / server -> link agent keepalive */
   | { type: 'agent.ping'; ts: number }
   | { type: 'agent.pong'; ts: number }
+  /**
+   * link agent -> server periodic full-state snapshot (~10s; Kilo P2
+   * pattern). Carries every session the link currently manages instead of a
+   * delta: the orchestrator needs no per-event bookkeeping to stay correct,
+   * and a session id that stops appearing here is gone from the link
+   * agent's point of view - the same conclusion as a socket close, just
+   * without needing one. `protocolVersion`/`capabilities` ride along so the
+   * server can gate future additive behaviour; both are optional and a
+   * server that predates this message type never receives it at all (an
+   * older link agent simply never sends `agent.heartbeat`).
+   */
+  | { type: 'agent.heartbeat'; sessions: LinkSessionState[]; protocolVersion?: number; capabilities?: LinkCapabilities }
   /** server -> link agent: session stopped from the app; link agent should shut down */
   | { type: 'agent.bye'; sessionId: string }
   | { type: 'error'; requestId?: string; sessionId?: string; message: string }

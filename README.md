@@ -1,6 +1,6 @@
 # PocketAgent
 
-Provider-agnostische Mobile-Agent-Plattform: Steuerung von Coding-Agenten (**Kilo Code, Claude Code, pi, Junie** — und jedem weiteren Harness als Plugin, siehe `ADAPTERS.md`) per Android-App; die Agenten arbeiten isoliert in Docker-Containern auf deinem Server (z. B. Coolify-VPS) direkt auf deinen GitHub-Repos. Wie Claude Remote Sessions / Kilo Cloud Sessions — aber harness- und provider-agnostisch.
+Provider-agnostische Mobile-Agent-Plattform: Steuerung von Coding-Agenten (**Kilo Code, Claude Code, pi, Junie, OpenAI Codex** — und jedem weiteren Harness als Plugin, siehe `ADAPTERS.md`) per Android-App; die Agenten arbeiten isoliert in Docker-Containern auf deinem Server (z. B. Coolify-VPS) direkt auf deinen GitHub-Repos. Wie Claude Remote Sessions / Kilo Cloud Sessions — aber harness- und provider-agnostisch.
 
 ```
 Android (Kotlin/Compose, WS + FCM)
@@ -12,7 +12,8 @@ Adapter-Shims in Session-Containern (einheitliches Protokoll)
    ├─ kilo-shim      → kilo serve (Kilo CLI, OpenCode-Fork, 75+ Provider via Models.dev)
    ├─ claude-shim    → Claude Agent SDK (Pro/Max-Subscription via setup-token)
    ├─ pi-shim        → pi SDK (ZAI/Kimi/Qwen-Kataloge, Remote-Approvals)
-   └─ junie-shim     → Junie CLI headless (BYOK)
+   ├─ junie-shim     → Junie CLI headless (BYOK)
+   └─ codex-shim     → codex app-server (JSON-RPC/stdio, OPENAI_API_KEY + Device-Code)
 ```
 
 ## Monorepo
@@ -25,6 +26,7 @@ Adapter-Shims in Session-Containern (einheitliches Protokoll)
 | `shims/claude/` | Claude-Code-Adapter (Agent SDK, `CLAUDE_CODE_OAUTH_TOKEN`) |
 | `shims/pi/` | pi-Adapter (SDK-Embedding, Approvals via `tool_call`-Hook) |
 | `shims/junie/` | Junie-Adapter (CLI-Spawn pro Prompt, JSON-Output) |
+| `shims/codex/` | OpenAI-Codex-Adapter (`codex app-server` als Child-Prozess, JSON-RPC über stdio, Thread/Turn + Approvals) |
 | `android/` | Native App (Kotlin, Jetpack Compose, Material3) — Adapterliste kommt dynamisch vom Server; CI baut das APK via GitHub Actions |
 | `link/` | **Link-Agent**: läuft in deinem Devcontainer/PC/VPS, verbindet sich per outbound-WebSocket mit dem Orchestrator und stellt deinen Live-Workspace als Session bereit (siehe `HOMEPC.md`) |
 | `ADAPTERS.md` | Plugin-Guide: Manifest-Schema + Harness in 5 Schritten hinzufügen |
@@ -35,10 +37,10 @@ Jeder Shim implementiert dasselbe Protokoll: `POST /prompt`, `POST /abort`, `POS
 
 | Modus | Verhalten |
 |---|---|
-| Yolo | Keine Gates; Auto-Push + Draft-PR pro Turn |
-| Auto | Kilo `--auto`, Claude `auto`, pi: nur risky Bash gegated, Junie: ohne Gates |
-| AcceptEdits | Edits frei, Bash fragt (kilo/claude/pi; Junie: Warnbanner, ohne Gates) |
-| Ask | Alles Wichtige fragt → Approval-Karte in der App (Junie: Warnbanner, ohne Gates) |
+| Yolo | Keine Gates; Auto-Push + Draft-PR pro Turn (Codex: `never` + `danger-full-access`) |
+| Auto | Kilo `--auto`, Claude `auto`, pi: nur risky Bash gegated, Junie: ohne Gates (Codex: `never` + `workspace-write` + Netz) |
+| AcceptEdits | Edits frei, Bash fragt (kilo/claude/pi; Codex: `on-request`, File-Changes auto-accept, Commands fragen; Junie: Warnbanner, ohne Gates) |
+| Ask | Alles Wichtige fragt → Approval-Karte in der App (Codex: `untrusted`, alles fragt; Junie: Warnbanner, ohne Gates) |
 
 ## Deployment (Coolify / Docker-Host)
 
@@ -110,12 +112,13 @@ Ohne Wert-Argument und ohne Pipe fragt die CLI interaktiv (Eingabe versteckt). `
 | claude | `claude_oauth` = `claude setup-token` (Pro/Max, ~1 Jahr gültig) oder `anthropic` API-Key | Token-Erneuerung auf dem Laptop, dann Secret updaten |
 | pi | Provider API-Keys; ZAI/Kimi/Qwen-Subscription-OAuth post-MVP | |
 | junie | `junie` API-Key (usage-based) oder BYOK-Keys (openai/anthropic/...) | Headless one-shot; keine Remote-Approvals (App zeigt Banner) |
+| codex | `openai` API-Key (`OPENAI_API_KEY`, BYOK) oder ChatGPT-Login via Device-Code (`codex login --device-auth`) | `CODEX_HOME` als beschreibbares Volume (Token-Refresh, Thread-Resume); voller In-App-Browser-OAuth folgt in W3.4 |
 
 Anzeigenamen, Key-Seiten und Einrichtungshinweise stehen im Manifest (`providers`-Feld in `shims/*/adapter.json`) — die App rendert daraus die Provider-Chips und im Zugang-Dialog einen „Key erstellen"-Link, statt eine eigene Tabelle zu pflegen.
 
 **Key prüfen:** Der Dialog hat neben „Speichern" ein „Prüfen", das den Key serverseitig gegen den Anbieter testet (ein billiger Read-Only-Call, 8 s Timeout, Wert wird nie geloggt oder gespeichert). Live-Prüfung gibt es für `openai`, `anthropic`, `groq`, `openrouter`, `moonshot`/`kimi`, `google`, `xai` und `github`; alle übrigen Arten (u. a. `zai`, `claude_oauth`, `junie`, `kilo`) melden neutral „keine Live-Prüfung" und lassen sich trotzdem speichern.
 
-**Neue Harnesses** (Codex CLI, Aider, eigener Agent, ...) ergänzt man als Plugin ohne Server-/App-Änderung — Anleitung in `ADAPTERS.md`.
+**Neue Harnesses** (Aider, eigener Agent, ...) ergänzt man als Plugin ohne Server-/App-Änderung — Anleitung in `ADAPTERS.md`.
 
 ## Lokale Entwicklung
 
@@ -123,7 +126,7 @@ Anzeigenamen, Key-Seiten und Einrichtungshinweise stehen im Manifest (`providers
 npm install                 # workspaces
 npm run typecheck           # alle TS-Pakete
 npm run smoke -w server
-npm run smoke -w shims/kilo && npm run smoke -w shims/claude && npm run smoke -w shims/pi && npm run smoke -w shims/junie
+npm run smoke -w shims/kilo && npm run smoke -w shims/claude && npm run smoke -w shims/pi && npm run smoke -w shims/junie && npm run smoke -w shims/codex
 ```
 
 Alle Smokes laufen ohne Docker/Credentials (Fake-Runtimes). Server-Dev: `npm run dev -w server` (DOCKER_ENABLED=0 erlaubt Pairing/Secrets/Repo-Verwaltung ohne Container).

@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
 import WebSocket from 'ws';
 import type { ServerMessage } from '@pocketagent/protocol';
+import { WS_CLOSE_REPLACED, WS_CLOSE_UNAUTHORIZED } from '@pocketagent/protocol';
 
 process.env.DOCKER_ENABLED = '0';
 process.env.DATA_DIR = mkdtempSync(join(tmpdir(), 'pa-smoke-'));
@@ -2213,6 +2214,143 @@ async function linkEventInjectionSmoke(store: Store, wsBase: string): Promise<vo
   );
 }
 
+/**
+ * W2.4 Link-Relay (Kilo P2, KILO-CLOUD-ANALYSE.md "Link-Agent auf Kilos
+ * Relay-Muster heben"): (a) heartbeat as full state - a session id missing
+ * from the snapshot is gone, no delta tracking needed; (b) protocolVersion/
+ * capabilities are read but never required, on `agent.hello` or
+ * `agent.heartbeat`; (c) the server's own terminal vs. transient close
+ * codes (the link agent's reconnect-loop reaction to them is unit-tested in
+ * link/test/link-status.test.ts, which has no server to close a socket).
+ */
+async function linkRelaySmoke(store: Store, wsBase: string, c2: Client): Promise<void> {
+  const { randomBytes } = await import('node:crypto');
+
+  /* ---- (a) heartbeat as full state ---- */
+
+  const tokenA = randomBytes(24).toString('hex');
+  store.createLink(randomUUID(), 'default', 'smoke-relay-a', sha256(tokenA));
+
+  const linkA = new Client(wsBase);
+  await linkA.opened;
+  // No protocolVersion/capabilities on hello at all - the shape of a link
+  // agent that predates W2.4 - must register exactly like a fully capable
+  // one; doubles as half of (b) below.
+  linkA.send({ type: 'agent.hello', token: tokenA, adapter: 'kilo', name: 'relay-a' });
+  const readyA = await linkA.wait((m) => m.type === 'agent.ready');
+  const sessionAId = readyA.type === 'agent.ready' ? readyA.sessionId : '';
+  assert(sessionAId !== '', 'a link registers fine without protocolVersion/capabilities on hello');
+  assert(store.getSession(sessionAId)?.status === 'idle', 'a freshly registered link session starts idle');
+
+  // A second, independent link: used below to prove neither an unrelated
+  // link's traffic nor an attempt to name its session id in linkA's own
+  // heartbeat can move a session linkA is not bound to.
+  const tokenC = randomBytes(24).toString('hex');
+  store.createLink(randomUUID(), 'default', 'smoke-relay-c', sha256(tokenC));
+  const linkC = new Client(wsBase);
+  await linkC.opened;
+  linkC.send({ type: 'agent.hello', token: tokenC, adapter: 'kilo', name: 'relay-c' });
+  const readyC = await linkC.wait((m) => m.type === 'agent.ready');
+  const sessionCId = readyC.type === 'agent.ready' ? readyC.sessionId : '';
+  assert(sessionCId !== '' && sessionCId !== sessionAId, 'a second link registers its own, separate session');
+
+  linkA.send({
+    type: 'agent.heartbeat',
+    sessions: [{ sessionId: sessionAId, status: 'busy' }],
+    protocolVersion: 2,
+    capabilities: { heartbeat: true },
+  });
+  await waitUntil(
+    () => store.getSession(sessionAId)?.status === 'running',
+    "a heartbeat reporting 'busy' for the bound session moves it to running",
+  );
+
+  linkA.send({ type: 'agent.heartbeat', sessions: [{ sessionId: sessionAId, status: 'idle' }] });
+  await waitUntil(
+    () => store.getSession(sessionAId)?.status === 'idle',
+    "a heartbeat reporting 'idle' moves a running session back to idle, without a turn.completed event",
+  );
+
+  linkA.send({
+    type: 'agent.heartbeat',
+    sessions: [{ sessionId: sessionAId, status: 'busy' }],
+  });
+  await waitUntil(() => store.getSession(sessionAId)?.status === 'running', 'set up running again before the "gone" check');
+
+  // Full-state discipline: the bound session simply absent from the list -
+  // not a delta, not a dedicated "gone" message - means it no longer exists
+  // from the link agent's point of view, the same conclusion a socket close
+  // would draw.
+  linkA.send({ type: 'agent.heartbeat', sessions: [] });
+  await waitUntil(
+    () => store.getSession(sessionAId)?.status === 'stopped',
+    'a session missing from the heartbeat is treated as gone (stopped)',
+  );
+
+  /* ---- (b) capability flags are read but never required ---- */
+
+  // Re-arm to 'running', then send a heartbeat naming linkC's REAL session id
+  // (a forgery attempt, same trust boundary as agent.event) plus a malformed
+  // status, alongside a valid entry for linkA's own bound session - none of
+  // that may stop the valid entry from applying, and linkC's session must
+  // stay completely untouched by traffic on linkA's socket.
+  linkA.send({ type: 'agent.heartbeat', sessions: [{ sessionId: sessionAId, status: 'busy' }] });
+  await waitUntil(() => store.getSession(sessionAId)?.status === 'running', 'set up running again before the tolerance check');
+  linkA.send({
+    type: 'agent.heartbeat',
+    sessions: [
+      { sessionId: sessionCId, status: 'busy' },
+      { sessionId: sessionAId, status: 'idle' },
+      { sessionId: sessionAId, status: 'not-a-real-status' },
+    ],
+  });
+  await waitUntil(
+    () => store.getSession(sessionAId)?.status === 'idle',
+    "a heartbeat with linkC's session id and a malformed entry alongside the valid one still applies the valid one",
+  );
+  assert(
+    store.getSession(sessionCId)?.status === 'idle',
+    "naming linkC's real session id in linkA's heartbeat does not move it - a link only ever affects its own binding",
+  );
+
+  // A heartbeat whose `sessions` is not even an array (arbitrary/garbled
+  // wire input) must degrade to "no entries" instead of throwing - only the
+  // sender's own bound session is affected (it goes missing -> stopped), a
+  // second link's session and the connection itself stay unaffected.
+  linkA.send({ type: 'agent.heartbeat', sessions: 'not-an-array' });
+  await new Promise((r) => setTimeout(r, 100));
+  assert(
+    store.getSession(sessionAId)?.status === 'stopped',
+    'a heartbeat with a non-array sessions field is treated as an empty snapshot for the sender, not the process crashing',
+  );
+  assert(
+    store.getSession(sessionCId)?.status === 'idle',
+    "a malformed heartbeat on linkA's socket never touches linkC's session",
+  );
+  const pingReq = await request(c2, { type: 'server.stats', requestId: 'relay-alive' });
+  assert(pingReq.type === 'server.stats', 'the server keeps serving other clients after a malformed heartbeat');
+
+  /* ---- (c) terminal vs. transient close codes the server itself sends ---- */
+
+  // Conflict: a second connection with the same link token displaces the
+  // first - WS_CLOSE_REPLACED, the code link/src/index.ts treats as terminal.
+  const linkAClosed = linkA.closeCode();
+  const linkA2 = new Client(wsBase);
+  await linkA2.opened;
+  linkA2.send({ type: 'agent.hello', token: tokenA, adapter: 'kilo', name: 'relay-a-2' });
+  await linkA2.wait((m) => m.type === 'agent.ready');
+  assert((await linkAClosed) === WS_CLOSE_REPLACED, 'a link displaced by a same-token reconnect is closed with WS_CLOSE_REPLACED');
+
+  // Revocation: WS_CLOSE_UNAUTHORIZED, the other code link/src/index.ts
+  // treats as terminal.
+  const linkA2Closed = linkA2.closeCode();
+  const linkIdA = store.getLinkByTokenHash(sha256(tokenA))?.id ?? '';
+  assert(linkIdA !== '', 'the link row for tokenA is resolvable');
+  const revoked = await request(c2, { type: 'link.revoke', requestId: 'relay-revoke', linkId: linkIdA });
+  assert(revoked.type === 'link.revoked', 'link.revoke acknowledged');
+  assert((await linkA2Closed) === WS_CLOSE_UNAUTHORIZED, "a revoked link's live socket is closed with WS_CLOSE_UNAUTHORIZED");
+}
+
 async function main(): Promise<void> {
   await protocolLoadsOnPlainNode();
   const { app, store, manager } = await buildApp();
@@ -2983,6 +3121,10 @@ async function main(): Promise<void> {
   await secretsUniqueSmoke(store);
   await adapterManifestSmoke();
   await linkEventInjectionSmoke(store, wsBase);
+
+  /* ---------------- W2.4 link relay: heartbeat, capabilities, close codes --------------------------- */
+
+  await linkRelaySmoke(store, wsBase, c2);
 
   console.log('SMOKE OK');
   process.exit(0);

@@ -13,8 +13,8 @@ android {
         applicationId = "com.pocketagent.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 14
-        versionName = "0.10.2"
+        versionCode = 15
+        versionName = "0.11.0"
 
         buildConfigField("String", "FBM_PROJECT_ID", "\"replace-me\"")
         buildConfigField("String", "FBM_APPLICATION_ID", "\"replace-me\"")

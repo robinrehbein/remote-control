@@ -264,6 +264,29 @@ Dann eine Testsession mit Policy `allowlist` starten: Repo-Clone muss
 funktionieren (github.com ist in der Default-Allowlist), ein Zugriff auf eine
 nicht gelistete Domain muss mit 403 scheitern.
 
+## Codex In-App-Login (ChatGPT-Abo, CODEX-OAUTH.md)
+
+- In der App unter *Einstellungen → Anmelden*: „OpenAI Codex: Mit ChatGPT anmelden".
+  Der Orchestrator startet einen kurzlebigen Auth-Container (codex-shim-Image),
+  treibt `codex app-server login_chatgpt`, schickt die Login-URL + Loopback-Port
+  an die App; die App öffnet den Browser, fängt den Redirect auf 127.0.0.1:{port}
+  ab und reicht code+state über den WSS zurück. Kein Token-Kopieren vom Laptop.
+- **Ein kanonisches CODEX_HOME-Volume pro Tenant** (`pocketagent-codex-home-<tenant>`),
+  rw in jeden Codex-Session-Container und in den Auth-Container gemountet. Das
+  Refresh-Token rotiert und ist single-use — `auth.json` darf deshalb **nie** in
+  mehrere Container kopiert werden (Kopien entwerten sich beim ersten Refresh
+  gegenseitig, `refresh_token_reused`). Ein geteiltes Volume aktualisiert die
+  Datei in-place. Restrisiko: zwei Codex-Container, die im selben ~5-min-Fenster
+  refreshen, können sich gegenseitig invalidieren — selten; dann in der App
+  einmal neu anmelden.
+- Nach erfolgreichem Login legt der Server `auth.json` **verschlüsselt** als
+  Vault-Secret `codex_oauth` ab (Backup gegen Volume-Verlust). Ein *altes* Backup
+  kann wegen der Rotation bereits tot sein → beim Restore neu anmelden.
+- Der Auth-Container hängt am Standard-Netz (`NETWORK_NAME`) und braucht direkten
+  Zugriff auf `auth.openai.com` für den Token-Exchange.
+- **Offen (manuell):** der echte End-to-End-Login mit einem ChatGPT-Konto am Handy
+  ist hier nicht automatisierbar und muss einmal von Hand geprüft werden.
+
 ## Bekannte Grenzen (bewusst)
 
 - Junie: keine Remote-Approvals (ein-shot-CLI) → App zeigt Warnbanner; ask/acceptEdits

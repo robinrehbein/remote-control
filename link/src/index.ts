@@ -148,10 +148,20 @@ async function spawnShim(): Promise<ShimProcess> {
 
 let shim: ShimProcess | null = null;
 let shimRestarting = false;
+let restartPending = false;
 let stopped = false;
 
 async function restart(): Promise<void> {
-  if (stopped || shimRestarting) return;
+  if (stopped) return;
+  if (shimRestarting) {
+    // A restart is already spawning/health-polling (e.g. still inside the
+    // 90s health wait after an earlier crash). Don't drop this request on
+    // the floor - the in-flight restart's `finally` below picks it back up
+    // once it settles, so a crash-during-health-wait always gets a follow-up
+    // attempt instead of leaving the shim dead forever.
+    restartPending = true;
+    return;
+  }
   shimRestarting = true;
   try {
     shim = await spawnShim();
@@ -160,6 +170,10 @@ async function restart(): Promise<void> {
     console.error(`[link] ${e instanceof Error ? e.message : String(e)}`);
   } finally {
     shimRestarting = false;
+    if (!stopped && restartPending) {
+      restartPending = false;
+      void restart();
+    }
   }
 }
 

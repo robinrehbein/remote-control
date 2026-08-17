@@ -183,6 +183,23 @@ let ws: WebSocket | null = null;
 let sessionId: string | null = null;
 let lastServerMsgAt = Date.now();
 const eventQueue: AgentEvent[] = [];
+/** Cap on eventQueue so a long orchestrator outage (or a bad token loop) can't grow it forever. */
+const MAX_QUEUED_EVENTS = 1000;
+let droppedEventCount = 0;
+
+function queueEvent(ev: AgentEvent): void {
+  // Pings are pure heartbeats - by the time a delayed reconnect would flush
+  // them they no longer mean anything, so don't waste queue budget on them.
+  if (ev.type === 'ping') return;
+  eventQueue.push(ev);
+  if (eventQueue.length > MAX_QUEUED_EVENTS) {
+    eventQueue.shift();
+    droppedEventCount++;
+    if (droppedEventCount === 1 || droppedEventCount % 100 === 0) {
+      log(`event queue at cap (${MAX_QUEUED_EVENTS}) - dropped ${droppedEventCount} oldest event(s) so far (no orchestrator connection)`);
+    }
+  }
+}
 
 function wsUrl(): string {
   return resolveWsUrl(args.server);
@@ -265,7 +282,7 @@ function startEventStream(): void {
               try {
                 const ev = JSON.parse(line.slice(5).trim()) as AgentEvent;
                 if (sessionId && !stopped) send({ type: 'agent.event', sessionId, event: ev });
-                else if (!stopped) eventQueue.push(ev);
+                else if (!stopped) queueEvent(ev);
               } catch {
                 /* malformed */
               }

@@ -516,6 +516,27 @@ export class Store {
     return events;
   }
 
+  /**
+   * Sequence number (AgentEventMeta.seq) of the newest stored event of a
+   * session, or 0 when the newest event carries none (older shim, link agent,
+   * or no events at all). Lets the orchestrator resume the shim's replay cursor
+   * after a redeploy without re-reading the whole timeline: the newest event's
+   * seq is the highest of the shim's current stream (seq is monotone per
+   * stream, and pings/progress notices are never stored).
+   */
+  lastEventSeq(sessionId: string): number {
+    const row = this.db
+      .prepare('SELECT payload FROM session_events WHERE session_id = ? ORDER BY id DESC LIMIT 1')
+      .get(sessionId) as { payload: string } | undefined;
+    if (!row) return 0;
+    try {
+      const seq = (JSON.parse(row.payload) as { seq?: unknown }).seq;
+      return typeof seq === 'number' && Number.isFinite(seq) ? seq : 0;
+    } catch {
+      return 0;
+    }
+  }
+
   deleteSession(id: string): void {
     this.bumpSessionAuth();
     this.db.prepare('DELETE FROM session_events WHERE session_id = ?').run(id);

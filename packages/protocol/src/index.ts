@@ -257,7 +257,29 @@ export interface TokenUsage {
  */
 export type NoticePhase = 'image-build' | 'container-start' | 'shim-start' | 'ready';
 
-export type AgentEvent =
+/**
+ * Sequence metadata every normalized event carries once a shim's sequenced
+ * broadcaster has stamped it (see SequencedSseBroadcaster):
+ *  - `seq`: a per-session, per-stream monotone sequence number, mirrored in the
+ *    SSE `id:` field. It is the basis for Last-Event-ID replay (the orchestrator
+ *    reconnects with the last seq it saw, the shim replays from there) and for
+ *    client-side dedup between the live stream and the stored history. Named
+ *    `seq`, not `id`, because `tool.call`/`tool.result` already carry a string
+ *    `id` (the tool-call id) that this must not collide with.
+ *  - `ts`: emit time in epoch milliseconds.
+ *
+ * Both are optional for backward compatibility: events from an older shim (or
+ * decoded by an older client) simply lack them, so every decoder must treat
+ * them as "may be absent". The seq resets to 0 whenever a shim process restarts
+ * (a new container / adapter switch / resume), so it is unique only within one
+ * shim stream, not across the whole life of a session.
+ */
+export interface AgentEventMeta {
+  seq?: number;
+  ts?: number;
+}
+
+export type AgentEventBody =
   | {
       type: 'status';
       adapter: AdapterId;
@@ -301,6 +323,14 @@ export type AgentEvent =
    */
   | { type: 'notice'; message: string; phase?: NoticePhase; detail?: string }
   | { type: 'ping'; ts: number };
+
+/**
+ * A normalized event as it travels the wire: the event body plus the optional
+ * sequence metadata a shim stamps on it. Consumers keep switching on `type`
+ * exactly as before (the intersection preserves the discriminated union); `id`
+ * and `ts` are simply available when present.
+ */
+export type AgentEvent = AgentEventBody & AgentEventMeta;
 
 /** SSE wire format: `event: agent` + `data: <AgentEvent JSON>` */
 export interface AgentSseEvent {
@@ -730,4 +760,129 @@ export function selectModel(
     next.model = raw;
   }
   return next;
+}
+
+/* ------------------------------------------------------------------ */
+/* Shared event sequencing + replay (used by every shim's broadcaster) */
+/*                                                                     */
+/* All shims speak the same normalized SSE stream, and all of them lost */
+/* events on a reconnect gap because the broadcaster buffered nothing   */
+/* and carried no ids. This one implementation gives every shim a       */
+/* monotone `id` per event, a ring buffer of the recent past, and       */
+/* Last-Event-ID replay - the orchestrator side reconnects with the id  */
+/* it last saw, and the shim resends whatever is still in the ring. It  */
+/* stays pure and dependency-free (loaded verbatim in shim containers   */
+/* via node's type stripping), so the sink is a structural type, never  */
+/* an import of node:http.                                              */
+/* ------------------------------------------------------------------ */
+
+/** How many recent events a shim keeps for Last-Event-ID replay. */
+export const EVENT_RING_CAPACITY = 1000;
+
+/**
+ * Minimal SSE client the broadcaster writes to. `ServerResponse` satisfies it
+ * structurally, so nothing here depends on node:http. `writableEnded` lets the
+ * broadcaster drop a client whose socket already closed.
+ */
+export interface SseSink {
+  write(chunk: string): unknown;
+  readonly writableEnded?: boolean;
+}
+
+/**
+ * Parse a `Last-Event-ID` header (SSE reconnect) into a sequence number. Node
+ * lower-cases header names and may hand back an array for a repeated header;
+ * anything that is not a non-negative integer means "no cursor" (a fresh
+ * connection), which replays nothing.
+ */
+export function parseLastEventId(header: string | string[] | undefined): number | undefined {
+  const raw = Array.isArray(header) ? header[0] : header;
+  if (typeof raw !== 'string') return undefined;
+  const n = Number.parseInt(raw.trim(), 10);
+  return Number.isFinite(n) && n >= 0 ? n : undefined;
+}
+
+/**
+ * Fan-out broadcaster for the normalized AgentEvent SSE stream with per-event
+ * sequence ids and a replay ring.
+ *
+ * `publish` stamps the next id (and a `ts`) into the event, formats the SSE
+ * frame with an `id:` line, buffers it, and writes it to every live client.
+ * `add` registers a client; on a reconnect the caller passes the client's
+ * Last-Event-ID and every buffered frame after it is replayed first, so a gap
+ * in the connection loses no event still held in the ring.
+ *
+ * `ping` keepalives are deliberately unsequenced: they are fanned out to keep
+ * the socket warm but never consume an id or a ring slot, so a long-idle
+ * session's pings cannot evict the real events (a missed `turn.completed`) that
+ * a reconnecting client still needs to replay.
+ */
+export class SequencedSseBroadcaster {
+  private seq = 0;
+  private readonly ring: { id: number; frame: string }[] = [];
+  private readonly clients = new Set<SseSink>();
+  private readonly capacity: number;
+
+  constructor(capacity: number = EVENT_RING_CAPACITY) {
+    this.capacity = capacity > 0 ? capacity : EVENT_RING_CAPACITY;
+  }
+
+  /**
+   * Stamp, buffer and fan out an event. Returns the assigned id, or `undefined`
+   * for a `ping` (which is sent live but never sequenced).
+   */
+  publish(event: AgentEvent): number | undefined {
+    if (event.type === 'ping') {
+      this.fanout(`event: agent\ndata: ${JSON.stringify(event)}\n\n`);
+      return undefined;
+    }
+    const id = ++this.seq;
+    const stamped: AgentEvent = { ...event, seq: id, ts: event.ts ?? Date.now() };
+    const frame = `id: ${id}\nevent: agent\ndata: ${JSON.stringify(stamped)}\n\n`;
+    this.ring.push({ id, frame });
+    if (this.ring.length > this.capacity) this.ring.shift();
+    this.fanout(frame);
+    return id;
+  }
+
+  /**
+   * Register an SSE client. `lastEventId` (from its Last-Event-ID header on a
+   * reconnect) replays every still-buffered frame after it before the client
+   * starts receiving live frames again.
+   */
+  add(sink: SseSink, lastEventId?: number): void {
+    if (lastEventId !== undefined) {
+      for (const entry of this.ring) if (entry.id > lastEventId) this.writeTo(sink, entry.frame);
+    }
+    this.clients.add(sink);
+  }
+
+  remove(sink: SseSink): void {
+    this.clients.delete(sink);
+  }
+
+  get clientCount(): number {
+    return this.clients.size;
+  }
+
+  /** The id of the last sequenced event (0 before anything was published). */
+  get lastId(): number {
+    return this.seq;
+  }
+
+  private fanout(frame: string): void {
+    for (const sink of this.clients) this.writeTo(sink, frame);
+  }
+
+  private writeTo(sink: SseSink, frame: string): void {
+    if (sink.writableEnded === true) {
+      this.clients.delete(sink);
+      return;
+    }
+    try {
+      sink.write(frame);
+    } catch {
+      this.clients.delete(sink);
+    }
+  }
 }

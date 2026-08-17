@@ -1,30 +1,31 @@
 import type { AgentEvent } from '@pocketagent/protocol';
+import { SequencedSseBroadcaster } from '@pocketagent/protocol';
 import type { ServerResponse } from 'node:http';
 
-/** Fan-out broadcaster for the normalized AgentEvent stream (SSE, `event: agent`). */
-export class EventBroadcaster {
-  private readonly clients = new Set<ServerResponse>();
+/**
+ * Fan-out broadcaster for the normalized AgentEvent stream (SSE, `event: agent`).
+ *
+ * Sequencing, the replay ring and Last-Event-ID handling come from the shared
+ * SequencedSseBroadcaster (identical across all shims, so a reconnect gap loses
+ * no event); this subclass keeps the claude-specific wiring: the `retry:` hint,
+ * the per-connection close cleanup, and the keepalive timer.
+ */
+export class EventBroadcaster extends SequencedSseBroadcaster {
   private timer: NodeJS.Timeout | null = null;
 
-  add(res: ServerResponse): void {
+  /**
+   * Register an SSE client. `lastEventId` (its Last-Event-ID header on a
+   * reconnect) replays every buffered frame after it before live frames resume.
+   */
+  addClient(res: ServerResponse, lastEventId?: number): void {
     res.write('retry: 3000\n\n');
-    this.clients.add(res);
-    res.on('close', () => {
-      this.clients.delete(res);
-    });
-  }
-
-  publish(event: AgentEvent): void {
-    if (this.clients.size === 0) return;
-    const frame = `event: agent\ndata: ${JSON.stringify(event)}\n\n`;
-    for (const res of this.clients) {
-      if (!res.writableEnded) res.write(frame);
-    }
+    this.add(res, lastEventId);
+    res.on('close', () => this.remove(res));
   }
 
   startHeartbeat(intervalMs = 15_000): void {
     if (this.timer) return;
-    this.timer = setInterval(() => this.publish({ type: 'ping', ts: Date.now() }), intervalMs);
+    this.timer = setInterval(() => this.publish({ type: 'ping', ts: Date.now() } satisfies AgentEvent), intervalMs);
     this.timer.unref();
   }
 

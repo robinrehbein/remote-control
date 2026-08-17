@@ -80,6 +80,15 @@ export function statusFromLinkHeartbeat(status: LinkSessionStatus): SessionStatu
  */
 const EGRESS_LIVE_STATUSES: readonly SessionStatus[] = ['creating', 'running', 'idle'];
 
+/**
+ * A 'running' session that has emitted no event for this long is treated as
+ * possibly hung (a lost turn.completed) and its shim is asked directly whether
+ * it is still busy - see resyncRunningStatuses. Long enough that an actually
+ * working turn (which keeps touching last_active_at with its events) is never
+ * caught, short enough to correct a hang well before the idle reaper would.
+ */
+export const RESYNC_STALE_MS = 90_000;
+
 /** `session.events.get`: youngest events, chronological; the client may ask for fewer. */
 export const EVENTS_DEFAULT_LIMIT = 200;
 export const EVENTS_MAX_LIMIT = 1000;
@@ -222,6 +231,14 @@ export class SessionManager {
    * Egress, auch wenn die Session selbst gerade gestoppt ist.
    */
   private readonly pushing = new Set<string>();
+  /**
+   * Höchste bereits persistierte Event-Sequenz (AgentEventMeta.seq) pro Session.
+   * persistEvent verwirft alles, was nicht darüber liegt - so schreibt ein
+   * Replay nach einem Reconnect keine Duplikate in die Historie. Wird beim
+   * Aufbau eines frischen Event-Streams (connectEvents) zurückgesetzt, weil die
+   * Shim-Sequenz mit einem neuen Container wieder bei 0 beginnt.
+   */
+  private readonly lastPersistedSeq = new Map<string, number>();
   /** Abgeleitete Token-Tabelle des Egress-Gates (siehe egressTokens). */
   private egressTokenCache: { revision: number; entries: TokenEntry<string>[] } | null = null;
   readonly startedAt = Date.now();
@@ -522,6 +539,7 @@ export class SessionManager {
       this.clients.get(id)?.stop();
       this.clients.delete(id);
       this.generations.delete(id);
+      this.lastPersistedSeq.delete(id);
       // Same derivation as provision(): the row is gone, so the volume name is
       // no longer readable from it.
       await docker.removeVolume(`pocketagent-sess-${id}`).catch(() => {});
@@ -701,16 +719,46 @@ export class SessionManager {
     }
   }
 
-  private connectEvents(id: string, base: string, token: string): void {
+  /**
+   * (Re)build the shim event stream for a session.
+   *
+   * A fresh container starts its event sequence at 0, so the dedup baseline is
+   * reset with it. `resumeCursor` is for reconnecting to a shim that kept
+   * running (an orchestrator redeploy): the highest seq already stored seeds
+   * both the client's Last-Event-ID and the dedup baseline, so the events
+   * emitted during the gap are replayed and land exactly once.
+   */
+  private connectEvents(id: string, base: string, token: string, resumeCursor = false): void {
     this.clients.get(id)?.stop();
     const client = this.shimClient(base, token);
+    if (resumeCursor) {
+      const seq = this.store.lastEventSeq(id);
+      if (seq > 0) {
+        client.seedEventCursor(seq);
+        this.lastPersistedSeq.set(id, seq);
+      } else {
+        this.lastPersistedSeq.delete(id);
+      }
+    } else {
+      this.lastPersistedSeq.delete(id);
+    }
     this.clients.set(id, client);
     client.startEvents((ev) => this.onEvent(id, ev));
   }
 
-  /** Single write path into the stored timeline (noise never reaches the table). */
+  /**
+   * Single write path into the stored timeline (noise never reaches the table).
+   * Deduplicated by the event's `seq`: a replayed event (same seq the shim
+   * already sent before a reconnect) is dropped instead of appended a second
+   * time. Events without a seq (older shim, link agent) are always written.
+   */
   private persistEvent(sessionId: string, ev: AgentEvent): void {
     if (!isHistoryEvent(ev)) return;
+    if (typeof ev.seq === 'number') {
+      const last = this.lastPersistedSeq.get(sessionId);
+      if (last !== undefined && ev.seq <= last) return;
+      this.lastPersistedSeq.set(sessionId, last === undefined ? ev.seq : Math.max(last, ev.seq));
+    }
     this.store.appendEvent(sessionId, ev.type, JSON.stringify(ev));
   }
 
@@ -780,7 +828,15 @@ export class SessionManager {
       console.warn(`[sessions] re-attach failed for ${id.slice(0, 8)}: ${failure}`);
       return null;
     }
-    this.connectEvents(id, this.shimBase(id, row.shim_endpoint), row.shim_token);
+    // Do NOT tear the event stream down here. A live client has its own
+    // reconnect loop that recovers over the freshly re-attached network and
+    // replays what it missed via Last-Event-ID; recreating it on every null
+    // (the old behaviour) reset that cursor mid-turn and dropped events - the
+    // aggravating half of the event-loss finding. Only stand a stream up when
+    // there is none, resuming its cursor from the stored history.
+    if (!this.clients.has(id)) {
+      this.connectEvents(id, this.shimBase(id, row.shim_endpoint), row.shim_token, true);
+    }
     return await call(this.client(id));
   }
 
@@ -1265,6 +1321,7 @@ export class SessionManager {
     // A start that is still running aborts on the missing row alone (see
     // checkpoint), so the counter may go with the session.
     this.generations.delete(id);
+    this.lastPersistedSeq.delete(id);
   }
 
   listSessions(tenant: string = TENANT): SessionInfo[] {
@@ -1429,7 +1486,10 @@ export class SessionManager {
     const failure = await docker.attachOrchestratorTo(row);
     if (failure !== null) throw new Error(failure);
     if (!row.shim_token) return;
-    this.connectEvents(row.id, this.shimBase(row.id, row.shim_endpoint), row.shim_token);
+    // The container kept running across the redeploy, so its shim sequence
+    // continued: resume the replay cursor from the last stored seq to pick up
+    // the events emitted during the restart gap.
+    this.connectEvents(row.id, this.shimBase(row.id, row.shim_endpoint), row.shim_token, true);
     // A turn (or a start) that was in flight during the restart is lost: its
     // shim events went nowhere, so the session would stay 'running' forever.
     const interrupted = row.status === 'running' || row.status === 'creating';
@@ -1446,6 +1506,7 @@ export class SessionManager {
   start(): void {
     this.timers.push(
       setInterval(() => void this.reapIdle().catch(() => {}), 60_000),
+      setInterval(() => void this.resyncRunningStatuses().catch(() => {}), 60_000),
       setInterval(() => void this.gc().catch(() => {}), 24 * 3_600_000),
       // Gateway-Modus: der Gateway hält die Session-Tabelle nur im Speicher,
       // ein Neustart des Containers verliert sie (no-op ohne Gateway).
@@ -1463,6 +1524,44 @@ export class SessionManager {
       ) {
         await this.stopSession(row.id).catch(() => {});
       }
+    }
+  }
+
+  /**
+   * Backstop gegen eine fälschlich in 'running' hängende Session (die Folge
+   * eines verlorenen turn.completed): Wird eine Session als laufend geführt,
+   * hat aber seit RESYNC_STALE_MS kein Event mehr geliefert, fragt dieser Lauf
+   * den Shim direkt nach seinem busy-Status; meldet der Shim busy:false, wird
+   * die Session auf 'idle' korrigiert. Das Sequenz-/Replay-Verfahren verhindert
+   * den Event-Verlust bereits an der Wurzel - dieser Resync ist die zweite
+   * Sicherung, falls je ein turn.completed doch nicht ankommt.
+   *
+   * Öffentlich, damit der Lauf testbar ist; regulär feuert ihn nur der Timer.
+   * Nur Docker-Sessions mit einem bereits verbundenen Event-Client werden
+   * geprüft (kein neuer Netz-Re-Attach im Timer), und die Staleness-Schranke
+   * verhindert, dass ein gerade gestarteter Turn - dessen busy-Flag der Shim
+   * noch nicht gesetzt hat - vorzeitig auf idle gekippt wird.
+   */
+  async resyncRunningStatuses(): Promise<void> {
+    if (!config.dockerEnabled) return;
+    const staleBefore = Date.now() - RESYNC_STALE_MS;
+    for (const row of this.store.listSessions(TENANT)) {
+      if (row.link_id || row.status !== 'running' || !row.shim_token || !row.container_id) continue;
+      if (Date.parse(row.last_active_at) >= staleBefore) continue; // recent event: really busy
+      const client = this.clients.get(row.id);
+      if (!client) continue; // no live stream to ask; reconcile/resume owns that case
+      const status = await client.status().catch(() => null);
+      if (!status || status.busy !== false) continue;
+      // Re-read under the current state: a turn may have started meanwhile.
+      const current = this.store.getSession(row.id);
+      if (!current || current.status !== 'running') continue;
+      if (Date.parse(current.last_active_at) >= staleBefore) continue;
+      this.setStatus(row.id, 'idle');
+      this.emitEvent(row.id, {
+        type: 'notice',
+        message: 'Turn abgeschlossen – der Status wurde nachträglich korrigiert (kein Abschluss-Event empfangen).',
+      });
+      console.log(`[sessions] resynced ${row.id.slice(0, 8)} from a stale 'running' to 'idle' (shim reports not busy)`);
     }
   }
 

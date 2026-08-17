@@ -5,7 +5,7 @@ import { homedir } from 'node:os';
 import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import Fastify, { type FastifyReply } from 'fastify';
-import { selectModel } from '@pocketagent/protocol';
+import { parseLastEventId, selectModel } from '@pocketagent/protocol';
 import type { AgentMode, PermissionDecision, PromptRequest, ResumeRequest, ShimStatus } from '@pocketagent/protocol';
 import { readEnv, type ShimEnvConfig } from './env.js';
 import { parsePermissionJson, permissionForMode, writeOpencodeConfig, type PermissionMap } from './modes.js';
@@ -284,8 +284,8 @@ async function main(): Promise<void> {
 
   app.get('/diff', async () => (opencodeSessionId === undefined ? [] : await client.diff(opencodeSessionId)));
 
-  app.get('/events', (_request, reply) => {
-    openEventStream(reply, broadcaster, () => normalizer.emitStatus());
+  app.get('/events', (request, reply) => {
+    openEventStream(reply, broadcaster, () => normalizer.emitStatus(), parseLastEventId(request.headers['last-event-id']));
   });
 
   const shutdown = (): void => {
@@ -301,7 +301,12 @@ async function main(): Promise<void> {
   console.log(`[shim] listening on :${env.port} (opencode ${env.opencodeSpawn ? `spawned :${env.opencodePort}` : `external ${env.opencodeBase}`})`);
 }
 
-function openEventStream(reply: FastifyReply, broadcaster: Broadcaster, sendInitial: () => void): void {
+function openEventStream(
+  reply: FastifyReply,
+  broadcaster: Broadcaster,
+  sendInitial: () => void,
+  lastEventId?: number,
+): void {
   reply.hijack();
   const raw = reply.raw;
   raw.writeHead(200, {
@@ -311,7 +316,9 @@ function openEventStream(reply: FastifyReply, broadcaster: Broadcaster, sendInit
     'x-accel-buffering': 'no',
   });
   raw.write(': connected\n\n');
-  broadcaster.add(raw);
+  // On a reconnect the orchestrator sends the last seq it saw; the ring replays
+  // everything after it (before the fresh status below) so no event is lost.
+  broadcaster.add(raw, lastEventId);
   sendInitial();
   raw.on('close', () => broadcaster.remove(raw));
 }

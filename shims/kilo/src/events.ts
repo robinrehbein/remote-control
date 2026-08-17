@@ -1,27 +1,18 @@
-import type { ServerResponse } from 'node:http';
 import type { AgentEvent, AgentMode, PermissionKind } from '@pocketagent/protocol';
+import { SequencedSseBroadcaster } from '@pocketagent/protocol';
 import type { OpenCodeClient } from './opencode-client.js';
 
-export class Broadcaster {
-  private readonly clients = new Set<ServerResponse>();
-
-  add(client: ServerResponse): void {
-    this.clients.add(client);
-  }
-
-  remove(client: ServerResponse): void {
-    this.clients.delete(client);
-  }
-
+/**
+ * Fan-out broadcaster for the normalized AgentEvent stream.
+ *
+ * Sequencing, the replay ring and Last-Event-ID handling come from the shared
+ * SequencedSseBroadcaster (identical across all shims, so a reconnect gap loses
+ * no event); `broadcast` is kept as the name the normalizer calls, delegating
+ * to the shared `publish` (which also stamps the seq and buffers for replay).
+ */
+export class Broadcaster extends SequencedSseBroadcaster {
   broadcast(event: AgentEvent): void {
-    const frame = `event: agent\ndata: ${JSON.stringify(event)}\n\n`;
-    for (const client of this.clients) {
-      try {
-        client.write(frame);
-      } catch {
-        this.clients.delete(client);
-      }
-    }
+    this.publish(event);
   }
 }
 

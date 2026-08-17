@@ -36,6 +36,15 @@ export class ShimClient {
   private readonly extraHeaders: Record<string, string>;
   private ac: AbortController | null = null;
   private stopped = false;
+  /**
+   * Last event sequence number seen on this stream (0 = none yet). Sent as
+   * `Last-Event-ID` on every (re)connect so the shim replays whatever fell into
+   * the gap, and used to drop the replayed events this client already forwarded
+   * - so a reconnect neither loses nor duplicates an event. The cursor lives on
+   * the client instance: a fresh client (a restarted container) starts at 0,
+   * which is correct because the shim's own sequence resets with it.
+   */
+  private lastEventId = 0;
 
   /**
    * `extraHeaders` ride along on every request; used for the remote-runner
@@ -108,6 +117,16 @@ export class ShimClient {
     return res === null ? null : normalizeModels(res);
   }
 
+  /**
+   * Seed the replay cursor before the stream starts. Used when reconnecting to
+   * a shim process that kept running (e.g. an orchestrator redeploy): the last
+   * seq already persisted for the session picks the events emitted during the
+   * gap back up. A fresh container leaves this at 0.
+   */
+  seedEventCursor(lastSeq: number): void {
+    if (Number.isFinite(lastSeq) && lastSeq > this.lastEventId) this.lastEventId = lastSeq;
+  }
+
   startEvents(onEvent: (e: AgentEvent) => void): void {
     void this.eventLoop(onEvent);
   }
@@ -121,6 +140,10 @@ export class ShimClient {
             ...this.extraHeaders,
             authorization: `Bearer ${this.token}`,
             accept: 'text/event-stream',
+            // Reconnect from where we were: the shim replays every buffered
+            // event after this seq, so the gap between disconnect and reconnect
+            // loses nothing. Omitted on the first connect (nothing to replay).
+            ...(this.lastEventId > 0 ? { 'last-event-id': String(this.lastEventId) } : {}),
           },
           signal: this.ac.signal,
         });
@@ -149,18 +172,50 @@ export class ShimClient {
       while (idx >= 0) {
         const block = buf.slice(0, idx);
         buf = buf.slice(idx + 2);
-        for (const line of block.split('\n')) {
-          if (!line.startsWith('data:')) continue;
-          try {
-            const ev = JSON.parse(line.slice(5).trim()) as AgentEvent;
-            if (ev && typeof ev.type === 'string') onEvent(ev);
-          } catch {
-            /* malformed line */
-          }
-        }
+        this.handleBlock(block, onEvent);
         idx = buf.indexOf('\n\n');
       }
     }
+  }
+
+  /**
+   * One SSE frame: an optional `id:` line (the event's sequence number) and a
+   * `data:` line (the AgentEvent JSON). The seq drives dedup + the reconnect
+   * cursor - an event at or below the last one seen is a replay this client
+   * already forwarded and is dropped, so a reconnect delivers each event
+   * exactly once. Frames without a seq (an older shim, or a ping) are always
+   * forwarded and never advance the cursor, preserving the old behaviour.
+   */
+  private handleBlock(block: string, onEvent: (e: AgentEvent) => void): void {
+    let dataLine: string | undefined;
+    let idLine: string | undefined;
+    for (const line of block.split('\n')) {
+      if (line.startsWith('data:')) dataLine = line.slice(5).trim();
+      else if (line.startsWith('id:')) idLine = line.slice(3).trim();
+    }
+    if (dataLine === undefined) return;
+    let ev: AgentEvent;
+    try {
+      ev = JSON.parse(dataLine) as AgentEvent;
+    } catch {
+      return; // malformed frame
+    }
+    if (!ev || typeof ev.type !== 'string') return;
+    // Prefer the seq embedded in the event; fall back to the SSE id: line and
+    // inject it so persistence and the app get a consistent sequence number.
+    let seq = typeof ev.seq === 'number' ? ev.seq : undefined;
+    if (seq === undefined && idLine !== undefined) {
+      const parsed = Number.parseInt(idLine, 10);
+      if (Number.isFinite(parsed) && parsed >= 0) {
+        seq = parsed;
+        ev.seq = parsed;
+      }
+    }
+    if (seq !== undefined) {
+      if (seq <= this.lastEventId) return; // replay of an event already forwarded
+      this.lastEventId = seq;
+    }
+    onEvent(ev);
   }
 
   stop(): void {

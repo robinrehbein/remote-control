@@ -1442,7 +1442,14 @@ async function protocolLoadsOnPlainNode(): Promise<void> {
   await new Promise<void>((resolve) => {
     execFile(
       process.execPath,
-      ['-e', "import('@pocketagent/protocol').then(m => { if (typeof m.selectModel !== 'function') process.exit(2); })"],
+      [
+        '-e',
+        // The shared SequencedSseBroadcaster is a class in the same single-file
+        // package the shim containers load via node's type stripping, so it must
+        // construct on plain node too (a parameter property or an enum in it
+        // would strip-fail every session container at startup).
+        "import('@pocketagent/protocol').then(m => { if (typeof m.selectModel !== 'function') process.exit(2); const b = new m.SequencedSseBroadcaster(2); if (b.publish({type:'notice',message:'x'}) !== 1) process.exit(3); if (typeof m.parseLastEventId !== 'function') process.exit(4); })",
+      ],
       { cwd: repoRoot },
       (err, _stdout, stderr) => {
         assert(!err, `protocol package must import on plain node (no tsx): ${String(stderr).trim()}`);
@@ -1648,6 +1655,139 @@ async function historySmoke(store: Store, manager: SessionManager, c2: Client, r
     .get(id) as { c: number };
   assert(leftover.c === 0, 'session.delete removes the stored events too');
   assert(store.getSession(id) === undefined, 'session.delete removes the row');
+}
+
+/**
+ * Event sequencing + replay against event loss (APP-REVIEW "SSE-Weiterleitung
+ * ohne Cursor/Replay" and "AgentEvent hat keine Sequenz-/Event-ID"). Three
+ * parts: the shared ring buffer in isolation, then the full orchestrator path -
+ * an event emitted into a reconnect gap arrives after reconnect via
+ * Last-Event-ID and lands exactly once, and a turn.completed in the gap does
+ * not leave the session stuck in 'running' - and finally the persistence dedup.
+ */
+async function eventReplaySmoke(store: Store, manager: SessionManager, _c2: Client, repoId: string): Promise<void> {
+  const { SequencedSseBroadcaster, parseLastEventId } = await import('@pocketagent/protocol');
+  type AgentEvent = import('@pocketagent/protocol').AgentEvent;
+  const http = await import('node:http');
+  const { ShimClient } = await import('./shim-client.js');
+
+  /* ---- Part A: the shared ring buffer + Last-Event-ID replay (pure) ---- */
+
+  const ring = new SequencedSseBroadcaster(3); // tiny capacity to force eviction
+  const seqOf = (frame: string): string | undefined => /^id: (\d+)/m.exec(frame)?.[1];
+  const live: string[] = [];
+  ring.add({ write: (s: string) => void live.push(s) });
+  const ids = ['a', 'b', 'c', 'd'].map((t) => ring.publish({ type: 'notice', message: t }));
+  assert(ids.join(',') === '1,2,3,4', 'every event gets the next monotone seq');
+  assert(live.length === 4 && live.every((f) => f.includes('"seq":')), 'a connected client receives every event with its seq embedded');
+
+  const fromZero: string[] = [];
+  ring.add({ write: (s: string) => void fromZero.push(s) }, 0);
+  assert(fromZero.map(seqOf).join(',') === '2,3,4', 'a reconnect from 0 replays what the ring still holds (seq 1 evicted at capacity 3)');
+
+  const fromTwo: string[] = [];
+  ring.add({ write: (s: string) => void fromTwo.push(s) }, 2);
+  assert(fromTwo.map(seqOf).join(',') === '3,4', 'Last-Event-ID replays only the events after it');
+
+  const beforePing = ring.lastId;
+  const pingFrames: string[] = [];
+  ring.add({ write: (s: string) => void pingFrames.push(s) });
+  ring.publish({ type: 'ping', ts: 1 });
+  assert(ring.lastId === beforePing, 'a ping is not sequenced - keepalive never consumes a seq or a ring slot');
+  assert(pingFrames.length === 1 && !/^id:/m.test(pingFrames[0]!), 'the ping frame carries no id: line, so it never advances a client cursor');
+  assert(
+    parseLastEventId('7') === 7 && parseLastEventId(undefined) === undefined && parseLastEventId('nope') === undefined,
+    'parseLastEventId turns a header into a cursor and rejects non-numbers',
+  );
+
+  /* ---- Part B: an event in a reconnect gap survives, exactly once, end to end ---- */
+
+  // The fake shim uses the very same shared broadcaster the real shims use, so
+  // this exercises both sides of the contract: the shim's replay ring and the
+  // orchestrator ShimClient's Last-Event-ID cursor + dedup, feeding the real
+  // SessionManager.onEvent (persistence + status) through handleLinkEvent.
+  const shimBus = new SequencedSseBroadcaster();
+  const token = 'replay-shim-token';
+  const conn: { res: import('node:http').ServerResponse | null } = { res: null };
+  const shim = http.createServer((req, res) => {
+    if ((req.headers.authorization ?? '') !== `Bearer ${token}`) {
+      res.writeHead(401, { 'content-type': 'application/json' }).end('{"ok":false}');
+      return;
+    }
+    if ((req.url ?? '').startsWith('/events')) {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      shimBus.add(res, parseLastEventId(req.headers['last-event-id']));
+      conn.res = res;
+      res.on('close', () => shimBus.remove(res));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' }).end('{"ok":true}');
+  });
+  const shimPort = await listen(shim);
+  const shimBase = `http://127.0.0.1:${shimPort}`;
+
+  const sessionId = randomUUID();
+  store.insertSession(sessionRow(sessionId, repoId, { status: 'running', shim_token: token, shim_endpoint: shimBase }));
+
+  const forwarded: AgentEvent[] = [];
+  const client = new ShimClient(shimBase, token);
+  client.startEvents((ev) => {
+    forwarded.push(ev);
+    manager.handleLinkEvent(sessionId, ev);
+  });
+  try {
+    await waitUntil(() => shimBus.clientCount === 1, 'the orchestrator connects the shim event stream');
+    shimBus.publish({ type: 'message.completed', role: 'assistant', text: 'Antwort' }); // seq 1, delivered live
+    await waitUntil(() => forwarded.some((e) => e.type === 'message.completed'), 'the live event is forwarded');
+
+    // The reconnect gap: drop the stream, then emit the turn's completion while
+    // nobody is connected - exactly the event that used to be lost for good.
+    conn.res?.destroy();
+    await waitUntil(() => shimBus.clientCount === 0, 'the event stream drops');
+    shimBus.publish({ type: 'turn.completed', summary: 'fertig' }); // seq 2, into the gap
+    assert(shimBus.clientCount === 0, 'the completion was emitted into the gap, with no client to receive it live');
+
+    // The orchestrator reconnects with Last-Event-ID and the shim replays it.
+    await waitUntil(
+      () => store.getSession(sessionId)?.status === 'idle',
+      'the gap turn.completed arrives after reconnect and moves the session out of running',
+      8_000,
+    );
+    assert(forwarded.filter((e) => e.type === 'turn.completed').length === 1, 'the gap event is forwarded exactly once');
+    const history = store.listSessionEvents(sessionId, 1000);
+    assert(
+      history.filter((e) => e.type === 'turn.completed').length === 1,
+      'the replayed turn.completed lands exactly once in the history',
+    );
+    assert(
+      history.filter((e) => e.type === 'message.completed').length === 1,
+      'the pre-gap event is not duplicated by the reconnect',
+    );
+    assert(store.getSession(sessionId)?.status === 'idle', "turn.completed in the gap does not leave the session stuck in 'running'");
+  } finally {
+    client.stop();
+    shim.close();
+    await manager.deleteSession(sessionId).catch(() => {});
+  }
+
+  /* ---- Part C: persistence dedup drops a re-delivered seq ---- */
+
+  const dedupId = randomUUID();
+  store.insertSession(sessionRow(dedupId, repoId, { status: 'running' }));
+  try {
+    manager.handleLinkEvent(dedupId, { type: 'message.completed', role: 'assistant', text: 'x', seq: 5 });
+    manager.handleLinkEvent(dedupId, { type: 'message.completed', role: 'assistant', text: 'x', seq: 5 });
+    manager.handleLinkEvent(dedupId, { type: 'turn.completed', summary: 'ok', seq: 6 });
+    const rows = store.listSessionEvents(dedupId, 1000);
+    assert(rows.filter((e) => e.type === 'message.completed').length === 1, 'persistEvent stores a seq only once, even if it is delivered twice');
+    assert(store.getSession(dedupId)?.status === 'idle', 'a sequenced turn.completed still moves the session to idle');
+  } finally {
+    await manager.deleteSession(dedupId).catch(() => {});
+  }
+
+  // The status resync is a no-op without a docker daemon (smoke runs with none);
+  // this only proves the guard, the correction path is covered by Part B.
+  await manager.resyncRunningStatuses();
 }
 
 /**
@@ -2774,6 +2914,7 @@ async function main(): Promise<void> {
   await reconcileSmoke(store, manager, c2, added.repo.id);
   await lifecycleSmoke(store, manager, c2, added.repo.id);
   await historySmoke(store, manager, c2, added.repo.id);
+  await eventReplaySmoke(store, manager, c2, added.repo.id);
   await heartbeatSmoke();
 
   const models = await request(c2, { type: 'session.models.get', requestId: 'mod1', sessionId });

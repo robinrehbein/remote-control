@@ -19,6 +19,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 import type { AgentEvent, AgentMode, ServerMessage } from '@pocketagent/protocol';
+import { resolveWsUrl } from './ws-url.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, '../..');
@@ -170,10 +171,7 @@ let lastServerMsgAt = Date.now();
 const eventQueue: AgentEvent[] = [];
 
 function wsUrl(): string {
-  const u = new URL(args.server);
-  u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
-  u.pathname = '/ws';
-  return u.toString();
+  return resolveWsUrl(args.server);
 }
 
 function send(m: unknown): void {

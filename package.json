@@ -2,7 +2,7 @@
   "name": "pocketagent",
   "version": "0.1.0",
   "private": true,
-  "description": "Provider-agnostic mobile agent platform: Android app + orchestrator + adapter shim plugins (kilo, claude, pi, junie)",
+  "description": "Provider-agnostic mobile agent platform: Android app + orchestrator + adapter shim plugins (kilo, claude, pi, junie, codex)",
   "type": "module",
   "workspaces": [
     "packages/*",
@@ -12,10 +12,10 @@
     "shims/*"
   ],
   "scripts": {
-    "typecheck": "tsc -p packages/protocol && tsc -p server && tsc -p link && tsc -p cli && tsc -p shims/kilo && tsc -p shims/claude && tsc -p shims/pi && tsc -p shims/junie",
+    "typecheck": "tsc -p packages/protocol && tsc -p server && tsc -p link && tsc -p cli && tsc -p shims/kilo && tsc -p shims/claude && tsc -p shims/pi && tsc -p shims/junie && tsc -p shims/codex",
     "smoke:server": "npm run smoke -w server --if-present",
     "smoke:link": "npm run smoke -w link --if-present",
-    "smoke:shims": "npm run smoke -w shims/kilo --if-present && npm run smoke -w shims/claude --if-present && npm run smoke -w shims/pi --if-present && npm run smoke -w shims/junie --if-present",
+    "smoke:shims": "npm run smoke -w shims/kilo --if-present && npm run smoke -w shims/claude --if-present && npm run smoke -w shims/pi --if-present && npm run smoke -w shims/junie --if-present && npm run smoke -w shims/codex --if-present",
     "smoke:real": "npm run smoke:real -w shims/pi --if-present && npm run smoke:real -w shims/claude --if-present"
   },
   "engines": {

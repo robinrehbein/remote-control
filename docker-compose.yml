@@ -134,6 +134,11 @@ services:
     build: { context: ., dockerfile: shims/junie/Dockerfile }
     image: pocketagent/junie-shim:latest
     entrypoint: ["true"]
+  codex-shim:
+    profiles: ["shims"]
+    build: { context: ., dockerfile: shims/codex/Dockerfile }
+    image: pocketagent/codex-shim:latest
+    entrypoint: ["true"]
 
 volumes:
   orchestrator-data:

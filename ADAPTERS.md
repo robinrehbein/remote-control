@@ -10,6 +10,7 @@ PocketAgent ist harness-agnostisch: Jeder Coding-Agent-Harness ist ein **Adapter
 | `claude` | Claude Code (Agent SDK) | `claude_oauth` (setup-token, Pro/Max) oder `anthropic` API-Key | ja | ja |
 | `pi` | pi (SDK-Embedding) | Provider-API-Keys (ZAI/Kimi/Qwen-Kataloge) | ja (`tool_call`-Hook) | ja |
 | `junie` | Junie CLI (headless one-shot) | `junie` API-Key oder BYOK-Keys | nein (App-Banner) | nein |
+| `codex` | OpenAI Codex (`codex app-server`, JSON-RPC/stdio) | `OPENAI_API_KEY` (BYOK) oder ChatGPT-Login (Device-Code; In-App-OAuth via `authFlows` folgt in W3.4) | ja (server-initiierte `requestApproval`) | ja (Thread-ID, `CODEX_HOME`-Volume) |
 
 ## Manifest-Schema (`shims/<id>/adapter.json`)
 
@@ -33,11 +34,19 @@ PocketAgent ist harness-agnostisch: Jeder Coding-Agent-Harness ist ein **Adapter
     "openai": "OPENAI_API_KEY",
     "zai": "ZHIPU_API_KEY"
   },
+  "authFlows": [                     // optional: Login-Wege, aus denen die App das Anmelde-UI rendert
+    { "type": "oauth-loopback", "ports": [1455, 1457] }, // Browser-Login mit localhost-Callback (codex)
+    { "type": "device-code" },                             // Verification-URL + Code auf beliebigem Gerät
+    { "type": "token-paste", "hint": "claude setup-token" },// Token vom Laptop einfügen (claude heute)
+    { "type": "api-key", "keyUrl": "https://…" }          // klassischer BYOK-Key
+  ],
   "defaults": { "provider": "zai", "model": "" } // App-Defaults beim Session-Anlegen
 }
 ```
 
 Ungültige Manifeste werden beim Boot übersprungen (Log-Warnung), der Server startet weiter.
+
+`authFlows` ist eine **Manifest-Deklaration** der Login-Wege (Codex nutzt sie: `oauth-loopback`, `device-code`, `api-key`). Der volle In-App-OAuth-Loopback-Flow (Server-Weiterleitung + Custom Tab) wird in Paket W3.4 gebaut; bis dahin funktionieren `api-key` (BYOK) und `device-code` (`codex login --device-auth`, Verification-URL/Code als `notice`-Event).
 
 **`providerEnv` muss die Variable nennen, die die Runtime wirklich liest** — nicht
 die, die nach dem Provider-Namen klingt. Beispiel Z.AI: kilo (ein OpenCode-Fork)

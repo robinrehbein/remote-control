@@ -30,6 +30,7 @@ jobs:
           - { name: claude-shim, dockerfile: shims/claude/Dockerfile, image: claude-shim }
           - { name: pi-shim, dockerfile: shims/pi/Dockerfile, image: pi-shim }
           - { name: junie-shim, dockerfile: shims/junie/Dockerfile, image: junie-shim }
+          - { name: codex-shim, dockerfile: shims/codex/Dockerfile, image: codex-shim }
     steps:
       - uses: actions/checkout@v4
 

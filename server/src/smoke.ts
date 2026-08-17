@@ -409,7 +409,7 @@ async function startProgressSmoke(store: Store, manager: SessionManager, c2: Cli
       type: 'session.create',
       requestId: 'prog1',
       repoId,
-      adapter: 'opencode',
+      adapter: 'kilo',
       provider: 'zai',
       model: 'glm-4.6',
       mode: 'ask',
@@ -528,7 +528,7 @@ async function egressPeerSmoke(store: Store, manager: SessionManager, repoId: st
     tenant_id: 'default',
     repo_id: repoId,
     repo_full_name: 'acme/demo',
-    adapter: 'opencode',
+    adapter: 'kilo',
     provider: 'zai',
     model: 'glm-4.6',
     mode: 'ask',
@@ -626,7 +626,7 @@ async function reconcileSmoke(store: Store, manager: SessionManager, c2: Client,
     tenant_id: 'default',
     repo_id: repoId,
     repo_full_name: 'acme/demo',
-    adapter: 'opencode',
+    adapter: 'kilo',
     provider: 'zai',
     model: 'glm-4.6',
     mode: 'ask',
@@ -901,7 +901,7 @@ async function historySmoke(store: Store, manager: SessionManager, c2: Client, r
     tenant_id: 'default',
     repo_id: repoId,
     repo_full_name: 'acme/demo',
-    adapter: 'opencode',
+    adapter: 'kilo',
     provider: 'zai',
     model: 'glm-4.6',
     mode: 'ask',
@@ -1141,27 +1141,25 @@ async function main(): Promise<void> {
   assert(welcome.type === 'welcome' && welcome.ok, 'authenticated hello gets welcome');
 
   const adapters = await request(c2, { type: 'adapter.list', requestId: 'adp1' });
-  assert(adapters.type === 'adapter.list' && adapters.adapters.length >= 5, 'adapter.list returns at least 5 adapters');
+  assert(adapters.type === 'adapter.list' && adapters.adapters.length >= 4, 'adapter.list returns at least 4 adapters');
   const adapterIds = adapters.type === 'adapter.list' ? adapters.adapters.map((a) => a.id) : [];
-  for (const expected of ['opencode', 'kilo', 'claude', 'pi', 'junie']) {
+  for (const expected of ['kilo', 'claude', 'pi', 'junie']) {
     assert(adapterIds.includes(expected), `adapter.list includes "${expected}"`);
   }
   const kilo = adapters.type === 'adapter.list' ? adapters.adapters.find((a) => a.id === 'kilo') : undefined;
   assert(kilo?.credentials?.kilo?.[0] === 'KILO_AUTH_CONTENT', 'kilo manifest carries credential mapping');
 
   /*
-   * The Z.AI key reaches opencode/kilo only as ZHIPU_API_KEY - that is the env
-   * var models.dev lists for all four Z.AI providers (zai, zai-coding-plan,
-   * zhipuai, zhipuai-coding-plan), and both runtimes auto-configure providers
-   * from that catalog. Verified against opencode 1.18.18 and kilo 7.4.22: with
-   * ZAI_API_KEY set they expose *no* Z.AI provider at all (kilo is left with
-   * only its own gateway), so every zai model reads as "model not found" and
-   * the gateway fallback answers "Forbidden". pi is deliberately not covered
-   * here - its SDK documents ZAI_API_KEY as its own coding-plan variable, so
-   * that manifest keeps it.
+   * The Z.AI key reaches kilo only as ZHIPU_API_KEY - that is the env var
+   * models.dev lists for all four Z.AI providers (zai, zai-coding-plan,
+   * zhipuai, zhipuai-coding-plan), and kilo (an OpenCode fork) auto-configures
+   * providers from that catalog. Verified against kilo 7.4.22: with
+   * ZAI_API_KEY set instead it exposes *no* Z.AI provider at all (kilo is left
+   * with only its own gateway), so every zai model reads as "model not found"
+   * and the gateway fallback answers "Forbidden". pi is deliberately not
+   * covered here - its SDK documents ZAI_API_KEY as its own coding-plan
+   * variable, so that manifest keeps it.
    */
-  const opencode = adapters.type === 'adapter.list' ? adapters.adapters.find((a) => a.id === 'opencode') : undefined;
-  assert(opencode?.providerEnv?.zai === 'ZHIPU_API_KEY', 'opencode manifest injects the Z.AI key as ZHIPU_API_KEY');
   assert(kilo?.providerEnv?.zai === 'ZHIPU_API_KEY', 'kilo manifest injects the Z.AI key as ZHIPU_API_KEY');
 
   const badAdapter = await request(c2, {
@@ -1273,7 +1271,7 @@ async function main(): Promise<void> {
     type: 'session.create',
     requestId: 'ses1',
     repoId: added.repo.id,
-    adapter: 'opencode',
+    adapter: 'claude',
     provider: 'zai',
     model: 'glm-4.6',
     mode: 'yolo',
@@ -1545,12 +1543,12 @@ async function main(): Promise<void> {
     noDocker.type === 'error' && noDocker.message.includes('Docker'),
     'adapter switch is refused (not half-applied) when docker is disabled',
   );
-  assert(store.getSession(sessionId)?.adapter === 'opencode', 'refused switch left the row untouched');
+  assert(store.getSession(sessionId)?.adapter === 'claude', 'refused switch left the row untouched');
 
   // link sessions carry no container: the switch must be refused with a reason
   const linkSessionId = randomUUID();
-  const opencodeRow = store.getSession(sessionId)!;
-  store.insertSession({ ...opencodeRow, id: linkSessionId, status: 'idle' });
+  const baseRow = store.getSession(sessionId)!;
+  store.insertSession({ ...baseRow, id: linkSessionId, status: 'idle' });
   store.setLinkId(linkSessionId, 'smoke-link');
   let linkRefused = '';
   try {
@@ -1603,7 +1601,7 @@ async function main(): Promise<void> {
     assert(swRow?.reasoning_effort === null, 'reasoning effort reset');
     assert(swRow?.provider === 'zai', 'provider reset to the new adapter default');
     assert(swRow?.volume_name === 'pocketagent-sess-smoke', 'volume kept across the switch');
-    assert(swRow?.branch === opencodeRow.branch, 'session branch kept across the switch');
+    assert(swRow?.branch === baseRow.branch, 'session branch kept across the switch');
 
     const notice = await c2.wait(
       (m) => m.type === 'session.event' && m.sessionId === sessionId && m.event.type === 'notice',
@@ -1638,7 +1636,7 @@ async function main(): Promise<void> {
       type: 'session.update',
       requestId: 'sw3',
       sessionId,
-      adapter: 'opencode',
+      adapter: 'claude',
     });
     assert(switchedAgain.type === 'request.ok', 'switch back is acked');
     const hostnameErr = await c2.wait(

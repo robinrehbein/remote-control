@@ -747,13 +747,27 @@ fun encodeSessionCreate(
  * [requestId] macht aus dem bisherigen Fire-and-forget eine Anfrage mit
  * Bestätigung (`request.ok`/`error`) — ohne sie wüsste die App nie, ob der
  * Agent den Auftrag wirklich bekommen hat.
+ *
+ * [messageId] ist die von der App erzeugte, über den Turn stabile Nachrichten-Id
+ * (`msg_<zufall>`; KILO-CLOUD-ANALYSE.md P1). Anders als [requestId], die pro
+ * WS-Anfrage neu ist, bleibt sie bei einem erneuten Senden gleich: der Server
+ * nimmt dieselbe [messageId] genau einmal an (idempotent) und echot sie in der
+ * Bestätigung. Fehlt sie (null), verhält sich der Server wie bisher (ohne
+ * Duplikaterkennung).
  */
-fun encodeSessionPrompt(requestId: String, sessionId: String, text: String, mode: AgentMode?): String = buildJsonObject {
+fun encodeSessionPrompt(
+    requestId: String,
+    sessionId: String,
+    text: String,
+    mode: AgentMode?,
+    messageId: String? = null,
+): String = buildJsonObject {
     put("type", "session.prompt")
     put("sessionId", sessionId)
     put("text", text)
     mode?.let { put("mode", it.wireName()) }
     put("requestId", requestId)
+    messageId?.let { put("messageId", it) }
 }.toString()
 
 /**

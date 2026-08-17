@@ -575,15 +575,19 @@ class ProtocolDecodeTest {
             sessionId = "s1",
             text = "Bau den Login um",
             mode = com.pocketagent.app.data.AgentMode.AUTO,
+            messageId = "msg_abc123",
         )
         assertTrue(withMode.contains(""""type":"session.prompt""""))
         assertTrue(withMode.contains(""""sessionId":"s1""""))
         assertTrue(withMode.contains(""""text":"Bau den Login um""""))
         assertTrue(withMode.contains(""""mode":"auto""""))
         assertTrue(withMode.contains(""""requestId":"req-p1""""))
+        // Die über den Turn stabile messageId reist mit (Idempotenz, P1).
+        assertTrue(withMode.contains(""""messageId":"msg_abc123""""))
 
         // Ohne Modus bleibt das Feld weg, requestId geht trotzdem mit — ohne
         // sie gäbe es keine Bestätigung, auf die der Client warten könnte.
+        // Ohne messageId (alter Aufrufer) bleibt auch dieses Feld weg.
         val withoutMode = com.pocketagent.app.data.encodeSessionPrompt(
             requestId = "req-p2",
             sessionId = "s1",
@@ -591,6 +595,7 @@ class ProtocolDecodeTest {
             mode = null,
         )
         assertFalse(withoutMode.contains("\"mode\""))
+        assertFalse(withoutMode.contains("\"messageId\""))
         assertTrue(withoutMode.contains(""""requestId":"req-p2""""))
     }
 

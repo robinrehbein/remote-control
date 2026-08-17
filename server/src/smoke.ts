@@ -834,7 +834,7 @@ async function historySmoke(store: Store, manager: SessionManager, c2: Client, r
   assert(clampEventLimit(10.7) === 10, 'a fractional limit is floored');
 
   assert(sanitizeSessionTitle('  Mein  Feature  ') === 'Mein Feature', 'a title is trimmed and collapsed');
-  assert(sanitizeSessionTitle('a\nb\tc d') === 'a b c d', 'control characters never survive a title');
+  assert(sanitizeSessionTitle('a\nb\tc\u0000d') === 'a b c d', 'control characters never survive a title');
   assert(sanitizeSessionTitle('   ') === null, 'a blank title clears the title');
   const long = sanitizeSessionTitle('x'.repeat(200));
   assert(long !== null && long.length === MAX_TITLE_LEN, `a title is cut to ${MAX_TITLE_LEN} chars`);

@@ -49,15 +49,25 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun handleDeepLink(intent: Intent?) {
-        val data = intent?.data ?: return
-        if (data.scheme == "pocketagent" && data.host == "session") {
+        intent ?: return
+        val data = intent.data
+        if (data != null && data.scheme == "pocketagent" && data.host == "session") {
             data.lastPathSegment?.let { deepLinkSessionId = it }
             // Intent als verarbeitet markieren: getIntent() liefert nach jeder
             // Konfigurationsänderung (Fold, Rotation, ...) weiterhin denselben
             // Intent zurück. Ohne das würde der Session-Screen bei jedem Recreate
             // erneut auf den Back-Stack gepusht.
             intent.data = null
+            return
         }
+        // Fällt die App-Zustellung in den Hintergrund/getötet-Zustand, zeigt
+        // das FCM-SDK die Notification selbst an (kein eigener Intent) und
+        // der Tap startet die normale Launcher-Activity — die data-Felder der
+        // Push-Nachricht landen dann als schlichte String-Extras statt als
+        // pocketagent://-URI. Ohne diesen Zweig würde ein solcher Tap auf der
+        // Sessionliste landen statt in der betroffenen Session.
+        intent.getStringExtra("sessionId")?.let { deepLinkSessionId = it }
+        intent.removeExtra("sessionId")
     }
 }
 

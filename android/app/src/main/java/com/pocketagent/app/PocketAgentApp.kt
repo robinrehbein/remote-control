@@ -8,6 +8,7 @@ import com.pocketagent.app.data.ConnectivityWatcher
 import com.pocketagent.app.data.PairingApi
 import com.pocketagent.app.data.TokenStore
 import com.pocketagent.app.data.WsClient
+import com.pocketagent.app.fcm.PocketFcmService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -51,6 +52,11 @@ class PocketAgentApp : Application() {
         super.onCreate()
         container = AppContainer(this, appScope)
         initFirebase()
+        // Vor der ersten möglichen Push anlegen: kommt die App-Zustellung bei
+        // getötetem Prozess an, rendert ausschließlich das FCM-SDK selbst
+        // (unser Code läuft dann gar nicht) — ohne existierenden Kanal würde
+        // Android 8+ diese erste Notification kommentarlos verwerfen.
+        PocketFcmService.ensureChannel(this)
         container.repository.start()
         container.connectivity.attach()
     }

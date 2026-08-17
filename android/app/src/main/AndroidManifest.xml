@@ -44,6 +44,22 @@
                 <action android:name="com.google.firebase.MESSAGING_EVENT" />
             </intent-filter>
         </service>
+
+        <!--
+          Nur ein Sicherheitsnetz: der eigene "sessions"-Kanal wird schon in
+          PocketAgentApp.onCreate angelegt (bevor überhaupt eine Push kommen
+          kann). Diese Meta-Daten steuern zusätzlich, was das FCM-SDK selbst
+          verwendet, falls es je (z.B. durch einen künftigen reinen
+          notification-Payload ohne data) an unserem onMessageReceived vorbei
+          direkt rendert — sonst würde ohne sie der Fallback-Kanal
+          "Miscellaneous" mit Default-Priorität und Launcher-Icon greifen.
+        -->
+        <meta-data
+            android:name="com.google.firebase.messaging.default_notification_channel_id"
+            android:value="sessions" />
+        <meta-data
+            android:name="com.google.firebase.messaging.default_notification_icon"
+            android:resource="@drawable/ic_notification" />
     </application>
 
 </manifest>

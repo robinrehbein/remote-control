@@ -681,7 +681,7 @@ private fun SessionActionSheet(
             Column {
                 sessionActions(session).forEachIndexed { index, action ->
                     if (index > 0) ListDivider(startInset = SheetRowDividerInset)
-                    SessionActionRow(action = action, onClick = { onAction(action) })
+                    SessionActionRow(action = action, session = session, onClick = { onAction(action) })
                 }
             }
         }
@@ -689,7 +689,7 @@ private fun SessionActionSheet(
 }
 
 @Composable
-private fun SessionActionRow(action: SessionAction, onClick: () -> Unit) {
+private fun SessionActionRow(action: SessionAction, session: SessionInfo, onClick: () -> Unit) {
     val destructive = action == SessionAction.DELETE
     val tint = if (destructive) {
         MaterialTheme.colorScheme.error

@@ -11,6 +11,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
@@ -22,6 +23,7 @@ import com.pocketagent.app.ui.screens.PairingScreen
 import com.pocketagent.app.ui.screens.RequestNotificationPermission
 import com.pocketagent.app.ui.theme.PocketAgentTheme
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 
 class MainActivity : FragmentActivity() {
 
@@ -80,7 +82,16 @@ private fun AppRoot(deepLinkSessionId: String?, onConsumeDeepLink: () -> Unit) {
         false -> PairingScreen(onPaired = { paired = true })
         true -> {
             RequestNotificationPermission()
-            val biometricEnabled by app.container.tokenStore.biometricEnabled.collectAsState(initial = false)
+            // initial = null statt false: der Platzhalter vor der ersten
+            // DataStore-Emission darf nicht wie "Sperre deaktiviert" aussehen
+            // — sonst läuft BiometricGate synchron mit enabled=false durch
+            // onUnlocked(), bevor der echte Wert (ggf. true) nachkommt, und
+            // die Sperre greift beim Kaltstart nie (der guarded return in
+            // BiometricGate blockt den späteren Prompt dann sogar).
+            val nullableBiometricEnabled = remember(app) {
+                app.container.tokenStore.biometricEnabled.map { it as Boolean? }
+            }
+            val biometricEnabled by nullableBiometricEnabled.collectAsState(initial = null)
             BiometricGate(enabled = biometricEnabled, unlocked = unlocked) {
                 unlocked = true
             }
@@ -102,13 +113,21 @@ private fun AppRoot(deepLinkSessionId: String?, onConsumeDeepLink: () -> Unit) {
 /**
  * Optional app lock: when enabled in settings, require device biometrics
  * (fingerprint / face) or fallback credential before showing content.
+ *
+ * [enabled] is nullable on purpose: `null` means the DataStore value hasn't
+ * arrived yet (the very first composition, before the first Flow emission).
+ * Treating that placeholder as `false` would unlock the app before the real
+ * value — possibly `true` — is known, which is exactly how the lock used to
+ * be bypassed on every cold start. So `null` neither unlocks nor prompts; it
+ * just waits.
  */
 @Composable
-private fun BiometricGate(enabled: Boolean, unlocked: Boolean, onUnlocked: () -> Unit) {
+private fun BiometricGate(enabled: Boolean?, unlocked: Boolean, onUnlocked: () -> Unit) {
     val context = LocalContext.current
     val activity = context as? FragmentActivity
     LaunchedEffect(enabled) {
         if (unlocked || activity == null) return@LaunchedEffect
+        if (enabled == null) return@LaunchedEffect // noch nicht geladen: weder entsperren noch prompten
         if (!enabled) {
             onUnlocked() // lock disabled: show content immediately
             return@LaunchedEffect

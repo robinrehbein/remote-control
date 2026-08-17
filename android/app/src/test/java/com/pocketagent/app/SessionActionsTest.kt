@@ -3,13 +3,16 @@ package com.pocketagent.app
 import com.pocketagent.app.data.AgentMode
 import com.pocketagent.app.data.SessionInfo
 import com.pocketagent.app.data.SessionStatus
+import com.pocketagent.app.ui.screens.ComposerButton
 import com.pocketagent.app.ui.screens.SessionAction
 import com.pocketagent.app.ui.screens.activeSessions
 import com.pocketagent.app.ui.screens.archiveDoneLabel
 import com.pocketagent.app.ui.screens.archiveSwipeArchives
 import com.pocketagent.app.ui.screens.archiveSwipeLabel
 import com.pocketagent.app.ui.screens.archivedSessions
+import com.pocketagent.app.ui.screens.composerButton
 import com.pocketagent.app.ui.screens.deleteConfirmText
+import com.pocketagent.app.ui.screens.diffPushAvailable
 import com.pocketagent.app.ui.screens.sessionActionLabel
 import com.pocketagent.app.ui.screens.sessionActions
 import com.pocketagent.app.ui.screens.sessionDisplayName
@@ -207,6 +210,39 @@ class SessionActionsTest {
         for (action in SessionAction.entries) {
             assertTrue(action.name, sessionActionLabel(action).isNotBlank())
         }
+    }
+
+    /* ---------------- Diff-Aktionsleiste (Fund: Diff-Screen ohne Handlung) ---------------- */
+
+    @Test
+    fun `the diff offers push only with changes, a live session and not in yolo`() {
+        // Der Fund: Pushen lag nur im Overflow-Menü eines anderen Screens.
+        // Die Aktionsleiste im Diff bietet es unter denselben Bedingungen wie
+        // das Kontextmenü — plus, dass überhaupt etwas geändert wurde.
+        assertTrue(diffPushAvailable(session(status = SessionStatus.IDLE), hasChanges = true))
+        assertTrue(diffPushAvailable(session(status = SessionStatus.RUNNING), hasChanges = true))
+        // Keine Änderungen -> nichts zu pushen.
+        assertFalse(diffPushAvailable(session(status = SessionStatus.IDLE), hasChanges = false))
+        // Yolo pusht selbst.
+        assertFalse(diffPushAvailable(session(mode = AgentMode.YOLO), hasChanges = true))
+        // Kein lebender Container.
+        assertFalse(diffPushAvailable(session(status = SessionStatus.STOPPED), hasChanges = true))
+        assertFalse(diffPushAvailable(session(status = SessionStatus.CREATING), hasChanges = true))
+        // Ohne Session gibt es nichts anzubieten.
+        assertFalse(diffPushAvailable(null, hasChanges = true))
+    }
+
+    /* ---------------- Ein Stop-Konzept (Fund: zwei Stop-Konzepte) ---------------- */
+
+    @Test
+    fun `the composer button stops the running turn, otherwise sends`() {
+        // Der Fund: zwei benachbarte Stop-Aktionen. Der Turn-Abbruch wandert in
+        // den Composer-Knopf — läuft ein Auftrag, ist er Stop; wartet ein Prompt
+        // auf Bestätigung, dreht er; sonst sendet er. Busy hat Vorrang.
+        assertEquals(ComposerButton.STOP, composerButton(busy = true, sending = false))
+        assertEquals(ComposerButton.STOP, composerButton(busy = true, sending = true))
+        assertEquals(ComposerButton.SENDING, composerButton(busy = false, sending = true))
+        assertEquals(ComposerButton.SEND, composerButton(busy = false, sending = false))
     }
 
     @Test

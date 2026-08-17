@@ -96,6 +96,36 @@ fun sessionActions(session: SessionInfo): List<SessionAction> = buildList {
     add(SessionAction.DELETE)
 }
 
+/**
+ * Ob der Diff-Screen die Push-Aktion anbietet. Dieselbe Regel wie im
+ * Kontextmenü (siehe [sessionActions]): nur eine laufende Session
+ * (RUNNING/IDLE) außerhalb des Yolo-Modus, in dem der Agent selbst pusht —
+ * plus die eigene Bedingung des Diff-Screens, dass überhaupt etwas geändert
+ * wurde. So liegt „Pushen & Draft-PR" am Ort der Prüfung, nicht nur im
+ * Overflow-Menü eines anderen Screens.
+ */
+fun diffPushAvailable(session: SessionInfo?, hasChanges: Boolean): Boolean {
+    if (session == null || !hasChanges) return false
+    val live = session.status == SessionStatus.RUNNING || session.status == SessionStatus.IDLE
+    return live && session.mode != AgentMode.YOLO
+}
+
+/** Der runde Knopf im Composer hat genau diese drei Gestalten. */
+enum class ComposerButton { SEND, STOP, SENDING }
+
+/**
+ * Was der Composer-Knopf gerade ist. Läuft ein Auftrag, bricht ihn derselbe
+ * Knopf ab — das einzige Stop-Konzept für den laufenden Zug, im Daumenbereich
+ * und eindeutig „bricht das Laufende ab". Wartet ein Prompt noch auf seine
+ * Bestätigung, dreht der Knopf; sonst sendet er. Das Anhalten der ganzen
+ * Session („Session pausieren") bleibt davon getrennt im Menü.
+ */
+fun composerButton(busy: Boolean, sending: Boolean): ComposerButton = when {
+    busy -> ComposerButton.STOP
+    sending -> ComposerButton.SENDING
+    else -> ComposerButton.SEND
+}
+
 fun sessionActionLabel(action: SessionAction): String = when (action) {
     SessionAction.RENAME -> "Umbenennen"
     SessionAction.ARCHIVE -> "Archivieren"

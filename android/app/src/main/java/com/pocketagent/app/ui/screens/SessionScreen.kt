@@ -53,6 +53,7 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Difference
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Stop
@@ -93,6 +94,8 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
@@ -536,14 +539,11 @@ fun SessionScreen(
                     }
                 },
                 actions = {
-                    if (busy || session?.status == SessionStatus.RUNNING) {
-                        IconButton(onClick = { vm.abort() }) {
-                            // vm.abort() bricht nur den laufenden Zug ab — die
-                            // Beschreibung darf nicht nach "Container anhalten"
-                            // klingen, das ist eine andere Aktion im Menü.
-                            Icon(Icons.Filled.Stop, contentDescription = "Aktuellen Auftrag abbrechen")
-                        }
-                    }
+                    // Der Turn-Abbruch lag früher hier oben als zweites Stop-
+                    // Symbol neben „Session pausieren" im Menü — zwei Aktionen,
+                    // die beide „etwas anhalten". Er sitzt jetzt im Composer: der
+                    // runde Knopf wird zum Stop-Knopf, solange ein Auftrag läuft
+                    // (siehe [composerButton]). Oben bleibt nur Diff + Menü.
                     IconButton(onClick = { onOpenDiff(sessionId) }) {
                         Icon(Icons.Filled.Difference, contentDescription = "Änderungen ansehen")
                     }
@@ -723,24 +723,41 @@ fun SessionScreen(
                                 ),
                             )
                             Spacer(modifier = Modifier.width(6.dp))
-                            // Filled circle when there is something to send: the
-                            // primary action of this screen should look like one.
-                            // Gesperrt, solange die letzte Anfrage noch auf ihre
-                            // Bestätigung wartet — kein Doppel-Senden per Doppeltap.
+                            // Ein Knopf, drei Gestalten (siehe [composerButton]):
+                            // läuft ein Auftrag, ist er der Stop-Knopf und bricht
+                            // den laufenden Zug ab — das einzige Stop-Konzept für
+                            // den Turn, im Daumenbereich, eindeutig „bricht das
+                            // Laufende ab". Sonst sendet er (gefüllt, wenn es etwas
+                            // zu senden gibt); solange die letzte Anfrage noch auf
+                            // ihre Bestätigung wartet, dreht er und ist gesperrt —
+                            // kein Doppel-Senden per Doppeltap.
+                            val composer = composerButton(busy = busy, sending = sending)
                             FilledIconButton(
-                                onClick = { vm.sendPrompt() },
-                                enabled = input.isNotBlank() && !sending,
+                                onClick = {
+                                    when (composer) {
+                                        ComposerButton.STOP -> vm.abort()
+                                        ComposerButton.SEND -> vm.sendPrompt()
+                                        ComposerButton.SENDING -> Unit
+                                    }
+                                },
+                                enabled = when (composer) {
+                                    ComposerButton.STOP -> true
+                                    ComposerButton.SEND -> input.isNotBlank()
+                                    ComposerButton.SENDING -> false
+                                },
                                 shape = CircleShape,
                                 modifier = Modifier.size(ComposerHeight),
                             ) {
-                                if (sending) {
-                                    CircularProgressIndicator(
+                                when (composer) {
+                                    ComposerButton.STOP ->
+                                        Icon(Icons.Filled.Stop, contentDescription = "Auftrag abbrechen")
+                                    ComposerButton.SENDING -> CircularProgressIndicator(
                                         strokeWidth = 2.dp,
                                         modifier = Modifier.size(18.dp),
                                         color = MaterialTheme.colorScheme.onPrimary,
                                     )
-                                } else {
-                                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Senden")
+                                    ComposerButton.SEND ->
+                                        Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Senden")
                                 }
                             }
                         }
@@ -1867,35 +1884,76 @@ private fun SystemLine(text: String, icon: ImageVector? = null) {
 
 @Composable
 private fun PushCard(item: TimelineItem.Pushed) {
+    val uriHandler = LocalUriHandler.current
+    val prUrl = item.prUrl?.takeIf { it.isNotBlank() }
+    // Der Höhepunkt des Flusses ist kein toter Steckbrief: liegt ein PR vor,
+    // öffnet ein Tap auf die Karte ihn im Browser — der Erfolg ist ein
+    // handlungsfähiger Zustand, keine reine Meldung. Ohne PR gibt es kein
+    // Ziel, dann bleibt die Karte eine ruhige Bestätigung.
     Surface(
         shape = MaterialTheme.shapes.large,
         color = MaterialTheme.colorScheme.primaryContainer,
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(
+                if (prUrl != null) {
+                    Modifier.clickable(
+                        onClickLabel = "Pull Request öffnen",
+                        role = Role.Button,
+                        onClick = { uriHandler.openUri(prUrl) },
+                    )
+                } else {
+                    Modifier
+                },
+            ),
     ) {
-        Column(Modifier.padding(14.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(14.dp),
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        Icons.Filled.CloudUpload,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                        modifier = Modifier.size(20.dp),
+                    )
+                    Text(
+                        text = listOfNotNull(
+                            if (item.auto) "Automatisch gepusht" else "Gepusht",
+                            prUrl?.let { "Draft-PR erstellt" },
+                        ).joinToString(" · "),
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                        modifier = Modifier.padding(start = 8.dp),
+                    )
+                }
+                Text(
+                    text = item.branch,
+                    style = MonoMedium,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                    modifier = Modifier.padding(top = 6.dp),
+                )
+                if (prUrl != null) {
+                    Text(
+                        text = "Pull Request öffnen",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
+                }
+            }
+            if (prUrl != null) {
+                Spacer(modifier = Modifier.width(10.dp))
                 Icon(
-                    Icons.Filled.CloudUpload,
+                    Icons.AutoMirrored.Filled.OpenInNew,
                     contentDescription = null,
                     tint = MaterialTheme.colorScheme.onPrimaryContainer,
                     modifier = Modifier.size(20.dp),
                 )
-                Text(
-                    text = listOfNotNull(
-                        if (item.auto) "Automatisch gepusht" else "Gepusht",
-                        item.prUrl?.let { "Draft-PR erstellt" },
-                    ).joinToString(" · "),
-                    style = MaterialTheme.typography.titleSmall,
-                    color = MaterialTheme.colorScheme.onPrimaryContainer,
-                    modifier = Modifier.padding(start = 8.dp),
-                )
             }
-            Text(
-                text = item.branch,
-                style = MonoMedium,
-                color = MaterialTheme.colorScheme.onPrimaryContainer,
-                modifier = Modifier.padding(top = 6.dp),
-            )
         }
     }
 }

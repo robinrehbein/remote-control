@@ -213,6 +213,32 @@ async function main(): Promise<void> {
   });
   expect(badModel.status === 400, `unknown model -> 400, got ${badModel.status}`);
 
+  // --- provider without model -> the adapter default, not a 400 ---
+  // Das ist die Form, die der Server im Normalbetrieb schickt: die App setzt
+  // immer einen Provider (den Zugang) und lässt das Modell leer, wenn der
+  // Nutzer "Standard des Agenten" stehen lässt. Die bisherigen Fälle prüften
+  // nur "beides gesetzt" und "beides leer" — dazwischen lief der Prompt in
+  // ein hartes 400 und die Session starb an ihrem ersten Auftrag.
+  const defaultModel = await fetch(`${base}/prompt`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ text: 'hi', mode: 'ask', provider: 'openai', model: '' }),
+  });
+  expect(
+    defaultModel.status !== 400,
+    `provider with empty model must not be rejected, got ${defaultModel.status}`,
+  );
+
+  // --- model without provider stays an error ---
+  // Umgekehrt bliebe das Modell unten wirkungslos liegen; das darf nicht
+  // still durchgehen.
+  const modelOnly = await fetch(`${base}/prompt`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ text: 'hi', model: 'some-model' }),
+  });
+  expect(modelOnly.status === 400, `model without provider -> 400, got ${modelOnly.status}`);
+
   // --- diff endpoint (untracked + committed state) ---
   await writeFile(join(workDir, 'uncommitted.txt'), 'extra line\n', 'utf8');
   const diff = (await (await fetch(`${base}/diff`, { headers: auth })).json()) as {

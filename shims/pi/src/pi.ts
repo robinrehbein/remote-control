@@ -437,8 +437,16 @@ export class RealPiRunner implements PiRunner {
   }
 
   async validateModel(provider?: string, model?: string): Promise<void> {
-    if (provider === undefined && model === undefined) return;
-    if (!provider || !model) {
+    // Kein Modell angefragt, also nichts zu prüfen. Die App schickt für
+    // "Standard des Agenten" ein leeres model bei gesetztem Provider — der
+    // Provider benennt dort den Zugang, nicht einen Modellwechsel. prompt()
+    // setzt unten ohnehin nur dann ein Modell, wenn beides da ist; dieser
+    // Wächter war strenger als die Stelle, die er schützt, und ließ genau
+    // die Kombination auflaufen, die im Normalbetrieb ankommt.
+    if (model === undefined) return;
+    // Umgekehrt gilt das nicht: ein Modell ohne Provider bliebe unten
+    // wirkungslos liegen. Das ist ein Fehler, kein Standard.
+    if (!provider) {
       throw new PromptError('provider and model must be set together');
     }
     if (!this.requireRuntime().getModel(provider, model)) {

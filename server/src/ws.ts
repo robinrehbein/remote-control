@@ -448,11 +448,18 @@ export function registerWs(
         }
         case 'session.prompt':
           await manager
-            .prompt(msg.sessionId, msg.text, msg.mode)
+            .prompt(msg.sessionId, msg.text, msg.mode, msg.messageId)
             .then(() => {
               // requestId is opt-in: older clients that never send one keep the
               // original fire-and-forget behaviour (no ack on success either).
-              if (msg.requestId) send({ type: 'request.ok', requestId: msg.requestId, payload: { sessionId: msg.sessionId } });
+              // The messageId is echoed back in the payload so the app can match
+              // the ack to the exact turn it admitted (KILO-CLOUD-ANALYSE.md P1).
+              if (msg.requestId)
+                send({
+                  type: 'request.ok',
+                  requestId: msg.requestId,
+                  payload: { sessionId: msg.sessionId, ...(msg.messageId ? { messageId: msg.messageId } : {}) },
+                });
             })
             .catch((e) =>
               send({
@@ -527,6 +534,15 @@ export function registerWs(
           try {
             const events = manager.sessionEvents(msg.sessionId, msg.limit);
             send({ type: 'session.events', requestId: msg.requestId, sessionId: msg.sessionId, events });
+          } catch (e) {
+            send({ type: 'error', requestId: msg.requestId, sessionId: msg.sessionId, message: errText(e) });
+          }
+          return;
+        }
+        case 'session.turns.get': {
+          try {
+            const turns = manager.turns(msg.sessionId, msg.limit);
+            send({ type: 'session.turns', requestId: msg.requestId, sessionId: msg.sessionId, turns });
           } catch (e) {
             send({ type: 'error', requestId: msg.requestId, sessionId: msg.sessionId, message: errText(e) });
           }

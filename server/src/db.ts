@@ -39,6 +39,19 @@ export interface PairingCodeRow {
   attempts: number;
 }
 export interface LinkRow { id: string; tenant_id: string; name: string; token_hash: string; created_at: string }
+export interface TurnRow {
+  /** Orchestrator-assigned turn id (uuid). */
+  id: string;
+  session_id: string;
+  /** App-generated per-turn id; null for a prompt from a client that sent none. */
+  message_id: string | null;
+  /** queued | running | completed | failed | interrupted. */
+  state: string;
+  /** JSON `TurnFailureReason`, set only in the failed state. */
+  reason: string | null;
+  created_at: string;
+  updated_at: string;
+}
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS devices (
@@ -72,6 +85,10 @@ CREATE TABLE IF NOT EXISTS links (
   id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, name TEXT NOT NULL,
   token_hash TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS turns (
+  id TEXT PRIMARY KEY, session_id TEXT NOT NULL, message_id TEXT,
+  state TEXT NOT NULL, reason TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
 `;
 
 export class Store {
@@ -92,6 +109,17 @@ export class Store {
     // (listSessionEvents) - without an index both are full-table scans over
     // every session's events, synchronous in the event loop.
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_session_events_sid ON session_events(session_id, id)');
+    // The turns table (see SCHEMA) also runs its CREATE TABLE IF NOT EXISTS on
+    // every boot, so an existing database gains the table here; these two
+    // indexes back the two hot lookups - a session's turns oldest-first, and
+    // the idempotency probe by (session, message_id). The partial unique index
+    // enforces "one turn per app-generated messageId" at the storage layer,
+    // the same guarantee the prompt path checks in code (rows with a NULL
+    // message_id - older clients - are exempt and never collide).
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id, id)');
+    this.db.exec(
+      'CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_message ON turns(session_id, message_id) WHERE message_id IS NOT NULL',
+    );
     this.migrateSecretsUnique();
     const sessionCols = this.db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>;
     if (!sessionCols.some((c) => c.name === 'shim_endpoint')) {
@@ -540,6 +568,60 @@ export class Store {
   deleteSession(id: string): void {
     this.bumpSessionAuth();
     this.db.prepare('DELETE FROM session_events WHERE session_id = ?').run(id);
+    this.db.prepare('DELETE FROM turns WHERE session_id = ?').run(id);
     this.db.prepare('DELETE FROM sessions WHERE id = ?').run(id);
+  }
+
+  /* ---- turns (per-turn lifecycle, KILO-CLOUD-ANALYSE.md P1) ---- */
+
+  insertTurn(row: TurnRow): void {
+    this.db
+      .prepare(
+        'INSERT INTO turns (id, session_id, message_id, state, reason, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      )
+      .run(row.id, row.session_id, row.message_id, row.state, row.reason, row.created_at, row.updated_at);
+  }
+
+  getTurn(id: string): TurnRow | undefined {
+    return this.db.prepare('SELECT * FROM turns WHERE id = ?').get(id) as TurnRow | undefined;
+  }
+
+  /**
+   * The turn a given app-generated messageId already admitted, if any. This is
+   * the idempotency probe: a non-undefined answer means the prompt was already
+   * accepted once and must not start a second agent turn.
+   */
+  getTurnByMessageId(sessionId: string, messageId: string): TurnRow | undefined {
+    return this.db
+      .prepare('SELECT * FROM turns WHERE session_id = ? AND message_id = ?')
+      .get(sessionId, messageId) as TurnRow | undefined;
+  }
+
+  /**
+   * Newest not-yet-terminal turn of a session (`queued`/`running`), i.e. the
+   * one a `turn.completed`/`.failed`/abort/restart applies to. There is at most
+   * one at a time in this model (a session runs its turns in sequence).
+   */
+  latestActiveTurn(sessionId: string): TurnRow | undefined {
+    return this.db
+      .prepare(
+        "SELECT * FROM turns WHERE session_id = ? AND state IN ('queued', 'running') ORDER BY created_at DESC, rowid DESC LIMIT 1",
+      )
+      .get(sessionId) as TurnRow | undefined;
+  }
+
+  /** Transition a turn; `reason` is JSON (`TurnFailureReason`) for the failed state, else null. */
+  updateTurnState(id: string, state: string, reason: string | null = null): void {
+    this.db
+      .prepare('UPDATE turns SET state = ?, reason = ?, updated_at = ? WHERE id = ?')
+      .run(state, reason, new Date().toISOString(), id);
+  }
+
+  /** The `limit` most recent turns of a session, oldest first (mirror of listSessionEvents). */
+  listTurns(sessionId: string, limit: number): TurnRow[] {
+    const rows = this.db
+      .prepare('SELECT * FROM turns WHERE session_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?')
+      .all(sessionId, limit) as TurnRow[];
+    return rows.reverse();
   }
 }

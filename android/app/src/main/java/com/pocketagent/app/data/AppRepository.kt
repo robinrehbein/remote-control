@@ -380,15 +380,31 @@ class AppRepository(
      * der Aufrufer den Text als angekommen behandelt. Der Server quittiert
      * jetzt explizit — ein `send()`, das nur „im Sendepuffer" hieß, reichte
      * nicht, um stillen Nachrichtenverlust nach einem Reconnect auszuschließen.
+     *
+     * Jeder Prompt trägt eine über den Turn stabile [messageId] (`msg_<zufall>`;
+     * KILO-CLOUD-ANALYSE.md P1). Ambiguous-Admission-Regel: bleibt die
+     * Bestätigung aus (null = Verbindung weg/uneindeutig), gilt die Annahme als
+     * *unklar* — hier wird bewusst NICHT automatisch neu gesendet, sondern der
+     * Misserfolg zurückgegeben (die UI überlässt dem Nutzer die Entscheidung).
+     * Ein manuelles erneutes Senden benutzt dieselbe [messageId], sodass der
+     * Server es als denselben Turn erkennt und keinen zweiten Agent-Turn startet.
      */
-    suspend fun sendPrompt(sessionId: String, text: String, mode: AgentMode?): Result<Unit> {
-        val response = request { id -> encodeSessionPrompt(id, sessionId, text, mode) }
+    suspend fun sendPrompt(
+        sessionId: String,
+        text: String,
+        mode: AgentMode?,
+        messageId: String = newMessageId(),
+    ): Result<Unit> {
+        val response = request { id -> encodeSessionPrompt(id, sessionId, text, mode, messageId) }
         return when (response) {
             is ServerMessage.ErrorMsg -> Result.failure(IllegalStateException(response.message))
             null -> Result.failure(IllegalStateException("Keine Verbindung"))
             else -> Result.success(Unit)
         }
     }
+
+    /** Über den Turn stabile Nachrichten-Id für die Idempotenz-/Ack-Zuordnung. */
+    private fun newMessageId(): String = "msg_" + UUID.randomUUID().toString().replace("-", "")
 
     fun sendPermission(sessionId: String, permissionId: String, decision: PermissionDecision): Boolean =
         ws.send(encodeSessionPermission(sessionId, permissionId, decision))

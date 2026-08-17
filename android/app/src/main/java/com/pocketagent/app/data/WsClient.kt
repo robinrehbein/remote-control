@@ -335,3 +335,30 @@ class WsClient(private val client: OkHttpClient) {
  */
 fun isUnauthorizedClose(code: Int, reason: String): Boolean =
     code == 4001 && (reason == "unauthorized" || reason == "revoked")
+
+/**
+ * Wartet bis zu [timeoutMs] darauf, dass [state] [WsClient.ConnState.Connected]
+ * erreicht — Polling statt Callback, weil kurzlebige Aufrufer (Notification-
+ * Action-Antworten, s. `AppRepository.respondToPermission`) sowieso schon in
+ * einer eigenen Coroutine mit festem Zeitbudget laufen. Als eigene, von
+ * [AppRepository]/Android entkoppelte Funktion ausgelagert, damit sie ohne
+ * Mocking-Framework testbar ist (s. [isUnauthorizedClose] oben — im Projekt
+ * ist keins verfügbar).
+ *
+ * [reconnect] läuft einmal vorab, falls noch nicht verbunden — steht z.B.
+ * gerade ein Backoff-Countdown an, überspringt das ihn, statt ihn abzuwarten.
+ * Ist die Verbindung schon da, passiert gar nichts (kein unnötiger Reconnect).
+ */
+suspend fun awaitConnected(
+    state: StateFlow<WsClient.ConnState>,
+    timeoutMs: Long,
+    pollMs: Long = 150,
+    reconnect: () -> Unit = {},
+): Boolean {
+    if (state.value !is WsClient.ConnState.Connected) reconnect()
+    val deadline = System.currentTimeMillis() + timeoutMs
+    while (state.value !is WsClient.ConnState.Connected && System.currentTimeMillis() < deadline) {
+        delay(pollMs)
+    }
+    return state.value is WsClient.ConnState.Connected
+}

@@ -757,6 +757,12 @@ export interface FcmPushPayload {
   eventType: 'permission.request' | 'turn.completed' | 'turn.failed' | 'session.status';
   title: string;
   body: string;
+  /**
+   * Only set for `permission.request`: lets the app answer directly from an
+   * actionable notification (Allow/Deny) without opening the session first —
+   * `session.permission` needs it to address the right approval.
+   */
+  permissionId?: string;
 }
 
 /* ------------------------------------------------------------------ */

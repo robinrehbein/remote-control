@@ -116,6 +116,41 @@ async function closedPort(): Promise<number> {
   return port;
 }
 
+/**
+ * A provisioned session row, ready to be inserted: everything a test does not
+ * care about filled in, the fields a test does care about (status, policy,
+ * token) overridable.
+ */
+function sessionRow(id: string, repoId: string, patch: Partial<import('./db.js').SessionRow> = {}): import('./db.js').SessionRow {
+  const now = new Date().toISOString();
+  return {
+    id,
+    tenant_id: 'default',
+    repo_id: repoId,
+    repo_full_name: 'acme/demo',
+    adapter: 'kilo',
+    provider: 'zai',
+    model: 'glm-4.6',
+    mode: 'ask',
+    status: 'idle',
+    branch: `agent/${id}`,
+    session_ref: null,
+    container_id: `cid-${id.slice(0, 8)}`,
+    volume_name: `pocketagent-sess-${id}`,
+    shim_token: null,
+    pr_url: null,
+    shim_endpoint: null,
+    link_id: null,
+    network_policy: 'allowlist',
+    reasoning_effort: null,
+    title: null,
+    archived: 0,
+    created_at: now,
+    last_active_at: now,
+    ...patch,
+  };
+}
+
 /** Raw request against a forward proxy: request-target is the absolute URI. */
 function proxyGet(
   http: typeof import('node:http'),
@@ -288,7 +323,10 @@ async function gatewaySmoke(): Promise<void> {
 
   const upstream = http.createServer((_req, res) => res.writeHead(200).end('pong'));
   const upstreamPort = await listen(upstream);
-  const egress = createEgressProxyServer(['127.0.0.1']);
+  // The fake upstream sits on a random high port, which the default port gate
+  // (80/443) would refuse - the tests allow exactly that one extra port.
+  const testPorts = [80, 443, upstreamPort];
+  const egress = createEgressProxyServer({ allowlist: ['127.0.0.1'], ports: testPorts });
   const egressPort = await listen(egress);
   const allowed = await proxyGet(http, egressPort, `http://127.0.0.1:${upstreamPort}/ping`);
   assert(allowed.status === 200 && allowed.body === 'pong', 'egress proxy forwards allowlisted hosts');
@@ -298,15 +336,24 @@ async function gatewaySmoke(): Promise<void> {
   // Denial reasons must stay distinguishable: an unauthenticated caller gets
   // 407 (so it can authenticate), everything else 403.
   const { denyReason } = await import('./egress-proxy.js');
-  assert(denyReason(false, '127.0.0.1', 443, ['127.0.0.1']) === 'auth', 'missing auth is reported as auth');
-  assert(denyReason(true, '127.0.0.1', 8443, ['127.0.0.1']) === 'port', 'CONNECT to a foreign port is refused');
-  assert(denyReason(true, '127.0.0.1', null, ['127.0.0.1']) === null, 'forwarded HTTP is not port-gated');
-  assert(denyReason(true, 'evil.example', 443, ['127.0.0.1']) === 'host', 'unlisted host is reported as host');
+  const open = { authorized: true, session: null };
+  assert(
+    denyReason({ authorized: false, session: null }, '127.0.0.1', 443, ['127.0.0.1']) === 'auth',
+    'missing auth is reported as auth',
+  );
+  assert(denyReason(open, '127.0.0.1', 8443, ['127.0.0.1']) === 'port', 'a foreign port is refused');
+  assert(denyReason(open, '127.0.0.1', 443, ['127.0.0.1']) === null, 'an allowlisted host on 443 passes');
+  assert(denyReason(open, 'evil.example', 443, ['127.0.0.1']) === 'host', 'unlisted host is reported as host');
 
   // A session token that the validator knows must tunnel; the same request
   // without credentials must not - this is the exact path a shim's git clone
   // takes, which previously failed with an opaque 403.
-  const gated = createEgressProxyServer(['127.0.0.1'], (t) => t === 'live-session-token');
+  const liveSession = { id: 'smoke-session', policy: 'allowlist' as const };
+  const gated = createEgressProxyServer({
+    allowlist: ['127.0.0.1'],
+    ports: testPorts,
+    tokenValidator: (t) => (t === 'live-session-token' ? liveSession : null),
+  });
   const gatedPort = await listen(gated);
   const authed = await proxyGet(http, gatedPort, `http://127.0.0.1:${upstreamPort}/ping`, 'live-session-token');
   assert(authed.status === 200, 'egress proxy accepts a live session token');
@@ -376,7 +423,7 @@ async function startProgressSmoke(store: Store, manager: SessionManager, c2: Cli
     req.resume();
     if (method === 'POST' && url === `/containers/${CID}/start`) {
       const token = createdEnv.find((e) => e.startsWith('SHIM_TOKEN='))?.slice('SHIM_TOKEN='.length) ?? '';
-      tokenValidAtStart = token.length > 0 && manager.egressTokenAllowed(token);
+      tokenValidAtStart = token.length > 0 && manager.egressTokenAllowed(token) !== null;
       res.writeHead(204).end();
       return;
     }
@@ -491,11 +538,13 @@ async function egressPeerSmoke(store: Store, manager: SessionManager, repoId: st
   const upstream = http.createServer((_req, res) => res.writeHead(200).end('pong'));
   const upstreamPort = await listen(upstream);
   const peers = new Set(['127.0.0.1']);
-  const proxy = createEgressProxyServer(
-    ['127.0.0.1'],
-    (t) => t === 'live-session-token',
-    (ip) => peers.has(ip),
-  );
+  const peerSession = { id: 'peer-session', policy: 'allowlist' as const };
+  const proxy = createEgressProxyServer({
+    allowlist: ['127.0.0.1'],
+    ports: [80, 443, upstreamPort],
+    tokenValidator: (t) => (t === 'live-session-token' ? peerSession : null),
+    peerValidator: (ip) => (peers.has(ip) ? peerSession : null),
+  });
   const proxyPort = await listen(proxy);
   const target = `http://127.0.0.1:${upstreamPort}/ping`;
 
@@ -557,6 +606,13 @@ async function egressPeerSmoke(store: Store, manager: SessionManager, repoId: st
 
   /* ---- ip -> session lookup against a fake daemon (cache, failures) ---- */
 
+  // The peer gate answers with the session behind an address, so the labelled
+  // container needs a live row to point at.
+  const peerRow = randomUUID();
+  store.insertSession(
+    sessionRow(peerRow, repoId, { status: 'idle', shim_token: `token-${peerRow.slice(0, 8)}` }),
+  );
+
   let listCalls = 0;
   let daemonBroken = false;
   const daemon = http.createServer((req, res) => {
@@ -568,6 +624,7 @@ async function egressPeerSmoke(store: Store, manager: SessionManager, repoId: st
         JSON.stringify([
           {
             Id: 'cid-peer',
+            Labels: { 'pocketagent.session': peerRow },
             NetworkSettings: { Networks: { 'pocketagent-s-1': { IPAddress: '10.9.0.7' } } },
           },
         ]),
@@ -584,16 +641,17 @@ async function egressPeerSmoke(store: Store, manager: SessionManager, repoId: st
   try {
     await dockerMod.refreshSessionPeers();
     assert(listCalls === 1, 'the peer set is loaded with a single daemon call');
-    assert(manager.egressPeerAllowed('10.9.0.7'), 'the IP of a live session container authorizes');
-    assert(manager.egressPeerAllowed('::ffff:10.9.0.7'), 'the same IP as IPv4-mapped IPv6 authorizes');
-    assert(!manager.egressPeerAllowed('10.9.0.8'), 'an IP outside the session containers does not authorize');
-    assert(!manager.egressPeerAllowed(''), 'an empty peer address never authorizes');
+    assert(manager.egressPeerAllowed('10.9.0.7')?.id === peerRow, 'the IP of a live session container authorizes');
+    assert(manager.egressPeerAllowed('::ffff:10.9.0.7') !== null, 'the same IP as IPv4-mapped IPv6 authorizes');
+    assert(manager.egressPeerAllowed('10.9.0.8') === null, 'an IP outside the session containers does not authorize');
+    assert(manager.egressPeerAllowed('') === null, 'an empty peer address never authorizes');
     assert(listCalls === 1, 'the lookup is cached - no daemon call per proxied request');
 
     daemonBroken = true;
     await dockerMod.refreshSessionPeers();
-    assert(!manager.egressPeerAllowed('10.9.0.7'), 'a failing daemon denies conservatively instead of crashing');
+    assert(manager.egressPeerAllowed('10.9.0.7') === null, 'a failing daemon denies conservatively instead of crashing');
   } finally {
+    store.deleteSession(peerRow);
     cfg.dockerEnabled = false;
     cfg.dockerHost = null;
     cfg.dockerHostIsLocal = false;
@@ -602,6 +660,207 @@ async function egressPeerSmoke(store: Store, manager: SessionManager, repoId: st
     proxy.close();
     upstream.close();
   }
+}
+
+/**
+ * The gates in front of the network: the session's own policy, the credentials
+ * that must not leave the proxy, and the addresses a name must never resolve
+ * to. Each block reproduces one finding of the egress review.
+ */
+async function egressSmoke(store: Store, manager: SessionManager, repoId: string): Promise<void> {
+  const http = await import('node:http');
+  const net = await import('node:net');
+  const {
+    EgressSessionRegistry,
+    createEgressProxyServer,
+    forwardableHeaders,
+    isInternalAddress,
+    parseEgressSessions,
+    resolveTarget,
+  } = await import('./egress-proxy.js');
+  const { createIngressServer } = await import('./gateway.js');
+  const { GATEWAY_AUTH_HEADER, GATEWAY_EGRESS_SYNC_PATH } = await import('./config.js');
+
+  /* ---- addresses a resolved name may never point at (pure) ---- */
+
+  for (const ip of ['127.0.0.1', '10.1.2.3', '192.168.1.9', '172.20.0.1', '169.254.169.254', '100.64.0.1', '0.0.0.0']) {
+    assert(isInternalAddress(ip), `${ip} counts as internal`);
+  }
+  for (const ip of ['::1', 'fe80::1', 'fd00::1', 'ff02::1', '::ffff:127.0.0.1']) {
+    assert(isInternalAddress(ip), `${ip} counts as internal`);
+  }
+  for (const ip of ['140.82.121.4', '2606:4700::1111']) {
+    assert(!isInternalAddress(ip), `${ip} is a public address`);
+  }
+  assert(isInternalAddress('not-an-address'), 'anything unparseable counts as internal');
+
+  /* ---- hop-by-hop headers never reach the upstream (pure) ---- */
+
+  const stripped = forwardableHeaders({
+    host: 'api.example',
+    'proxy-authorization': 'Basic cGE6c2VjcmV0',
+    'proxy-connection': 'keep-alive',
+    connection: 'x-hop',
+    'x-hop': 'internal',
+    authorization: 'Bearer upstream-credential',
+  });
+  assert(stripped['proxy-authorization'] === undefined, 'proxy-authorization is stripped before the forward');
+  assert(stripped['proxy-connection'] === undefined && stripped.connection === undefined, 'proxy-connection/connection are stripped');
+  assert(stripped['x-hop'] === undefined, 'headers listed in connection are stripped too');
+  assert(stripped.authorization === 'Bearer upstream-credential', 'the upstream Authorization header survives');
+
+  /* ---- sessions with the three policies, straight from the DB ---- */
+
+  const allowId = randomUUID();
+  const isoId = randomUUID();
+  const stoppedId = randomUUID();
+  const allowToken = `allow-${allowId}`;
+  const isoToken = `iso-${isoId}`;
+  const stoppedToken = `stopped-${stoppedId}`;
+  store.insertSession(sessionRow(allowId, repoId, { status: 'idle', shim_token: allowToken }));
+  store.insertSession(
+    sessionRow(isoId, repoId, { status: 'idle', shim_token: isoToken, network_policy: 'isolated' }),
+  );
+  store.insertSession(sessionRow(stoppedId, repoId, { status: 'stopped', shim_token: stoppedToken }));
+
+  assert(manager.egressTokenAllowed(allowToken)?.id === allowId, 'a live session token names its session');
+  assert(manager.egressTokenAllowed(allowToken)?.policy === 'allowlist', 'the token gate reports the session policy');
+  assert(manager.egressTokenAllowed(isoToken)?.policy === 'isolated', 'an isolated session is identified, not hidden');
+  assert(manager.egressTokenAllowed(stoppedToken) === null, 'the token of a stopped session no longer opens the proxy');
+  assert(manager.egressTokenAllowed('never-issued') === null, 'an unknown token names no session');
+  store.setSessionArchived(allowId, true);
+  assert(manager.egressTokenAllowed(allowToken) === null, 'an archived session loses its egress right away');
+  store.setSessionArchived(allowId, false);
+  assert(manager.egressTokenAllowed(allowToken)?.id === allowId, 'and gets it back when it is unarchived');
+  assert(
+    manager.egressSessions().some((s) => s.id === allowId) &&
+      !manager.egressSessions().some((s) => s.id === stoppedId),
+    'the table pushed to the gateway holds exactly the sessions that may egress',
+  );
+
+  /* ---- the proxy in front of them ---- */
+
+  let seenHeaders: import('node:http').IncomingHttpHeaders = {};
+  const upstream = http.createServer((req, res) => {
+    seenHeaders = req.headers;
+    res.writeHead(200).end('pong');
+  });
+  const upstreamPort = await listen(upstream);
+  const target = `http://127.0.0.1:${upstreamPort}/ping`;
+  const ports = [80, 443, upstreamPort];
+
+  // Peer gate answers for whoever is asking; the token gate is the real one.
+  let peerSession: ReturnType<typeof manager.egressTokenAllowed> = null;
+  const proxy = createEgressProxyServer({
+    allowlist: ['127.0.0.1'],
+    ports,
+    tokenValidator: (t) => manager.egressTokenAllowed(t),
+    peerValidator: () => peerSession,
+  });
+  const proxyPort = await listen(proxy);
+
+  const allowed = await proxyGet(http, proxyPort, target, allowToken);
+  assert(allowed.status === 200, 'an allowlist session passes with its token');
+
+  // Finding: the forward path used to hand the session's shim token (which is
+  // also the shim API credential) to every plain-HTTP upstream it talked to.
+  assert(seenHeaders['proxy-authorization'] === undefined, 'the upstream never sees Proxy-Authorization');
+  assert(seenHeaders['proxy-connection'] === undefined, 'the upstream never sees Proxy-Connection');
+  assert(seenHeaders.host === `127.0.0.1:${upstreamPort}`, 'the forwarded request keeps addressing its origin host');
+
+  // Finding: networkPolicy 'isolated' was decoration - the container simply
+  // pointed HTTP_PROXY at the orchestrator and egressed like everyone else.
+  const isolated = await proxyGet(http, proxyPort, target, isoToken);
+  assert(isolated.status === 403 && isolated.body.includes('policy'), 'an isolated session is refused, token or not');
+  const isolatedConnect = await proxyConnect(net, proxyPort, '127.0.0.1:443', isoToken);
+  assert(isolatedConnect === 403, 'an isolated session cannot open a CONNECT tunnel either');
+  const stopped = await proxyGet(http, proxyPort, target, stoppedToken);
+  assert(stopped.status === 407, 'a stopped session has to authenticate again - and cannot');
+
+  // The source address is the claim that cannot be forged: an isolated
+  // container must not borrow another session's token to get out.
+  peerSession = { id: isoId, policy: 'isolated' };
+  const borrowed = await proxyGet(http, proxyPort, target, allowToken);
+  assert(borrowed.status === 403, 'a foreign token does not lift the calling container\'s policy');
+  peerSession = null;
+
+  // Finding: the plain-HTTP path was not port-gated at all (CONNECT was).
+  const strict = createEgressProxyServer({ allowlist: ['127.0.0.1'], tokenValidator: (t) => manager.egressTokenAllowed(t) });
+  const strictPort = await listen(strict);
+  const oddPort = await proxyGet(http, strictPort, target, allowToken);
+  assert(oddPort.status === 403 && oddPort.body.includes('port'), 'forwarded HTTP is port-gated like CONNECT');
+
+  /* ---- SSRF: a name may not resolve into internal space ---- */
+
+  const loopbackName = await resolveTarget('localhost', ['localhost']);
+  assert(!loopbackName.ok && loopbackName.reason === 'address', 'a name resolving to loopback is refused');
+  const literal = await resolveTarget('127.0.0.1', ['127.0.0.1']);
+  assert(literal.ok, 'an IP literal the operator wrote into the allowlist stays reachable');
+  const wildcardLiteral = await resolveTarget('127.0.0.1', ['*.0.0.1']);
+  assert(!wildcardLiteral.ok, 'an internal literal matched only by a wildcard entry does not');
+
+  const rebind = createEgressProxyServer({
+    allowlist: ['localhost'],
+    ports,
+    tokenValidator: (t) => manager.egressTokenAllowed(t),
+  });
+  const rebindPort = await listen(rebind);
+  const viaName = await proxyGet(http, rebindPort, `http://localhost:${upstreamPort}/ping`, allowToken);
+  assert(viaName.status === 403 && viaName.body.includes('address'), 'an allowlisted name pointing inside is blocked');
+  const viaNameConnect = await proxyConnect(net, rebindPort, 'localhost:443', allowToken);
+  assert(viaNameConnect === 403, 'the CONNECT path resolves and blocks the same way');
+
+  /* ---- gateway: same gates, fed by the orchestrator over the ingress ---- */
+
+  assert(parseEgressSessions({ sessions: [{ id: 'a', policy: 'nope', token: null, ips: [] }] }) === null, 'a bad policy rejects the whole table');
+  assert(parseEgressSessions({}) === null, 'a body without a session list is no table');
+
+  const gwToken = 'gw-egress-smoke';
+  const registry = new EgressSessionRegistry();
+  const ingress = createIngressServer({ token: gwToken, onEgressSessions: (e) => registry.set(e) });
+  const ingressPort = await listen(ingress);
+  const syncUrl = `http://127.0.0.1:${ingressPort}${GATEWAY_EGRESS_SYNC_PATH}`;
+  const push = (body: string, auth = true): Promise<Response> =>
+    fetch(syncUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...(auth ? { [GATEWAY_AUTH_HEADER]: gwToken } : {}) },
+      body,
+    });
+
+  const table = JSON.stringify({
+    sessions: [
+      { id: 'gw-allow', policy: 'allowlist', token: 'gw-allow-token', ips: ['10.1.2.3'] },
+      { id: 'gw-iso', policy: 'isolated', token: 'gw-iso-token', ips: ['10.1.2.4'] },
+    ],
+  });
+  const unauthedPush = await push(table, false);
+  assert(unauthedPush.status === 401 && registry.size === 0, 'the session table cannot be pushed without the gateway secret');
+  const authedPush = await push(table);
+  assert(authedPush.status === 204, 'an authenticated push is accepted');
+  assert(registry.byToken('gw-allow-token')?.id === 'gw-allow', 'the gateway knows the pushed tokens');
+  assert(registry.byToken('gw-allow-token-x') === null, 'and only those');
+  assert(registry.byPeer('::ffff:10.1.2.3')?.id === 'gw-allow', 'the gateway knows the pushed container addresses');
+  const badPush = await push('{"sessions":[{"id":42}]}');
+  assert(badPush.status === 400 && registry.byToken('gw-allow-token') !== null, 'a malformed push never empties the table');
+
+  // Finding: the gateway's egress proxy ran without any validator - every
+  // container that reached gateway:3128 egressed without credentials.
+  const gwEgress = createEgressProxyServer({
+    allowlist: ['127.0.0.1'],
+    ports,
+    tokenValidator: (t) => registry.byToken(t),
+    peerValidator: (ip) => registry.byPeer(ip),
+  });
+  const gwEgressPort = await listen(gwEgress);
+  const gwAnon = await proxyGet(http, gwEgressPort, target);
+  assert(gwAnon.status === 407, 'the gateway egress proxy refuses an unauthenticated caller');
+  const gwAllowed = await proxyGet(http, gwEgressPort, target, 'gw-allow-token');
+  assert(gwAllowed.status === 200, 'a session from the pushed table passes');
+  const gwIsolated = await proxyGet(http, gwEgressPort, target, 'gw-iso-token');
+  assert(gwIsolated.status === 403, 'an isolated session is refused on the gateway too');
+
+  for (const s of [upstream, proxy, strict, rebind, ingress, gwEgress]) s.close();
+  for (const id of [allowId, isoId, stoppedId]) store.deleteSession(id);
 }
 
 /**
@@ -2373,6 +2632,7 @@ async function main(): Promise<void> {
 
   await startProgressSmoke(store, manager, c2, added.repo.id);
   await egressPeerSmoke(store, manager, added.repo.id);
+  await egressSmoke(store, manager, added.repo.id);
   await reconcileSmoke(store, manager, c2, added.repo.id);
   await lifecycleSmoke(store, manager, c2, added.repo.id);
   await historySmoke(store, manager, c2, added.repo.id);

@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS links (
 
 export class Store {
   readonly db: Database.Database;
+  private sessionAuthRev = 0;
 
   constructor(dir: string = config.dataDir) {
     mkdirSync(dir, { recursive: true });
@@ -318,7 +319,24 @@ export class Store {
     return this.db.prepare('SELECT * FROM repos WHERE tenant_id = ?').all(tenant) as RepoRow[];
   }
 
+  /**
+   * Zähler über alle Änderungen an Session-Feldern, die über Egress-Auth
+   * entscheiden (Existenz, Status, shim_token, Container, Archiv-Flag, Link).
+   * Der Egress-Gate leitet daraus seine Token-Tabelle ab und baut sie nur neu,
+   * wenn sich hier etwas bewegt hat (sessions.ts: egressTokens). Bewusst nicht
+   * erhöht wird bei touchSession & Co: die laufen pro Event und ändern nichts,
+   * was den Proxy interessiert.
+   */
+  get sessionAuthRevision(): number {
+    return this.sessionAuthRev;
+  }
+
+  private bumpSessionAuth(): void {
+    this.sessionAuthRev++;
+  }
+
   insertSession(row: SessionRow): void {
+    this.bumpSessionAuth();
     this.db
       .prepare(
         `INSERT INTO sessions (id, tenant_id, repo_id, repo_full_name, adapter, provider, model, mode,
@@ -353,6 +371,7 @@ export class Store {
   }
 
   updateSessionStatus(id: string, status: string): void {
+    this.bumpSessionAuth();
     this.db.prepare('UPDATE sessions SET status = ? WHERE id = ?').run(status, id);
   }
 
@@ -407,12 +426,14 @@ export class Store {
   }
 
   setProvisioned(id: string, containerId: string, volumeName: string, shimToken: string): void {
+    this.bumpSessionAuth();
     this.db
       .prepare('UPDATE sessions SET container_id = ?, volume_name = ?, shim_token = ? WHERE id = ?')
       .run(containerId, volumeName, shimToken, id);
   }
 
   setContainer(id: string, containerId: string): void {
+    this.bumpSessionAuth();
     this.db.prepare('UPDATE sessions SET container_id = ? WHERE id = ?').run(containerId, id);
   }
 
@@ -421,6 +442,7 @@ export class Store {
   }
 
   setLinkId(id: string, linkId: string | null): void {
+    this.bumpSessionAuth();
     this.db.prepare('UPDATE sessions SET link_id = ? WHERE id = ?').run(linkId, id);
   }
 
@@ -438,6 +460,7 @@ export class Store {
   }
 
   setSessionArchived(id: string, archived: boolean): void {
+    this.bumpSessionAuth();
     this.db.prepare('UPDATE sessions SET archived = ? WHERE id = ?').run(archived ? 1 : 0, id);
   }
 
@@ -494,6 +517,7 @@ export class Store {
   }
 
   deleteSession(id: string): void {
+    this.bumpSessionAuth();
     this.db.prepare('DELETE FROM session_events WHERE session_id = ?').run(id);
     this.db.prepare('DELETE FROM sessions WHERE id = ?').run(id);
   }

@@ -188,8 +188,11 @@ Orchestrator (Fly/anderswo)
                                                 ├─ ingress :8443  /s/<sessionId>/<pfad>
                                                 │    → http://<sessionId>:8080/<pfad>
                                                 │    Auth: Header x-pocketagent-gateway
-                                                └─ egress :3128 (NICHT published)
-                                                     Allowlist-Forward-Proxy
+                                                ├─ egress :3128 (NICHT published)
+                                                │    Allowlist-Forward-Proxy, gated
+                                                │    pro Session (Policy/Token/IP)
+                                                └─ /_pa/egress (auf :8443)
+                                                     Session-Tabelle vom Orchestrator
                                               Session-Netz je Session (internal)
                                                 └─ Shim-Container (kein Port, kein Internet)
 ```
@@ -235,6 +238,12 @@ ersten Session-Start steht eine Warnung im Log
 - Änderungen an `NETWORK_ALLOWLIST` greifen erst nach
   `docker rm -f pocketagent-gateway` auf dem Runner (die Allowlist steckt im
   Container-Env); der nächste Session-Start legt ihn neu an.
+- Der Egress-Proxy des Gateways lässt nur Sessions durch, die der Orchestrator
+  ihm gemeldet hat (Policy, Shim-Token, Container-IPs; POST `/_pa/egress` mit
+  demselben Shared Secret wie der Ingress). Die Tabelle liegt nur im Speicher:
+  nach einem Neustart des Gateways ist sie leer und alles wird abgewiesen, bis
+  der Orchestrator sie spätestens nach 15 s erneut pusht. Im Gateway-Log steht
+  dann `egress session table updated (n sessions)`.
 
 ### Prüfen
 
@@ -242,6 +251,7 @@ ersten Session-Start steht eine Warnung im Log
 # auf dem Runner
 docker ps --filter name=pocketagent-gateway     # up, Port 0.0.0.0:8443->8443/tcp
 docker logs pocketagent-gateway                 # "ingress listening" + "egress proxy listening"
+                                                # + "egress session table updated (n sessions)"
 docker network ls --filter name=pocketagent-s-  # je aktive Session ein internes Netz
 
 # vom Orchestrator aus

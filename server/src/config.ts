@@ -207,6 +207,13 @@ export const GATEWAY_INGRESS_PORT = 8443;
 export const GATEWAY_EGRESS_PORT = 3128;
 /** Header carrying the gateway shared secret. */
 export const GATEWAY_AUTH_HEADER = 'x-pocketagent-gateway';
+/**
+ * Ingress path the orchestrator pushes the live session table to (policy, proxy
+ * token and container addresses per session). It is what lets the gateway's
+ * egress proxy apply the same per-session gates as the local one; outside the
+ * `/s/<sessionId>/...` namespace on purpose, so no session id can ever name it.
+ */
+export const GATEWAY_EGRESS_SYNC_PATH = '/_pa/egress';
 /** Container name of the managed gateway on the runner. */
 export const GATEWAY_CONTAINER_NAME = 'pocketagent-gateway';
 /** DNS alias the gateway gets inside every session network. */

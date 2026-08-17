@@ -29,6 +29,7 @@ import {
 } from './progress.js';
 
 import { getAdapter } from './adapters.js';
+import { matchTokenDigest, tokenDigest, type EgressSession, type TokenEntry } from './egress-proxy.js';
 import { ShimClient, normalizeModels } from './shim-client.js';
 import { sendPush } from './fcm.js';
 
@@ -49,6 +50,16 @@ export function isReasoningEffort(v: unknown): v is ReasoningEffort {
 export function isNoticePhase(v: unknown): v is NoticePhase {
   return typeof v === 'string' && (NOTICE_PHASES as readonly string[]).includes(v);
 }
+
+/**
+ * Session states in which a container of that session may be talking to the
+ * egress proxy: it is being provisioned, or it is up. A stopped, failed or
+ * archived session has no running container, so its shim token must not open
+ * the proxy for anyone who still holds it (it stays in the row until GC).
+ * The one container that lives outside these states is the throwaway push
+ * container, which gets an explicit grant for the duration of the push.
+ */
+const EGRESS_LIVE_STATUSES: readonly SessionStatus[] = ['creating', 'running', 'idle'];
 
 /** `session.events.get`: youngest events, chronological; the client may ask for fewer. */
 export const EVENTS_DEFAULT_LIMIT = 200;
@@ -186,6 +197,14 @@ export class SessionManager {
   private readonly generations = new Map<string, number>();
   /** Laufende Resumes pro Session (Doppel-Tap/zweites Gerät teilen sich einen Lauf). */
   private readonly resuming = new Map<string, Promise<void>>();
+  /**
+   * Sessions mit einem laufenden Push-Container. Der ist ein Wegwerf-Container
+   * ohne eigene Zeile und pusht durch denselben Egress-Proxy - er braucht also
+   * Egress, auch wenn die Session selbst gerade gestoppt ist.
+   */
+  private readonly pushing = new Set<string>();
+  /** Abgeleitete Token-Tabelle des Egress-Gates (siehe egressTokens). */
+  private egressTokenCache: { revision: number; entries: TokenEntry<string>[] } | null = null;
   readonly startedAt = Date.now();
 
   constructor(
@@ -194,11 +213,20 @@ export class SessionManager {
   ) {}
 
   /**
-   * Egress proxy auth (wired by the caller into startEgressProxy): only
-   * tokens matching a live session's shim_token pass (read-only lookup).
+   * Egress proxy auth (wired by the caller into startEgressProxy): the session
+   * a proxy token belongs to, or null.
+   *
+   * The token table is derived from the session rows and rebuilt whenever a row
+   * that decides egress changes (Store.sessionAuthRevision), so the hot proxy
+   * path costs one hash and no query. The comparison runs over SHA-256 digests
+   * with timingSafeEqual and without an early exit - the tokens are 24 random
+   * bytes, but a token table is not the place to leave a timing side channel.
+   * Liveness is checked on the matched row itself, so a session that stopped a
+   * moment ago is refused immediately instead of at the next rebuild.
    */
-  egressTokenAllowed(token: string): boolean {
-    return this.store.listSessions(TENANT).some((r) => r.shim_token === token);
+  egressTokenAllowed(token: string): EgressSession | null {
+    const id = matchTokenDigest(token, this.egressTokens());
+    return id === null ? null : this.liveEgressSession(id);
   }
 
   /**
@@ -208,8 +236,57 @@ export class SessionManager {
    * never authenticates - the token gate alone would deny every one of its
    * turns while git (which does send it) keeps working.
    */
-  egressPeerAllowed(ip: string): boolean {
-    return docker.isSessionPeerIp(ip);
+  egressPeerAllowed(ip: string): EgressSession | null {
+    const id = docker.sessionIdForPeerIp(ip);
+    return id === null ? null : this.liveEgressSession(id);
+  }
+
+  /**
+   * The live sessions the remote gateway has to know to gate its own egress
+   * proxy the same way (docker.publishEgressTable pushes this table). A session
+   * that may not egress right now is simply absent.
+   */
+  egressSessions(tenant: string = TENANT): { id: string; policy: NetworkPolicy; token: string | null }[] {
+    const live: { id: string; policy: NetworkPolicy; token: string | null }[] = [];
+    for (const row of this.store.listSessions(tenant)) {
+      const session = this.egressSessionOf(row);
+      if (session !== null) live.push({ ...session, token: row.shim_token });
+    }
+    return live;
+  }
+
+  /**
+   * May this session reach the network right now, and under which policy?
+   * `null` = not at all. Policy and liveness are read from the row on every
+   * call: both change without the proxy noticing, and a wrong answer here is
+   * either an open door or a broken session.
+   */
+  private egressSessionOf(row: SessionRow): EgressSession | null {
+    const policy: NetworkPolicy = isNetworkPolicy(row.network_policy)
+      ? row.network_policy
+      : config.networkPolicyDefault;
+    const live =
+      this.pushing.has(row.id) ||
+      (row.archived === 0 && (EGRESS_LIVE_STATUSES as readonly string[]).includes(row.status));
+    return live ? { id: row.id, policy } : null;
+  }
+
+  private liveEgressSession(id: string): EgressSession | null {
+    const row = this.store.getSession(id);
+    return row === undefined ? null : this.egressSessionOf(row);
+  }
+
+  /** Token table for the proxy gate, rebuilt only when a session row changed. */
+  private egressTokens(): readonly TokenEntry<string>[] {
+    const revision = this.store.sessionAuthRevision;
+    if (this.egressTokenCache === null || this.egressTokenCache.revision !== revision) {
+      const entries: TokenEntry<string>[] = [];
+      for (const row of this.store.listSessions(TENANT)) {
+        if (row.shim_token) entries.push({ digest: tokenDigest(row.shim_token), value: row.id });
+      }
+      this.egressTokenCache = { revision, entries };
+    }
+    return this.egressTokenCache.entries;
   }
 
   setLinkTransport(t: LinkTransport): void {
@@ -1030,9 +1107,18 @@ export class SessionManager {
     if (!repo) throw new Error('repo missing');
     const env = this.buildEnv(row, repo, row.shim_token, repo.default_branch);
     const pat = this.githubPatFor(row);
-    if (!(await docker.oneShotPush(row, env, pat ? { githubPat: pat } : undefined, this.noticeFor(id)))) {
-      throw new Error('push failed');
+    // Egress-Fenster für den Wegwerf-Container: er trägt das Label und den
+    // Token der Session, deren Status ('stopped' nach reapIdle) sonst jeden
+    // seiner git-Requests am Proxy abweisen würde.
+    this.pushing.add(id);
+    let ok: boolean;
+    try {
+      ok = await docker.oneShotPush(row, env, pat ? { githubPat: pat } : undefined, this.noticeFor(id));
+    } finally {
+      this.pushing.delete(id);
+      await docker.refreshSessionPeers().catch(() => {});
     }
+    if (!ok) throw new Error('push failed');
     this.emitEvent(id, { type: 'pushed', branch: row.branch, auto: false });
   }
 
@@ -1302,6 +1388,9 @@ export class SessionManager {
     this.timers.push(
       setInterval(() => void this.reapIdle().catch(() => {}), 60_000),
       setInterval(() => void this.gc().catch(() => {}), 24 * 3_600_000),
+      // Gateway-Modus: der Gateway hält die Session-Tabelle nur im Speicher,
+      // ein Neustart des Containers verliert sie (no-op ohne Gateway).
+      setInterval(() => void docker.syncGatewayEgress().catch(() => {}), 15_000),
     );
   }
 

@@ -20,6 +20,14 @@
  *                   -> allowlist-filtered forward proxy (same code as the
  *                      orchestrator's in-process proxy)
  *
+ * The gateway has neither the database nor docker access, so it cannot look up
+ * on its own which session an egress request belongs to. The orchestrator
+ * pushes that table (session id, policy, proxy token, container addresses) to
+ * GATEWAY_EGRESS_SYNC_PATH on the *authenticated* ingress; the egress proxy
+ * gates every request against it, exactly like the in-process proxy does
+ * locally. Until the first push arrives the proxy denies everything - a gateway
+ * that just restarted must not be an open relay for its network.
+ *
  * The process runs from the orchestrator image (`npx tsx src/gateway.ts`), so
  * no extra image has to be built or shipped.
  */
@@ -28,10 +36,16 @@ import { timingSafeEqual } from 'node:crypto';
 import {
   GATEWAY_AUTH_HEADER,
   GATEWAY_EGRESS_PORT,
+  GATEWAY_EGRESS_SYNC_PATH,
   GATEWAY_INGRESS_PORT,
   parseAllowlist,
 } from './config.js';
-import { createEgressProxyServer } from './egress-proxy.js';
+import {
+  EgressSessionRegistry,
+  createEgressProxyServer,
+  parseEgressSessions,
+  type EgressSessionEntry,
+} from './egress-proxy.js';
 
 /** Port the session shims listen on inside their containers. */
 export const SHIM_PORT = 8080;
@@ -84,6 +98,47 @@ export function authorize(headers: http.IncomingHttpHeaders, token: string): boo
 export interface IngressOptions {
   token: string;
   shimPort?: number;
+  /** Called with every accepted session-table push (see GATEWAY_EGRESS_SYNC_PATH). */
+  onEgressSessions?: (entries: EgressSessionEntry[]) => void;
+}
+
+/** Largest session table the ingress accepts (a few hundred sessions). */
+const EGRESS_SYNC_MAX_BYTES = 256 * 1024;
+
+/**
+ * Read the pushed session table off an authenticated request. Anything that is
+ * not a well-formed table is rejected instead of partially applied: the table
+ * decides who may egress, so a truncated one would silently lock sessions out.
+ */
+function readEgressSessions(req: http.IncomingMessage, res: http.ServerResponse, apply: (e: EgressSessionEntry[]) => void): void {
+  let body = '';
+  let tooLarge = false;
+  req.on('data', (chunk) => {
+    if (tooLarge) return;
+    body += String(chunk);
+    if (body.length > EGRESS_SYNC_MAX_BYTES) {
+      tooLarge = true;
+      res.writeHead(413, { 'content-type': 'text/plain' }).end('too large');
+      req.destroy();
+    }
+  });
+  req.on('end', () => {
+    if (tooLarge) return;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      res.writeHead(400, { 'content-type': 'text/plain' }).end('bad json');
+      return;
+    }
+    const entries = parseEgressSessions(parsed);
+    if (entries === null) {
+      res.writeHead(400, { 'content-type': 'text/plain' }).end('bad session table');
+      return;
+    }
+    apply(entries);
+    res.writeHead(204).end();
+  });
 }
 
 /**
@@ -97,6 +152,15 @@ export function createIngressServer(opts: IngressOptions): http.Server {
   const server = http.createServer((req, res) => {
     if (!authorize(req.headers, opts.token)) {
       res.writeHead(401, { 'content-type': 'text/plain' }).end('unauthorized');
+      return;
+    }
+    const path = (req.url ?? '').split('?')[0];
+    if (path === GATEWAY_EGRESS_SYNC_PATH) {
+      if (req.method !== 'POST') {
+        res.writeHead(405, { 'content-type': 'text/plain' }).end('method not allowed');
+        return;
+      }
+      readEgressSessions(req, res, (entries) => opts.onEgressSessions?.(entries));
       return;
     }
     const route = routeIngress(req.url ?? '', shimPort);
@@ -146,13 +210,26 @@ function main(): void {
   const ingressPort = Number(process.env.GATEWAY_INGRESS_PORT ?? GATEWAY_INGRESS_PORT);
   const egressPort = Number(process.env.GATEWAY_EGRESS_PORT ?? GATEWAY_EGRESS_PORT);
 
-  const ingress = createIngressServer({ token });
+  // The session table the orchestrator pushes; both egress gates read from it.
+  const sessions = new EgressSessionRegistry();
+
+  const ingress = createIngressServer({
+    token,
+    onEgressSessions: (entries) => {
+      sessions.set(entries);
+      console.log(`[gateway] egress session table updated (${entries.length} sessions)`);
+    },
+  });
   ingress.on('error', (e) => console.error(`[gateway] ingress error: ${String(e)}`));
   ingress.listen(ingressPort, '0.0.0.0', () =>
     console.log(`[gateway] ingress listening on :${ingressPort}`),
   );
 
-  const egress = createEgressProxyServer(allowlist);
+  const egress = createEgressProxyServer({
+    allowlist,
+    tokenValidator: (t) => sessions.byToken(t),
+    peerValidator: (ip) => sessions.byPeer(ip),
+  });
   egress.on('error', (e) => console.error(`[gateway] egress error: ${String(e)}`));
   egress.listen(egressPort, '0.0.0.0', () =>
     console.log(`[gateway] egress proxy listening on :${egressPort} (${allowlist.length} hosts allowed)`),

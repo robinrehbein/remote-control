@@ -1427,6 +1427,393 @@ async function heartbeatSmoke(): Promise<void> {
   wss.close();
 }
 
+/**
+ * shim-client.ts `call()` must never read a non-2xx JSON response as a ready
+ * shim - APP-REVIEW "HTTP-Status wird ignoriert: waitForShim wertet
+ * Fehlerantworten als 'Shim bereit'" (shim-client.ts ~62). Runs against a
+ * tiny local HTTP server so it does not need Docker or a real shim.
+ */
+async function shimClientStatusSmoke(): Promise<void> {
+  const http = await import('node:http');
+  const { ShimClient } = await import('./shim-client.js');
+
+  let respond: { status: number; body: unknown } = { status: 200, body: {} };
+  const server = http.createServer((_req, res) => {
+    res.writeHead(respond.status, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(respond.body));
+  });
+  const port = await listen(server);
+  const client = new ShimClient(`http://127.0.0.1:${port}`, 'smoke-shim-token');
+
+  try {
+    // The exact failure mode from the finding: a proxy/gateway answers with a
+    // parsable JSON error body while the shim is still booting.
+    respond = { status: 502, body: { error: 'upstream not ready' } };
+    assert(
+      (await client.status()) === null,
+      'a non-2xx JSON body is not read as a ready shim (waitForShim must keep polling, not declare success)',
+    );
+
+    // Same failure even when the body happens to look like a valid ShimStatus.
+    respond = { status: 401, body: { adapter: 'kilo', mode: 'ask', busy: false } };
+    assert((await client.status()) === null, 'a 401 is rejected even with an otherwise well-shaped body');
+
+    respond = { status: 200, body: { adapter: 'kilo', mode: 'ask', busy: false } };
+    const ready = await client.status();
+    assert(ready?.adapter === 'kilo' && ready.busy === false, 'a 2xx response is still read normally');
+  } finally {
+    server.close();
+  }
+}
+
+/**
+ * /api/secrets: AAD binding (finding "REST-Pfad verschluesselt ohne AAD",
+ * secrets-api.ts ~39) and the sliding-window rate limit (finding "POST
+ * /api/secrets ohne Rate-Limit", secrets-api.ts ~47) that protects the same
+ * PAIRING_ADMIN_TOKEN /api/pairing/* is guarded by.
+ */
+async function secretsRestSmoke(base: string, store: Store): Promise<void> {
+  const priorAdminToken = process.env.PAIRING_ADMIN_TOKEN;
+  process.env.PAIRING_ADMIN_TOKEN = 'smoke-admin-token-for-secrets-rest';
+  try {
+    const post = (headers: Record<string, string>, body: unknown) =>
+      fetch(`${base}/api/secrets`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...headers },
+        body: JSON.stringify(body),
+      });
+    const authHeader = { authorization: `Bearer ${process.env.PAIRING_ADMIN_TOKEN}` };
+
+    const noAuth = await post({}, { kind: 'rest-aad-smoke', value: 'x' });
+    assert(noAuth.status === 401, '/api/secrets rejects a missing admin token');
+
+    const badKind = await post(authHeader, { kind: 'Not Valid!', value: 'x' });
+    assert(badKind.status === 400, '/api/secrets rejects an invalid kind');
+
+    const secretValue = 'rest-secret-value-smoke';
+    const saveRes = await post(authHeader, { kind: 'rest-aad-smoke', value: secretValue });
+    const saveBody = (await saveRes.json()) as { ok: boolean; secret?: { id: string; kind: string } };
+    assert(
+      saveRes.ok && saveBody.ok && saveBody.secret?.kind === 'rest-aad-smoke',
+      '/api/secrets saves a valid secret',
+    );
+
+    // AAD binding: the REST path must encrypt with the exact same AAD shape
+    // as ws.ts `secret.set` ("secret:<tenant>:<kind>"), not plaintext/no AAD.
+    const row = store.getSecret(saveBody.secret!.id)!;
+    const vaultMod = await import('./vault.js');
+    const decrypted = vaultMod.decryptStrict(
+      { ciphertext: row.ciphertext, nonce: row.nonce },
+      'secret:default:rest-aad-smoke',
+    );
+    assert(decrypted === secretValue, 'a REST-saved secret decrypts under its own kind AAD, strictly (no fallback needed)');
+    let transplanted = true;
+    try {
+      vaultMod.decryptStrict({ ciphertext: row.ciphertext, nonce: row.nonce }, 'secret:default:other-kind');
+    } catch {
+      transplanted = false;
+    }
+    assert(
+      !transplanted,
+      'a REST-saved ciphertext cannot be transplanted onto a different kind - the AAD binding actually holds',
+    );
+    assert(
+      store.getSecretValue('rest-aad-smoke', 'default') === secretValue,
+      'the normal read path still returns the REST-saved value',
+    );
+
+    // Rate limit: an admin-token consumer just like /api/pairing/*, so it
+    // must not be brute-forceable at wire speed (10 req/min/IP).
+    let sawRateLimit = false;
+    for (let i = 0; i < 15 && !sawRateLimit; i++) {
+      const res = await post(authHeader, { kind: 'rest-aad-smoke', value: `probe-${i}` });
+      if (res.status === 429) sawRateLimit = true;
+    }
+    assert(sawRateLimit, '/api/secrets rate-limits repeated admin-token attempts (429 eventually)');
+  } finally {
+    if (priorAdminToken === undefined) delete process.env.PAIRING_ADMIN_TOKEN;
+    else process.env.PAIRING_ADMIN_TOKEN = priorAdminToken;
+  }
+}
+
+/**
+ * Secrets are unique per (tenant, kind) now (finding "Secrets pro
+ * (tenant,kind) nicht eindeutig", db.ts ~250): a save upserts instead of
+ * inserting a second row, so deleting "the" secret of a kind can no longer
+ * silently reactivate an older, already-rotated-away value - reproduces the
+ * exact scenario from the finding. Also covers the one-time migration that
+ * dedupes a database that predates the UNIQUE index.
+ */
+async function secretsUniqueSmoke(store: Store): Promise<void> {
+  const kind = 'unique-smoke-kind';
+  const encMod = await import('./vault.js');
+
+  const v1 = encMod.encrypt('leaked-old-value', `secret:default:${kind}`);
+  store.saveSecret('unique-smoke-v1', 'default', kind, v1.ciphertext, v1.nonce);
+  assert(store.listSecrets('default').filter((s) => s.kind === kind).length === 1, 'first save creates one row');
+
+  const v2 = encMod.encrypt('rotated-new-value', `secret:default:${kind}`);
+  store.saveSecret('unique-smoke-v2', 'default', kind, v2.ciphertext, v2.nonce);
+  const rows = store.listSecrets('default').filter((s) => s.kind === kind);
+  assert(rows.length === 1, 'a second save for the same (tenant,kind) replaces the row instead of adding one');
+  assert(rows[0]!.id === 'unique-smoke-v2', 'the surviving row is the newest save (the upsert also moves the id)');
+  assert(store.getSecretValue(kind, 'default') === 'rotated-new-value', 'the newest value is what getSecretValue returns');
+
+  store.deleteSecret('unique-smoke-v2', 'default');
+  assert(
+    store.getSecretByKind(kind, 'default') === undefined,
+    'deleting the current row leaves no older row behind to silently reactivate (the original finding)',
+  );
+
+  // --- one-time migration of a pre-existing DB with duplicate rows ---
+  // Seeded with the raw driver, NOT the Store class: Store's constructor
+  // always runs migrate() (and so creates the UNIQUE index) immediately, so
+  // going through Store here could never reach the "pre-fix" state this
+  // migration is meant to heal.
+  const { Store } = await import('./db.js');
+  const { default: Database } = await import('better-sqlite3');
+  const dir = mkdtempSync(join(tmpdir(), 'pa-smoke-secrets-migrate-'));
+  try {
+    const dbPath = join(dir, 'orchestrator.db');
+    const raw = new Database(dbPath);
+    raw.exec(
+      `CREATE TABLE IF NOT EXISTS secrets (
+         id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, kind TEXT NOT NULL,
+         ciphertext TEXT NOT NULL, nonce TEXT NOT NULL, created_at TEXT NOT NULL
+       )`,
+    );
+    const insertRaw = (id: string, createdAt: string): void => {
+      raw
+        .prepare('INSERT INTO secrets (id, tenant_id, kind, ciphertext, nonce, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(id, 'default', 'legacy-kind', `ct-${id}`, `n-${id}`, createdAt);
+    };
+    // Three raw rows for the same (tenant,kind) - the shape a pre-fix
+    // database could reach (saveSecret always inserted a new row).
+    insertRaw('legacy-old', '2020-01-01T00:00:00.000Z');
+    insertRaw('legacy-mid', '2021-01-01T00:00:00.000Z');
+    insertRaw('legacy-new', '2022-01-01T00:00:00.000Z');
+    raw.close();
+
+    // Opening the real Store for the first time is the "server restarts on
+    // the fixed version" path - this is what runs the dedup + index once.
+    const reopened = new Store(dir);
+    const survivors = reopened.listSecrets('default').filter((s) => s.kind === 'legacy-kind');
+    assert(survivors.length === 1, 'migration collapses duplicate (tenant,kind) rows to exactly one');
+    assert(survivors[0]!.id === 'legacy-new', 'migration keeps the newest row by created_at');
+    reopened.close();
+
+    // Idempotent: a second reopen (the unique index is the "already
+    // migrated" marker) must not error or change anything further, and the
+    // index now rejects a raw duplicate insert too (defense in depth beyond
+    // the application-level upsert).
+    const reopenedAgain = new Store(dir);
+    assert(
+      reopenedAgain.listSecrets('default').filter((s) => s.kind === 'legacy-kind').length === 1,
+      'reopening an already-migrated DB is a no-op',
+    );
+    let dupRejected = false;
+    try {
+      reopenedAgain.db
+        .prepare('INSERT INTO secrets (id, tenant_id, kind, ciphertext, nonce, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+        .run('legacy-dup', 'default', 'legacy-kind', 'ct-dup', 'n-dup', new Date().toISOString());
+    } catch {
+      dupRejected = true;
+    }
+    assert(dupRejected, 'the UNIQUE(tenant_id, kind) index rejects a second raw insert for the same kind');
+    reopenedAgain.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Adapter manifest validation (finding "Manifest-Validierung castet
+ * credentials/providerEnv/defaults ungeprueft", adapters.ts ~59) and
+ * ADAPTERS_DIR precedence over bundled/repo manifests (finding "Gebundelte
+ * /app/adapters-Manifeste ueberschreiben Operator-Manifeste aus
+ * ADAPTERS_DIR", adapters.ts ~75).
+ */
+async function adapterManifestSmoke(): Promise<void> {
+  const adaptersMod = await import('./adapters.js');
+  const priorAdaptersDir = process.env.ADAPTERS_DIR;
+  const dir = mkdtempSync(join(tmpdir(), 'pa-smoke-adapters-'));
+  const warnBefore = console.warn;
+  const logBefore = console.log;
+  try {
+    writeFileSync(
+      join(dir, 'broken-creds.json'),
+      JSON.stringify({
+        id: 'broken-creds',
+        name: 'Broken Creds',
+        capabilities: {},
+        // The exact bug from the finding: a string instead of an array. Pre-fix
+        // this passed validation and got iterated character by character.
+        credentials: { github: 'GITHUB_TOKEN' },
+        defaults: { provider: '' },
+      }),
+    );
+    writeFileSync(
+      join(dir, 'broken-env.json'),
+      JSON.stringify({
+        id: 'broken-env',
+        name: 'Broken Env',
+        capabilities: {},
+        providerEnv: { openai: 'not a valid env name' },
+        defaults: { provider: '' },
+      }),
+    );
+    writeFileSync(
+      join(dir, 'broken-defaults.json'),
+      JSON.stringify({ id: 'broken-defaults', name: 'Broken Defaults', capabilities: {}, defaults: {} }),
+    );
+    writeFileSync(
+      join(dir, 'ok-adapter.json'),
+      JSON.stringify({
+        id: 'ok-adapter',
+        name: 'OK Adapter',
+        capabilities: { approvals: true },
+        credentials: { ok: ['OK_TOKEN'] },
+        providerEnv: { ok: 'OK_API_KEY' },
+        defaults: { provider: 'ok' },
+      }),
+    );
+
+    process.env.ADAPTERS_DIR = dir;
+    const warnings: string[] = [];
+    console.warn = (...a: unknown[]): void => {
+      warnings.push(a.map(String).join(' '));
+    };
+    adaptersMod.resetAdapterRegistry();
+    const list = adaptersMod.listAdapters();
+    console.warn = warnBefore;
+
+    const ids = list.map((a) => a.id);
+    assert(
+      !ids.includes('broken-creds'),
+      'credentials as a string (not an array) is rejected, not silently iterated character by character',
+    );
+    assert(!ids.includes('broken-env'), 'an invalid env var name in providerEnv is rejected');
+    assert(!ids.includes('broken-defaults'), 'defaults:{} without a provider string is rejected');
+    assert(ids.includes('ok-adapter'), 'a structurally valid manifest still loads');
+    assert(
+      warnings.some((w) => w.includes('broken-creds')) &&
+        warnings.some((w) => w.includes('broken-env')) &&
+        warnings.some((w) => w.includes('broken-defaults')),
+      'each rejected manifest is logged with a clear reason, not silently dropped',
+    );
+    const ok = list.find((a) => a.id === 'ok-adapter');
+    assert(ok?.credentials?.ok?.[0] === 'OK_TOKEN', 'a valid credentials array is kept verbatim');
+    assert(ok?.providerEnv?.ok === 'OK_API_KEY', 'a valid providerEnv value is kept verbatim');
+
+    // Precedence: ADAPTERS_DIR must win over the repo's own bundled manifest
+    // for a colliding id (here: the real "kilo" adapter).
+    writeFileSync(
+      join(dir, 'kilo.json'),
+      JSON.stringify({
+        id: 'kilo',
+        name: 'Operator Kilo Override',
+        capabilities: {},
+        image: 'registry.example/kilo-shim@sha256:deadbeef',
+        defaults: { provider: 'operator-default' },
+      }),
+    );
+    const logs: string[] = [];
+    console.log = (...a: unknown[]): void => {
+      logs.push(a.map(String).join(' '));
+    };
+    adaptersMod.resetAdapterRegistry();
+    const list2 = adaptersMod.listAdapters();
+    console.log = logBefore;
+
+    const kilo = list2.find((a) => a.id === 'kilo');
+    assert(
+      kilo?.image === 'registry.example/kilo-shim@sha256:deadbeef',
+      'ADAPTERS_DIR wins over the bundled/repo manifest for a colliding id',
+    );
+    assert(
+      logs.some((l) => l.includes('kilo') && l.includes('ignored')),
+      'the overridden lower-precedence manifest is logged, not silently discarded',
+    );
+  } finally {
+    console.warn = warnBefore;
+    console.log = logBefore;
+    if (priorAdaptersDir === undefined) delete process.env.ADAPTERS_DIR;
+    else process.env.ADAPTERS_DIR = priorAdaptersDir;
+    adaptersMod.resetAdapterRegistry();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Trust boundary (finding "Link-Agent kann Events in beliebige fremde
+ * Sessions injizieren", ws.ts ~319): a link socket is bound to exactly one
+ * session, and must not be able to write events into another session by
+ * simply claiming a different `sessionId` in the `agent.event` frame.
+ */
+async function linkEventInjectionSmoke(store: Store, wsBase: string): Promise<void> {
+  const { randomBytes } = await import('node:crypto');
+  const tokenA = randomBytes(24).toString('hex');
+  const tokenB = randomBytes(24).toString('hex');
+  store.createLink(randomUUID(), 'default', 'smoke-link-a', sha256(tokenA));
+  store.createLink(randomUUID(), 'default', 'smoke-link-b', sha256(tokenB));
+
+  const linkA = new Client(wsBase);
+  await linkA.opened;
+  linkA.send({ type: 'agent.hello', token: tokenA, adapter: 'kilo', name: 'link-a' });
+  const readyA = await linkA.wait((m) => m.type === 'agent.ready');
+  const sessionAId = readyA.type === 'agent.ready' ? readyA.sessionId : '';
+
+  const linkB = new Client(wsBase);
+  await linkB.opened;
+  linkB.send({ type: 'agent.hello', token: tokenB, adapter: 'kilo', name: 'link-b' });
+  const readyB = await linkB.wait((m) => m.type === 'agent.ready');
+  const sessionBId = readyB.type === 'agent.ready' ? readyB.sessionId : '';
+
+  assert(
+    sessionAId !== '' && sessionBId !== '' && sessionAId !== sessionBId,
+    'two link agents register two distinct sessions',
+  );
+  const refBefore = store.getSession(sessionBId)?.session_ref ?? null;
+
+  const warnings: string[] = [];
+  const warnBefore = console.warn;
+  console.warn = (...a: unknown[]): void => {
+    warnings.push(a.map(String).join(' '));
+  };
+  try {
+    // linkA forges an event claiming to be for sessionB - it is only bound
+    // to sessionA.
+    linkA.send({
+      type: 'agent.event',
+      sessionId: sessionBId,
+      event: { type: 'status', adapter: 'kilo', mode: 'ask', busy: false, sessionRef: 'attacker-injected-ref' },
+    });
+    // A legitimate event for its OWN session, sent right after on the same
+    // socket: once this lands, the forged one (same socket, in-order
+    // delivery, processed first) is guaranteed to already have been handled.
+    linkA.send({
+      type: 'agent.event',
+      sessionId: sessionAId,
+      event: { type: 'status', adapter: 'kilo', mode: 'ask', busy: false, sessionRef: 'linka-legit-ref' },
+    });
+    await waitUntil(
+      () => store.getSession(sessionAId)?.session_ref === 'linka-legit-ref',
+      'linkA legit event applied to its own session',
+    );
+  } finally {
+    console.warn = warnBefore;
+  }
+
+  assert(
+    store.getSession(sessionBId)?.session_ref === refBefore,
+    'a link cannot inject an event into a session it is not bound to',
+  );
+  assert(
+    warnings.some((w) => w.includes('ws.link-event-foreign-session') && w.includes(sessionBId)),
+    'the rejected cross-session event is audit-logged',
+  );
+}
+
 async function main(): Promise<void> {
   await protocolLoadsOnPlainNode();
   const { app, store, manager } = await buildApp();
@@ -2187,6 +2574,14 @@ async function main(): Promise<void> {
   store.createDevice('smoke-admin-dev', 'default', 'admin-test', sha256('x'));
   admin.revokeDevice(store, 'smoke-admin-dev');
   assert(!store.getDevice('smoke-admin-dev'), 'admin revokeDevice removes the row');
+
+  /* ---------------- W1.4 server hardening regression tests ------------------------------------------ */
+
+  await shimClientStatusSmoke();
+  await secretsRestSmoke(base, store);
+  await secretsUniqueSmoke(store);
+  await adapterManifestSmoke();
+  await linkEventInjectionSmoke(store, wsBase);
 
   console.log('SMOKE OK');
   process.exit(0);

@@ -59,6 +59,13 @@ export class ShimClient {
         body: body !== undefined ? JSON.stringify(body) : undefined,
         signal: AbortSignal.timeout(TIMEOUT_MS),
       });
+      // A non-2xx response with a parsable JSON body (a proxy's "upstream not
+      // ready" while the shim is still booting, a reverse proxy's JSON error
+      // page) must not read as success just because the body parses - only an
+      // ok response carries a real T. Treated the same as a transport failure:
+      // waitForShim's `if (await client.status()) return;` keeps polling
+      // instead of declaring a failing shim "ready".
+      if (!res.ok) return null;
       return (await res.json()) as T;
     } catch {
       return null;

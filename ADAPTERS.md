@@ -71,4 +71,5 @@ Konventionen: Repo-Checkout liegt in `$WORK_DIR` (Volume `/work`), Branch `agent
 
 - Dev: Registry scannt `<repo>/shims/*/adapter.json`
 - Container: `server/Dockerfile` kopiert alle Manifeste nach `/app/adapters/<id>.json`; alternativ Env `ADAPTERS_DIR` auf ein eigenes Verzeichnis zeigen lassen
+- Präzedenz bei gleicher Adapter-`id`: `ADAPTERS_DIR` > `<repo>/shims/*` > gebündelte `/app/adapters` — ein eigenes Manifest (z. B. mit gepinntem `image`-Digest) überschreibt also nie kommentarlos das eingebaute; die gewählte Reihenfolge steht beim Start im Log
 - App: holt Adapter via WS `adapter.list` beim Verbinden; Provider-/Model-Defaults und Approval-Warnbanner kommen aus dem Manifest

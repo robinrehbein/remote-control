@@ -46,6 +46,15 @@
         </service>
 
         <!--
+          Empfängt "Erlauben"/"Ablehnen" aus einer Approval-Notification
+          (PocketFcmService.actionButton) — nur vom System adressiert (per
+          PendingIntent), nie von einer anderen App, daher exported=false.
+        -->
+        <receiver
+            android:name=".fcm.NotificationActionReceiver"
+            android:exported="false" />
+
+        <!--
           Nur ein Sicherheitsnetz: der eigene "sessions"-Kanal wird schon in
           PocketAgentApp.onCreate angelegt (bevor überhaupt eine Push kommen
           kann). Diese Meta-Daten steuern zusätzlich, was das FCM-SDK selbst

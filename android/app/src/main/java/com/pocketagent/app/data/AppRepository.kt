@@ -3,7 +3,6 @@ package com.pocketagent.app.data
 import com.google.firebase.messaging.FirebaseMessaging
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -409,6 +408,38 @@ class AppRepository(
     fun sendPermission(sessionId: String, permissionId: String, decision: PermissionDecision): Boolean =
         ws.send(encodeSessionPermission(sessionId, permissionId, decision))
 
+    /**
+     * Antwortet zuverlässig auf eine Permission-Anfrage — auch dann, wenn der
+     * Prozess gerade erst durch den Tap auf einen Notification-Aktionsbutton
+     * gestartet wurde (App im Hintergrund/getötet, s.
+     * `fcm.NotificationActionReceiver`). Wartet bis zu [connectTimeoutMs] auf
+     * eine offene Verbindung, statt wie [sendPermission] sofort aufzugeben —
+     * der normale Start-Pfad ([start]s tokens.setup-Collector) baut sie
+     * ohnehin auf, das hier ist nur die aktive Wartezeit dafür und ein
+     * sofortiger Reconnect-Anstoß, falls gerade ein Backoff läuft.
+     *
+     * [true] heißt: die Verbindung stand und `session.permission` ging raus —
+     * wie beim In-App-Pfad (SessionScreen.decide) ist das fire-and-forget,
+     * kein Beweis, dass der Agent sie schon verarbeitet hat. [false] heißt:
+     * es kam innerhalb der Frist keine Verbindung zustande — der Aufrufer
+     * weicht dann auf den Deep-Link in die Session aus, wo der Nutzer die
+     * Entscheidung manuell trifft, sobald die App selbst verbunden ist.
+     */
+    suspend fun respondToPermission(
+        sessionId: String,
+        permissionId: String,
+        decision: PermissionDecision,
+        connectTimeoutMs: Long = PERMISSION_RESPONSE_CONNECT_TIMEOUT_MS,
+    ): Boolean {
+        val connected = awaitConnected(
+            state = ws.state,
+            timeoutMs = connectTimeoutMs,
+            reconnect = { ws.reconnectNow(manual = true) },
+        )
+        if (!connected) return false
+        return sendPermission(sessionId, permissionId, decision)
+    }
+
     fun sendAbort(sessionId: String): Boolean = ws.send(encodeSessionAbort(sessionId))
     fun sendStop(sessionId: String): Boolean = ws.send(encodeSessionStop(sessionId))
     fun sendResume(sessionId: String): Boolean = ws.send(encodeSessionResume(sessionId))
@@ -531,12 +562,7 @@ class AppRepository(
     }
 
     suspend fun awaitConnected() {
-        val deadline = System.currentTimeMillis() + REQUEST_TIMEOUT_MS
-        while (System.currentTimeMillis() < deadline &&
-            ws.state.value !is WsClient.ConnState.Connected
-        ) {
-            delay(200)
-        }
+        awaitConnected(state = ws.state, timeoutMs = REQUEST_TIMEOUT_MS)
     }
 
     suspend fun isPaired(): Boolean = tokens.setup.first() != null
@@ -549,5 +575,14 @@ class AppRepository(
 
         /** Kurzes Timeout der Liveness-Probe — soll schnell ehrlich sein, nicht 15s warten. */
         private const val ENSURE_ALIVE_TIMEOUT_MS = 4_000L
+
+        /**
+         * Zeitbudget für [respondToPermission], um die Verbindung aufzubauen.
+         * Der Aufrufer (`NotificationActionReceiver.onReceive`) läuft in
+         * `goAsync()` — Android gibt einem BroadcastReceiver dafür grob 10s,
+         * bevor er als hängen geblieben gilt; 7s lassen Luft für den Rest der
+         * Verarbeitung (Notification-Update, `pendingResult.finish()`).
+         */
+        const val PERMISSION_RESPONSE_CONNECT_TIMEOUT_MS = 7_000L
     }
 }

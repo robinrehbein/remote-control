@@ -18,7 +18,11 @@ app/src/main/java/com/pocketagent/app/
 │   ├── WsClient.kt          OkHttp-WebSocket, hello, StateFlow<ConnState>, Backoff 1s–60s + Jitter
 │   └── AppRepository.kt     StateFlows (sessions/repos/secrets/stats), request/response über
 │                            requestId + CompletableDeferred (Timeout 15 s), FCM-Register
-├── fcm/PocketFcmService.kt  FCM → Notification (Channel "sessions") + Deep-Link + fcm.register
+├── fcm/
+│   ├── PocketFcmService.kt          FCM → Notification (Channel "sessions"), Deep-Link,
+│   │                                fcm.register, Gruppierung pro Session, Approval-Aktionsbuttons
+│   └── NotificationActionReceiver.kt "Erlauben"/"Ablehnen" direkt aus der Notification
+│                                     (session.permission, ggf. mit kurzem WS-Reconnect)
 └── ui/
     ├── Nav.kt               NavHost: main → newSession → session/{id} → diff/{id}, settings
     ├── theme/Theme.kt       Material3, dynamische Farben ab Android 12
@@ -104,7 +108,12 @@ Ohne Firebase-Konfiguration läuft die App normal (kein Push). Für echtes FCM:
    `FBM_PROJECT_ID`, `FBM_APPLICATION_ID`, `FBM_API_KEY`, `FBM_SENDER_ID`
 3. Server-Seite: FCM-Server-Key hinterlegen; App registriert sich nach Token-Erhalt
    mit `{type: "fcm.register", token}`; Push-Payload: `sessionId`, `title`, `body`,
-   `eventType` → Notification mit Deep-Link `pocketagent://session/<sessionId>`
+   `eventType`, bei `eventType === "permission.request"` zusätzlich `permissionId`
+   → Notification mit Deep-Link `pocketagent://session/<sessionId>`, gruppiert pro
+   Session (`setGroup`/Summary) und – nur bei einer Approval-Anfrage – mit den
+   Aktionsbuttons "Erlauben"/"Ablehnen" (`NotificationActionReceiver`, sendet
+   `session.permission` direkt, baut dafür nötigenfalls kurz die WS-Verbindung neu
+   auf; Details/Einschränkung s. PR-Beschreibung von W3.3)
 
 ## Tests
 

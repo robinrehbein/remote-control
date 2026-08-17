@@ -90,7 +90,11 @@ export async function sendPush(tokens: string[], payload: FcmPushPayload): Promi
               message: {
                 token: t,
                 notification: { title: payload.title, body: payload.body },
-                data: { sessionId: payload.sessionId, eventType: payload.eventType },
+                data: {
+                  sessionId: payload.sessionId,
+                  eventType: payload.eventType,
+                  ...(payload.permissionId ? { permissionId: payload.permissionId } : {}),
+                },
               },
             }),
             signal: AbortSignal.timeout(10_000),

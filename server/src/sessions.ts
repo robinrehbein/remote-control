@@ -779,7 +779,8 @@ export class SessionManager {
     this.store.touchSession(sessionId);
     this.broadcast({ type: 'session.event', sessionId, event: ev });
     if (ev.type === 'status' && ev.sessionRef) this.store.setSessionRef(sessionId, ev.sessionRef);
-    else if (ev.type === 'permission.request') void this.notifyPermission(sessionId, ev.title);
+    else if (ev.type === 'permission.request')
+      void this.notifyPermission(sessionId, ev.permissionId, ev.title);
     else if (ev.type === 'turn.completed' || ev.type === 'turn.failed') {
       // Close the per-turn resource from the shim's own terminal signal: the
       // in-flight turn reaches 'completed' or 'failed' (carrying the shim's
@@ -791,7 +792,7 @@ export class SessionManager {
     } else if (ev.type === 'pushed' && ev.prUrl) this.store.setPrUrl(sessionId, ev.prUrl);
   }
 
-  private async notifyPermission(sessionId: string, title: string): Promise<void> {
+  private async notifyPermission(sessionId: string, permissionId: string, title: string): Promise<void> {
     const tokens = this.store.listFcmTokens(TENANT);
     if (tokens.length === 0) return;
     await sendPush(tokens, {
@@ -799,6 +800,7 @@ export class SessionManager {
       eventType: 'permission.request',
       title: 'Permission required',
       body: title,
+      permissionId,
     }).catch(() => {});
   }
 

@@ -9,4 +9,19 @@
     <string name="pairing_device_name">Gerätename</string>
     <string name="pairing_button">Koppeln</string>
     <string name="notification_channel_sessions">Sessions</string>
+    <!-- Aktionsbuttons einer Approval-Notification — dieselben Begriffe wie
+         auf der Approval-Karte im SessionScreen (dort primär "Erlauben",
+         sekundär "Ablehnen"). -->
+    <string name="notification_action_allow">Erlauben</string>
+    <string name="notification_action_deny">Ablehnen</string>
+    <!-- Zwischenstand, solange die Antwort noch unterwegs ist (WS-Verbindung
+         wird ggf. erst aufgebaut, s. AppRepository.respondToPermission). -->
+    <string name="notification_decision_pending">Wird gesendet …</string>
+    <string name="notification_decision_allowed">Erlaubt</string>
+    <string name="notification_decision_denied">Abgelehnt</string>
+    <!-- Kein Netz/Server in der Zeit erreichbar, in der ein Notification-Tap
+         ohne App-Start beantwortet werden kann — zum Öffnen auffordern statt
+         die Antwort stillschweigend zu verlieren. -->
+    <string name="notification_decision_failed">Nicht zugestellt – zum Öffnen tippen</string>
+    <string name="notification_group_summary">Neue Ereignisse in dieser Session</string>
 </resources>

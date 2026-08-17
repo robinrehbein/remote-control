@@ -1,5 +1,8 @@
+import { PassThrough, type Writable } from 'node:stream';
 import Docker from 'dockerode';
 import type { NetworkPolicy, NoticePhase } from '@pocketagent/protocol';
+import { CodexJsonRpc } from './codex-jsonrpc.js';
+import type { CodexAppServerSession, CodexAuthTransport } from './codex-auth.js';
 import {
   GATEWAY_ALIAS,
   GATEWAY_AUTH_HEADER,
@@ -571,6 +574,37 @@ async function sessionNetworking(
   return { EndpointsConfig: { [netName]: { Aliases: [session.id] } } };
 }
 
+/**
+ * In-container mount point of the codex CODEX_HOME volume. Matches the codex
+ * shim image's `ENV CODEX_HOME=/codex-home` (shims/codex/Dockerfile) so the
+ * runtime finds auth.json + thread state exactly where it expects them.
+ */
+export const CODEX_HOME_MOUNT = '/codex-home';
+
+/**
+ * The ONE canonical CODEX_HOME docker volume per tenant (CODEX-OAUTH.md §4).
+ * codex's refresh token rotates and is single-use, so auth.json must never be
+ * copied into N containers (copies invalidate each other on the first refresh).
+ * Instead every codex session container — and the short-lived auth container —
+ * mounts this same volume read-write, updating the file in place.
+ */
+export function codexHomeVolumeName(tenant: string): string {
+  return `pocketagent-codex-home-${tenant}`;
+}
+
+/**
+ * Extra bind mounts a session container needs beyond the work volume. codex
+ * gets the shared CODEX_HOME volume (see codexHomeVolumeName); every other
+ * adapter gets none. The volume is created on demand so a first codex session
+ * without a prior login still starts (empty CODEX_HOME = "not signed in yet").
+ */
+async function extraBindsFor(session: SessionRow): Promise<string[]> {
+  if (session.adapter !== 'codex') return [];
+  const vol = codexHomeVolumeName(session.tenant_id);
+  await ensureVolume(vol);
+  return [`${vol}:${CODEX_HOME_MOUNT}`];
+}
+
 export async function ensureVolume(name: string): Promise<void> {
   const d = docker();
   if (!d) return;
@@ -618,7 +652,7 @@ async function imageExists(d: Docker, image: string): Promise<boolean> {
  * those are operator-controlled artifacts and must never be shadowed by a
  * locally built one. Throws with an actionable German message otherwise.
  */
-async function ensureAdapterImage(adapter: string, onNotice?: NoticeFn): Promise<string> {
+export async function ensureAdapterImage(adapter: string, onNotice?: NoticeFn): Promise<string> {
   const d = docker();
   const image = adapterImage(adapter);
   if (!d) return image;
@@ -712,6 +746,9 @@ export async function createSessionContainer(
   const image = await ensureAdapterImage(session.adapter, onNotice);
   try {
     await ensureVolume(session.volume_name);
+    // codex: mount the ONE shared CODEX_HOME volume rw (rotating single-use
+    // refresh token => never copy auth.json into N containers, see CODEX-OAUTH.md §4).
+    const extraBinds = await extraBindsFor(session);
     // With a gateway the shim is reached through it, so no host port is published
     // (an internal per-session network could not serve one anyway).
     const remote = isRemote() && !gatewayEnabled();
@@ -722,7 +759,7 @@ export async function createSessionContainer(
       ...(remote ? { ExposedPorts: { '8080/tcp': {} } } : {}),
       HostConfig: {
         Memory: parseMem(config.sessionMemLimit),
-        Binds: [`${session.volume_name}:/work`],
+        Binds: [`${session.volume_name}:/work`, ...extraBinds],
         CapDrop: ['ALL'],
         SecurityOpt: ['no-new-privileges'],
         PidsLimit: config.sessionPidsLimit,
@@ -978,5 +1015,114 @@ export async function oneShotPush(
     return false;
   } finally {
     if (pushContainer) await pushContainer.remove({ force: true }).catch(() => {});
+  }
+}
+
+/** Container label marking the short-lived codex auth container. */
+const CODEX_AUTH_LABEL = 'pocketagent.codex-auth';
+
+/** Run a command in a container and collect its stdout/exit code. */
+async function execCollect(
+  container: Docker.Container,
+  cmd: string[],
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  const exec = await container.exec({ Cmd: cmd, AttachStdout: true, AttachStderr: true });
+  const stream = await exec.start({ hijack: true, stdin: false });
+  const out = new PassThrough();
+  const err = new PassThrough();
+  const d = docker();
+  d?.modem.demuxStream(stream, out, err);
+  let stdout = '';
+  let stderr = '';
+  out.on('data', (c: Buffer) => (stdout += c.toString('utf8')));
+  err.on('data', (c: Buffer) => (stderr += c.toString('utf8')));
+  await new Promise<void>((resolve) => stream.on('end', resolve));
+  const info = await exec.inspect();
+  return { exitCode: info.ExitCode ?? 0, stdout, stderr };
+}
+
+/**
+ * Production transport for the in-app codex login (CODEX-OAUTH.md, see
+ * codex-auth.ts): a short-lived container running `codex app-server`, mounting
+ * the tenant's ONE canonical CODEX_HOME volume rw. JSON-RPC rides the attached
+ * stdio; the loopback callback and the auth.json read run *inside* the
+ * container (docker exec) where 127.0.0.1:<port> and CODEX_HOME are reachable.
+ *
+ * This path is not covered by the smoke test (it needs a real daemon + the
+ * codex binary + a real ChatGPT account); the smoke test exercises the
+ * identical flow logic through a spawned fake app-server transport instead, and
+ * the end-to-end phone login is the documented manual verification step.
+ */
+export class DockerCodexAuthTransport implements CodexAuthTransport {
+  async open(tenant: string): Promise<CodexAppServerSession> {
+    const d = docker();
+    if (!d) throw new Error('Docker ist auf diesem Server deaktiviert.');
+    const image = await ensureAdapterImage('codex');
+    const vol = codexHomeVolumeName(tenant);
+    await ensureVolume(vol);
+    const container = await d.createContainer({
+      Image: image,
+      Cmd: ['codex', 'app-server', '--ignore-user-config'],
+      Labels: { [CODEX_AUTH_LABEL]: tenant },
+      Env: envArr({ CODEX_HOME: CODEX_HOME_MOUNT, HOME: '/tmp', XDG_CONFIG_HOME: '/tmp/xdg' }),
+      OpenStdin: true,
+      AttachStdin: true,
+      AttachStdout: true,
+      AttachStderr: true,
+      Tty: false,
+      HostConfig: {
+        Memory: parseMem(config.sessionMemLimit),
+        Binds: [`${vol}:${CODEX_HOME_MOUNT}`],
+        CapDrop: ['ALL'],
+        SecurityOpt: ['no-new-privileges'],
+        PidsLimit: config.sessionPidsLimit,
+        ReadonlyRootfs: true,
+        Tmpfs: { '/tmp': 'rw,size=256m' },
+        ...(config.sessionCpuQuota ? { NanoCpus: config.sessionCpuQuota } : {}),
+      },
+    });
+    // Attach before start so no early app-server output is missed.
+    const stream = await container.attach({ stream: true, stdin: true, stdout: true, stderr: true, hijack: true });
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    d.modem.demuxStream(stream, stdout, stderr);
+    stderr.on('data', (c: Buffer) => {
+      const line = c.toString('utf8').trim();
+      if (line) console.error(`[codex-auth app-server] ${line}`);
+    });
+    await container.start();
+
+    const rpc = new CodexJsonRpc(stream as unknown as Writable, stdout);
+    // codex app-server handshake before login_chatgpt.
+    await rpc.request('initialize', { clientInfo: { name: 'pocketagent-orchestrator', version: '0.1.0' } }, 30_000);
+    rpc.notify('initialized', {});
+
+    return {
+      rpc,
+      async forwardCallback(port: number, code: string, state: string): Promise<number> {
+        // Reach the login server on the container's own loopback (docker exec
+        // runs inside the netns); code/state pass as argv, never string-spliced.
+        const script =
+          'const[,p,c,s]=process.argv;' +
+          "const u='http://127.0.0.1:'+p+'/auth/callback?'+new URLSearchParams({code:c,state:s}).toString();" +
+          "fetch(u).then(r=>{console.log('STATUS:'+r.status);process.exit(0)}).catch(()=>{console.log('STATUS:0');process.exit(1)});";
+        const res = await execCollect(container, ['node', '-e', script, String(port), code, state]);
+        const m = /STATUS:(\d+)/.exec(res.stdout);
+        return m ? Number(m[1]) : 0;
+      },
+      async readAuthJson(): Promise<string | null> {
+        const res = await execCollect(container, ['cat', `${CODEX_HOME_MOUNT}/auth.json`]);
+        return res.exitCode === 0 && res.stdout.trim().length > 0 ? res.stdout : null;
+      },
+      async close(): Promise<void> {
+        rpc.close();
+        try {
+          await container.stop({ t: 5 });
+        } catch {
+          /* not running */
+        }
+        await container.remove({ force: true }).catch(() => {});
+      },
+    };
   }
 }

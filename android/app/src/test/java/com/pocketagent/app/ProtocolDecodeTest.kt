@@ -626,4 +626,106 @@ class ProtocolDecodeTest {
         assertNull(parseServerMessage("""{"type":"link.list","requestId":"r3","links":[]}"""))
         assertNull(parseServerMessage("""{"type":"link.revoke","requestId":"r4","linkId":"l1"}"""))
     }
+
+    /* -------------------- Unbekannte Enum-Werte (mode/status) -------------------- */
+
+    @Test
+    fun `an unknown session status no longer drops the whole session from session-list`() {
+        // Fund: ein neuerer Server kennt einen status-Wert (hier "paused"),
+        // den diese App-Version nicht kennt. Vorher warf das Dekodieren der
+        // SessionInfo, mapNotNull verwarf die ganze Session — sie fehlte
+        // kommentarlos in der Liste.
+        val msg = parseServerMessage(
+            """
+            {
+              "type": "session.list",
+              "requestId": "req-u1",
+              "sessions": [
+                {
+                  "id": "s1", "repoId": "r1", "adapter": "claude", "provider": "anthropic",
+                  "model": "opus", "mode": "auto", "status": "paused", "branch": "agent/s1",
+                  "createdAt": "2026-01-01T10:00:00Z", "lastActiveAt": "2026-01-01T11:00:00Z"
+                },
+                {
+                  "id": "s2", "repoId": "r1", "adapter": "claude", "provider": "anthropic",
+                  "model": "opus", "mode": "futureMode", "status": "idle", "branch": "agent/s2",
+                  "createdAt": "2026-01-01T10:00:00Z", "lastActiveAt": "2026-01-01T11:00:00Z"
+                }
+              ]
+            }
+            """.trimIndent(),
+        )
+        assertTrue(msg is ServerMessage.SessionListMsg)
+        val sessions = (msg as ServerMessage.SessionListMsg).sessions
+        // Beide Sessions bleiben erhalten — die unbekannten Werte fallen
+        // einzeln auf UNKNOWN, statt die Session komplett zu verwerfen.
+        assertEquals(2, sessions.size)
+        assertEquals("s1", sessions[0].id)
+        assertEquals(com.pocketagent.app.data.SessionStatus.UNKNOWN, sessions[0].status)
+        assertEquals(com.pocketagent.app.data.AgentMode.AUTO, sessions[0].mode)
+        assertEquals("s2", sessions[1].id)
+        assertEquals(com.pocketagent.app.data.AgentMode.UNKNOWN, sessions[1].mode)
+        assertEquals(com.pocketagent.app.data.SessionStatus.IDLE, sessions[1].status)
+    }
+
+    @Test
+    fun `an unknown top-level session status is coerced to UNKNOWN instead of dropping the event`() {
+        val msg = parseServerMessage(
+            """
+            {
+              "type": "session.status",
+              "sessionId": "s1",
+              "status": "paused",
+              "session": {
+                "id": "s1", "repoId": "r1", "adapter": "claude", "provider": "anthropic",
+                "model": "opus", "mode": "auto", "status": "paused", "branch": "agent/s1",
+                "createdAt": "2026-01-01T10:00:00Z", "lastActiveAt": "2026-01-01T11:00:00Z"
+              }
+            }
+            """.trimIndent(),
+        )
+        assertTrue(msg is ServerMessage.SessionStatusMsg)
+        val status = msg as ServerMessage.SessionStatusMsg
+        assertEquals(com.pocketagent.app.data.SessionStatus.UNKNOWN, status.status)
+        assertEquals(com.pocketagent.app.data.SessionStatus.UNKNOWN, status.session?.status)
+    }
+
+    @Test
+    fun `an unknown mode on a live status event keeps the busy update instead of dropping it`() {
+        // Fund: "Gleiches Muster beim status-event: unbekannter mode -> return
+        // null, das Busy-Update geht verloren." AgentMode.fromRaw fiel vorher
+        // sogar für bekannte Werte wie "acceptEdits" auf null zurück (Namens-
+        // vergleich ACCEPT_EDITS vs. acceptEdits scheiterte am Unterstrich) —
+        // beides wird hier mitgeprüft.
+        val msg = parseServerMessage(
+            """
+            {
+              "type": "session.event",
+              "sessionId": "s1",
+              "event": {
+                "type": "status",
+                "adapter": "claude",
+                "mode": "futureMode",
+                "busy": true
+              }
+            }
+            """.trimIndent(),
+        )
+        assertTrue(msg is ServerMessage.SessionEventMsg)
+        val status = (msg as ServerMessage.SessionEventMsg).event as AgentEvent.Status
+        assertTrue(status.busy)
+        assertEquals(com.pocketagent.app.data.AgentMode.UNKNOWN, status.mode)
+
+        val known = parseServerMessage(
+            """
+            {
+              "type": "session.event",
+              "sessionId": "s1",
+              "event": { "type": "status", "adapter": "claude", "mode": "acceptEdits", "busy": false }
+            }
+            """.trimIndent(),
+        )
+        val knownStatus = (known as ServerMessage.SessionEventMsg).event as AgentEvent.Status
+        assertEquals(com.pocketagent.app.data.AgentMode.ACCEPT_EDITS, knownStatus.mode)
+    }
 }

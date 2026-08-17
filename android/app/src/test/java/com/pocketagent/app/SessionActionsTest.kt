@@ -146,6 +146,21 @@ class SessionActionsTest {
     }
 
     @Test
+    fun `an unrecognized future status behaves like starting or broken, not like a crash`() {
+        // Fund: ein neuerer Server kennt einen status, den diese App-Version
+        // nicht kennt. Die Session muss nutzbar bleiben (Umbenennen,
+        // Archivieren, Löschen) statt eine Exception auszulösen — nur
+        // Stop/Resume/Push, die einen bekannten Live-Zustand voraussetzen,
+        // bleiben aus.
+        val actions = sessionActions(session(status = SessionStatus.UNKNOWN))
+        assertFalse(actions.contains(SessionAction.STOP))
+        assertFalse(actions.contains(SessionAction.RESUME))
+        assertFalse(actions.contains(SessionAction.PUSH))
+        assertTrue(actions.contains(SessionAction.RENAME))
+        assertTrue(actions.contains(SessionAction.DELETE))
+    }
+
+    @Test
     fun `yolo pushes on its own, so the menu does not offer it`() {
         assertFalse(sessionActions(session(mode = AgentMode.YOLO)).contains(SessionAction.PUSH))
         assertTrue(sessionActions(session(mode = AgentMode.AUTO)).contains(SessionAction.PUSH))

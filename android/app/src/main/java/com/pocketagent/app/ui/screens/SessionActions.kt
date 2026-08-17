@@ -87,7 +87,7 @@ fun sessionActions(session: SessionInfo): List<SessionAction> = buildList {
         when (session.status) {
             SessionStatus.RUNNING, SessionStatus.IDLE -> add(SessionAction.STOP)
             SessionStatus.STOPPED -> add(SessionAction.RESUME)
-            SessionStatus.CREATING, SessionStatus.ERROR -> Unit
+            SessionStatus.CREATING, SessionStatus.ERROR, SessionStatus.UNKNOWN -> Unit
         }
         val live = session.status == SessionStatus.RUNNING || session.status == SessionStatus.IDLE
         if (live && session.mode != AgentMode.YOLO) add(SessionAction.PUSH)

@@ -211,11 +211,20 @@ async function proxyCommand(callId: string, path: string, method: 'GET' | 'POST'
 }
 
 function startEventStream(): void {
-  if (!shim) return;
-  const base = `http://127.0.0.1:${shim.port}`;
   void (async () => {
     for (;;) {
-      if (stopped || !shim) return;
+      if (stopped) return;
+      // Re-resolve the shim on every (re)connect attempt, never once outside
+      // the loop: a shim restart lands on a brand-new random port
+      // (freePort()), and a stale base URL here means every future /events
+      // fetch 404s/ECONNREFUSEDs forever even though proxyCommand() (which
+      // reads shim.port live) keeps working fine.
+      const current = shim;
+      if (!current) {
+        await new Promise((r) => setTimeout(r, 1000));
+        continue;
+      }
+      const base = `http://127.0.0.1:${current.port}`;
       try {
         const res = await fetch(`${base}/events`, {
           headers: { authorization: `Bearer ${shimToken}`, accept: 'text/event-stream' },
@@ -225,6 +234,11 @@ function startEventStream(): void {
         const decoder = new TextDecoder();
         let buf = '';
         for (;;) {
+          // Bail out of a still-open stream as soon as the shim has been
+          // swapped out from under it, so the outer loop reconnects against
+          // the new port immediately instead of reading from a shim that is
+          // no longer the active one.
+          if (stopped || shim !== current) break;
           const { done, value } = await reader.read();
           if (done) break;
           buf += decoder.decode(value, { stream: true });

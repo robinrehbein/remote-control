@@ -5,12 +5,13 @@ import {
   GATEWAY_AUTH_HEADER,
   GATEWAY_CONTAINER_NAME,
   GATEWAY_EGRESS_PORT,
+  GATEWAY_EGRESS_SYNC_PATH,
   GATEWAY_INGRESS_PORT,
   config,
   isNetworkPolicy,
 } from './config.js';
 import { adapterImage, getAdapter } from './adapters.js';
-import { normalizePeerIp } from './egress-proxy.js';
+import { normalizePeerIp, type EgressSessionEntry } from './egress-proxy.js';
 import { buildShimImage, shimContextFiles } from './image-build.js';
 import { LOG_TAIL_LINES, redactTokens, stripLogFraming } from './progress.js';
 import type { SessionRow } from './db.js';
@@ -30,7 +31,7 @@ let client: Docker | null = null;
 /** Drop the cached daemon connection (docker config changed at runtime, tests). */
 export function resetDockerClient(): void {
   client = null;
-  peerIps = new Set();
+  peerIps = new Map();
   peerIpsAt = 0;
 }
 
@@ -60,29 +61,34 @@ function docker(): Docker | null {
 
 /**
  * Peer-IP authorization for the egress proxy (see egress-proxy.ts): the source
- * addresses of all live session containers, as the daemon reports them.
+ * addresses of all live session containers mapped onto the session they belong
+ * to, as the daemon reports them. The session id is what makes the gate
+ * policy-aware - an address alone cannot tell an 'isolated' container (which
+ * must never egress) from an 'allowlist' one.
  *
  * The TTL keeps the proxy off the daemon on the hot path (one list call per
  * window, not per request) and still picks up a new container within seconds;
  * every start additionally primes it (startContainer), so a shim's very first
- * request is already covered. A daemon error yields an empty set - never a
+ * request is already covered. A daemon error yields an empty map - never a
  * throw and never a stale allow.
  */
 const PEER_CACHE_TTL_MS = 10_000;
-let peerIps = new Set<string>();
+let peerIps = new Map<string, string>();
 let peerIpsAt = 0; // 0 = never loaded
-let peerRefresh: Promise<Set<string>> | null = null;
+let peerRefresh: Promise<Map<string, string>> | null = null;
 
-async function loadSessionPeers(): Promise<Set<string>> {
-  const next = new Set<string>();
+async function loadSessionPeers(): Promise<Map<string, string>> {
+  const next = new Map<string, string>();
   try {
     const d = docker();
-    const raw = d ? await d.listContainers({ filters: { label: ['pocketagent.session'] } }) : [];
+    const raw = d ? await d.listContainers({ filters: { label: [SESSION_LABEL] } }) : [];
     for (const c of Array.isArray(raw) ? raw : []) {
+      const sessionId = (c.Labels ?? {})[SESSION_LABEL] ?? '';
+      if (!sessionId) continue;
       for (const net of Object.values(c.NetworkSettings?.Networks ?? {})) {
         for (const ip of [net?.IPAddress, net?.GlobalIPv6Address]) {
           const norm = normalizePeerIp(ip);
-          if (norm) next.add(norm);
+          if (norm) next.set(norm, sessionId);
         }
       }
     }
@@ -91,11 +97,14 @@ async function loadSessionPeers(): Promise<Set<string>> {
   }
   peerIps = next;
   peerIpsAt = Date.now();
+  // The gateway's proxy answers from the pushed table only, so every change to
+  // the addresses has to reach it right away.
+  await publishEgressTable();
   return next;
 }
 
 /** Reload the peer-IP cache now (deduplicated); never rejects. */
-export async function refreshSessionPeers(): Promise<Set<string>> {
+export async function refreshSessionPeers(): Promise<Map<string, string>> {
   if (!peerRefresh) {
     peerRefresh = loadSessionPeers().finally(() => {
       peerRefresh = null;
@@ -105,23 +114,90 @@ export async function refreshSessionPeers(): Promise<Set<string>> {
 }
 
 /**
- * Prime the cache right after a container start. Skipped for a remote daemon:
- * those sessions egress through the gateway container, which has no docker
- * access and therefore no peer gate to feed.
+ * Prime the cache right after a container start. Skipped for a remote daemon
+ * without a gateway: those sessions are reached through published ports and
+ * have no proxy at all. With a gateway the addresses are needed - not for the
+ * local proxy, but for the table the gateway gates its own proxy with.
  */
 async function primeSessionPeers(): Promise<void> {
-  if (isRemote()) return;
+  if (isRemote() && !gatewayEnabled()) return;
   await refreshSessionPeers();
 }
 
 /**
- * Synchronous gate for the egress proxy: does `ip` belong to a live session
- * container? Answers from the cache and refreshes it in the background when
- * stale - the proxy must never block a request on a daemon round trip.
+ * Synchronous gate for the egress proxy: which session does `ip` belong to?
+ * Answers from the cache and refreshes it in the background when stale - the
+ * proxy must never block a request on a daemon round trip.
  */
-export function isSessionPeerIp(ip: string): boolean {
+export function sessionIdForPeerIp(ip: string): string | null {
   if (Date.now() - peerIpsAt >= PEER_CACHE_TTL_MS) void refreshSessionPeers();
-  return peerIps.has(normalizePeerIp(ip));
+  return peerIps.get(normalizePeerIp(ip)) ?? null;
+}
+
+/** Container addresses of one session (for the gateway's session table). */
+function peerIpsOf(sessionId: string): string[] {
+  const ips: string[] = [];
+  for (const [ip, id] of peerIps) if (id === sessionId) ips.push(ip);
+  return ips;
+}
+
+/** Live sessions the orchestrator publishes to the gateway (set by index.ts). */
+export type EgressSessionProvider = () => { id: string; policy: NetworkPolicy; token: string | null }[];
+
+let egressSessions: EgressSessionProvider | null = null;
+let lastPublishFailed = false;
+
+export function setEgressSessionProvider(provider: EgressSessionProvider | null): void {
+  egressSessions = provider;
+}
+
+/**
+ * Push the live session table to the gateway's egress proxy. Without it the
+ * gateway would have to let every container through unauthenticated (it has no
+ * database and no docker access of its own). No-op in every local mode, where
+ * the in-process proxy reads the same data directly.
+ *
+ * Failures are logged once per state change and never thrown: a gateway that is
+ * momentarily unreachable must not fail a session start, and the next refresh
+ * (or the periodic sync) carries the table again.
+ */
+export async function publishEgressTable(): Promise<boolean> {
+  if (!gatewayEnabled() || egressSessions === null || !config.dockerAddr) return false;
+  const entries: EgressSessionEntry[] = egressSessions().map((s) => ({
+    id: s.id,
+    policy: s.policy,
+    token: s.token,
+    ips: peerIpsOf(s.id),
+  }));
+  const url = `http://${config.dockerAddr}:${config.gatewayPort}${GATEWAY_EGRESS_SYNC_PATH}`;
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { ...gatewayHeaders(), 'content-type': 'application/json' },
+      body: JSON.stringify({ sessions: entries }),
+      signal: AbortSignal.timeout(5_000),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    if (lastPublishFailed) console.log('[docker] egress session table reached the gateway again');
+    lastPublishFailed = false;
+    return true;
+  } catch (e) {
+    if (!lastPublishFailed) {
+      console.warn(`[docker] pushing the egress session table to the gateway failed: ${String(e)}`);
+    }
+    lastPublishFailed = true;
+    return false;
+  }
+}
+
+/**
+ * Periodic gateway sync (see SessionManager.start): refreshes the container
+ * addresses and republishes the table, so a gateway that restarted - it keeps
+ * the table in memory only - gets it back without a session having to change.
+ */
+export async function syncGatewayEgress(): Promise<void> {
+  if (!gatewayEnabled()) return;
+  await refreshSessionPeers();
 }
 
 /**
@@ -464,6 +540,9 @@ async function sessionNetworking(
   const { name: netName, relay } = sessionNetworkFor(session);
   await requireAttached(session);
   const viaGateway = relay === 'gateway';
+  // 'isolated' keeps both defaults - and gets no usable proxy either: the relay
+  // hangs on its network too, but both proxies refuse every request of a
+  // session whose policy says 'isolated' (egress-proxy.ts, denyReason 'policy').
   let egress = 'none';
   let auth = 'n/a';
   if (policy === 'allowlist') {
@@ -666,6 +745,10 @@ export async function createSessionContainer(
 export async function startContainer(id: string): Promise<boolean> {
   const d = docker();
   if (!d) return false;
+  // In gateway mode the proxy that will serve this container runs on the
+  // runner, so it has to know the session's token *before* the container can
+  // ask for anything - same ordering as setProvisioned -> start locally.
+  await publishEgressTable();
   let started: boolean;
   try {
     await d.getContainer(id).start();
@@ -882,6 +965,9 @@ export async function oneShotPush(
     });
     pushContainer = c;
     if (creds && Object.keys(creds).length > 0) await injectCredsFile(c.id, creds);
+    // Same ordering as startContainer: the gateway has to know the session
+    // (whose push window the caller just opened) before its container asks.
+    await publishEgressTable();
     await c.start();
     await primeSessionPeers(); // the push container pushes through the egress proxy too
     const res = await c.wait();

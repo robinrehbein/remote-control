@@ -10,6 +10,7 @@ import { Heartbeat, Hub, registerWs } from './ws.js';
 import { confirmPairing, generatePairingCode, adminTokenOk, SlidingWindowRateLimiter } from './pairing.js';
 import { registerSecretsApi } from './secrets-api.js';
 import { startEgressProxy } from './egress-proxy.js';
+import { setEgressSessionProvider } from './docker.js';
 
 export interface App {
   app: ReturnType<typeof Fastify>;
@@ -33,6 +34,9 @@ export async function buildApp(): Promise<App> {
   const hub = new Hub();
   const heartbeat = new Heartbeat();
   const manager = new SessionManager(store, (m) => hub.broadcast(m));
+  // Remote-gateway mode: the gateway's egress proxy gates on the same session
+  // table as the in-process one, pushed to it whenever it changes (docker.ts).
+  setEgressSessionProvider(() => manager.egressSessions());
   manager.setLinkTransport({
     call: (linkId, path, method, body) => hub.callLink(linkId, path, method, body),
     isConnected: (linkId) => hub.hasLink(linkId),
@@ -98,7 +102,9 @@ export async function main(): Promise<void> {
   if (config.dockerEnabled) {
     try {
       // Two gates: a live session's shim token, or the source IP of a live
-      // session container (clients that drop the proxy URL's userinfo).
+      // session container (clients that drop the proxy URL's userinfo). Both
+      // answer with the session behind the request, whose network policy then
+      // decides - an 'isolated' session never passes either way.
       egress = startEgressProxy({
         tokenValidator: (t) => manager.egressTokenAllowed(t),
         peerValidator: (ip) => manager.egressPeerAllowed(ip),

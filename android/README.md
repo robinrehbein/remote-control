@@ -2,7 +2,7 @@
 
 Android-Client (Kotlin + Jetpack Compose) für den PocketAgent-Orchestrator.
 Steht per WebSocket mit dem Orchestrator in Verbindung, verwaltet
-Coding-Agent-Sessions (opencode, claude, pi, junie) in Docker-Containern und
+Coding-Agent-Sessions (kilo, claude, pi, junie) in Docker-Containern und
 zeigt die normalisierte Event-Timeline (Chat, Tools, Approvals, Diffs, Push/PRs).
 
 ## Architektur

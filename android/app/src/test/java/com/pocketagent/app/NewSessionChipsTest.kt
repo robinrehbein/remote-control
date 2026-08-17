@@ -26,11 +26,11 @@ class NewSessionChipsTest {
         ),
     )
 
-    /** Zugang über Provider-Umgebungsvariablen — wie OpenCode. */
-    private val opencode = AdapterDescriptor(
-        id = "opencode",
-        name = "OpenCode",
-        providerEnv = mapOf("openai" to "OPENAI_API_KEY", "zai" to "ZAI_API_KEY"),
+    /** Zugang über Provider-Umgebungsvariablen — wie Kilo (OpenCode-Fork). */
+    private val kilo = AdapterDescriptor(
+        id = "kilo",
+        name = "Kilo Code",
+        providerEnv = mapOf("openai" to "OPENAI_API_KEY", "zai" to "ZHIPU_API_KEY"),
     )
 
     /* ---------------- accessLabel ---------------- */
@@ -43,14 +43,14 @@ class NewSessionChipsTest {
     @Test
     fun `an api key reads as api`() {
         assertEquals("API", accessLabel(claude, "anthropic"))
-        assertEquals("API", accessLabel(opencode, "openai"))
-        assertEquals("API", accessLabel(opencode, "zai"))
+        assertEquals("API", accessLabel(kilo, "openai"))
+        assertEquals("API", accessLabel(kilo, "zai"))
     }
 
     @Test
     fun `an unknown provider carries no label`() {
         assertNull(accessLabel(claude, "deepseek"))
-        assertNull(accessLabel(opencode, "claude_oauth"))
+        assertNull(accessLabel(kilo, "claude_oauth"))
     }
 
     @Test

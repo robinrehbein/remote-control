@@ -5,6 +5,11 @@
     <!-- Nur um zu erfahren, wann wieder ein Netz da ist (registerNetworkCallback). -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- In-App-Updater (Settings → App-Update): darf den System-Installer für
+         ein heruntergeladenes Release-APK öffnen. Sideload-Verteilung ohne
+         Store — der Nutzer muss "Unbekannte Apps installieren" einmalig für
+         diese App erlauben. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <application
         android:name=".PocketAgentApp"
@@ -69,6 +74,22 @@
         <meta-data
             android:name="com.google.firebase.messaging.default_notification_icon"
             android:resource="@drawable/ic_notification" />
+
+        <!--
+          Reicht dem System-Installer das in cacheDir/updates/ heruntergeladene
+          Release-APK als content://-URI (UpdateInstaller). ${applicationId}
+          statt fester Id, damit auch die usercatrust-Variante (eigene
+          applicationId, siehe build.gradle.kts) eine eindeutige Authority hat.
+        -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 
 </manifest>

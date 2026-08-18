@@ -28,11 +28,13 @@ import androidx.compose.material.icons.automirrored.outlined.OpenInNew
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.outlined.AccountCircle
 import androidx.compose.material.icons.outlined.CheckCircleOutline
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.ErrorOutline
+import androidx.compose.material.icons.outlined.FileDownload
 import androidx.compose.material.icons.outlined.Fingerprint
 import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.Info
@@ -87,9 +89,13 @@ import com.pocketagent.app.data.AdapterDescriptor
 import com.pocketagent.app.data.AppRepository
 import com.pocketagent.app.data.CodexAuthUiState
 import com.pocketagent.app.data.CodexOAuthController
+import com.pocketagent.app.data.PairingApi
 import com.pocketagent.app.data.ProviderDescriptor
+import com.pocketagent.app.data.ReleaseInfo
 import com.pocketagent.app.data.SecretInfo
 import com.pocketagent.app.data.SecretValidation
+import com.pocketagent.app.data.UpdateChecker
+import com.pocketagent.app.data.UpdateInstaller
 import com.pocketagent.app.data.WsClient
 import com.pocketagent.app.ui.theme.CardInset
 import com.pocketagent.app.ui.theme.SectionSpacing
@@ -562,6 +568,9 @@ fun SettingsScreen(onBack: () -> Unit) {
 
             error?.let { SectionError(it) }
 
+            /* ---------- App-Update ---------- */
+            AppUpdateSection()
+
             /* ---------- Gerät ---------- */
             SectionHeader("Gerät")
             GroupCard {
@@ -743,6 +752,155 @@ private fun CodexAuthDialog(
 }
 
 /* ------------------------------------------------------------------ */
+/* App-Update (GitHub-Releases)                                        */
+/* ------------------------------------------------------------------ */
+
+private sealed interface UpdateUiState {
+    data object Idle : UpdateUiState
+    data object Checking : UpdateUiState
+    data object UpToDate : UpdateUiState
+    data class Available(val release: ReleaseInfo) : UpdateUiState
+    data class Downloading(val release: ReleaseInfo) : UpdateUiState
+    data class Failed(val message: String) : UpdateUiState
+}
+
+/**
+ * Update-Check und -Installation über die öffentlichen GitHub-Releases.
+ * Läuft ausschließlich auf Nutzeraktion — bewusst kein Auto-Check im
+ * Hintergrund, die App soll ohne Anlass nicht zu GitHub funken.
+ */
+@Composable
+private fun AppUpdateSection() {
+    val context = LocalContext.current
+    // Version über den PackageManager, nicht BuildConfig — das
+    // buildConfig-Feature ist nicht in jeder Build-Variante garantiert.
+    val installedVersion = remember {
+        runCatching {
+            context.packageManager.getPackageInfo(context.packageName, 0).versionName
+        }.getOrNull() ?: "unbekannt"
+    }
+    val scope = rememberCoroutineScope()
+    val checker = remember { UpdateChecker(PairingApi.httpClient()) }
+    val installer = remember {
+        UpdateInstaller(context.applicationContext, UpdateInstaller.downloadClient())
+    }
+    var state by remember { mutableStateOf<UpdateUiState>(UpdateUiState.Idle) }
+
+    fun startCheck() {
+        state = UpdateUiState.Checking
+        scope.launch {
+            checker.fetchLatest().fold(
+                onSuccess = { release ->
+                    state = when {
+                        release == null -> UpdateUiState.Failed("Das aktuelle Release enthält kein APK.")
+                        UpdateChecker.isNewer(release.tag, installedVersion) -> UpdateUiState.Available(release)
+                        else -> UpdateUiState.UpToDate
+                    }
+                },
+                onFailure = { state = UpdateUiState.Failed(userMessage("Update-Prüfung fehlgeschlagen. Prüf die Internetverbindung.", it)) },
+            )
+        }
+    }
+
+    fun startDownload(release: ReleaseInfo) {
+        state = UpdateUiState.Downloading(release)
+        scope.launch {
+            installer.download(release).fold(
+                onSuccess = { file ->
+                    // Zurück auf „verfügbar": bricht der Nutzer den
+                    // System-Installer ab, lässt sich der Versuch direkt
+                    // wiederholen.
+                    state = UpdateUiState.Available(release)
+                    runCatching { installer.install(file) }.onFailure {
+                        state = UpdateUiState.Failed(userMessage("Installation konnte nicht gestartet werden.", it))
+                    }
+                },
+                onFailure = { state = UpdateUiState.Failed(userMessage("Download fehlgeschlagen.", it)) },
+            )
+        }
+    }
+
+    SectionHeader("App-Update")
+    GroupCard {
+        Column(Modifier.padding(vertical = 4.dp)) {
+            SettingsRow(label = "Installierte Version", value = installedVersion)
+            ListDivider(CardInset)
+            when (val s = state) {
+                UpdateUiState.Checking -> UpdateBusyRow("Suche nach Update …")
+
+                is UpdateUiState.Downloading -> UpdateBusyRow("${s.release.tag} wird heruntergeladen …")
+
+                is UpdateUiState.Available -> {
+                    Column(Modifier.padding(horizontal = CardInset, vertical = 10.dp)) {
+                        Text(
+                            "${s.release.tag} verfügbar",
+                            style = MaterialTheme.typography.bodyLarge,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        if (s.release.notes.isNotBlank()) {
+                            Text(
+                                s.release.notes,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 4,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                    ListDivider(CardInset)
+                    AddRow(
+                        label = "Herunterladen & installieren",
+                        onClick = { startDownload(s.release) },
+                        icon = Icons.Outlined.FileDownload,
+                    )
+                }
+
+                else -> {
+                    if (s is UpdateUiState.UpToDate) {
+                        EmptyRow("Die App ist aktuell.")
+                        ListDivider(CardInset)
+                    }
+                    if (s is UpdateUiState.Failed) {
+                        Text(
+                            s.message,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.padding(horizontal = CardInset, vertical = 10.dp),
+                        )
+                        ListDivider(CardInset)
+                    }
+                    AddRow(
+                        label = "Nach Update suchen",
+                        onClick = { startCheck() },
+                        icon = Icons.Filled.Refresh,
+                    )
+                }
+            }
+        }
+    }
+    SectionNote("Prüft nur auf Antippen die GitHub-Releases des Projekts — kein automatischer Check im Hintergrund.")
+}
+
+@Composable
+private fun UpdateBusyRow(text: String) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = TileMinHeight)
+            .padding(horizontal = CardInset),
+    ) {
+        CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.size(18.dp))
+        Spacer(modifier = Modifier.width(12.dp))
+        Text(
+            text,
+            style = MaterialTheme.typography.bodyLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Building blocks                                                     */
 /* ------------------------------------------------------------------ */
 
@@ -836,7 +994,7 @@ private fun EmptyRow(text: String) {
 }
 
 @Composable
-private fun AddRow(label: String, onClick: () -> Unit) {
+private fun AddRow(label: String, onClick: () -> Unit, icon: ImageVector = Icons.Filled.Add) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier
@@ -846,7 +1004,7 @@ private fun AddRow(label: String, onClick: () -> Unit) {
             .padding(horizontal = CardInset),
     ) {
         Icon(
-            Icons.Filled.Add,
+            icon,
             contentDescription = null,
             tint = MaterialTheme.colorScheme.primary,
             modifier = Modifier.size(20.dp),

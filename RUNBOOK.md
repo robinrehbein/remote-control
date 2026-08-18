@@ -99,6 +99,30 @@ Pull requests R/W je Repo), danach pro Adapter siehe README-Tabelle
 (`zai`/`openai`/`moonshot`, `claude_oauth` = `claude setup-token`, `junie`,
 `kilo` = Inhalt der Kilo-Gateway-`auth.json`).
 
+### Troubleshooting: „Failed to connect …“ / keine Verbindung beim Koppeln
+
+Die App meldet bei Netzwerkfehlern inzwischen, welcher Schritt scheiterte
+(DNS, TLS, Timeout, TCP) samt nächstem Prüfschritt, und wiederholt einen
+gescheiterten Connect einmal automatisch. Wenn es trotzdem hakt, die Seiten
+einzeln abklopfen:
+
+1. **Server-Seite** (vom Laptop): `curl https://<domain>/api/health` →
+   muss `{"ok":true,...}` liefern. Zusätzlich beide Adressfamilien testen,
+   wenn die Domain A- **und** AAAA-Record hat: `curl -4 …` und `curl -6 …`.
+2. **Kommt der Versuch überhaupt an?** Orchestrator-Logs prüfen: jeder
+   Confirm-Fehlversuch erscheint als `{"ev":"auth.fail","kind":"pairing.confirm",
+   "ip":…}`. Steht dort nichts, erreicht das Handy den Server nie — das
+   Problem liegt vor dem Server (Handy-Netz, VPN, DNS, Firewall).
+3. **Handy-Seite**: `https://<domain>/api/health` im Handy-Browser öffnen
+   (im selben Netz, in dem die App scheitert). Lädt es dort, aber die App
+   nicht → VPN, privates DNS oder ein Firewall-/Werbefilter blockiert die
+   App. Lädt es auch im Browser nicht → WLAN ↔ Mobilfunk wechseln; geht es
+   in einem der Netze, liegt es am Provider/Netzpfad, nicht an der App.
+4. **Code-Fehler sind keine Verbindungsfehler**: `HTTP 400: invalid or
+   expired code` heißt, die Verbindung steht — der Code ist abgelaufen
+   (TTL 10 min), verbraucht oder nach 5 Fehlversuchen gesperrt → auf dem
+   Server einen frischen erzeugen.
+
 ## 5. Erste echte Session (E2E)
 
 1. Repo in Settings hinzufügen (z. B. ein Test-Repo)

@@ -26,6 +26,7 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.pocketagent.app.ui.theme.MonoMedium
@@ -181,34 +182,37 @@ private fun inlineStyled(raw: String): AnnotatedString = buildAnnotatedString {
     if (cursor < raw.length) appendMarkup(raw.substring(cursor))
 }
 
-/** Sequential matcher: bold-italic wins over bold over italic. */
-private fun AnnotatedString.Builder.appendMarkup(segment: String) {
-    appendRuns(segment, BoldItalic, SpanStyle(fontWeight = FontWeight.Bold, fontStyle = androidx.compose.ui.text.font.FontStyle.Italic))
-}
+/**
+ * Kaskade der Auszeichnungsebenen: Bold-Italic schlägt Bold schlägt Italic.
+ * Jede Rekursion steigt strikt eine Ebene ab — auch für den Text zwischen
+ * und nach den Treffern. Die frühere Fassung sprang für trefferlose Reste
+ * zurück an die Spitze der Kaskade (`appendTail` → `appendRuns` mit
+ * demselben Segment): eine Endlos-Rekursion, die bei praktisch jedem
+ * Antworttext im StackOverflowError endete (Fund: App stürzt ab, sobald
+ * eine Agenten-Antwort gerendert wird).
+ */
+private val MarkupLevels: List<Pair<Regex, SpanStyle>> = listOf(
+    BoldItalic to SpanStyle(fontWeight = FontWeight.Bold, fontStyle = FontStyle.Italic),
+    Bold to SpanStyle(fontWeight = FontWeight.Bold),
+    Italic to SpanStyle(fontStyle = FontStyle.Italic),
+)
 
-private fun AnnotatedString.Builder.appendRuns(
-    segment: String,
-    top: Regex,
-    topStyle: SpanStyle,
-) {
+internal fun AnnotatedString.Builder.appendMarkup(segment: String, levels: List<Pair<Regex, SpanStyle>> = MarkupLevels) {
+    if (segment.isEmpty()) return
+    val (regex, style) = levels.firstOrNull() ?: run {
+        append(segment)
+        return
+    }
+    val lower = levels.subList(1, levels.size)
     var last = 0
-    top.findAll(segment).forEach { m ->
-        if (m.range.first > last) appendTail(segment.substring(last, m.range.first))
-        pushStyle(topStyle)
-        val inner = m.groupValues.last()
-        when (top) {
-            BoldItalic -> appendRuns(inner, Bold, SpanStyle(fontWeight = FontWeight.Bold))
-            Bold -> appendRuns(inner, Italic, SpanStyle(fontStyle = androidx.compose.ui.text.font.FontStyle.Italic))
-            else -> append(inner)
-        }
+    regex.findAll(segment).forEach { m ->
+        if (m.range.first > last) appendMarkup(segment.substring(last, m.range.first), lower)
+        pushStyle(style)
+        appendMarkup(m.groupValues.last(), lower)
         pop()
         last = m.range.last + 1
     }
-    if (last < segment.length) appendTail(segment.substring(last))
-}
-
-private fun AnnotatedString.Builder.appendTail(segment: String) {
-    appendRuns(segment, BoldItalic, SpanStyle(fontWeight = FontWeight.Bold, fontStyle = androidx.compose.ui.text.font.FontStyle.Italic))
+    if (last < segment.length) appendMarkup(segment.substring(last), lower)
 }
 
 @Composable

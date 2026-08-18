@@ -18,6 +18,7 @@ import * as dns from 'node:dns';
 import * as http from 'node:http';
 import * as https from 'node:https';
 import * as net from 'node:net';
+import * as tls from 'node:tls';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import type { NetworkPolicy } from '@pocketagent/protocol';
 import { config, isNetworkPolicy } from './config.js';
@@ -92,6 +93,13 @@ export interface EgressGateOptions {
   ports?: readonly number[];
   tokenValidator?: TokenValidator;
   peerValidator?: PeerValidator;
+  /**
+   * The target check, defaulting to resolveTarget. Only the tests replace it -
+   * connecting through a real DNS answer whose first address is dead is not
+   * reproducible otherwise. Whatever it returns is what the proxy connects to,
+   * so a replacement carries the same responsibility as resolveTarget itself.
+   */
+  resolve?: TargetResolver;
 }
 
 /**
@@ -308,13 +316,24 @@ export function isInternalAddress(raw: string): boolean {
   return false;
 }
 
-/** The single address a request is pinned to after the target check. */
+/** One address a request may be pinned to after the target check. */
 export interface PinnedTarget {
   address: string;
   family: 4 | 6;
 }
 
-export type ResolveOutcome = { ok: true; target: PinnedTarget } | { ok: false; reason: 'address' | 'dns' };
+export type ResolveOutcome = { ok: true; targets: PinnedTarget[] } | { ok: false; reason: 'address' | 'dns' };
+
+/** The target check as the proxy calls it; see resolveTarget. */
+export type TargetResolver = (host: string, allowlist: string[]) => Promise<ResolveOutcome>;
+
+/**
+ * The DNS answer resolveTarget decides on. Injectable so the ordering and the
+ * filtering can be tested without a name that really resolves both ways.
+ */
+export type AddressLookup = (host: string) => Promise<readonly { address: string; family: number }[]>;
+
+const systemLookup: AddressLookup = (host) => dns.promises.lookup(host, { all: true });
 
 /** An IP literal counts as an internal target only the operator may name. */
 function listedVerbatim(host: string, allowlist: string[]): boolean {
@@ -323,29 +342,110 @@ function listedVerbatim(host: string, allowlist: string[]): boolean {
 }
 
 /**
- * Resolve a target host once and decide whether its address may be reached.
- * The returned address is what the connection is pinned to: resolving again at
- * connect time would leave the classic rebinding window between the checked and
- * the connected address open.
+ * Resolve a target host once and decide which of its addresses may be reached.
+ * The returned addresses are what the connection is pinned to: resolving again
+ * at connect time would leave the classic rebinding window between the checked
+ * and the connected address open.
+ *
+ * *Every* checked address is returned, not just the first one, because pinning
+ * to a single one turns a partly reachable host into an unreachable one: a name
+ * with an AAAA record hands back an IPv6 address that a container without a
+ * global IPv6 route can never reach, and the A record next to it never gets
+ * tried. Connecting by name left that to the kernel's happy eyeballs; the list
+ * gives the connect paths the same second chance without a second resolve.
+ * IPv4 comes first for the same pragmatic reason - session containers usually
+ * have IPv4 only, so the address most likely to work is tried first.
  *
  * A host that is already an IP literal is only reachable when the operator put
  * exactly that literal into the allowlist - that, and only that, is how an
  * internal target gets through (an on-prem mirror, the loopback upstreams in
  * the tests). A *name* can never resolve into internal space.
  */
-export async function resolveTarget(host: string, allowlist: string[]): Promise<ResolveOutcome> {
+export async function resolveTarget(
+  host: string,
+  allowlist: string[],
+  lookup: AddressLookup = systemLookup,
+): Promise<ResolveOutcome> {
   const literal = net.isIP(host);
   if (literal !== 0) {
     if (listedVerbatim(host, allowlist) || !isInternalAddress(host)) {
-      return { ok: true, target: { address: host, family: literal === 6 ? 6 : 4 } };
+      return { ok: true, targets: [{ address: host, family: literal === 6 ? 6 : 4 }] };
     }
     return { ok: false, reason: 'address' };
   }
-  const addrs = await dns.promises.lookup(host, { all: true }).catch(() => null);
+  const addrs = await lookup(host).catch(() => null);
   if (addrs === null || addrs.length === 0) return { ok: false, reason: 'dns' };
-  const usable = addrs.find((a) => !isInternalAddress(a.address));
-  if (usable === undefined) return { ok: false, reason: 'address' };
-  return { ok: true, target: { address: usable.address, family: usable.family === 6 ? 6 : 4 } };
+  const usable: PinnedTarget[] = addrs
+    .filter((a) => !isInternalAddress(a.address))
+    .map((a) => ({ address: a.address, family: a.family === 6 ? 6 : 4 }));
+  if (usable.length === 0) return { ok: false, reason: 'address' };
+  return { ok: true, targets: [...usable.filter((t) => t.family === 4), ...usable.filter((t) => t.family === 6)] };
+}
+
+/**
+ * How long one connect attempt may take before the next checked address is
+ * tried. A dead address does not usually refuse - it is dropped, and the kernel
+ * would keep retransmitting the SYN for over a minute - so without a bound the
+ * fallback would arrive long after the caller gave up.
+ */
+export const UPSTREAM_CONNECT_TIMEOUT_MS = 10_000;
+
+/** A connected socket to one address, or a rejection with the reason it failed. */
+function connectOnce(address: string, port: number): Promise<net.Socket> {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect({ host: address, port });
+    const onError = (err: Error): void => {
+      socket.destroy();
+      reject(err);
+    };
+    const onTimeout = (): void => onError(Object.assign(new Error('connect timeout'), { code: 'ETIMEDOUT' }));
+    socket.setTimeout(UPSTREAM_CONNECT_TIMEOUT_MS);
+    socket.once('error', onError);
+    socket.once('timeout', onTimeout);
+    socket.once('connect', () => {
+      // The idle timeout was only meant to bound the handshake; a tunnel that
+      // stays quiet for a while (an idle SSE upstream) must not be torn down.
+      socket.setTimeout(0);
+      socket.off('error', onError);
+      socket.off('timeout', onTimeout);
+      resolve(socket);
+    });
+  });
+}
+
+/**
+ * Connect to the first reachable of the *already checked* addresses. Nothing
+ * here resolves anything: the list comes from resolveTarget, so every attempt
+ * goes to an address that passed isInternalAddress/listedVerbatim, and a name
+ * still cannot end up pointing inside. Attempts are sequential - a session
+ * container is not the place to open speculative parallel connections, and the
+ * per-attempt timeout keeps the total bounded.
+ */
+async function connectChecked(targets: readonly PinnedTarget[], port: number): Promise<net.Socket> {
+  let last: unknown = new Error('no address');
+  for (const target of targets) {
+    try {
+      return await connectOnce(target.address, port);
+    } catch (err) {
+      last = err;
+    }
+  }
+  throw last;
+}
+
+/**
+ * An upstream that could not be reached at all. Without this line a failed
+ * connect is invisible in operation: the caller sees "Connection error." from
+ * its own HTTP client and the orchestrator log says nothing, which is exactly
+ * how a proxy pinned to an unreachable AAAA address stayed undiagnosed. Kept in
+ * the shape of logDenial and just as free of secrets - method, target and the
+ * errno, never a header or a token.
+ */
+function logUpstreamFailure(method: string, host: string, port: number, err: unknown, tried?: number): void {
+  const e = err as { code?: unknown; message?: unknown } | null;
+  const detail = typeof e?.code === 'string' ? e.code : typeof e?.message === 'string' ? e.message : 'unknown error';
+  const addresses = tried === undefined ? '' : `, tried ${tried} address${tried === 1 ? '' : 'es'}`;
+  console.warn(`[egress] upstream failed ${method} ${host}:${port} (${detail}${addresses})`);
 }
 
 /**
@@ -358,6 +458,7 @@ export async function resolveTarget(host: string, allowlist: string[]): Promise<
 export function createEgressProxyServer(opts: EgressGateOptions): http.Server {
   const { allowlist, tokenValidator, peerValidator } = opts;
   const ports = opts.ports ?? DEFAULT_EGRESS_PORTS;
+  const checkTarget = opts.resolve ?? resolveTarget;
 
   const server = http.createServer((req, res) => {
     const auth = proxyAuthorized(req, req.socket.remoteAddress, tokenValidator, peerValidator);
@@ -382,36 +483,67 @@ export function createEgressProxyServer(opts: EgressGateOptions): http.Server {
       deny(reason);
       return;
     }
-    void resolveTarget(target.hostname, allowlist).then((resolved) => {
+    void checkTarget(target.hostname, allowlist).then(async (resolved) => {
       if (res.writableEnded || req.destroyed) return;
       if (!resolved.ok) {
         if (resolved.reason === 'address') return deny('address');
         res.writeHead(502).end('upstream error');
         return;
       }
+      const method = req.method ?? 'GET';
       const secure = target.protocol === 'https:';
       const headers = forwardableHeaders(req.headers);
       // A forwarded request keeps addressing its origin by name (Host header,
-      // TLS servername) but connects to the one address that was checked. The
+      // TLS servername) but connects to the addresses that were checked. The
       // authority of the absolute request-target wins over whatever Host the
       // client sent (RFC 7230 §5.4) - which, for a proxy request, is often the
       // proxy's own address.
       headers.host = target.host;
+      /*
+       * The connection is opened here rather than by node, so this path gets the
+       * same fallback over all checked addresses as the tunnel: an http.request
+       * pinned to one address cannot retry once its body is piped. Handing the
+       * open socket over as createConnection (and setting no agent, which is
+       * what makes node use it) keeps the request itself ordinary - by name in
+       * the Host header, by name in the TLS servername, on an address the target
+       * check approved. It costs the agent's connection pooling, which the
+       * forward path barely used: browsers and git send https through CONNECT.
+       */
+      const socket = await connectChecked(resolved.targets, port).catch((err: unknown) => {
+        logUpstreamFailure(method, target.hostname, port, err, resolved.targets.length);
+        return null;
+      });
+      if (socket === null) {
+        if (res.writableEnded) return;
+        if (!res.headersSent) res.writeHead(502);
+        res.end('upstream error');
+        return;
+      }
+      if (res.writableEnded || req.destroyed) {
+        socket.destroy();
+        return;
+      }
       const upstream = (secure ? https : http).request(
         {
           method: req.method,
-          host: resolved.target.address,
+          host: target.hostname,
           port,
           path: `${target.pathname}${target.search}`,
           headers,
-          ...(secure ? { servername: target.hostname } : {}),
+          createConnection: secure
+            ? (): net.Socket => tls.connect({ socket, servername: target.hostname, host: target.hostname })
+            : (): net.Socket => socket,
         },
         (up) => {
           res.writeHead(up.statusCode ?? 502, up.headers);
           up.pipe(res);
         },
       );
-      upstream.on('error', () => {
+      // Everything that goes wrong after the socket stood - a failed TLS
+      // handshake, a reset mid-response - has no address left to fall back to,
+      // but is just as invisible to the caller without a line here.
+      upstream.on('error', (err) => {
+        logUpstreamFailure(method, target.hostname, port, err);
         if (!res.headersSent) res.writeHead(502);
         res.end('upstream error');
       });
@@ -457,7 +589,7 @@ export function createEgressProxyServer(opts: EgressGateOptions): http.Server {
       else forbidden(socket);
       return;
     }
-    void resolveTarget(host, allowlist).then((resolved) => {
+    void checkTarget(host, allowlist).then(async (resolved) => {
       if (socket.destroyed) return;
       if (!resolved.ok) {
         if (resolved.reason === 'address') {
@@ -468,17 +600,34 @@ export function createEgressProxyServer(opts: EgressGateOptions): http.Server {
         }
         return;
       }
-      // The checked address, not the name: nothing resolves a second time.
-      const upstream = net.connect({ host: resolved.target.address, port: portNum }, () => {
-        socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-        if (head.length > 0) upstream.write(head);
-        upstream.pipe(socket);
-        socket.pipe(upstream);
+      // The checked addresses, in order, and nothing else: no second resolve
+      // happens here, so every attempt goes to an address the target check
+      // already approved.
+      const upstream = await connectChecked(resolved.targets, portNum).catch((err: unknown) => {
+        logUpstreamFailure('CONNECT', host, portNum, err, resolved.targets.length);
+        return null;
       });
-      upstream.on('error', () => {
+      if (upstream === null) {
         if (!socket.destroyed) socket.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n');
-      });
+        return;
+      }
+      if (socket.destroyed) {
+        upstream.destroy();
+        return;
+      }
+      /*
+       * From here the tunnel is established and the client has its 200: a later
+       * error is the connection ending badly, not a target that could not be
+       * reached, so it tears the pair down instead of writing a 502 into a live
+       * tunnel (and stays out of the log - a reset at the end of a TLS session
+       * is ordinary traffic, not a fault worth a line per request).
+       */
+      upstream.on('error', () => socket.destroy());
       socket.on('error', () => upstream.destroy());
+      socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+      if (head.length > 0) upstream.write(head);
+      upstream.pipe(socket);
+      socket.pipe(upstream);
     }).catch(() => socket.destroy());
   });
 

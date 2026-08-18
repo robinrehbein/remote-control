@@ -9,18 +9,40 @@ The Android signing keystore **and its passwords are committed to this repositor
 - `android/keystore/pocketagent.keystore`
 - `android/app/build.gradle.kts` — signing config `shared` with plain-text `storePassword`/`keyPassword`
 
-Anyone with read access to the repository can sign a malicious APK that Android will install over the official app (same `applicationId`, same signature → silent upgrade). This is a deliberate, temporary trade-off so CI debug builds are deterministic; it is **not acceptable for any public distribution**. Rotate before launch:
+Anyone with read access to the repository can sign a malicious APK that Android will install over the official app (same `applicationId`, same signature → silent upgrade). This is a deliberate, temporary trade-off so CI debug builds are deterministic; it is **not acceptable for any public distribution**. Rotate before launch.
+
+**Already prepared in the build (no maintainer action needed):**
+
+- `android/app/build.gradle.kts` reads `POCKETAGENT_KEYSTORE_FILE`, `POCKETAGENT_KEYSTORE_PASSWORD`,
+  `POCKETAGENT_KEY_ALIAS`, `POCKETAGENT_KEY_PASSWORD` (environment variables or Gradle
+  properties). If **all four** are set, signing uses exclusively those values; otherwise the
+  build falls back to the committed keystore and prints a loud warning.
+- `.github/workflows/android-release.yml` has a "Prepare signing from secrets" step: if the
+  secret `KEYSTORE_BASE64` is non-empty, it decodes the keystore into `$RUNNER_TEMP` and
+  exports the four `POCKETAGENT_*` variables via `$GITHUB_ENV` for the subsequent steps.
+  Without the secrets the workflow behaves exactly as before (fallback keystore + warning).
+
+**Remaining manual steps for the maintainer:**
 
 1. Generate a fresh release keystore, e.g.
    `keytool -genkeypair -v -keystore pocketagent-release.keystore -alias pocketagent -keyalg RSA -keysize 4096 -validity 10000`
-2. Store the keystore (base64-encoded) and its secrets as GitHub Actions secrets:
-   `KEYSTORE_BASE64`, `KEYSTORE_PASSWORD`, `KEY_ALIAS`, `KEY_PASSWORD`.
-3. Change the release `signingConfig` in `android/app/build.gradle.kts` to read those
-   values from CI environment variables / Gradle properties instead of literals.
-4. Stop committing the keystore: `.gitignore` already ignores `*.keystore`, but an explicit
-   negation keeps the current one tracked — remove the line `!android/keystore/pocketagent.keystore`
-   (and its comment) from `.gitignore`, then `git rm --cached android/keystore/pocketagent.keystore`.
-5. Bump `versionCode` in `android/app/build.gradle.kts` for the first APK signed with the new key.
+2. Create the four GitHub Actions secrets in this repository
+   (Settings → Secrets and variables → Actions):
+   - `KEYSTORE_BASE64` — the keystore, base64-encoded: `base64 -w0 pocketagent-release.keystore`
+   - `KEYSTORE_PASSWORD` — the store password chosen in step 1
+   - `KEY_ALIAS` — `pocketagent` (or whatever alias was used in step 1)
+   - `KEY_PASSWORD` — the key password chosen in step 1
+3. In a follow-up PR, once the secrets are verified working: remove the fallback branch from
+   the `shared` signing config in `android/app/build.gradle.kts`, delete
+   `android/keystore/pocketagent.keystore`, and drop the `.gitignore` negation line
+   `!android/keystore/pocketagent.keystore` (and its comment), then
+   `git rm --cached android/keystore/pocketagent.keystore`.
+4. Bump `versionCode` in `android/app/build.gradle.kts` for the first APK signed with the new key.
+5. **Heads-up for existing installations:** Android refuses to update an installed app with an
+   APK signed by a different key ("signatures do not match"). Every device that installed the
+   old APK must **uninstall and reinstall once** — this wipes app data, so the device loses its
+   pairing and has to be paired with the orchestrator again. Communicate this in the release
+   notes of the first release signed with the new key.
 6. The old keystore remains in git history — harmless once the old key is no longer trusted by devices.
 
 ## Known limitations (accepted residual risks)

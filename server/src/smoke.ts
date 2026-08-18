@@ -549,6 +549,10 @@ async function startProgressSmoke(store: Store, manager: SessionManager, c2: Cli
       createdEnv.some((e) => e.startsWith('HTTP_PROXY=http://pa:')),
       'allowlist sessions reach the network through the authenticated egress proxy',
     );
+    assert(
+      createdEnv.includes('NODE_USE_ENV_PROXY=1'),
+      'allowlist sessions also ask node itself (and every node child) to honour the proxy variables',
+    );
     assert(store.getSession(sessionId)?.container_id === CID, 'the container id is recorded before the start');
 
     const setupLine = logged.find((l) => l.startsWith(`[docker] session ${sessionId.slice(0, 8)} `));

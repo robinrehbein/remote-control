@@ -1,3 +1,6 @@
+// Egress proxy first: this side-effect import pins undici's global dispatcher
+// before any SDK module below can issue a request (see ./proxy).
+import './proxy.js';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';

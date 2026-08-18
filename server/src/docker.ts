@@ -563,6 +563,14 @@ async function sessionNetworking(
     env.HTTP_PROXY = `http://${userinfo}${proxyHost}`;
     env.HTTPS_PROXY = `http://${userinfo}${proxyHost}`;
     env.NO_PROXY = 'localhost,127.0.0.1';
+    // Node honours none of the three variables above on its own, so the shims
+    // pin undici's global dispatcher themselves (shims/*/src/proxy.ts). This
+    // flag is the second half of the belt: it is the only thing that also
+    // routes node's *other* client - http/https.request - and it reaches every
+    // node child process the shim spawns (the agent CLIs inherit the env),
+    // where an in-process dispatcher cannot help. Node builds that do not know
+    // the variable ignore it.
+    env.NODE_USE_ENV_PROXY = '1';
     egress = proxyHost;
     auth = userinfo ? 'yes' : 'no';
   }

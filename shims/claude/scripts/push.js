@@ -14,6 +14,16 @@ import { chmodSync, readFileSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { EnvHttpProxyAgent, setGlobalDispatcher } from 'undici';
+import { installEnvProxyDispatcher } from '@pocketagent/protocol';
+
+// Same egress rule as the shim process itself (src/proxy.ts): node ignores
+// HTTP_PROXY/HTTPS_PROXY on its own, and under network policy 'allowlist' this
+// container has no other route to api.github.com. No log line here - stdout
+// belongs to the JSON outcome the orchestrator parses.
+installEnvProxyDispatcher(process.env, () => {
+  setGlobalDispatcher(new EnvHttpProxyAgent());
+});
 
 const exec = promisify(execFile);
 

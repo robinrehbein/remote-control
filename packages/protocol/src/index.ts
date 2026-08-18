@@ -1042,3 +1042,73 @@ export class SequencedSseBroadcaster {
     }
   }
 }
+
+/* ------------------------------------------------------------------ */
+/* Egress proxy wiring (used at process start by every shim)          */
+/* Under network policy 'allowlist' a session container hangs on an   */
+/* internal docker network with no route out: the only way to the     */
+/* internet is the orchestrator's egress proxy, handed in as          */
+/* HTTP_PROXY / HTTPS_PROXY / NO_PROXY (server/src/docker.ts,         */
+/* sessionNetworking). Node honours none of those on its own - not    */
+/* fetch (undici), not http.request - so whether a provider call went */
+/* through the proxy came down to which HTTP client the SDK happened  */
+/* to use. The clients that ignore the variables died with a bare     */
+/* "Connection error." and left no line in the proxy log at all,      */
+/* because nothing ever reached the proxy. Pinning undici's *global*  */
+/* dispatcher fixes that for the whole process at once, an SDK's own  */
+/* bundled undici copy included: the global dispatcher lives on a     */
+/* globalThis symbol that every copy reads.                           */
+/*                                                                    */
+/* Pure and node-free like the rest of this file (it is loaded        */
+/* verbatim in the containers via node's type stripping): the undici  */
+/* call comes in as a callback, and the caller does the logging.      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The proxy URL the environment asks outbound traffic to take, or `undefined`
+ * when the session was started without one (policy 'open': direct internet).
+ * https wins over http because every provider endpoint is https, and both
+ * spellings are read - these variables are conventionally lowercase, but the
+ * orchestrator injects the uppercase form.
+ */
+export function envProxyUrl(env: Record<string, string | undefined>): string | undefined {
+  const raw = env.https_proxy ?? env.HTTPS_PROXY ?? env.http_proxy ?? env.HTTP_PROXY;
+  const trimmed = raw?.trim();
+  return trimmed !== undefined && trimmed.length > 0 ? trimmed : undefined;
+}
+
+/**
+ * Proxy URL without its userinfo. The injected URL carries the session's shim
+ * token as Basic credentials for the egress proxy, so only this form may be
+ * logged.
+ */
+export function redactProxyUrl(url: string): string {
+  return url.replace(/\/\/[^/@]*@/, '//***@');
+}
+
+/**
+ * Pin every outbound HTTP(S) request of this process to the egress proxy - but
+ * only when one is configured. Without proxy variables the container has direct
+ * internet access and must keep it: installing a dispatcher there would aim
+ * every request at a proxy that does not exist.
+ *
+ * `install` is expected to set undici's global dispatcher to an
+ * `EnvHttpProxyAgent`, which reads HTTP_PROXY/HTTPS_PROXY/NO_PROXY itself - so
+ * loopback traffic named in NO_PROXY (the shim's own HTTP surface, kilo's local
+ * `kilo serve`) keeps going direct. It is a callback because this package is
+ * loaded as TypeScript source from /app/packages/protocol in the shim images,
+ * where a bare `import 'undici'` would resolve against the package's own
+ * (nonexistent) node_modules instead of the shim's.
+ *
+ * Returns the redacted proxy URL now in force, or `undefined` when nothing was
+ * installed.
+ */
+export function installEnvProxyDispatcher(
+  env: Record<string, string | undefined>,
+  install: () => void,
+): string | undefined {
+  const proxy = envProxyUrl(env);
+  if (proxy === undefined) return undefined;
+  install();
+  return redactProxyUrl(proxy);
+}

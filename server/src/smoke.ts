@@ -232,6 +232,55 @@ function proxyConnect(
 }
 
 /**
+ * A CONNECT that is not just answered but used: opens the tunnel, sends one
+ * payload through it and returns what comes back. Tells "the proxy replied 200"
+ * apart from "bytes really reach the upstream that accepted the connection".
+ */
+function proxyTunnel(
+  net: typeof import('node:net'),
+  proxyPort: number,
+  hostPort: string,
+  payload: string,
+): Promise<{ status: number; echo: string }> {
+  return new Promise((resolve, reject) => {
+    const sock = net.connect(proxyPort, '127.0.0.1', () => {
+      sock.write(`CONNECT ${hostPort} HTTP/1.1\r\nHost: ${hostPort}\r\n\r\n`);
+    });
+    const timer = setTimeout(() => {
+      sock.destroy();
+      reject(new Error('proxy did not answer the CONNECT'));
+    }, 10_000);
+    const done = (value: { status: number; echo: string }): void => {
+      clearTimeout(timer);
+      sock.destroy();
+      resolve(value);
+    };
+    let head = '';
+    let echo = '';
+    let established = false;
+    sock.on('data', (c) => {
+      if (!established) {
+        head += String(c);
+        const end = head.indexOf('\r\n\r\n');
+        if (end === -1) return;
+        const status = Number(/^HTTP\/1\.\d (\d{3})/.exec(head.split('\r\n')[0] ?? '')?.[1] ?? 0);
+        if (status !== 200) return done({ status, echo: '' });
+        established = true;
+        echo = head.slice(end + 4);
+        sock.write(payload);
+      } else {
+        echo += String(c);
+      }
+      if (echo.length > 0) done({ status: 200, echo });
+    });
+    sock.on('error', (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+  });
+}
+
+/**
  * A CONNECT whose caller vanishes before the answer is written: the request
  * goes out, then the connection is reset instead of closed. That is what a
  * client does when it gives up on a refused tunnel, and it leaves the proxy
@@ -824,6 +873,110 @@ async function egressSmoke(store: Store, manager: SessionManager, repoId: string
   const viaNameConnect = await proxyConnect(net, rebindPort, 'localhost:443', allowToken);
   assert(viaNameConnect === 403, 'the CONNECT path resolves and blocks the same way');
 
+  /* ---- reachability: one dead address must not make a host unreachable ---- */
+
+  // Finding: the target check pinned a request to the *first* checked address,
+  // so a host answering with an AAAA record was unreachable from a container
+  // without an IPv6 route - the agent saw "Connection error.", the A record next
+  // to it was never tried, and connecting by name (kernel happy eyeballs) had
+  // covered exactly this before.
+  const dual = await resolveTarget('dual.example', ['dual.example'], async () => [
+    { address: '2606:4700::1111', family: 6 },
+    { address: '203.0.113.7', family: 4 },
+    { address: '10.1.2.3', family: 4 },
+    { address: 'fd00::1', family: 6 },
+    { address: '198.51.100.9', family: 4 },
+  ]);
+  assert(dual.ok && dual.targets.length === 3, 'a resolved name keeps every checked address, not just the first');
+  assert(
+    dual.ok && dual.targets.map((t) => t.address).join(',') === '203.0.113.7,198.51.100.9,2606:4700::1111',
+    'IPv4 comes before IPv6, and the DNS order inside a family is kept',
+  );
+  assert(
+    dual.ok && !dual.targets.some((t) => isInternalAddress(t.address)),
+    'no internal address ever reaches the list a request may connect to',
+  );
+  const insideOnly = await resolveTarget('inside.example', ['inside.example'], async () => [
+    { address: '10.1.2.3', family: 4 },
+    { address: 'fd00::1', family: 6 },
+  ]);
+  assert(!insideOnly.ok && insideOnly.reason === 'address', 'a name resolving only into internal space is still refused');
+
+  // The fallback end to end. 127.0.0.9 is loopback with nothing bound, so the
+  // first attempt is refused immediately and only the second address can carry
+  // the tunnel. The address list is injected: a name that really resolves to a
+  // dead address first is not reproducible in a test, and the injected list is
+  // exactly what resolveTarget would have handed over.
+  const tunnelUpstream = net.createServer((s) => {
+    s.on('data', () => s.write('tunneled'));
+  });
+  const tunnelPort = await new Promise<number>((r) =>
+    tunnelUpstream.listen(0, '127.0.0.1', () => r((tunnelUpstream.address() as AddressInfo).port)),
+  );
+  const fallbackPorts = [80, 443, tunnelPort];
+  const withFallback = createEgressProxyServer({
+    allowlist: ['dual.example'],
+    ports: fallbackPorts,
+    resolve: async () => ({
+      ok: true,
+      targets: [
+        { address: '127.0.0.9', family: 4 },
+        { address: '127.0.0.1', family: 4 },
+      ],
+    }),
+  });
+  const fallbackPort = await listen(withFallback);
+  const tunnel = await proxyTunnel(net, fallbackPort, `dual.example:${tunnelPort}`, 'ping');
+  assert(
+    tunnel.status === 200 && tunnel.echo === 'tunneled',
+    'CONNECT tries the next checked address when the first one refuses',
+  );
+
+  // And when none of them answers: 502, plus the line that was missing - a
+  // failed upstream connect used to leave no trace at all, which is what kept
+  // the pinned-address failure undiagnosed on the live instance.
+  const allDead = createEgressProxyServer({
+    allowlist: ['dual.example'],
+    ports: fallbackPorts,
+    resolve: async () => ({
+      ok: true,
+      targets: [
+        { address: '127.0.0.9', family: 4 },
+        { address: '127.0.0.8', family: 4 },
+      ],
+    }),
+  });
+  const deadPort = await listen(allDead);
+  const upstreamWarnings: string[] = [];
+  const warnBefore = console.warn;
+  console.warn = (...a: unknown[]): void => {
+    upstreamWarnings.push(a.map(String).join(' '));
+  };
+  let deadConnect = 0;
+  let deadForward = { status: 0, body: '' };
+  try {
+    deadConnect = await proxyConnect(net, deadPort, `dual.example:${tunnelPort}`);
+    deadForward = await proxyGet(http, deadPort, `http://dual.example:${tunnelPort}/ping`);
+  } finally {
+    console.warn = warnBefore;
+  }
+  assert(deadConnect === 502, 'a CONNECT whose addresses are all unreachable ends in 502');
+  assert(deadForward.status === 502, 'the forward path answers 502 when no checked address answers');
+  assert(
+    upstreamWarnings.some(
+      (w) => w.startsWith(`[egress] upstream failed CONNECT dual.example:${tunnelPort} `) && w.includes('tried 2 addresses'),
+    ),
+    'a failed CONNECT upstream is logged with host, port and how many addresses were tried',
+  );
+  assert(
+    upstreamWarnings.some((w) => w.startsWith(`[egress] upstream failed GET dual.example:${tunnelPort} `)),
+    'the forward path logs its upstream failures too',
+  );
+  assert(
+    !upstreamWarnings.some((w) => w.includes(allowToken) || w.toLowerCase().includes('authorization')),
+    'the upstream failure line carries no credentials',
+  );
+
   /* ---- gateway: same gates, fed by the orchestrator over the ingress ---- */
 
   assert(parseEgressSessions({ sessions: [{ id: 'a', policy: 'nope', token: null, ips: [] }] }) === null, 'a bad policy rejects the whole table');
@@ -873,7 +1026,8 @@ async function egressSmoke(store: Store, manager: SessionManager, repoId: string
   const gwIsolated = await proxyGet(http, gwEgressPort, target, 'gw-iso-token');
   assert(gwIsolated.status === 403, 'an isolated session is refused on the gateway too');
 
-  for (const s of [upstream, proxy, strict, rebind, ingress, gwEgress]) s.close();
+  for (const s of [upstream, proxy, strict, rebind, withFallback, allDead, ingress, gwEgress]) s.close();
+  tunnelUpstream.close();
   for (const id of [allowId, isoId, stoppedId]) store.deleteSession(id);
 }
 

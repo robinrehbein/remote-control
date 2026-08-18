@@ -100,7 +100,12 @@ android {
         }
     }
     testOptions {
-        unitTests.isReturnDefaultValues = true
+        unitTests {
+            isReturnDefaultValues = true
+            // Robolectric braucht das gemergte Manifest und die Ressourcen
+            // der App, sonst kann kein Compose-Baum aufgebaut werden.
+            isIncludeAndroidResources = true
+        }
     }
     lint {
         abortOnError = false
@@ -130,6 +135,13 @@ dependencies {
     implementation(libs.firebase.messaging)
 
     debugImplementation(libs.androidx.ui.tooling)
+    // Liefert die ComponentActivity, in der createComposeRule() rendert.
+    // debugImplementation, weil Robolectric-Unit-Tests gegen das gemergte
+    // Debug-Manifest laufen — testImplementation würde nicht gemergt.
+    debugImplementation(libs.androidx.ui.test.manifest)
 
     testImplementation(libs.junit)
+    testImplementation(libs.robolectric)
+    testImplementation(platform(libs.androidx.compose.bom))
+    testImplementation(libs.androidx.ui.test.junit4)
 }

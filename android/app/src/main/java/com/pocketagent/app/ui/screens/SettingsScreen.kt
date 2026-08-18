@@ -2,6 +2,8 @@
 
 package com.pocketagent.app.ui.screens
 
+import android.content.Context
+import android.content.Intent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -29,6 +31,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.outlined.AccountCircle
+import androidx.compose.material.icons.outlined.BugReport
 import androidx.compose.material.icons.outlined.CheckCircleOutline
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Edit
@@ -87,17 +90,24 @@ import com.pocketagent.app.data.AdapterDescriptor
 import com.pocketagent.app.data.AppRepository
 import com.pocketagent.app.data.CodexAuthUiState
 import com.pocketagent.app.data.CodexOAuthController
+import com.pocketagent.app.data.CrashLog
 import com.pocketagent.app.data.ProviderDescriptor
 import com.pocketagent.app.data.SecretInfo
 import com.pocketagent.app.data.SecretValidation
 import com.pocketagent.app.data.WsClient
+import com.pocketagent.app.data.truncateForShare
 import com.pocketagent.app.ui.theme.CardInset
 import com.pocketagent.app.ui.theme.SectionSpacing
 import com.pocketagent.app.ui.theme.TileMinHeight
 import com.pocketagent.app.ui.theme.semantic
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 
 /**
  * Fehlermeldung für den Nutzer: eine deutsche Ansage mit nächstem Schritt.
@@ -308,7 +318,8 @@ private fun recommendedKinds(adapters: List<AdapterDescriptor>, existing: Set<St
 
 @Composable
 fun SettingsScreen(onBack: () -> Unit) {
-    val app = LocalContext.current.applicationContext as PocketAgentApp
+    val context = LocalContext.current
+    val app = context.applicationContext as PocketAgentApp
     val repository = app.container.repository
     val vm: SettingsViewModel = viewModel { SettingsViewModel().also { it.repository = repository } }
     val stats by repository.stats.collectAsState()
@@ -333,6 +344,13 @@ fun SettingsScreen(onBack: () -> Unit) {
     var showAddRepo by rememberSaveable { mutableStateOf(false) }
     var confirmLogout by rememberSaveable { mutableStateOf(false) }
     var serverDetailsOpen by rememberSaveable { mutableStateOf(false) }
+
+    // Letzter Absturzbericht (CrashLog): einmal beim Öffnen von Platte lesen.
+    var lastCrash by remember { mutableStateOf<CrashLog.LastCrash?>(null) }
+    val crashScope = rememberCoroutineScope()
+    LaunchedEffect(Unit) {
+        lastCrash = withContext(Dispatchers.IO) { CrashLog.latest(app) }
+    }
 
     // In-App-Login (CODEX-OAUTH.md): der Controller treibt den Flow, öffnet die
     // Login-URL im Browser (LocalUriHandler) und lauscht auf dem Loopback-Port.
@@ -561,6 +579,42 @@ fun SettingsScreen(onBack: () -> Unit) {
             SectionNote("Werte liegen verschlüsselt im Server-Vault und werden nie an die App zurückgeschickt.")
 
             error?.let { SectionError(it) }
+
+            /* ---------- Diagnose ---------- */
+            // Ohne Report keine Section — ein leerer Platzhalter würde nur
+            // eine Frage aufwerfen, die die App nicht beantworten kann.
+            lastCrash?.let { crash ->
+                SectionHeader("Diagnose")
+                GroupCard {
+                    Column(Modifier.padding(vertical = 4.dp)) {
+                        SettingsTile(
+                            icon = Icons.Outlined.BugReport,
+                            title = "Letzter Absturz",
+                            subtitle = "${formatCrashTime(crash.timestampIso)} · ${crash.summary}",
+                        )
+                        ListDivider()
+                        Row(
+                            horizontalArrangement = Arrangement.End,
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 8.dp, vertical = 4.dp),
+                        ) {
+                            TextButton(onClick = {
+                                crashScope.launch {
+                                    withContext(Dispatchers.IO) { CrashLog.discardAll(app) }
+                                    lastCrash = null
+                                }
+                            }) { Text("Verwerfen", color = MaterialTheme.colorScheme.error) }
+                            Spacer(modifier = Modifier.width(4.dp))
+                            TextButton(onClick = { shareCrashReport(context, crash.report) }) {
+                                Text("Teilen")
+                            }
+                        }
+                    }
+                }
+                SectionNote("Der Bericht enthält Stacktrace, App-Version und Gerätemodell — keine Chat-Inhalte oder Zugänge.")
+            }
 
             /* ---------- Gerät ---------- */
             SectionHeader("Gerät")
@@ -921,6 +975,28 @@ private fun formatUptime(sec: Long): String {
     val h = sec / 3600
     val m = (sec % 3600) / 60
     return if (h > 0) "$h h $m min" else "$m min"
+}
+
+/** Absoluter Zeitpunkt in Lokalzeit — bei einem Absturzbericht zählt das Datum, nicht „vor 3 h". */
+private fun formatCrashTime(iso: String?): String {
+    if (iso == null) return "Zeitpunkt unbekannt"
+    return try {
+        DateTimeFormatter.ofPattern("dd.MM.yyyy, HH:mm")
+            .withZone(ZoneId.systemDefault())
+            .format(Instant.parse(iso))
+    } catch (_: Exception) {
+        iso
+    }
+}
+
+/** Kompletter Report als text/plain (auf ~100 KB gekürzt) über den System-Share-Sheet. */
+private fun shareCrashReport(context: Context, report: String) {
+    val intent = Intent(Intent.ACTION_SEND).apply {
+        type = "text/plain"
+        putExtra(Intent.EXTRA_SUBJECT, "PocketAgent Absturzbericht")
+        putExtra(Intent.EXTRA_TEXT, truncateForShare(report))
+    }
+    runCatching { context.startActivity(Intent.createChooser(intent, "Absturzbericht teilen")) }
 }
 
 /* ------------------------------------------------------------------ */

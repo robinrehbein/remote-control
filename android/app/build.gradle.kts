@@ -22,12 +22,55 @@ android {
         buildConfigField("String", "FBM_SENDER_ID", "\"replace-me\"")
     }
 
+    /*
+     * Signierung: bevorzugt aus Secrets, sonst Fallback auf den committeden
+     * Keystore (SECURITY.md, „Rotate before launch").
+     *
+     * Gelesen werden POCKETAGENT_KEYSTORE_FILE, POCKETAGENT_KEYSTORE_PASSWORD,
+     * POCKETAGENT_KEY_ALIAS und POCKETAGENT_KEY_PASSWORD — jeweils erst als
+     * Umgebungsvariable, dann als Gradle-Property. Nur wenn ALLE vier gesetzt
+     * sind, wird ausschließlich damit signiert; die Keystore-Datei wird dabei
+     * nicht auf Existenz geprüft (das passiert erst beim Signieren selbst,
+     * damit die Konfigurationsphase nie an einer fehlenden Datei scheitert).
+     *
+     * Fehlt etwas, signiert der Build wie bisher mit dem committeden Keystore
+     * samt Klartext-Passwörtern und warnt deutlich. Bewusst KEIN Fehlschlag:
+     * der Maintainer kann die GitHub-Secrets nachziehen, ohne dass CI-Debug-
+     * Builds oder Releases vorher brechen.
+     */
     signingConfigs {
         create("shared") {
-            storeFile = rootProject.file("keystore/pocketagent.keystore")
-            storePassword = "pocketagent-debug-2026"
-            keyAlias = "pocketagent"
-            keyPassword = "pocketagent-debug-2026"
+            fun secret(name: String): String? =
+                providers.environmentVariable(name)
+                    .orElse(providers.gradleProperty(name))
+                    .orNull
+                    ?.takeIf { it.isNotBlank() }
+
+            val secretStoreFile = secret("POCKETAGENT_KEYSTORE_FILE")
+            val secretStorePassword = secret("POCKETAGENT_KEYSTORE_PASSWORD")
+            val secretKeyAlias = secret("POCKETAGENT_KEY_ALIAS")
+            val secretKeyPassword = secret("POCKETAGENT_KEY_PASSWORD")
+
+            if (secretStoreFile != null && secretStorePassword != null &&
+                secretKeyAlias != null && secretKeyPassword != null
+            ) {
+                storeFile = File(secretStoreFile)
+                storePassword = secretStorePassword
+                keyAlias = secretKeyAlias
+                keyPassword = secretKeyPassword
+                logger.lifecycle("app: Signierung mit Keystore aus POCKETAGENT_KEYSTORE_*-Secrets.")
+            } else {
+                storeFile = rootProject.file("keystore/pocketagent.keystore")
+                storePassword = "pocketagent-debug-2026"
+                keyAlias = "pocketagent"
+                keyPassword = "pocketagent-debug-2026"
+                logger.warn(
+                    "app: WARNUNG – POCKETAGENT_KEYSTORE_*-Variablen unvollständig oder nicht gesetzt. " +
+                        "Fallback auf den UNSICHEREN committeden Keystore " +
+                        "(android/keystore/pocketagent.keystore, Passwörter im Repo). " +
+                        "Für verteilbare Releases ungeeignet – siehe SECURITY.md.",
+                )
+            }
         }
     }
 

@@ -15,7 +15,8 @@
   "dependencies": {
     "@earendil-works/pi-coding-agent": "0.84.2",
     "@pocketagent/protocol": "file:../../packages/protocol",
-    "fastify": "^5.2.1"
+    "fastify": "^5.2.1",
+    "undici": "^8.9.0"
   },
   "devDependencies": {
     "@types/node": "^22.15.0",

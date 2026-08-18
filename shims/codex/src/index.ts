@@ -1,3 +1,6 @@
+// Egress proxy first: this side-effect import pins undici's global dispatcher
+// before any SDK module below can issue a request (see ./proxy).
+import './proxy.js';
 import { spawn } from 'node:child_process';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { homedir } from 'node:os';

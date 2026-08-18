@@ -2,6 +2,9 @@
  * PocketAgent Claude shim: fastify HTTP server exposing the unified shim
  * protocol on top of the Claude Code Agent SDK.
  */
+// Egress proxy first: this side-effect import pins undici's global dispatcher
+// before any SDK module below can issue a request (see ./proxy).
+import './proxy.ts';
 import type {
   AgentMode,
   AgentEvent,

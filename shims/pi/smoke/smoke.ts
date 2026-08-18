@@ -5,7 +5,9 @@ import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
+import { EnvHttpProxyAgent, getGlobalDispatcher, setGlobalDispatcher } from 'undici';
 import type { AgentEvent } from '@pocketagent/protocol';
+import { installEnvProxyDispatcher } from '@pocketagent/protocol';
 import { EventBroadcaster } from '../src/events';
 import { askpassEnv, commitTurn, ensureRepo, pushBranch, readGithubPat, type GitContext } from '../src/gitops';
 import { buildApp, loadConfig } from '../src/index';
@@ -122,6 +124,93 @@ function collectSse(base: string, token: string, lastEventId: number | undefined
       resolve(events);
     }, ms);
   });
+}
+
+/**
+ * The egress-proxy contract of src/proxy.ts, checked against a real listener
+ * instead of a mock: a session under policy 'allowlist' sits on an internal
+ * docker network, so a provider call that ignores HTTPS_PROXY never leaves the
+ * container and dies as "Connection error." with nothing in the proxy log.
+ *
+ * Asserted here: nothing is installed without proxy variables (policy 'open'
+ * keeps talking directly), an https call is tunnelled through the proxy once
+ * the dispatcher is in place, NO_PROXY still gets loopback out of the way, and
+ * the reported proxy carries no credentials.
+ */
+async function checkEgressProxyDispatcher(): Promise<void> {
+  const seen: string[] = [];
+  const proxy = http.createServer((req, res) => {
+    seen.push(`FORWARD ${req.url ?? ''}`);
+    res.writeHead(204).end();
+  });
+  // https goes out as a CONNECT tunnel; answering with a closed socket is
+  // enough - the request line is the evidence, the response is not.
+  proxy.on('connect', (req: IncomingMessage, socket: { end(): void }) => {
+    seen.push(`CONNECT ${req.url ?? ''}`);
+    socket.end();
+  });
+  const origin = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' }).end('local');
+  });
+  await new Promise<void>(resolve => proxy.listen(0, '127.0.0.1', resolve));
+  await new Promise<void>(resolve => origin.listen(0, '127.0.0.1', resolve));
+  const proxyPort = (proxy.address() as AddressInfo).port;
+  const originPort = (origin.address() as AddressInfo).port;
+  const token = 'smoke-shim-token';
+  const proxyUrl = `http://pa:${token}@127.0.0.1:${proxyPort}`;
+
+  let installs = 0;
+  const withoutProxy = installEnvProxyDispatcher({ PATH: '/usr/bin' }, () => {
+    installs += 1;
+  });
+  expect(withoutProxy === undefined && installs === 0, 'without proxy variables no dispatcher is installed');
+
+  // Both spellings are set (and restored): EnvHttpProxyAgent reads the
+  // lowercase ones first, and a developer machine may well have them pointing
+  // somewhere else entirely.
+  const proxyKeys = ['HTTP_PROXY', 'http_proxy', 'HTTPS_PROXY', 'https_proxy', 'NO_PROXY', 'no_proxy'];
+  const dispatcherBefore = getGlobalDispatcher();
+  const envBefore = { ...process.env };
+  try {
+    process.env.HTTP_PROXY = proxyUrl;
+    process.env.http_proxy = proxyUrl;
+    process.env.HTTPS_PROXY = proxyUrl;
+    process.env.https_proxy = proxyUrl;
+    process.env.NO_PROXY = 'localhost,127.0.0.1';
+    process.env.no_proxy = 'localhost,127.0.0.1';
+    const active = installEnvProxyDispatcher(process.env, () => {
+      setGlobalDispatcher(new EnvHttpProxyAgent());
+    });
+    expect(active !== undefined, 'a configured proxy is installed');
+    expect(active?.includes(token) === false, 'the reported proxy URL carries no credentials');
+
+    await fetch('https://api.provider.test/v1/models', { signal: AbortSignal.timeout(5_000) }).catch(() => undefined);
+    expect(
+      seen.includes('CONNECT api.provider.test:443'),
+      `an https provider call reaches the proxy instead of DNS (saw ${JSON.stringify(seen)})`,
+    );
+
+    seen.length = 0;
+    const local = await fetch(`http://127.0.0.1:${originPort}/health`, { signal: AbortSignal.timeout(5_000) });
+    expect(local.status === 200 && seen.length === 0, 'NO_PROXY keeps loopback traffic off the proxy');
+  } finally {
+    setGlobalDispatcher(dispatcherBefore);
+    for (const key of proxyKeys) {
+      const before = envBefore[key];
+      if (before === undefined) delete process.env[key];
+      else process.env[key] = before;
+    }
+  }
+
+  seen.length = 0;
+  await fetch('https://api.provider.test/v1/models', { signal: AbortSignal.timeout(5_000) }).catch(() => undefined);
+  expect(seen.length === 0, 'with the dispatcher gone nothing is routed through the proxy any more');
+
+  // Sockets the fetches above left in the pool would keep close() waiting.
+  proxy.closeAllConnections();
+  origin.closeAllConnections();
+  await new Promise<void>(resolve => proxy.close(() => resolve()));
+  await new Promise<void>(resolve => origin.close(() => resolve()));
 }
 
 async function main(): Promise<void> {
@@ -474,6 +563,9 @@ async function main(): Promise<void> {
   await rm(workDir, { recursive: true, force: true });
   await rm(agentDir, { recursive: true, force: true });
   await rm(credsDir, { recursive: true, force: true });
+
+  // Last, because it swaps the process-wide dispatcher for the duration.
+  await checkEgressProxyDispatcher();
 
   console.log('SMOKE OK');
 }

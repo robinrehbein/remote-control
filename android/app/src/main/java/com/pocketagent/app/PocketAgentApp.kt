@@ -5,6 +5,7 @@ import com.google.firebase.FirebaseApp
 import com.google.firebase.FirebaseOptions
 import com.pocketagent.app.data.AppRepository
 import com.pocketagent.app.data.ConnectivityWatcher
+import com.pocketagent.app.data.CrashLog
 import com.pocketagent.app.data.PairingApi
 import com.pocketagent.app.data.TokenStore
 import com.pocketagent.app.data.WsClient
@@ -53,6 +54,9 @@ class PocketAgentApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        // Vor allem anderen: auch ein Crash während der restlichen
+        // Initialisierung soll schon einen Report hinterlassen.
+        CrashLog.install(this)
         container = AppContainer(this, appScope)
         initFirebase()
         // Vor der ersten möglichen Push anlegen: kommt die App-Zustellung bei

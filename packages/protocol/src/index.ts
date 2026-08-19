@@ -424,8 +424,19 @@ export interface TokenUsage {
  *  - 'ready'           : der Runner antwortet, die Session nimmt Prompts an
  * Die Reihenfolge ist die eines Starts, aber Clients dürfen nicht annehmen,
  * dass jede Phase vorkommt (eine Link-Session hat keinen Container-Start).
- * v1 kannte zusätzlich 'image-build'; das Runner-Image entsteht jetzt beim
- * Deploy und nie zur Laufzeit, die Phase kann also nicht mehr auftreten.
+ *
+ * Diese drei Schreibweisen sind vollständig: gesendet werden sie AUSSCHLIESSLICH
+ * vom Orchestrator (server/src/sessions.ts, server/src/docker.ts); der Runner
+ * selbst kennt `phase` gar nicht, seine Notices sind gewöhnliche Systemzeilen.
+ * v1 kannte zusätzlich 'image-build'. Das Runner-Image wird zwar weiterhin zur
+ * Laufzeit gebaut (`ensureRunnerImage`, beim ersten Start auf einem Host), aber
+ * bewusst unter 'container-start' gemeldet — es ist Teil des Container-Starts,
+ * keine eigene Phase mehr.
+ *
+ * `ready` ist das Ende: erst danach nimmt die Session Prompts an, und erst
+ * dadurch verschwindet die Fortschrittskarte der App. Ein Startpfad, der nicht
+ * in `ready` mündet, MUSS stattdessen in einem `error`-Event enden (die App
+ * räumt die Karte auch daran weg) — sonst dreht sie sich ewig.
  */
 export type NoticePhase = 'container-start' | 'shim-start' | 'ready';
 
@@ -575,8 +586,9 @@ export interface ServerStats {
 }
 
 /* ------------------------------------------------------------------ */
-/* Link-Agent-Relay (Kilo-Muster „remote connections",                 */
-/* siehe KILO-CLOUD-ANALYSE.md P2)                                     */
+/* Link-Agent-Relay (Kilo-Muster „remote connections", siehe             */
+/* KILO-CLOUD-ANALYSE.md P2 im Tag v0.13.0 — GREENFIELD-PI.md,           */
+/* „Entfallene Dokumente")                                               */
 /* ------------------------------------------------------------------ */
 
 /**

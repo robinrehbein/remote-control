@@ -325,6 +325,43 @@ async function runnerConfigSmoke(): Promise<void> {
   assert(moon.KIMI_API_KEY === 'moon-key', 'moonshot und kimi teilen sich KIMI_API_KEY (Protokolltabelle)');
   assert(moon.AUTO_PUSH === '0', "AUTO_PUSH ist im Modus 'auto' aus");
 
+  /* ---- moonshot <-> kimi: zwei Secret-Arten, ein Konto ---- */
+
+  // Der Vault kennt nur 'moonshot'; eine Session mit Provider 'kimi' darf davon
+  // NICHT ohne Schluessel starten - beides ist derselbe Account bei
+  // platform.moonshot.ai und teilt sich ohnehin KIMI_API_KEY.
+  const onlyMoonshot = (kind: string): string | null => (kind === 'moonshot' ? 'moon-only' : null);
+  const kimiViaMoonshot = buildRunnerEnv(
+    { sessionId: 's', shimToken: 't', mode: 'ask', provider: 'kimi', model: '', repoFullName: 'a/b', baseBranch: 'main' },
+    onlyMoonshot,
+  );
+  assert(kimiViaMoonshot.KIMI_API_KEY === 'moon-only', "Provider 'kimi' faellt auf das moonshot-Secret zurueck");
+
+  const onlyKimi = (kind: string): string | null => (kind === 'kimi' ? 'kimi-only' : null);
+  const moonshotViaKimi = buildRunnerEnv(
+    { sessionId: 's', shimToken: 't', mode: 'ask', provider: 'moonshot', model: '', repoFullName: 'a/b', baseBranch: 'main' },
+    onlyKimi,
+  );
+  assert(moonshotViaKimi.KIMI_API_KEY === 'kimi-only', "Provider 'moonshot' faellt auf das kimi-Secret zurueck");
+
+  // Die eigene Art schlaegt den Alias, und der Fallback bleibt auf dieses eine
+  // Paar beschraenkt - kein anderer Provider erbt fremde Schluessel.
+  const both = (kind: string): string | null => (kind === 'kimi' ? 'kimi-eigen' : kind === 'moonshot' ? 'moon-eigen' : null);
+  assert(
+    buildRunnerEnv(
+      { sessionId: 's', shimToken: 't', mode: 'ask', provider: 'kimi', model: '', repoFullName: 'a/b', baseBranch: 'main' },
+      both,
+    ).KIMI_API_KEY === 'kimi-eigen',
+    'liegt das eigene Secret vor, wird der Alias nicht gezogen',
+  );
+  assert(
+    buildRunnerEnv(
+      { sessionId: 's', shimToken: 't', mode: 'ask', provider: 'openai', model: '', repoFullName: 'a/b', baseBranch: 'main' },
+      onlyMoonshot,
+    ).OPENAI_API_KEY === undefined,
+    'der Fallback gilt nur fuer moonshot/kimi, nicht fuer beliebige Provider',
+  );
+
   const unknown = buildRunnerEnv(
     { sessionId: 's', shimToken: 't', mode: 'ask', provider: 'does-not-exist', model: '', repoFullName: 'a/b', baseBranch: 'main' },
     () => 'irrelevant',
@@ -356,6 +393,60 @@ async function runnerConfigSmoke(): Promise<void> {
     );
     assert(!ctxFiles.some((f) => f.includes('node_modules')), 'der Kontext traegt nie node_modules');
     assert(!ctxFiles.some((f) => f.startsWith('runner/dist/')), 'der Kontext traegt kein Build-Ergebnis (runner/Dockerfile baut selbst)');
+
+    /* ---- Jede COPY-Quelle des Runner-Dockerfiles liegt im Kontext ---- */
+
+    // Docker ist in CI und in dieser Umgebung nicht verfuegbar, der Bau also
+    // nicht ausfuehrbar. Was sich trotzdem pruefen laesst - und was in v1
+    // regelmaessig auseinanderlief - ist die Kopplung Kontext <-> Dockerfile:
+    // eine COPY-Quelle, die im gebuendelten Kontext fehlt, laesst
+    // ensureRunnerImage erst beim ersten echten Session-Start scheitern.
+    const { readFileSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const root = runnerContextRoot() as string;
+    const dockerfile = readFileSync(join(root, 'runner', 'Dockerfile'), 'utf8');
+    const ctxSet = new Set(ctxFiles);
+    const dirs = new Set(ctxFiles.map((f) => f.slice(0, f.lastIndexOf('/'))).filter((d) => d.length > 0));
+    const copySources: string[] = [];
+    for (const line of dockerfile.split(/\r?\n/)) {
+      const m = /^\s*COPY\s+(.*)$/i.exec(line);
+      if (!m) continue;
+      const parts = (m[1] ?? '').trim().split(/\s+/);
+      // `COPY --from=builder …` kopiert aus einer vorherigen Stage, nicht aus
+      // dem Kontext; alles andere ist Kontext-relativ (letztes Feld = Ziel).
+      if (parts.some((p) => p.startsWith('--from='))) continue;
+      copySources.push(...parts.filter((p) => !p.startsWith('--')).slice(0, -1));
+    }
+    assert(copySources.length > 0, 'das Runner-Dockerfile kopiert ueberhaupt aus dem Kontext');
+    for (const src of copySources) {
+      assert(ctxSet.has(src) || dirs.has(src), `COPY-Quelle "${src}" liegt im gebuendelten Build-Kontext`);
+    }
+    assert(
+      copySources.includes('tsconfig.base.json'),
+      'tsconfig.base.json wird mitkopiert (runner/tsconfig.json extendet darauf)',
+    );
+
+    /* ---- Tap-Push: Server-Pfad und Image-Layout sind dieselbe Wahrheit ---- */
+
+    const { RUNNER_PUSH_SCRIPT, RUNNER_PUSH_SCRIPT_REL, RUNNER_IMAGE_DIR } = await import('./runner.js');
+    assert(
+      ctxSet.has(`runner/${RUNNER_PUSH_SCRIPT_REL}`),
+      `das Push-Skript liegt als runner/${RUNNER_PUSH_SCRIPT_REL} im Kontext (docker.ts startet genau dieses)`,
+    );
+    assert(
+      RUNNER_PUSH_SCRIPT === `${RUNNER_IMAGE_DIR}/${RUNNER_PUSH_SCRIPT_REL}`,
+      'der absolute Pfad im Container leitet sich aus WORKDIR + relativem Pfad ab',
+    );
+    // `npm run build` (tsc, include: ["src"]) emittiert nur TypeScript nach
+    // dist/ - ein Pfad unter dist/ waere im Image also leer.
+    assert(
+      !RUNNER_PUSH_SCRIPT.includes('/dist/'),
+      'der Push-Pfad zeigt nicht nach dist/ (push.js ist fertiges JS und wird nicht kompiliert)',
+    );
+    assert(
+      copySources.includes('runner/scripts'),
+      'runner/Dockerfile kopiert runner/scripts unveraendert ins Image',
+    );
   }
 
   /* ---- Bau ueber die Docker-API: Fehler-Frame und Fortschritt ---- */
@@ -1457,6 +1548,36 @@ async function main(): Promise<void> {
     mode: 'ask',
   });
   assert(badRepoId.type === 'error', 'session.create mit unbekanntem Repo wird abgewiesen');
+
+  /* ---- Unbekannte Wire-Felder werden ignoriert, nicht abgelehnt ---- */
+
+  // Die App schickt `adapter: "pi"` weiterhin mit (Wire-Format unveraendert,
+  // GREENFIELD-PI.md). Der Server kennt das Feld nicht mehr - er darf die
+  // Nachricht deswegen aber nicht abweisen, sonst kann keine App-Version, die
+  // aelter ist als dieser Server, noch eine Session anlegen. Dasselbe gilt fuer
+  // jedes spaetere Feld: unbekannt = ignoriert.
+  const withAdapter = await request(c2, {
+    type: 'session.create',
+    requestId: 'ses-fwd',
+    repoId,
+    provider: 'openai',
+    model: '',
+    mode: 'ask',
+    adapter: 'pi',
+    authFlow: 'irgendwas-aus-v1',
+  });
+  assert(withAdapter.type === 'request.ok', 'session.create mit unbekannten Feldern (adapter) wird angenommen');
+  const fwdId = (withAdapter.payload as { sessionId?: string } | undefined)?.sessionId ?? '';
+  assert(fwdId.length > 0, 'auch diese Session bekommt eine Id');
+  const fwdRow = store.getSession(fwdId);
+  assert(fwdRow?.provider === 'openai' && fwdRow.mode === 'ask', 'die bekannten Felder werden ganz normal uebernommen');
+  assert(
+    !Object.keys(fwdRow as object).includes('adapter'),
+    'das unbekannte Feld landet nirgends in der Session-Zeile',
+  );
+  // Aufraeumen: ohne Docker laeuft diese Session sonst in denselben
+  // Fehlerstatus wie die naechste und stoert deren Erwartungen.
+  await manager.deleteSession(fwdId).catch(() => undefined);
 
   // Docker ist aus: die Session wird angelegt, angekuendigt und scheitert sauber.
   const created = await request(c2, {

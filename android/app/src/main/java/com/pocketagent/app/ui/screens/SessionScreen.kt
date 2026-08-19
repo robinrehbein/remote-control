@@ -135,6 +135,14 @@ import kotlinx.coroutines.launch
 /* ------------------------------------------------------------------ */
 
 /**
+ * Textmarke des Runner-Image-Baus in den Fortschrittsmeldungen des Servers
+ * („Runner-Image wird gebaut …", „Image wird gebaut (Schritt 7/14)" —
+ * server/src/progress.ts: BUILD_MESSAGE). Der Bau hat in v2 keine eigene Phase
+ * mehr, läuft aber weiterhin minutenlang; daran hängt der Geduldshinweis.
+ */
+private const val IMAGE_BUILD_MARKER = "Image wird gebaut"
+
+/**
  * Was gerade beim Start passiert — immer nur der jüngste Stand, nie ein
  * Verlauf. [phase] ist null, solange der Server noch nichts gemeldet hat.
  */
@@ -875,7 +883,12 @@ private fun StartProgressCard(progress: StartProgress) {
                     )
                 }
             }
-            if (progress.phase == StartPhase.IMAGE_BUILD) {
+            // v1 hatte für den Image-Bau eine eigene Phase; v2 meldet ihn als
+            // 'container-start' (der Server baut das eine Runner-Image beim
+            // ersten Session-Start selbst, server/src/docker.ts). Der Hinweis
+            // hing an der alten Phase und war damit unerreichbar geworden —
+            // deshalb hier zusätzlich an der Meldung erkannt.
+            if (progress.phase == StartPhase.IMAGE_BUILD || progress.message.contains(IMAGE_BUILD_MARKER)) {
                 Text(
                     text = "Der erste Start dauert einige Minuten – das Image wird einmalig gebaut.",
                     style = MaterialTheme.typography.bodySmall,

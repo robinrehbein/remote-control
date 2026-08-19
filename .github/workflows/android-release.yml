@@ -95,6 +95,35 @@ jobs:
         with:
           gradle-version: "8.11"
 
+      # Signier-Secrets (SECURITY.md, „Rotate before launch"): Secrets lassen
+      # sich nicht direkt in `if:` prüfen, deshalb werden sie ins Step-Env
+      # gemappt und im Skript auf nichtleer getestet. Sind sie gesetzt, landet
+      # der Keystore in $RUNNER_TEMP und die vier POCKETAGENT_*-Variablen
+      # gelten via $GITHUB_ENV für alle Folge-Steps. Ohne Secrets läuft alles
+      # wie bisher: Gradle fällt auf den committeden Keystore zurück und warnt.
+      - name: Prepare signing from secrets
+        if: steps.resolve.outputs.skip != 'true'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$KEYSTORE_BASE64" ]]; then
+            echo "::warning::KEYSTORE_BASE64 nicht gesetzt – Release wird mit dem UNSICHEREN committeden Keystore signiert (siehe SECURITY.md)."
+            exit 0
+          fi
+          KEYSTORE_FILE="$RUNNER_TEMP/pocketagent-release.keystore"
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$KEYSTORE_FILE"
+          {
+            echo "POCKETAGENT_KEYSTORE_FILE=$KEYSTORE_FILE"
+            echo "POCKETAGENT_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
+            echo "POCKETAGENT_KEY_ALIAS=$KEY_ALIAS"
+            echo "POCKETAGENT_KEY_PASSWORD=$KEY_PASSWORD"
+          } >> "$GITHUB_ENV"
+          echo "::notice::Signierung mit Keystore aus GitHub-Secrets."
+
       - name: Unit tests
         if: steps.resolve.outputs.skip != 'true'
         run: gradle :app:testReleaseUnitTest --stacktrace --no-daemon

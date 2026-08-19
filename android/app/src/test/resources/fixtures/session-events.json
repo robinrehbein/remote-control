@@ -1,0 +1,129 @@
+{
+  "type": "session.events",
+  "requestId": "req-1",
+  "sessionId": "sess-1",
+  "events": [
+    {
+      "type": "status",
+      "adapter": "claude-code",
+      "provider": "anthropic",
+      "model": "claude-sonnet",
+      "mode": "auto",
+      "busy": true,
+      "seq": 1
+    },
+    {
+      "type": "message.completed",
+      "role": "user",
+      "text": "Bitte räum den Markdown-Renderer auf und push das Ergebnis.",
+      "seq": 2
+    },
+    {
+      "type": "message.delta",
+      "role": "assistant",
+      "delta": "Ich habe den Renderer",
+      "seq": 3
+    },
+    {
+      "type": "message.completed",
+      "role": "assistant",
+      "text": "# Aufräumen erledigt\n\nIch habe den Renderer **komplett** überarbeitet und *nebenbei* die `appendMarkup`-Kaskade begradigt.\n\n- **Fett** und *kursiv* mischen sich jetzt korrekt\n- `inline code` bleibt monospaced\n- Verschachteltes ***fett-kursiv*** terminiert\n\n```kotlin\nfun greet() {\n    println(\"Hallo PocketAgent\")\n}\n```\n\nDamit rendert jede Antwort ohne StackOverflow.",
+      "seq": 4
+    },
+    {
+      "type": "tool.call",
+      "id": "call-1",
+      "tool": "bash",
+      "input": { "command": "gradle :app:testDebugUnitTest" },
+      "title": "bash: gradle :app:testDebugUnitTest",
+      "seq": 5
+    },
+    {
+      "type": "tool.result",
+      "id": "call-1",
+      "tool": "bash",
+      "output": "BUILD SUCCESSFUL in 42s",
+      "isError": false,
+      "seq": 6
+    },
+    {
+      "type": "tool.call",
+      "id": "call-2",
+      "tool": "bash",
+      "input": { "command": "cat /etc/shadow" },
+      "seq": 7
+    },
+    {
+      "type": "tool.result",
+      "id": "call-2",
+      "tool": "bash",
+      "output": "cat: /etc/shadow: Keine Berechtigung",
+      "isError": true,
+      "seq": 8
+    },
+    {
+      "type": "permission.request",
+      "permissionId": "perm-1",
+      "kind": "edit",
+      "title": "Markdown.kt ändern",
+      "detail": "android/app/src/main/java/com/pocketagent/app/ui/components/Markdown.kt",
+      "diff": "--- a/Markdown.kt\n+++ b/Markdown.kt\n-    appendRuns(tail)\n+    appendMarkup(tail, lower)",
+      "seq": 9
+    },
+    {
+      "type": "permission.resolved",
+      "permissionId": "perm-1",
+      "decision": "once",
+      "seq": 10
+    },
+    {
+      "type": "permission.request",
+      "permissionId": "perm-2",
+      "kind": "bash",
+      "title": "npm install ausführen",
+      "detail": "npm install --no-fund",
+      "seq": 11
+    },
+    {
+      "type": "notice",
+      "message": "Image wird gebaut…",
+      "phase": "image-build",
+      "detail": "Step 3/12: RUN npm ci",
+      "seq": 12
+    },
+    {
+      "type": "notice",
+      "message": "Agent gewechselt: claude-code",
+      "seq": 13
+    },
+    {
+      "type": "turn.completed",
+      "summary": "Renderer gefixt",
+      "usage": { "input": 1200, "output": 800, "costUsd": 0.05 },
+      "commitSha": "a1b2c3d4e5f67890",
+      "seq": 14
+    },
+    {
+      "type": "pushed",
+      "branch": "pocketagent/markdown-fix",
+      "prUrl": "https://github.com/acme/repo/pull/7",
+      "auto": true,
+      "seq": 15
+    },
+    {
+      "type": "turn.failed",
+      "error": "adapter exited with code 1",
+      "seq": 16
+    },
+    {
+      "type": "error",
+      "message": "Verbindung zum Shim verloren",
+      "fatal": false,
+      "seq": 17
+    },
+    {
+      "type": "ping",
+      "ts": 1700000000000
+    }
+  ]
+}

@@ -2,6 +2,8 @@
 
 package com.pocketagent.app.ui.screens
 
+import android.content.Context
+import android.content.Intent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -28,11 +30,14 @@ import androidx.compose.material.icons.automirrored.outlined.OpenInNew
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.outlined.AccountCircle
+import androidx.compose.material.icons.outlined.BugReport
 import androidx.compose.material.icons.outlined.CheckCircleOutline
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.ErrorOutline
+import androidx.compose.material.icons.outlined.FileDownload
 import androidx.compose.material.icons.outlined.Fingerprint
 import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.Info
@@ -87,17 +92,28 @@ import com.pocketagent.app.data.AdapterDescriptor
 import com.pocketagent.app.data.AppRepository
 import com.pocketagent.app.data.CodexAuthUiState
 import com.pocketagent.app.data.CodexOAuthController
+import com.pocketagent.app.data.CrashLog
+import com.pocketagent.app.data.PairingApi
 import com.pocketagent.app.data.ProviderDescriptor
+import com.pocketagent.app.data.ReleaseInfo
 import com.pocketagent.app.data.SecretInfo
 import com.pocketagent.app.data.SecretValidation
+import com.pocketagent.app.data.UpdateChecker
+import com.pocketagent.app.data.UpdateInstaller
 import com.pocketagent.app.data.WsClient
+import com.pocketagent.app.data.truncateForShare
 import com.pocketagent.app.ui.theme.CardInset
 import com.pocketagent.app.ui.theme.SectionSpacing
 import com.pocketagent.app.ui.theme.TileMinHeight
 import com.pocketagent.app.ui.theme.semantic
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 
 /**
  * Fehlermeldung für den Nutzer: eine deutsche Ansage mit nächstem Schritt.
@@ -308,7 +324,8 @@ private fun recommendedKinds(adapters: List<AdapterDescriptor>, existing: Set<St
 
 @Composable
 fun SettingsScreen(onBack: () -> Unit) {
-    val app = LocalContext.current.applicationContext as PocketAgentApp
+    val context = LocalContext.current
+    val app = context.applicationContext as PocketAgentApp
     val repository = app.container.repository
     val vm: SettingsViewModel = viewModel { SettingsViewModel().also { it.repository = repository } }
     val stats by repository.stats.collectAsState()
@@ -333,6 +350,13 @@ fun SettingsScreen(onBack: () -> Unit) {
     var showAddRepo by rememberSaveable { mutableStateOf(false) }
     var confirmLogout by rememberSaveable { mutableStateOf(false) }
     var serverDetailsOpen by rememberSaveable { mutableStateOf(false) }
+
+    // Letzter Absturzbericht (CrashLog): einmal beim Öffnen von Platte lesen.
+    var lastCrash by remember { mutableStateOf<CrashLog.LastCrash?>(null) }
+    val crashScope = rememberCoroutineScope()
+    LaunchedEffect(Unit) {
+        lastCrash = withContext(Dispatchers.IO) { CrashLog.latest(app) }
+    }
 
     // In-App-Login (CODEX-OAUTH.md): der Controller treibt den Flow, öffnet die
     // Login-URL im Browser (LocalUriHandler) und lauscht auf dem Loopback-Port.
@@ -562,6 +586,45 @@ fun SettingsScreen(onBack: () -> Unit) {
 
             error?.let { SectionError(it) }
 
+            /* ---------- Diagnose ---------- */
+            // Ohne Report keine Section — ein leerer Platzhalter würde nur
+            // eine Frage aufwerfen, die die App nicht beantworten kann.
+            lastCrash?.let { crash ->
+                SectionHeader("Diagnose")
+                GroupCard {
+                    Column(Modifier.padding(vertical = 4.dp)) {
+                        SettingsTile(
+                            icon = Icons.Outlined.BugReport,
+                            title = "Letzter Absturz",
+                            subtitle = "${formatCrashTime(crash.timestampIso)} · ${crash.summary}",
+                        )
+                        ListDivider()
+                        Row(
+                            horizontalArrangement = Arrangement.End,
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 8.dp, vertical = 4.dp),
+                        ) {
+                            TextButton(onClick = {
+                                crashScope.launch {
+                                    withContext(Dispatchers.IO) { CrashLog.discardAll(app) }
+                                    lastCrash = null
+                                }
+                            }) { Text("Verwerfen", color = MaterialTheme.colorScheme.error) }
+                            Spacer(modifier = Modifier.width(4.dp))
+                            TextButton(onClick = { shareCrashReport(context, crash.report) }) {
+                                Text("Teilen")
+                            }
+                        }
+                    }
+                }
+                SectionNote("Der Bericht enthält Stacktrace, App-Version und Gerätemodell — keine Chat-Inhalte oder Zugänge.")
+            }
+
+            /* ---------- App-Update ---------- */
+            AppUpdateSection()
+
             /* ---------- Gerät ---------- */
             SectionHeader("Gerät")
             GroupCard {
@@ -743,6 +806,155 @@ private fun CodexAuthDialog(
 }
 
 /* ------------------------------------------------------------------ */
+/* App-Update (GitHub-Releases)                                        */
+/* ------------------------------------------------------------------ */
+
+private sealed interface UpdateUiState {
+    data object Idle : UpdateUiState
+    data object Checking : UpdateUiState
+    data object UpToDate : UpdateUiState
+    data class Available(val release: ReleaseInfo) : UpdateUiState
+    data class Downloading(val release: ReleaseInfo) : UpdateUiState
+    data class Failed(val message: String) : UpdateUiState
+}
+
+/**
+ * Update-Check und -Installation über die öffentlichen GitHub-Releases.
+ * Läuft ausschließlich auf Nutzeraktion — bewusst kein Auto-Check im
+ * Hintergrund, die App soll ohne Anlass nicht zu GitHub funken.
+ */
+@Composable
+private fun AppUpdateSection() {
+    val context = LocalContext.current
+    // Version über den PackageManager, nicht BuildConfig — das
+    // buildConfig-Feature ist nicht in jeder Build-Variante garantiert.
+    val installedVersion = remember {
+        runCatching {
+            context.packageManager.getPackageInfo(context.packageName, 0).versionName
+        }.getOrNull() ?: "unbekannt"
+    }
+    val scope = rememberCoroutineScope()
+    val checker = remember { UpdateChecker(PairingApi.httpClient()) }
+    val installer = remember {
+        UpdateInstaller(context.applicationContext, UpdateInstaller.downloadClient())
+    }
+    var state by remember { mutableStateOf<UpdateUiState>(UpdateUiState.Idle) }
+
+    fun startCheck() {
+        state = UpdateUiState.Checking
+        scope.launch {
+            checker.fetchLatest().fold(
+                onSuccess = { release ->
+                    state = when {
+                        release == null -> UpdateUiState.Failed("Das aktuelle Release enthält kein APK.")
+                        UpdateChecker.isNewer(release.tag, installedVersion) -> UpdateUiState.Available(release)
+                        else -> UpdateUiState.UpToDate
+                    }
+                },
+                onFailure = { state = UpdateUiState.Failed(userMessage("Update-Prüfung fehlgeschlagen. Prüf die Internetverbindung.", it)) },
+            )
+        }
+    }
+
+    fun startDownload(release: ReleaseInfo) {
+        state = UpdateUiState.Downloading(release)
+        scope.launch {
+            installer.download(release).fold(
+                onSuccess = { file ->
+                    // Zurück auf „verfügbar": bricht der Nutzer den
+                    // System-Installer ab, lässt sich der Versuch direkt
+                    // wiederholen.
+                    state = UpdateUiState.Available(release)
+                    runCatching { installer.install(file) }.onFailure {
+                        state = UpdateUiState.Failed(userMessage("Installation konnte nicht gestartet werden.", it))
+                    }
+                },
+                onFailure = { state = UpdateUiState.Failed(userMessage("Download fehlgeschlagen.", it)) },
+            )
+        }
+    }
+
+    SectionHeader("App-Update")
+    GroupCard {
+        Column(Modifier.padding(vertical = 4.dp)) {
+            SettingsRow(label = "Installierte Version", value = installedVersion)
+            ListDivider(CardInset)
+            when (val s = state) {
+                UpdateUiState.Checking -> UpdateBusyRow("Suche nach Update …")
+
+                is UpdateUiState.Downloading -> UpdateBusyRow("${s.release.tag} wird heruntergeladen …")
+
+                is UpdateUiState.Available -> {
+                    Column(Modifier.padding(horizontal = CardInset, vertical = 10.dp)) {
+                        Text(
+                            "${s.release.tag} verfügbar",
+                            style = MaterialTheme.typography.bodyLarge,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        if (s.release.notes.isNotBlank()) {
+                            Text(
+                                s.release.notes,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 4,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                    ListDivider(CardInset)
+                    AddRow(
+                        label = "Herunterladen & installieren",
+                        onClick = { startDownload(s.release) },
+                        icon = Icons.Outlined.FileDownload,
+                    )
+                }
+
+                else -> {
+                    if (s is UpdateUiState.UpToDate) {
+                        EmptyRow("Die App ist aktuell.")
+                        ListDivider(CardInset)
+                    }
+                    if (s is UpdateUiState.Failed) {
+                        Text(
+                            s.message,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.padding(horizontal = CardInset, vertical = 10.dp),
+                        )
+                        ListDivider(CardInset)
+                    }
+                    AddRow(
+                        label = "Nach Update suchen",
+                        onClick = { startCheck() },
+                        icon = Icons.Filled.Refresh,
+                    )
+                }
+            }
+        }
+    }
+    SectionNote("Prüft nur auf Antippen die GitHub-Releases des Projekts — kein automatischer Check im Hintergrund.")
+}
+
+@Composable
+private fun UpdateBusyRow(text: String) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = TileMinHeight)
+            .padding(horizontal = CardInset),
+    ) {
+        CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.size(18.dp))
+        Spacer(modifier = Modifier.width(12.dp))
+        Text(
+            text,
+            style = MaterialTheme.typography.bodyLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Building blocks                                                     */
 /* ------------------------------------------------------------------ */
 
@@ -836,7 +1048,7 @@ private fun EmptyRow(text: String) {
 }
 
 @Composable
-private fun AddRow(label: String, onClick: () -> Unit) {
+private fun AddRow(label: String, onClick: () -> Unit, icon: ImageVector = Icons.Filled.Add) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier
@@ -846,7 +1058,7 @@ private fun AddRow(label: String, onClick: () -> Unit) {
             .padding(horizontal = CardInset),
     ) {
         Icon(
-            Icons.Filled.Add,
+            icon,
             contentDescription = null,
             tint = MaterialTheme.colorScheme.primary,
             modifier = Modifier.size(20.dp),
@@ -921,6 +1133,28 @@ private fun formatUptime(sec: Long): String {
     val h = sec / 3600
     val m = (sec % 3600) / 60
     return if (h > 0) "$h h $m min" else "$m min"
+}
+
+/** Absoluter Zeitpunkt in Lokalzeit — bei einem Absturzbericht zählt das Datum, nicht „vor 3 h". */
+private fun formatCrashTime(iso: String?): String {
+    if (iso == null) return "Zeitpunkt unbekannt"
+    return try {
+        DateTimeFormatter.ofPattern("dd.MM.yyyy, HH:mm")
+            .withZone(ZoneId.systemDefault())
+            .format(Instant.parse(iso))
+    } catch (_: Exception) {
+        iso
+    }
+}
+
+/** Kompletter Report als text/plain (auf ~100 KB gekürzt) über den System-Share-Sheet. */
+private fun shareCrashReport(context: Context, report: String) {
+    val intent = Intent(Intent.ACTION_SEND).apply {
+        type = "text/plain"
+        putExtra(Intent.EXTRA_SUBJECT, "PocketAgent Absturzbericht")
+        putExtra(Intent.EXTRA_TEXT, truncateForShare(report))
+    }
+    runCatching { context.startActivity(Intent.createChooser(intent, "Absturzbericht teilen")) }
 }
 
 /* ------------------------------------------------------------------ */

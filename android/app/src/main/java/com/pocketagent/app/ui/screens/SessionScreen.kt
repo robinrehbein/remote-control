@@ -1551,8 +1551,14 @@ private fun ModelSheet(
 /* Timeline item views                                                 */
 /* ------------------------------------------------------------------ */
 
+// internal statt private: der Render-Test (TimelineRenderTest) baut über
+// genau diesen Einstiegspunkt jede Timeline-Karte wirklich auf — die
+// Endlos-Rekursion im Markdown-Renderer überlebte jahrelang, weil kein
+// Test je die Compose-UI gerendert hat. Die einzelnen Karten bleiben
+// private; [vm] wird nur in Klick-Handlern angefasst, ein unge-bundenes
+// SessionViewModel() reicht dem Test darum aus.
 @Composable
-private fun TimelineItemView(item: TimelineItem, vm: SessionViewModel) {
+internal fun TimelineItemView(item: TimelineItem, vm: SessionViewModel) {
     when (item) {
         is TimelineItem.Chat -> ChatBubble(item)
         is TimelineItem.Tool -> ToolCard(item)

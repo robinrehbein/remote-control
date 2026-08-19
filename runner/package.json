@@ -1,0 +1,29 @@
+{
+  "name": "@pocketagent/runner",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "PocketAgent v2 pi-runner: embeds the pi coding agent SDK (badlogic) behind the REST/SSE contract; runs in every session container and, in-process, inside the link agent",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p . --noEmit",
+    "smoke": "tsx smoke/smoke.ts",
+    "smoke:real": "tsx smoke/real.ts"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.2",
+    "@pocketagent/protocol": "file:../packages/protocol",
+    "fastify": "^5.2.1",
+    "undici": "^8.9.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

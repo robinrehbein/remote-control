@@ -1,22 +1,21 @@
-import { PassThrough, type Writable } from 'node:stream';
 import Docker from 'dockerode';
+import { cpSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import tar from 'tar-fs';
 import type { NetworkPolicy, NoticePhase } from '@pocketagent/protocol';
-import { CodexJsonRpc } from './codex-jsonrpc.js';
-import type { CodexAppServerSession, CodexAuthTransport } from './codex-auth.js';
+import { config, isNetworkPolicy } from './config.js';
+import { normalizePeerIp } from './egress-proxy.js';
 import {
-  GATEWAY_ALIAS,
-  GATEWAY_AUTH_HEADER,
-  GATEWAY_CONTAINER_NAME,
-  GATEWAY_EGRESS_PORT,
-  GATEWAY_EGRESS_SYNC_PATH,
-  GATEWAY_INGRESS_PORT,
-  config,
-  isNetworkPolicy,
-} from './config.js';
-import { adapterImage, getAdapter } from './adapters.js';
-import { normalizePeerIp, type EgressSessionEntry } from './egress-proxy.js';
-import { buildShimImage, shimContextFiles } from './image-build.js';
-import { LOG_TAIL_LINES, redactTokens, stripLogFraming } from './progress.js';
+  BUILD_NOTICE_INTERVAL_MS,
+  LOG_TAIL_LINES,
+  buildProgressMessage,
+  createThrottle,
+  detailFrom,
+  redactTokens,
+  stripLogFraming,
+} from './progress.js';
+import { RUNNER_PORT, RUNNER_PUSH_SCRIPT, RUNNER_WORK_DIR, runnerContextFiles, runnerContextRoot, runnerImageName } from './runner.js';
 import type { SessionRow } from './db.js';
 
 /** Optional payload of a progress notice (phases are the protocol contract). */
@@ -36,6 +35,7 @@ export function resetDockerClient(): void {
   client = null;
   peerIps = new Map();
   peerIpsAt = 0;
+  runnerImageReady = null;
 }
 
 function docker(): Docker | null {
@@ -71,7 +71,7 @@ function docker(): Docker | null {
  *
  * The TTL keeps the proxy off the daemon on the hot path (one list call per
  * window, not per request) and still picks up a new container within seconds;
- * every start additionally primes it (startContainer), so a shim's very first
+ * every start additionally primes it (startContainer), so a runner's very first
  * request is already covered. A daemon error yields an empty map - never a
  * throw and never a stale allow.
  */
@@ -100,9 +100,6 @@ async function loadSessionPeers(): Promise<Map<string, string>> {
   }
   peerIps = next;
   peerIpsAt = Date.now();
-  // The gateway's proxy answers from the pushed table only, so every change to
-  // the addresses has to reach it right away.
-  await publishEgressTable();
   return next;
 }
 
@@ -117,17 +114,6 @@ export async function refreshSessionPeers(): Promise<Map<string, string>> {
 }
 
 /**
- * Prime the cache right after a container start. Skipped for a remote daemon
- * without a gateway: those sessions are reached through published ports and
- * have no proxy at all. With a gateway the addresses are needed - not for the
- * local proxy, but for the table the gateway gates its own proxy with.
- */
-async function primeSessionPeers(): Promise<void> {
-  if (isRemote() && !gatewayEnabled()) return;
-  await refreshSessionPeers();
-}
-
-/**
  * Synchronous gate for the egress proxy: which session does `ip` belong to?
  * Answers from the cache and refreshes it in the background when stale - the
  * proxy must never block a request on a daemon round trip.
@@ -135,90 +121,6 @@ async function primeSessionPeers(): Promise<void> {
 export function sessionIdForPeerIp(ip: string): string | null {
   if (Date.now() - peerIpsAt >= PEER_CACHE_TTL_MS) void refreshSessionPeers();
   return peerIps.get(normalizePeerIp(ip)) ?? null;
-}
-
-/** Container addresses of one session (for the gateway's session table). */
-function peerIpsOf(sessionId: string): string[] {
-  const ips: string[] = [];
-  for (const [ip, id] of peerIps) if (id === sessionId) ips.push(ip);
-  return ips;
-}
-
-/** Live sessions the orchestrator publishes to the gateway (set by index.ts). */
-export type EgressSessionProvider = () => { id: string; policy: NetworkPolicy; token: string | null }[];
-
-let egressSessions: EgressSessionProvider | null = null;
-let lastPublishFailed = false;
-
-export function setEgressSessionProvider(provider: EgressSessionProvider | null): void {
-  egressSessions = provider;
-}
-
-/**
- * Push the live session table to the gateway's egress proxy. Without it the
- * gateway would have to let every container through unauthenticated (it has no
- * database and no docker access of its own). No-op in every local mode, where
- * the in-process proxy reads the same data directly.
- *
- * Failures are logged once per state change and never thrown: a gateway that is
- * momentarily unreachable must not fail a session start, and the next refresh
- * (or the periodic sync) carries the table again.
- */
-export async function publishEgressTable(): Promise<boolean> {
-  if (!gatewayEnabled() || egressSessions === null || !config.dockerAddr) return false;
-  const entries: EgressSessionEntry[] = egressSessions().map((s) => ({
-    id: s.id,
-    policy: s.policy,
-    token: s.token,
-    ips: peerIpsOf(s.id),
-  }));
-  const url = `http://${config.dockerAddr}:${config.gatewayPort}${GATEWAY_EGRESS_SYNC_PATH}`;
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { ...gatewayHeaders(), 'content-type': 'application/json' },
-      body: JSON.stringify({ sessions: entries }),
-      signal: AbortSignal.timeout(5_000),
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    if (lastPublishFailed) console.log('[docker] egress session table reached the gateway again');
-    lastPublishFailed = false;
-    return true;
-  } catch (e) {
-    if (!lastPublishFailed) {
-      console.warn(`[docker] pushing the egress session table to the gateway failed: ${String(e)}`);
-    }
-    lastPublishFailed = true;
-    return false;
-  }
-}
-
-/**
- * Periodic gateway sync (see SessionManager.start): refreshes the container
- * addresses and republishes the table, so a gateway that restarted - it keeps
- * the table in memory only - gets it back without a session having to change.
- */
-export async function syncGatewayEgress(): Promise<void> {
-  if (!gatewayEnabled()) return;
-  await refreshSessionPeers();
-}
-
-/**
- * true when session containers run on a *remote* daemon; shim ports are then
- * published on the docker host (or routed through the gateway container).
- * A DOCKER_HOST pointing at a docker socket proxy is still the local daemon,
- * so DOCKER_HOST_IS_LOCAL=1 keeps the full local behaviour (session networks,
- * egress proxy, no port publishes). A unix:// DOCKER_HOST is also local.
- */
-export function isRemote(): boolean {
-  if (!config.dockerHost) return false;
-  if (config.dockerHostIsLocal) return false;
-  try {
-    const proto = new URL(config.dockerHost).protocol.replace(/:$/, '');
-    return proto !== 'unix';
-  } catch {
-    return true; // unparseable, non-unix host string: assume remote daemon
-  }
 }
 
 export function parseMem(spec: string): number {
@@ -239,391 +141,138 @@ function envArr(env: Record<string, string | undefined>): string[] {
 /** Network alias the orchestrator container gets inside every session network. */
 const ORCHESTRATOR_ALIAS = 'orchestrator';
 
-/**
- * true when session networking is routed through the gateway container on the
- * runner (remote daemon + configured shared secret). Then remote mode keeps
- * per-session internal networks and the egress allowlist instead of falling
- * back to 'open' + published shim ports.
- */
-export function gatewayEnabled(): boolean {
-  return isRemote() && config.gatewayToken !== null;
-}
+/* ------------------------------------------------------------------ */
+/* Runner-Image                                                        */
+/* ------------------------------------------------------------------ */
 
-/** Auth headers the orchestrator must add when talking through the gateway. */
-export function gatewayHeaders(): Record<string, string> {
-  return gatewayEnabled() ? { [GATEWAY_AUTH_HEADER]: config.gatewayToken as string } : {};
-}
-
-let gatewayReady: Promise<string | null> | null = null;
+let runnerImageReady: Promise<string> | null = null;
 
 /**
- * Create/start the managed gateway container on the runner (idempotent, the
- * result is cached for the process lifetime). It runs the orchestrator image
- * with `npx tsx src/gateway.ts`, publishes only its ingress port and stays on
- * the default bridge network so it - and only it - has internet.
- */
-export async function ensureGatewayContainer(): Promise<string | null> {
-  if (!gatewayEnabled()) return null;
-  if (!gatewayReady) {
-    gatewayReady = createGateway().catch((e: unknown) => {
-      const msg = e instanceof Error ? e.message : String(e);
-      console.error(`[docker] gateway container failed: ${msg}`);
-      // drop the failed attempt so the next session retries instead of being
-      // served a permanently broken cache entry
-      gatewayReady = null;
-      throw new Error(`gateway container unavailable: ${msg}`);
-    });
-  }
-  return gatewayReady;
-}
-
-async function createGateway(): Promise<string | null> {
-  const d = docker();
-  if (!d) return null;
-  const existing = d.getContainer(GATEWAY_CONTAINER_NAME);
-  let info: Awaited<ReturnType<typeof existing.inspect>> | null = null;
-  try {
-    info = await existing.inspect();
-  } catch {
-    /* not created yet */
-  }
-  if (info !== null) {
-    // A failing start (host port taken, bad image, ...) must not be reported as
-    // success: the caller would otherwise time out later in waitForShim with a
-    // misleading message. "already started" is a benign race and stays success.
-    if (!info.State?.Running) {
-      try {
-        await existing.start();
-      } catch (e) {
-        const msg = String(e);
-        if (!msg.includes('already started')) {
-          throw new Error(`could not start existing gateway container ${GATEWAY_CONTAINER_NAME}: ${msg}`);
-        }
-      }
-    }
-    return info.Id;
-  }
-  await pullImage(config.gatewayImage);
-  const c = await d.createContainer({
-    name: GATEWAY_CONTAINER_NAME,
-    Image: config.gatewayImage,
-    Cmd: ['npx', 'tsx', 'src/gateway.ts'],
-    Env: envArr({
-      GATEWAY_TOKEN: config.gatewayToken ?? undefined,
-      GATEWAY_ALLOWLIST: config.networkAllowlist.join(','),
-      GATEWAY_INGRESS_PORT: String(GATEWAY_INGRESS_PORT),
-      GATEWAY_EGRESS_PORT: String(GATEWAY_EGRESS_PORT),
-    }),
-    Labels: { 'pocketagent.role': 'gateway' },
-    ExposedPorts: { [`${GATEWAY_INGRESS_PORT}/tcp`]: {} },
-    HostConfig: {
-      RestartPolicy: { Name: 'unless-stopped' },
-      CapDrop: ['ALL'],
-      SecurityOpt: ['no-new-privileges'],
-      PortBindings: {
-        [`${GATEWAY_INGRESS_PORT}/tcp`]: [{ HostPort: String(config.gatewayPort) }],
-      },
-    },
-  });
-  await c.start();
-  console.log(`[docker] gateway container up (host port ${config.gatewayPort})`);
-  return c.id;
-}
-
-/** Connect the gateway container to a network; returns the error message, or undefined when attached (or already attached). */
-async function connectGateway(d: Docker, networkName: string, id: string): Promise<string | undefined> {
-  try {
-    await d.getNetwork(networkName).connect({
-      Container: id,
-      EndpointConfig: { Aliases: [GATEWAY_ALIAS] },
-    });
-    return undefined;
-  } catch (e) {
-    const msg = String(e);
-    return msg.includes('already') ? undefined : msg;
-  }
-}
-
-/** Attach the gateway to a session network so shims can reach it as 'gateway'. */
-async function attachGateway(networkName: string): Promise<void> {
-  const d = docker();
-  const id = await ensureGatewayContainer();
-  if (!d || !id) return;
-  const failure = await connectGateway(d, networkName, id);
-  if (failure === undefined) return;
-  if (!failure.includes('No such container') && !failure.includes('404')) {
-    console.warn(`[docker] gateway attach to ${networkName} failed: ${failure}`);
-    return;
-  }
-  // The gateway was removed behind our back. Dropping the cache alone would
-  // leave *this* session without any relay, so recreate it and retry once;
-  // if that fails too the error propagates and the session fails cleanly.
-  gatewayReady = null;
-  console.warn(`[docker] gateway container gone (${failure}) - recreating it for ${networkName}`);
-  const recreated = await ensureGatewayContainer();
-  if (!recreated) throw new Error(`gateway container could not be recreated for ${networkName}`);
-  const retryFailure = await connectGateway(d, networkName, recreated);
-  if (retryFailure !== undefined) {
-    throw new Error(`gateway attach to ${networkName} failed after recreating the gateway: ${retryFailure}`);
-  }
-}
-
-/** Create a network unless the daemon already knows it (idempotent). */
-async function ensureNetworkExists(name: string, internal: boolean): Promise<void> {
-  const d = docker();
-  if (!d) return;
-  try {
-    await d.getNetwork(name).inspect();
-  } catch {
-    try {
-      await d.createNetwork({ Name: name, CheckDuplicate: true, ...(internal ? { Internal: true } : {}) });
-    } catch {
-      /* already created concurrently */
-    }
-  }
-}
-
-export async function ensureNetwork(): Promise<void> {
-  await ensureNetworkExists(config.networkName, false);
-  await ensureSelfAttached(config.networkName);
-}
-
-/**
- * Attach the orchestrator's own container (local mode only; HOSTNAME is the
- * container id inside docker) to a network so it can reach session shims by
- * alias and shims can reach the egress proxy. Idempotent, errors are logged
- * but never thrown (e.g. running outside docker).
+ * Das Runner-Image auf dem Daemon verfügbar machen - minimal und ohne jede
+ * Hash-Rechnung (das Content-Hash-System aus v1 ist entfallen).
  *
- * Works for both local variants: raw socket mount and socket proxy, since the
- * proxy talks to the very same daemon, so HOSTNAME still resolves to a
- * container the daemon knows. Skipped only for a truly remote daemon, where
- * HOSTNAME means nothing.
+ * Reihenfolge:
+ *  1. schon lokal vorhanden -> fertig,
+ *  2. `RUNNER_IMAGE` gesetzt -> ausschließlich pullen. Dann besitzt der
+ *     Betreiber das Artefakt; ein lokal gebautes dürfte es nicht verdecken,
+ *     also ist ein fehlgeschlagener Pull hier ein Fehler,
+ *  3. sonst aus dem im Server-Image mitgelieferten Kontext bauen
+ *     (`runner/Dockerfile`, siehe runner.ts). Das ist der Normalfall: Coolify
+ *     baut nur `server/Dockerfile`, das Runner-Image entsteht deshalb beim
+ *     ersten Session-Start auf dem Host.
+ *
+ * Das Ergebnis wird für die Prozesslaufzeit gecacht (parallele Session-Starts
+ * teilen einen Bau); ein Fehlschlag wird verworfen, damit der nächste Start es
+ * erneut versucht.
  */
-export async function ensureSelfAttached(networkName: string): Promise<string | null> {
-  const d = docker();
-  if (!d || isRemote()) return null;
-  const selfId = process.env.HOSTNAME;
-  // Without HOSTNAME there is no way to name our own container to the daemon.
-  // Silently skipping used to leave the session reachable by nobody, surfacing
-  // minutes later as a bare "shim did not become ready in time".
-  if (!selfId) {
-    return 'HOSTNAME ist im Orchestrator-Container nicht gesetzt – der Orchestrator kann sich nicht selbst ans Session-Netz hängen.';
-  }
-  try {
-    await d.getNetwork(networkName).connect({
-      Container: selfId,
-      EndpointConfig: { Aliases: [ORCHESTRATOR_ALIAS] },
+export async function ensureRunnerImage(onNotice?: NoticeFn): Promise<string> {
+  if (!runnerImageReady) {
+    runnerImageReady = provideRunnerImage(onNotice).catch((e: unknown) => {
+      runnerImageReady = null;
+      throw e;
     });
-    return null;
-  } catch (e) {
-    const msg = String(e);
-    if (msg.includes('already')) return null;
-    console.warn(`[docker] self-attach to ${networkName} failed: ${msg}`);
-    // An unreachable daemon is not an attach problem: every later call fails
-    // the same way and says so more precisely, so only a daemon that answered
-    // (e.g. "no such container" for a HOSTNAME that is not ours) blocks here.
-    if (/ECONNREFUSED|ENOENT|EAI_AGAIN|ETIMEDOUT|ECONNRESET|socket hang up/.test(msg)) return null;
-    return `Orchestrator (HOSTNAME=${selfId}) konnte nicht ans Netz ${networkName} angebunden werden: ${msg}`;
   }
+  return runnerImageReady;
 }
 
-/**
- * Local mode reaches the shim only through the session's docker network, and an
- * 'allowlist' session reaches the egress proxy only the same way. A failed
- * attach therefore has to fail the session immediately with its real cause
- * instead of running into the shim-readiness timeout.
- */
-async function requireAttached(session: SessionRow): Promise<void> {
-  const failure = await attachOrchestratorTo(session);
-  if (failure === null) return;
-  const hint =
-    sessionNetworkFor(session).relay === 'gateway'
-      ? 'Prüfe den Gateway-Container auf dem Docker-Host.'
-      : 'Prüfe, ob der Orchestrator selbst als Docker-Container mit gesetztem HOSTNAME läuft.';
-  throw new Error(`${failure} Ohne diese Anbindung ist der Agent-Container nicht erreichbar. ${hint}`);
-}
-
-export function sessionNetworkName(sessionId: string): string {
-  return `pocketagent-s-${sessionId.slice(0, 12)}`;
-}
-
-/** Delete a session's internal network together with any containers left on it. */
-export async function removeSessionNetwork(sessionId: string): Promise<void> {
+async function provideRunnerImage(onNotice?: NoticeFn): Promise<string> {
+  const image = runnerImageName();
   const d = docker();
-  if (!d) return;
-  const net = d.getNetwork(sessionNetworkName(sessionId));
-  try {
-    const info = await net.inspect();
-    const selfId = process.env.HOSTNAME;
-    const members = (info.Containers ?? {}) as Record<string, { Name?: string } | undefined>;
-    for (const [cid, meta] of Object.entries(members)) {
-      const isSelf = selfId !== undefined && selfId.length > 0 && cid.startsWith(selfId);
-      const isGateway = (meta?.Name ?? '') === GATEWAY_CONTAINER_NAME;
-      if (isSelf || isGateway) {
-        await net.disconnect({ Container: cid }).catch(() => {});
-      } else {
-        await d.getContainer(cid).remove({ force: true }).catch(() => {});
-      }
-    }
-    await net.remove().catch(() => {});
-  } catch {
-    /* network gone */
+  if (!d) return image; // Docker aus: der Aufrufer scheitert ohnehin mit klarer Meldung
+  if (await imageExists(d, image)) return image;
+  await pullImage(image);
+  if (await imageExists(d, image)) return image;
+  if (config.runnerImage !== null) {
+    throw new Error(
+      `Runner-Image ${image} ist über RUNNER_IMAGE fest vorgegeben, liegt aber weder lokal vor noch konnte es ` +
+        `aus der Registry geladen werden. Image bereitstellen oder RUNNER_IMAGE entfernen, damit der Server es selbst baut.`,
+    );
   }
-}
-
-/**
- * Validate the session row's network policy (fallback: config default).
- * Remote-mode gating lives in createSession: without a gateway container
- * (GATEWAY_TOKEN) remote sessions with 'allowlist'/'isolated' are rejected
- * and 'open' requires explicit REMOTE_NETWORK_OPEN=1 consent - never silently
- * downgraded.
- */
-function policyFor(session: SessionRow): NetworkPolicy {
-  const raw = session.network_policy;
-  return isNetworkPolicy(raw) ? raw : config.networkPolicyDefault;
-}
-
-/** Who relays orchestrator traffic into a session's network. */
-export type SessionRelay =
-  /** local daemon: the orchestrator container itself (alias 'orchestrator') */
-  | 'orchestrator'
-  /** remote daemon + GATEWAY_TOKEN: the gateway container (alias 'gateway') */
-  | 'gateway'
-  /** remote daemon without gateway: the shim is reached via a published port */
-  | 'none';
-
-export interface SessionNetwork {
-  /** docker network the session container lives on */
-  name: string;
-  relay: SessionRelay;
-}
-
-/**
- * Network a session's container lives on and who has to be attached to it so
- * the orchestrator can reach the shim: 'open' shares the main network,
- * 'allowlist'/'isolated' get a dedicated internal one. Pure by contract - the
- * single source of truth for both session creation and the startup reconcile.
- */
-export function sessionNetworkFor(session: SessionRow): SessionNetwork {
-  const name = policyFor(session) === 'open' ? config.networkName : sessionNetworkName(session.id);
-  const relay: SessionRelay = gatewayEnabled() ? 'gateway' : isRemote() ? 'none' : 'orchestrator';
-  return { name, relay };
-}
-
-/**
- * (Re)establish the link between the orchestrator and a session's network,
- * creating the network when it is missing. Idempotent; returns null when the
- * link stands, otherwise its German cause. Needed on every path that has to
- * talk to a shim - including a freshly deployed orchestrator container, which
- * starts out attached to no session network at all.
- */
-export async function attachOrchestratorTo(session: SessionRow): Promise<string | null> {
-  const { name, relay } = sessionNetworkFor(session);
-  if (relay === 'none') return null; // published shim port, no shared network
-  await ensureNetworkExists(name, name !== config.networkName);
-  if (relay === 'orchestrator') return ensureSelfAttached(name);
+  if (runnerContextFiles() === null) {
+    throw new Error(
+      `Runner-Image ${image} fehlt und kann nicht gebaut werden: im Server-Image liegt kein Build-Kontext ` +
+        `(erwartet runner/Dockerfile neben packages/protocol und tsconfig.base.json).`,
+    );
+  }
   try {
-    await attachGateway(name);
-    return null;
+    await buildRunnerImage(d, image, onNotice);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    return `Gateway-Container konnte nicht ans Netz ${name} angebunden werden: ${msg}`;
+    throw new Error(`Runner-Image ${image} fehlt und konnte nicht gebaut werden: ${msg}`);
   }
+  return image;
+}
+
+/** Cause plus the last build-log lines, trimmed for an error message (never full logs). */
+function withTail(cause: string, lines: string[], n = 8): string {
+  const last = lines.slice(-n).join(' | ');
+  return last.length > 0 ? `${cause} (${last})` : cause;
 }
 
 /**
- * Container networking for a session (see sessionNetworkFor). For 'allowlist'
- * the proxy env vars are injected into `env`.
+ * Das Runner-Image über die Docker-API bauen. Der Kontext wird in ein
+ * Wegwerf-Verzeichnis gestaged (dieselbe relative Struktur, die
+ * `runner/Dockerfile` erwartet) und als tar an den Daemon gestreamt.
+ *
+ * Exportiert, damit der Smoke den Bau gegen einen gefälschten Daemon prüfen
+ * kann - regulär ruft ihn nur `provideRunnerImage`.
  */
-async function sessionNetworking(
-  session: SessionRow,
-  env: Record<string, string | undefined>,
-): Promise<{ EndpointsConfig: Record<string, { Aliases: string[] }> }> {
-  const policy = policyFor(session);
-  const { name: netName, relay } = sessionNetworkFor(session);
-  await requireAttached(session);
-  const viaGateway = relay === 'gateway';
-  // 'isolated' keeps both defaults - and gets no usable proxy either: the relay
-  // hangs on its network too, but both proxies refuse every request of a
-  // session whose policy says 'isolated' (egress-proxy.ts, denyReason 'policy').
-  let egress = 'none';
-  let auth = 'n/a';
-  if (policy === 'allowlist') {
-    // Proxy auth: egress proxies accept requests carrying a valid per-session
-    // shim token (Basic "pa:<token>"); instances without a validator ignore it.
-    // Every caller of this function must therefore hand in a row that already
-    // has its shim_token (provision stages it, reprovisionAdapter/resumeSession/
-    // push refuse an unprovisioned session) - a URL without credentials leaves
-    // the session dependent on the peer-IP gate alone, hence the auth= in the
-    // log line below.
-    const userinfo = session.shim_token ? `pa:${session.shim_token}@` : '';
-    const proxyHost = viaGateway
-      ? `${GATEWAY_ALIAS}:${GATEWAY_EGRESS_PORT}`
-      : `${ORCHESTRATOR_ALIAS}:${config.egressProxyPort}`;
-    env.HTTP_PROXY = `http://${userinfo}${proxyHost}`;
-    env.HTTPS_PROXY = `http://${userinfo}${proxyHost}`;
-    env.NO_PROXY = 'localhost,127.0.0.1';
-    // Node honours none of the three variables above on its own, so the shims
-    // pin undici's global dispatcher themselves (shims/*/src/proxy.ts). This
-    // flag is the second half of the belt: it is the only thing that also
-    // routes node's *other* client - http/https.request - and it reaches every
-    // node child process the shim spawns (the agent CLIs inherit the env),
-    // where an in-process dispatcher cannot help. Node builds that do not know
-    // the variable ignore it.
-    env.NODE_USE_ENV_PROXY = '1';
-    egress = proxyHost;
-    auth = userinfo ? 'yes' : 'no';
-  }
-  // The one line that tells a broken session's egress setup apart from a broken
-  // network at a glance (no secrets: host and presence of credentials only).
-  console.log(
-    `[docker] session ${session.id.slice(0, 8)} policy=${policy} net=${netName} egress=${egress} auth=${auth}`,
-  );
-  return { EndpointsConfig: { [netName]: { Aliases: [session.id] } } };
-}
-
-/**
- * In-container mount point of the codex CODEX_HOME volume. Matches the codex
- * shim image's `ENV CODEX_HOME=/codex-home` (shims/codex/Dockerfile) so the
- * runtime finds auth.json + thread state exactly where it expects them.
- */
-export const CODEX_HOME_MOUNT = '/codex-home';
-
-/**
- * The ONE canonical CODEX_HOME docker volume per tenant (CODEX-OAUTH.md §4).
- * codex's refresh token rotates and is single-use, so auth.json must never be
- * copied into N containers (copies invalidate each other on the first refresh).
- * Instead every codex session container — and the short-lived auth container —
- * mounts this same volume read-write, updating the file in place.
- */
-export function codexHomeVolumeName(tenant: string): string {
-  return `pocketagent-codex-home-${tenant}`;
-}
-
-/**
- * Extra bind mounts a session container needs beyond the work volume. codex
- * gets the shared CODEX_HOME volume (see codexHomeVolumeName); every other
- * adapter gets none. The volume is created on demand so a first codex session
- * without a prior login still starts (empty CODEX_HOME = "not signed in yet").
- */
-async function extraBindsFor(session: SessionRow): Promise<string[]> {
-  if (session.adapter !== 'codex') return [];
-  const vol = codexHomeVolumeName(session.tenant_id);
-  await ensureVolume(vol);
-  return [`${vol}:${CODEX_HOME_MOUNT}`];
-}
-
-export async function ensureVolume(name: string): Promise<void> {
-  const d = docker();
-  if (!d) return;
+export async function buildRunnerImage(d: Docker, image: string, onNotice?: NoticeFn): Promise<void> {
+  const root = runnerContextRoot();
+  const files = runnerContextFiles();
+  if (root === null || files === null) throw new Error('kein Build-Kontext im Server-Image');
+  onNotice?.('Runner-Image wird gebaut – erster Start auf diesem Host, das dauert einige Minuten …', {
+    phase: 'container-start',
+  });
+  console.log(`[runner-image] building ${image} from ${files.length} context files`);
+  const started = Date.now();
+  const ctx = mkdtempSync(join(tmpdir(), 'pa-runner-ctx-'));
+  // Der Pack streamt von der Platte, während der Daemon liest. Bricht der Bau
+  // früh ab (Daemon nicht erreichbar), zöge das Aufräumen dem noch lesenden
+  // Stream die Dateien weg - dessen unbehandeltes 'error' nähme den Prozess mit.
+  let pack: ReturnType<typeof tar.pack> | null = null;
   try {
-    await d.createVolume({ Name: name });
-  } catch {
-    /* exists */
+    for (const rel of files) cpSync(join(root, rel), join(ctx, rel), { dereference: true, recursive: false });
+    pack = tar.pack(ctx);
+    pack.on('error', () => {});
+    // Kontext-Layout == Repo-Root, `dockerfile` ist also der Pfad, den
+    // runner/Dockerfile selbst dokumentiert (`docker build -f runner/Dockerfile .`).
+    const stream = await d.buildImage(pack, { t: image, dockerfile: 'runner/Dockerfile' });
+    // Ein gescheiterter Bau beendet den Stream normal und meldet sich nur in
+    // einem `error`-Frame - der Callback von followProgress deckt allein
+    // Transportfehler ab, also müssen beide geprüft werden.
+    const lines: string[] = [];
+    let failure: string | null = null;
+    const mayNotice = createThrottle(BUILD_NOTICE_INTERVAL_MS);
+    await new Promise<void>((res, rej) => {
+      d.modem.followProgress(
+        stream,
+        (err: Error | null) => (err ? rej(new Error(withTail(err.message, lines))) : res()),
+        (ev: { stream?: string; error?: string; errorDetail?: { message?: string } }) => {
+          const failed = (ev.error ?? ev.errorDetail?.message ?? '').trim();
+          if (failed.length > 0) failure = failed;
+          const text = (ev.stream ?? '').trim();
+          if (text.length === 0) return;
+          lines.push(text);
+          // Nur der Schwanz wird je gelesen; ein langer Bau hielte sonst jede Zeile.
+          if (lines.length > 200) lines.splice(0, lines.length - 200);
+          if (onNotice && mayNotice()) {
+            onNotice(buildProgressMessage(lines), { phase: 'container-start', detail: detailFrom(lines) });
+          }
+        },
+      );
+    });
+    if (failure !== null) throw new Error(withTail(failure, lines));
+    const sec = Math.round((Date.now() - started) / 1000);
+    console.log(`[runner-image] ${image} built in ${sec}s`);
+    onNotice?.(`Runner-Image fertig gebaut (${sec}s) – Session startet.`, { phase: 'container-start' });
+  } finally {
+    pack?.destroy();
+    rmSync(ctx, { recursive: true, force: true });
   }
 }
 
-/** Pull the adapter image (registry mode, e.g. ghcr.io); no-op when unavailable locally and pull fails are surfaced by the caller's create. */
+/** Pull an image; failures stay silent here and surface at the caller's imageExists check. */
 export async function pullImage(image: string): Promise<void> {
   const d = docker();
   if (!d) return;
@@ -651,45 +300,199 @@ async function imageExists(d: Docker, image: string): Promise<boolean> {
   }
 }
 
-/**
- * Make the adapter image available on the daemon that runs the session:
- * (a) already present locally, (b) pullable from a registry, (c) built from the
- * build context bundled into the orchestrator image (see image-build.ts).
- *
- * (c) is skipped for adapters that pin an explicit "image" in their manifest -
- * those are operator-controlled artifacts and must never be shadowed by a
- * locally built one. Throws with an actionable German message otherwise.
- */
-export async function ensureAdapterImage(adapter: string, onNotice?: NoticeFn): Promise<string> {
+/* ------------------------------------------------------------------ */
+/* Netze                                                               */
+/* ------------------------------------------------------------------ */
+
+/** Create a network unless the daemon already knows it (idempotent). */
+async function ensureNetworkExists(name: string, internal: boolean): Promise<void> {
   const d = docker();
-  const image = adapterImage(adapter);
-  if (!d) return image;
-  if (await imageExists(d, image)) return image;
-  await pullImage(image);
-  if (await imageExists(d, image)) return image;
-  if (getAdapter(adapter)?.image) {
-    throw new Error(
-      `Shim-Image ${image} ist im Adapter-Manifest fest eingetragen, liegt aber weder lokal vor noch ` +
-        `konnte es aus der Registry geladen werden. Image pushen/verfügbar machen oder das Feld "image" ` +
-        `in shims/${adapter}/adapter.json entfernen, damit der Server es selbst baut.`,
-    );
-  }
-  if (shimContextFiles(adapter) === null) {
-    throw new Error(
-      `Shim-Image ${image} fehlt und konnte nicht gebaut werden: im Orchestrator-Image liegt kein ` +
-        `Build-Kontext für Adapter "${adapter}" (erwartet shims/${adapter}/Dockerfile).`,
-    );
-  }
+  if (!d) return;
   try {
-    await buildShimImage(d, adapter, image, onNotice);
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    throw new Error(`Shim-Image ${image} fehlt und konnte nicht gebaut werden: ${msg}`);
+    await d.getNetwork(name).inspect();
+  } catch {
+    try {
+      await d.createNetwork({ Name: name, CheckDuplicate: true, ...(internal ? { Internal: true } : {}) });
+    } catch {
+      /* already created concurrently */
+    }
   }
-  return image;
 }
 
-/** One ustar header (512 bytes) + data padded to a 512-byte block. uid/gid 1000 = 'node' in the shim images. */
+export async function ensureNetwork(): Promise<void> {
+  await ensureNetworkExists(config.networkName, false);
+  await ensureSelfAttached(config.networkName);
+}
+
+/**
+ * Attach the orchestrator's own container (HOSTNAME is the container id inside
+ * docker) to a network so it can reach session runners by alias and runners can
+ * reach the egress proxy. Idempotent, errors are logged but never thrown (e.g.
+ * running outside docker).
+ *
+ * Works for both variants of the local daemon - raw socket mount and socket
+ * proxy - since the proxy talks to the very same daemon, so HOSTNAME still
+ * resolves to a container the daemon knows.
+ */
+export async function ensureSelfAttached(networkName: string): Promise<string | null> {
+  const d = docker();
+  if (!d) return null;
+  const selfId = process.env.HOSTNAME;
+  // Without HOSTNAME there is no way to name our own container to the daemon.
+  // Silently skipping used to leave the session reachable by nobody, surfacing
+  // minutes later as a bare "runner did not become ready in time".
+  if (!selfId) {
+    return 'HOSTNAME ist im Orchestrator-Container nicht gesetzt – der Orchestrator kann sich nicht selbst ans Session-Netz hängen.';
+  }
+  try {
+    await d.getNetwork(networkName).connect({
+      Container: selfId,
+      EndpointConfig: { Aliases: [ORCHESTRATOR_ALIAS] },
+    });
+    return null;
+  } catch (e) {
+    const msg = String(e);
+    if (msg.includes('already')) return null;
+    console.warn(`[docker] self-attach to ${networkName} failed: ${msg}`);
+    // An unreachable daemon is not an attach problem: every later call fails
+    // the same way and says so more precisely, so only a daemon that answered
+    // (e.g. "no such container" for a HOSTNAME that is not ours) blocks here.
+    if (/ECONNREFUSED|ENOENT|EAI_AGAIN|ETIMEDOUT|ECONNRESET|socket hang up/.test(msg)) return null;
+    return `Orchestrator (HOSTNAME=${selfId}) konnte nicht ans Netz ${networkName} angebunden werden: ${msg}`;
+  }
+}
+
+/**
+ * Der Orchestrator erreicht den Runner nur über das Docker-Netz der Session, und
+ * eine 'allowlist'-Session erreicht den Egress-Proxy nur denselben Weg. Ein
+ * fehlgeschlagenes Anbinden muss die Session deshalb sofort mit der echten
+ * Ursache scheitern lassen, statt in den Bereitschafts-Timeout zu laufen.
+ */
+async function requireAttached(session: SessionRow): Promise<void> {
+  const failure = await attachOrchestratorTo(session);
+  if (failure === null) return;
+  throw new Error(
+    `${failure} Ohne diese Anbindung ist der Agent-Container nicht erreichbar. ` +
+      'Prüfe, ob der Orchestrator selbst als Docker-Container mit gesetztem HOSTNAME läuft.',
+  );
+}
+
+export function sessionNetworkName(sessionId: string): string {
+  return `pocketagent-s-${sessionId.slice(0, 12)}`;
+}
+
+/** Delete a session's internal network together with any containers left on it. */
+export async function removeSessionNetwork(sessionId: string): Promise<void> {
+  const d = docker();
+  if (!d) return;
+  const net = d.getNetwork(sessionNetworkName(sessionId));
+  try {
+    const info = await net.inspect();
+    const selfId = process.env.HOSTNAME;
+    const members = (info.Containers ?? {}) as Record<string, { Name?: string } | undefined>;
+    for (const cid of Object.keys(members)) {
+      const isSelf = selfId !== undefined && selfId.length > 0 && cid.startsWith(selfId);
+      if (isSelf) {
+        await net.disconnect({ Container: cid }).catch(() => {});
+      } else {
+        await d.getContainer(cid).remove({ force: true }).catch(() => {});
+      }
+    }
+    await net.remove().catch(() => {});
+  } catch {
+    /* network gone */
+  }
+}
+
+/** Validate the session row's network policy (fallback: config default). */
+function policyFor(session: SessionRow): NetworkPolicy {
+  const raw = session.network_policy;
+  return isNetworkPolicy(raw) ? raw : config.networkPolicyDefault;
+}
+
+/**
+ * Netz, auf dem der Container einer Session lebt: 'open' teilt sich das
+ * Hauptnetz, 'allowlist'/'isolated' bekommen je ein eigenes internes. Pur -
+ * einzige Quelle für Session-Start und Startup-Reconcile.
+ */
+export function sessionNetworkFor(session: SessionRow): string {
+  return policyFor(session) === 'open' ? config.networkName : sessionNetworkName(session.id);
+}
+
+/**
+ * (Re)establish the link between the orchestrator and a session's network,
+ * creating the network when it is missing. Idempotent; returns null when the
+ * link stands, otherwise its German cause. Needed on every path that has to
+ * talk to a runner - including a freshly deployed orchestrator container, which
+ * starts out attached to no session network at all.
+ */
+export async function attachOrchestratorTo(session: SessionRow): Promise<string | null> {
+  const name = sessionNetworkFor(session);
+  await ensureNetworkExists(name, name !== config.networkName);
+  return ensureSelfAttached(name);
+}
+
+/**
+ * Container networking for a session (see sessionNetworkFor). For 'allowlist'
+ * the proxy env vars are injected into `env`.
+ */
+async function sessionNetworking(
+  session: SessionRow,
+  env: Record<string, string | undefined>,
+): Promise<{ EndpointsConfig: Record<string, { Aliases: string[] }> }> {
+  const policy = policyFor(session);
+  const netName = sessionNetworkFor(session);
+  await requireAttached(session);
+  // 'isolated' behält beide Vorgaben - und bekommt auch keinen brauchbaren
+  // Proxy: der Orchestrator hängt zwar an seinem Netz, weist aber jede Anfrage
+  // einer Session ab, deren Policy 'isolated' sagt (egress-proxy.ts, 'policy').
+  let egress = 'none';
+  let auth = 'n/a';
+  if (policy === 'allowlist') {
+    // Proxy-Auth: der Egress-Proxy akzeptiert Anfragen mit gültigem
+    // Session-Token (Basic "pa:<token>"). Jeder Aufrufer muss deshalb eine
+    // Zeile hereinreichen, die ihren shim_token schon trägt (provision staged
+    // ihn, resumeSession/push weisen eine unprovisionierte Session ab) - eine
+    // URL ohne Credentials ließe die Session allein vom Peer-IP-Gate abhängen,
+    // daher das auth= in der Logzeile unten.
+    const userinfo = session.shim_token ? `pa:${session.shim_token}@` : '';
+    const proxyHost = `${ORCHESTRATOR_ALIAS}:${config.egressProxyPort}`;
+    env.HTTP_PROXY = `http://${userinfo}${proxyHost}`;
+    env.HTTPS_PROXY = `http://${userinfo}${proxyHost}`;
+    env.NO_PROXY = 'localhost,127.0.0.1';
+    // Node beachtet keine der drei Variablen von sich aus, deshalb nagelt der
+    // Runner undicis globalen Dispatcher selbst fest (installEnvProxyDispatcher
+    // aus dem Protokoll). Dieses Flag ist die zweite Hälfte des Gürtels: nur es
+    // leitet auch nodes anderen Client (http/https.request) um und erreicht
+    // jeden Kindprozess, den der Runner startet. Node-Builds, die die Variable
+    // nicht kennen, ignorieren sie. (PR #57)
+    env.NODE_USE_ENV_PROXY = '1';
+    egress = proxyHost;
+    auth = userinfo ? 'yes' : 'no';
+  }
+  // Die eine Zeile, die eine kaputte Egress-Einrichtung von einem kaputten Netz
+  // unterscheidbar macht (ohne Geheimnisse: Host und Vorhandensein von Credentials).
+  console.log(
+    `[docker] session ${session.id.slice(0, 8)} policy=${policy} net=${netName} egress=${egress} auth=${auth}`,
+  );
+  return { EndpointsConfig: { [netName]: { Aliases: [session.id] } } };
+}
+
+export async function ensureVolume(name: string): Promise<void> {
+  const d = docker();
+  if (!d) return;
+  try {
+    await d.createVolume({ Name: name });
+  } catch {
+    /* exists */
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Container                                                           */
+/* ------------------------------------------------------------------ */
+
+/** One ustar header (512 bytes) + data padded to a 512-byte block. uid/gid 1000 = 'node' in the runner image. */
 function tarEntry(name: string, mode: number, typeflag: '0' | '5', data: Buffer): Buffer {
   const h = Buffer.alloc(512);
   h.write(name.slice(0, 99), 0, 100, 'utf8');
@@ -712,8 +515,8 @@ function tarEntry(name: string, mode: number, typeflag: '0' | '5', data: Buffer)
 /**
  * Inject `creds` into a NOT-YET-STARTED container as /run/secrets/pa/creds.json
  * (uid/gid 1000, dir 0700, file 0400) via a minimal in-memory tar. Replaces
- * GITHUB_PAT container env (K2 contract): shims read PA_CREDS_FILE at runtime.
- * putArchive writes are daemon-side and work on a not-yet-started
+ * GITHUB_PAT container env (K2 contract): the runner reads PA_CREDS_FILE at
+ * runtime. putArchive writes are daemon-side and work on a not-yet-started
  * readonly-rootfs container; if a daemon ever rejects it, creds injection
  * failing is logged here and sessions continue without push credentials.
  */
@@ -751,31 +554,23 @@ export async function createSessionContainer(
   if (!session.volume_name) throw new Error('Session hat kein Volume – nicht provisioniert.');
   const containerEnv = { ...env };
   const networking = await sessionNetworking(session, containerEnv);
-  const image = await ensureAdapterImage(session.adapter, onNotice);
+  const image = await ensureRunnerImage(onNotice);
   try {
     await ensureVolume(session.volume_name);
-    // codex: mount the ONE shared CODEX_HOME volume rw (rotating single-use
-    // refresh token => never copy auth.json into N containers, see CODEX-OAUTH.md §4).
-    const extraBinds = await extraBindsFor(session);
-    // With a gateway the shim is reached through it, so no host port is published
-    // (an internal per-session network could not serve one anyway).
-    const remote = isRemote() && !gatewayEnabled();
     const c = await d.createContainer({
       Image: image,
       Env: envArr(containerEnv),
       Labels: { [SESSION_LABEL]: session.id },
-      ...(remote ? { ExposedPorts: { '8080/tcp': {} } } : {}),
       HostConfig: {
         Memory: parseMem(config.sessionMemLimit),
-        Binds: [`${session.volume_name}:/work`, ...extraBinds],
+        Binds: [`${session.volume_name}:${RUNNER_WORK_DIR}`],
         CapDrop: ['ALL'],
         SecurityOpt: ['no-new-privileges'],
         PidsLimit: config.sessionPidsLimit,
         ReadonlyRootfs: true,
-        // executable /tmp: shims run their GIT_ASKPASS helper script from /tmp
+        // ausführbares /tmp: der Runner legt sein GIT_ASKPASS-Helferskript dort ab
         Tmpfs: { '/tmp': 'rw,size=1g' },
         ...(config.sessionCpuQuota ? { NanoCpus: config.sessionCpuQuota } : {}),
-        ...(remote ? { PortBindings: { '8080/tcp': [{ HostPort: '', HostIp: config.dockerPublishIp }] } } : {}),
       },
       NetworkingConfig: networking,
     });
@@ -790,10 +585,6 @@ export async function createSessionContainer(
 export async function startContainer(id: string): Promise<boolean> {
   const d = docker();
   if (!d) return false;
-  // In gateway mode the proxy that will serve this container runs on the
-  // runner, so it has to know the session's token *before* the container can
-  // ask for anything - same ordering as setProvisioned -> start locally.
-  await publishEgressTable();
   let started: boolean;
   try {
     await d.getContainer(id).start();
@@ -802,35 +593,24 @@ export async function startContainer(id: string): Promise<boolean> {
     started = String(e).includes('already started');
   }
   // A container only has an IP once it runs: reloading here is what lets the
-  // egress proxy authorize the shim's very first request by peer IP.
-  if (started) await primeSessionPeers();
+  // egress proxy authorize the runner's very first request by peer IP.
+  if (started) await refreshSessionPeers();
   return started;
 }
 
 /**
- * Base URL the orchestrator uses to reach a running session shim.
- * Local mode: docker-network alias (null => caller uses http://<sessionId>:8080).
- * Remote mode with gateway: the gateway's single published port, path-routed
- *   per session (`http://<DOCKER_ADDR>:<GATEWAY_PORT>/s/<sessionId>`).
- * Remote mode without gateway: published random host port on the docker host.
+ * Base URL des Runners. Lokal ist das immer der Docker-Netz-Alias, deshalb
+ * `null` - der Aufrufer setzt `http://<sessionId>:8080` ein. Die Funktion (und
+ * die Spalte `shim_endpoint`) bleiben, weil Link-Sessions und Tests einen
+ * expliziten Endpunkt setzen.
  */
-export async function shimEndpoint(containerId: string, sessionId: string): Promise<string | null> {
-  if (!isRemote() || !config.dockerAddr) return null;
-  if (gatewayEnabled()) {
-    return `http://${config.dockerAddr}:${config.gatewayPort}/s/${encodeURIComponent(sessionId)}`;
-  }
-  const d = docker();
-  if (!d) return null;
-  try {
-    const info = await d.getContainer(containerId).inspect();
-    const bindings = info.NetworkSettings.Ports?.['8080/tcp'];
-    const hostPort = bindings?.[0]?.HostPort;
-    if (!hostPort) return null;
-    return `http://${config.dockerAddr}:${hostPort}`;
-  } catch (e) {
-    console.error(`[docker] endpoint inspect failed: ${String(e)}`);
-    return null;
-  }
+export function runnerEndpoint(): string | null {
+  return null;
+}
+
+/** Default-Basis-URL eines Session-Runners im lokalen Docker-Netz. */
+export function defaultRunnerBase(sessionId: string): string {
+  return `http://${sessionId}:${RUNNER_PORT}`;
 }
 
 /**
@@ -869,11 +649,11 @@ export async function containerState(id: string): Promise<ContainerState> {
 }
 
 /**
- * Last log lines of a container plus its exit state. When a shim never becomes
+ * Last log lines of a container plus its exit state. When a runner never becomes
  * ready, its own stderr holds the reason (failed clone, missing key, crash) -
- * without this the app only ever sees "shim did not become ready in time".
- * Token-shaped words are masked: shim logs are not supposed to contain secrets,
- * but this text is forwarded to the app and the server log.
+ * without this the app only ever sees "runner did not become ready in time".
+ * Token-shaped words are masked: runner logs are not supposed to contain
+ * secrets, but this text is forwarded to the app and the server log.
  */
 export async function containerDiagnostics(id: string, lines = LOG_TAIL_LINES): Promise<string> {
   const d = docker();
@@ -929,7 +709,7 @@ export async function listRunning(): Promise<number | null> {
   const d = docker();
   if (!d) return null;
   try {
-    const list = await d.listContainers({ filters: { label: ['pocketagent.session'] } });
+    const list = await d.listContainers({ filters: { label: [SESSION_LABEL] } });
     return list.length;
   } catch {
     return null;
@@ -969,10 +749,6 @@ export async function listSessionContainers(): Promise<LabeledSessionContainer[]
   }
 }
 
-export function pushScriptFor(adapter: string): string {
-  return getAdapter(adapter)?.pushScript ?? `/app/shims/${adapter}/scripts/push.js`;
-}
-
 /** Tap-push in a throwaway container. Boolean result; the real cause is logged. */
 export async function oneShotPush(
   session: SessionRow,
@@ -987,22 +763,21 @@ export async function oneShotPush(
   // noch gc kennen ihn) - deshalb das finally.
   let pushContainer: Docker.Container | null = null;
   try {
-    const image = await ensureAdapterImage(session.adapter, onNotice);
+    const image = await ensureRunnerImage(onNotice);
     const containerEnv = { ...env };
     const networking = await sessionNetworking(session, containerEnv);
     const c = await d.createContainer({
       Image: image,
       Env: envArr(containerEnv),
-      Cmd: ['node', pushScriptFor(session.adapter)],
+      Cmd: ['node', RUNNER_PUSH_SCRIPT],
       Labels: { [SESSION_LABEL]: session.id },
       HostConfig: {
         Memory: parseMem(config.sessionMemLimit),
-        Binds: [`${session.volume_name}:/work`],
+        Binds: [`${session.volume_name}:${RUNNER_WORK_DIR}`],
         CapDrop: ['ALL'],
         SecurityOpt: ['no-new-privileges'],
         PidsLimit: config.sessionPidsLimit,
         ReadonlyRootfs: true,
-        // executable /tmp: shims run their GIT_ASKPASS helper script from /tmp
         Tmpfs: { '/tmp': 'rw,size=1g' },
         ...(config.sessionCpuQuota ? { NanoCpus: config.sessionCpuQuota } : {}),
       },
@@ -1010,11 +785,8 @@ export async function oneShotPush(
     });
     pushContainer = c;
     if (creds && Object.keys(creds).length > 0) await injectCredsFile(c.id, creds);
-    // Same ordering as startContainer: the gateway has to know the session
-    // (whose push window the caller just opened) before its container asks.
-    await publishEgressTable();
     await c.start();
-    await primeSessionPeers(); // the push container pushes through the egress proxy too
+    await refreshSessionPeers(); // der Push-Container pusht durch denselben Egress-Proxy
     const res = await c.wait();
     return res.StatusCode === 0;
   } catch (e) {
@@ -1023,114 +795,5 @@ export async function oneShotPush(
     return false;
   } finally {
     if (pushContainer) await pushContainer.remove({ force: true }).catch(() => {});
-  }
-}
-
-/** Container label marking the short-lived codex auth container. */
-const CODEX_AUTH_LABEL = 'pocketagent.codex-auth';
-
-/** Run a command in a container and collect its stdout/exit code. */
-async function execCollect(
-  container: Docker.Container,
-  cmd: string[],
-): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-  const exec = await container.exec({ Cmd: cmd, AttachStdout: true, AttachStderr: true });
-  const stream = await exec.start({ hijack: true, stdin: false });
-  const out = new PassThrough();
-  const err = new PassThrough();
-  const d = docker();
-  d?.modem.demuxStream(stream, out, err);
-  let stdout = '';
-  let stderr = '';
-  out.on('data', (c: Buffer) => (stdout += c.toString('utf8')));
-  err.on('data', (c: Buffer) => (stderr += c.toString('utf8')));
-  await new Promise<void>((resolve) => stream.on('end', resolve));
-  const info = await exec.inspect();
-  return { exitCode: info.ExitCode ?? 0, stdout, stderr };
-}
-
-/**
- * Production transport for the in-app codex login (CODEX-OAUTH.md, see
- * codex-auth.ts): a short-lived container running `codex app-server`, mounting
- * the tenant's ONE canonical CODEX_HOME volume rw. JSON-RPC rides the attached
- * stdio; the loopback callback and the auth.json read run *inside* the
- * container (docker exec) where 127.0.0.1:<port> and CODEX_HOME are reachable.
- *
- * This path is not covered by the smoke test (it needs a real daemon + the
- * codex binary + a real ChatGPT account); the smoke test exercises the
- * identical flow logic through a spawned fake app-server transport instead, and
- * the end-to-end phone login is the documented manual verification step.
- */
-export class DockerCodexAuthTransport implements CodexAuthTransport {
-  async open(tenant: string): Promise<CodexAppServerSession> {
-    const d = docker();
-    if (!d) throw new Error('Docker ist auf diesem Server deaktiviert.');
-    const image = await ensureAdapterImage('codex');
-    const vol = codexHomeVolumeName(tenant);
-    await ensureVolume(vol);
-    const container = await d.createContainer({
-      Image: image,
-      Cmd: ['codex', 'app-server', '--ignore-user-config'],
-      Labels: { [CODEX_AUTH_LABEL]: tenant },
-      Env: envArr({ CODEX_HOME: CODEX_HOME_MOUNT, HOME: '/tmp', XDG_CONFIG_HOME: '/tmp/xdg' }),
-      OpenStdin: true,
-      AttachStdin: true,
-      AttachStdout: true,
-      AttachStderr: true,
-      Tty: false,
-      HostConfig: {
-        Memory: parseMem(config.sessionMemLimit),
-        Binds: [`${vol}:${CODEX_HOME_MOUNT}`],
-        CapDrop: ['ALL'],
-        SecurityOpt: ['no-new-privileges'],
-        PidsLimit: config.sessionPidsLimit,
-        ReadonlyRootfs: true,
-        Tmpfs: { '/tmp': 'rw,size=256m' },
-        ...(config.sessionCpuQuota ? { NanoCpus: config.sessionCpuQuota } : {}),
-      },
-    });
-    // Attach before start so no early app-server output is missed.
-    const stream = await container.attach({ stream: true, stdin: true, stdout: true, stderr: true, hijack: true });
-    const stdout = new PassThrough();
-    const stderr = new PassThrough();
-    d.modem.demuxStream(stream, stdout, stderr);
-    stderr.on('data', (c: Buffer) => {
-      const line = c.toString('utf8').trim();
-      if (line) console.error(`[codex-auth app-server] ${line}`);
-    });
-    await container.start();
-
-    const rpc = new CodexJsonRpc(stream as unknown as Writable, stdout);
-    // codex app-server handshake before login_chatgpt.
-    await rpc.request('initialize', { clientInfo: { name: 'pocketagent-orchestrator', version: '0.1.0' } }, 30_000);
-    rpc.notify('initialized', {});
-
-    return {
-      rpc,
-      async forwardCallback(port: number, code: string, state: string): Promise<number> {
-        // Reach the login server on the container's own loopback (docker exec
-        // runs inside the netns); code/state pass as argv, never string-spliced.
-        const script =
-          'const[,p,c,s]=process.argv;' +
-          "const u='http://127.0.0.1:'+p+'/auth/callback?'+new URLSearchParams({code:c,state:s}).toString();" +
-          "fetch(u).then(r=>{console.log('STATUS:'+r.status);process.exit(0)}).catch(()=>{console.log('STATUS:0');process.exit(1)});";
-        const res = await execCollect(container, ['node', '-e', script, String(port), code, state]);
-        const m = /STATUS:(\d+)/.exec(res.stdout);
-        return m ? Number(m[1]) : 0;
-      },
-      async readAuthJson(): Promise<string | null> {
-        const res = await execCollect(container, ['cat', `${CODEX_HOME_MOUNT}/auth.json`]);
-        return res.exitCode === 0 && res.stdout.trim().length > 0 ? res.stdout : null;
-      },
-      async close(): Promise<void> {
-        rpc.close();
-        try {
-          await container.stop({ t: 5 });
-        } catch {
-          /* not running */
-        }
-        await container.remove({ force: true }).catch(() => {});
-      },
-    };
   }
 }

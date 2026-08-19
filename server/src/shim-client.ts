@@ -33,7 +33,6 @@ export function normalizeModels(body: unknown): ModelInfo[] {
 export class ShimClient {
   private readonly base: string;
   private readonly token: string;
-  private readonly extraHeaders: Record<string, string>;
   private ac: AbortController | null = null;
   private stopped = false;
   /**
@@ -46,14 +45,9 @@ export class ShimClient {
    */
   private lastEventId = 0;
 
-  /**
-   * `extraHeaders` ride along on every request; used for the remote-runner
-   * gateway's shared-secret header (empty in all local modes).
-   */
-  constructor(base: string, token: string, extraHeaders: Record<string, string> = {}) {
+  constructor(base: string, token: string) {
     this.base = base.replace(/\/+$/, '');
     this.token = token;
-    this.extraHeaders = extraHeaders;
   }
 
   private async call<T>(path: string, method: string, body?: unknown): Promise<T | null> {
@@ -61,7 +55,6 @@ export class ShimClient {
       const res = await fetch(`${this.base}${path}`, {
         method,
         headers: {
-          ...this.extraHeaders,
           authorization: `Bearer ${this.token}`,
           ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
         },
@@ -137,7 +130,6 @@ export class ShimClient {
       try {
         const res = await fetch(`${this.base}/events`, {
           headers: {
-            ...this.extraHeaders,
             authorization: `Bearer ${this.token}`,
             accept: 'text/event-stream',
             // Reconnect from where we were: the shim replays every buffered

@@ -12,14 +12,26 @@
  */
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { randomUUID } from 'node:crypto';
+import { SECRET_KINDS } from '@pocketagent/protocol';
 import { encrypt } from './vault.js';
 import { adminTokenOk, SlidingWindowRateLimiter } from './pairing.js';
 import type { Store } from './db.js';
 
 const KIND_RE = /^[a-z0-9_-]{1,64}$/;
 
+/** Formprüfung: nur solche Arten dürfen in den AAD-String `secret:<tenant>:<kind>`. */
 export function isValidSecretKind(kind: unknown): kind is string {
   return typeof kind === 'string' && KIND_RE.test(kind);
+}
+
+/**
+ * Gehört die Art zum pi-Contract (`SECRET_KINDS` = pi-Provider + `github`)?
+ * Getrennt von der Formprüfung, weil beide Aufrufer unterschiedliche Meldungen
+ * geben - und weil eine Art, die kein Session-Env füllt, nur Verwirrung im
+ * Secrets-Screen der App stiftet.
+ */
+export function isKnownSecretKind(kind: unknown): kind is string {
+  return typeof kind === 'string' && SECRET_KINDS.includes(kind);
 }
 
 /**
@@ -75,6 +87,11 @@ export function registerSecretsApi(app: FastifyInstance, store: Store): void {
       return reply
         .code(400)
         .send({ ok: false, error: 'invalid kind (expected lowercase [a-z0-9_-]{1,64})' });
+    }
+    if (!isKnownSecretKind(kind)) {
+      return reply
+        .code(400)
+        .send({ ok: false, error: `unknown secret kind "${kind}" (expected one of ${SECRET_KINDS.join(', ')})` });
     }
     if (typeof value !== 'string' || value.length === 0) {
       return reply.code(400).send({ ok: false, error: 'value must be a non-empty string' });

@@ -1,8 +1,9 @@
 # server/Dockerfile is built with the repo root as context, so the root
 # /.dockerignore is the file docker actually reads. This copy is kept in sync
 # for builders that resolve the ignore file next to the Dockerfile instead.
-# It must NOT exclude shims/*/src|scripts|Dockerfile: those are bundled into
-# the orchestrator image as build contexts for the shim self build.
+# It must NOT exclude runner/: its sources are bundled into the server image as
+# the build context for `ensureRunnerImage` (server/src/runner.ts). `**/dist`
+# stays excluded on purpose - runner/Dockerfile runs its own npm ci and build.
 **/node_modules
 **/dist
 **/*.tsbuildinfo

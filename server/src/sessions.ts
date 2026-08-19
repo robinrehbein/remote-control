@@ -1,6 +1,5 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import type {
-  AdapterId,
   AgentEvent,
   AgentMode,
   ClientMessage,
@@ -14,10 +13,18 @@ import type {
   PromptRequest,
   ReasoningEffort,
   ServerMessage,
+  ServerStats,
   SessionInfo,
   SessionStatus,
   TurnFailureReason,
   TurnInfo,
+} from '@pocketagent/protocol';
+import {
+  DEFAULT_AGENT_MODE,
+  PI_DEFAULT_PROVIDER,
+  isAgentMode as isAgentModeContract,
+  isPiProvider,
+  isReasoningEffort as isReasoningEffortContract,
 } from '@pocketagent/protocol';
 import { SERVER_VERSION, config, isNetworkPolicy } from './config.js';
 import type { LinkRow, RepoRow, SessionRow, Store, TurnRow } from './db.js';
@@ -31,25 +38,29 @@ import {
   shimProgressMessage,
   splitLogLines,
 } from './progress.js';
-
-import { getAdapter } from './adapters.js';
+import { buildRunnerEnv } from './runner.js';
 import { matchTokenDigest, tokenDigest, type EgressSession, type TokenEntry } from './egress-proxy.js';
 import { ShimClient, normalizeModels } from './shim-client.js';
 import { sendPush } from './fcm.js';
 
 const TENANT = 'default';
 
-const AGENT_MODES: readonly AgentMode[] = ['yolo', 'auto', 'acceptEdits', 'ask'];
-const REASONING_EFFORTS: readonly ReasoningEffort[] = ['low', 'medium', 'high'];
-const NOTICE_PHASES: readonly NoticePhase[] = ['image-build', 'container-start', 'shim-start', 'ready'];
+/**
+ * v1 kannte zusätzlich 'image-build'; das Runner-Image entsteht jetzt entweder
+ * beim ersten Session-Start (dann meldet der Bau sich als 'container-start',
+ * siehe docker.buildRunnerImage) oder gar nicht mehr - die Phase existiert im
+ * Protokoll nicht länger.
+ */
+const NOTICE_PHASES: readonly NoticePhase[] = ['container-start', 'shim-start', 'ready'];
 const LINK_SESSION_STATUSES: readonly LinkSessionStatus[] = ['idle', 'busy', 'question', 'permission'];
 
+/** Wire-Eingang: `unknown` -> Modus. Die Liste selbst kommt aus dem Protokoll. */
 export function isAgentMode(v: unknown): v is AgentMode {
-  return typeof v === 'string' && (AGENT_MODES as readonly string[]).includes(v);
+  return typeof v === 'string' && isAgentModeContract(v);
 }
 
 export function isReasoningEffort(v: unknown): v is ReasoningEffort {
-  return typeof v === 'string' && (REASONING_EFFORTS as readonly string[]).includes(v);
+  return typeof v === 'string' && isReasoningEffortContract(v);
 }
 
 export function isNoticePhase(v: unknown): v is NoticePhase {
@@ -62,11 +73,10 @@ export function isLinkSessionStatus(v: unknown): v is LinkSessionStatus {
 
 /**
  * Maps a link agent's heartbeat status onto ours. `SessionStatus` has no
- * counterpart for "mid-turn, waiting on the user" (question/permission) -
- * the shim's own `busy` flag already collapses those into one boolean, and
- * `permission.request`/`.resolved` events carry the finer detail
- * separately - so both fold into 'running', same as everything else that is
- * not 'idle'.
+ * counterpart for "mid-turn, waiting on the user" (question/permission) - the
+ * runner's own `busy` flag already collapses those into one boolean, and
+ * `permission.request`/`.resolved` events carry the finer detail separately -
+ * so both fold into 'running', same as everything else that is not 'idle'.
  */
 export function statusFromLinkHeartbeat(status: LinkSessionStatus): SessionStatus {
   return status === 'idle' ? 'idle' : 'running';
@@ -75,16 +85,16 @@ export function statusFromLinkHeartbeat(status: LinkSessionStatus): SessionStatu
 /**
  * Session states in which a container of that session may be talking to the
  * egress proxy: it is being provisioned, or it is up. A stopped, failed or
- * archived session has no running container, so its shim token must not open
- * the proxy for anyone who still holds it (it stays in the row until GC).
- * The one container that lives outside these states is the throwaway push
- * container, which gets an explicit grant for the duration of the push.
+ * archived session has no running container, so its token must not open the
+ * proxy for anyone who still holds it (it stays in the row until GC). The one
+ * container that lives outside these states is the throwaway push container,
+ * which gets an explicit grant for the duration of the push.
  */
 const EGRESS_LIVE_STATUSES: readonly SessionStatus[] = ['creating', 'running', 'idle'];
 
 /**
  * A 'running' session that has emitted no event for this long is treated as
- * possibly hung (a lost turn.completed) and its shim is asked directly whether
+ * possibly hung (a lost turn.completed) and its runner is asked directly whether
  * it is still busy - see resyncRunningStatuses. Long enough that an actually
  * working turn (which keeps touching last_active_at with its events) is never
  * caught, short enough to correct a hang well before the idle reaper would.
@@ -144,25 +154,14 @@ export function sanitizeSessionTitle(raw: string): string | null {
 }
 
 /**
- * Provider a session falls back to when it switches to another harness: the
- * manifest default, else its first provider key, else none (adapters whose
- * credentials are fixed, e.g. claude).
- */
-export function defaultProviderFor(adapter: string): string {
-  const desc = getAdapter(adapter);
-  const fallback = Object.keys(desc?.providerEnv ?? {})[0] ?? '';
-  return desc?.defaults.provider || fallback;
-}
-
-/**
  * Prompt body from the session row: mode/model/reasoningEffort are session
- * state (switchable via `session.update`), so every turn carries them.
- * Provider only rides along with a model, since runtimes that address models
- * as provider+model need both.
+ * state (switchable via `session.update`), so every turn carries them. The
+ * provider only rides along with a model, since pi addresses models as
+ * provider + id.
  *
  * `model` is sent whenever the column holds a string - including the empty
- * string, which is the documented "adapter default" reset every shim
- * implements (and a no-op for sessions that never picked a model).
+ * string, which is the documented "pi default" reset (and a no-op for sessions
+ * that never picked a model).
  */
 export function buildPromptBody(row: SessionRow, text: string, mode?: AgentMode): PromptRequest {
   const effectiveMode = mode ?? (isAgentMode(row.mode) ? row.mode : undefined);
@@ -201,10 +200,10 @@ export function isCollectableSession(row: SessionRow, cutoffMs: number): boolean
 }
 
 /**
- * Ein Lifecycle-Lauf (provision/reprovision/resume) wurde überholt: die Session
- * ist gelöscht oder gestoppt worden, oder ein neuerer Lauf hat übernommen. Kein
- * Fehler der Session - der abgebrochene Lauf räumt nur sein eigenes Werk ab und
- * meldet nichts an die App.
+ * Ein Lifecycle-Lauf (provision/resume) wurde überholt: die Session ist gelöscht
+ * oder gestoppt worden, oder ein neuerer Lauf hat übernommen. Kein Fehler der
+ * Session - der abgebrochene Lauf räumt nur sein eigenes Werk ab und meldet
+ * nichts an die App.
  */
 class LifecycleAborted extends Error {
   constructor(sessionId: string) {
@@ -230,9 +229,8 @@ export class SessionManager {
   private linkTransport: LinkTransport | null = null;
   /**
    * Generation pro Session: jede Aktion, die einen laufenden Start ungültig
-   * macht (Stop, Delete, Resume, Adapter-Wechsel), zählt sie hoch. Ein
-   * Lifecycle-Lauf merkt sich seine eigene Generation und prüft sie nach jedem
-   * `await` - siehe checkpoint().
+   * macht (Stop, Delete, Resume), zählt sie hoch. Ein Lifecycle-Lauf merkt sich
+   * seine eigene Generation und prüft sie nach jedem `await` - siehe checkpoint().
    */
   private readonly generations = new Map<string, number>();
   /** Laufende Resumes pro Session (Doppel-Tap/zweites Gerät teilen sich einen Lauf). */
@@ -248,7 +246,7 @@ export class SessionManager {
    * persistEvent verwirft alles, was nicht darüber liegt - so schreibt ein
    * Replay nach einem Reconnect keine Duplikate in die Historie. Wird beim
    * Aufbau eines frischen Event-Streams (connectEvents) zurückgesetzt, weil die
-   * Shim-Sequenz mit einem neuen Container wieder bei 0 beginnt.
+   * Runner-Sequenz mit einem neuen Container wieder bei 0 beginnt.
    */
   private readonly lastPersistedSeq = new Map<string, number>();
   /** Abgeleitete Token-Tabelle des Egress-Gates (siehe egressTokens). */
@@ -287,20 +285,6 @@ export class SessionManager {
   egressPeerAllowed(ip: string): EgressSession | null {
     const id = docker.sessionIdForPeerIp(ip);
     return id === null ? null : this.liveEgressSession(id);
-  }
-
-  /**
-   * The live sessions the remote gateway has to know to gate its own egress
-   * proxy the same way (docker.publishEgressTable pushes this table). A session
-   * that may not egress right now is simply absent.
-   */
-  egressSessions(tenant: string = TENANT): { id: string; policy: NetworkPolicy; token: string | null }[] {
-    const live: { id: string; policy: NetworkPolicy; token: string | null }[] = [];
-    for (const row of this.store.listSessions(tenant)) {
-      const session = this.egressSessionOf(row);
-      if (session !== null) live.push({ ...session, token: row.shim_token });
-    }
-    return live;
   }
 
   /**
@@ -358,10 +342,9 @@ export class SessionManager {
       tenant_id: link.tenant_id,
       repo_id: '',
       repo_full_name: `link:${hello.name ?? link.name}${hello.workDir ? ` (${hello.workDir})` : ''}`,
-      adapter: hello.adapter,
       provider: '',
       model: '',
-      mode: hello.mode ?? 'ask',
+      mode: hello.mode ?? DEFAULT_AGENT_MODE,
       status: 'idle',
       branch: hello.branch ?? 'local',
       session_ref: hello.sessionRef ?? null,
@@ -390,7 +373,7 @@ export class SessionManager {
     if (row && row.status !== 'stopped') this.setStatus(row.id, 'stopped');
   }
 
-  /** Normalized event arriving from a link agent (same pipeline as shim SSE). */
+  /** Normalized event arriving from a link agent (same pipeline as runner SSE). */
   handleLinkEvent(sessionId: string, ev: AgentEvent): void {
     this.onEvent(sessionId, ev);
   }
@@ -405,18 +388,15 @@ export class SessionManager {
    * whole truth rather than a delta.
    *
    * `sessions` is untrusted wire input (JSON off the socket), so it is
-   * re-validated here rather than trusted as `LinkSessionState[]`; a
-   * malformed frame degrades to "no entries", never a crash. A link is bound
-   * to exactly one orchestrator session (registerLinkSession), so only the
-   * entry matching that session id is ever acted on - extra ids in the array
-   * (a future link agent hosting more than one session) are accepted on the
-   * wire but ignored today, not an error.
+   * re-validated here rather than trusted as `LinkSessionState[]`; a malformed
+   * frame degrades to "no entries", never a crash. A link is bound to exactly
+   * one orchestrator session (registerLinkSession), so only the entry matching
+   * that session id is ever acted on - extra ids in the array (a future link
+   * agent hosting more than one session) are accepted on the wire but ignored
+   * today, not an error.
    *
    * Absent from the list = gone, the same conclusion `linkDisconnected` draws
-   * from a closed socket: today that only happens on disconnect (the link
-   * agent's own process manages exactly one session), but the server honours
-   * it either way so a future multi-session link agent that drops a session
-   * without closing its socket is handled correctly from day one.
+   * from a closed socket.
    */
   handleLinkHeartbeat(linkId: string, sessions: unknown): void {
     const row = this.store.getSessionByLink(linkId);
@@ -435,28 +415,22 @@ export class SessionManager {
     if (row.status !== next) this.setStatus(row.id, next);
   }
 
+  /**
+   * Neue Docker-Session. Der Adapter ist entfallen; validiert werden Repo,
+   * Provider (gegen die pi-Tabelle im Protokoll), Modus und Netz-Policy - ein
+   * unbekannter Provider würde sonst als Session ohne jeden Key starten und
+   * erst im ersten Turn scheitern.
+   */
   createSession(msg: CreateMsg, tenant: string = TENANT): SessionRow {
     const repo = this.store.getRepo(msg.repoId);
     if (!repo) throw new Error('repo not found');
-    if (!getAdapter(msg.adapter)) throw new Error(`unknown adapter "${msg.adapter}"`);
+    const provider = msg.provider && msg.provider.length > 0 ? msg.provider : PI_DEFAULT_PROVIDER;
+    if (!isPiProvider(provider)) throw new Error(`unknown provider "${String(msg.provider)}"`);
+    if (!isAgentMode(msg.mode)) throw new Error(`invalid mode "${String(msg.mode)}"`);
     if (msg.networkPolicy !== undefined && !isNetworkPolicy(msg.networkPolicy)) {
       throw new Error(`invalid networkPolicy "${String(msg.networkPolicy)}"`);
     }
     const networkPolicy: NetworkPolicy = msg.networkPolicy ?? config.networkPolicyDefault;
-    // Remote-mode gating (skip when the gateway container provides per-session
-    // networks + egress): without GATEWAY_TOKEN, allowlist/isolated cannot be
-    // served and 'open' publishes plaintext shim ports - explicit consent only.
-    if (docker.isRemote() && !docker.gatewayEnabled()) {
-      if (networkPolicy === 'allowlist' || networkPolicy === 'isolated') {
-        throw new Error('network policies require local docker socket mode or a configured gateway (GATEWAY_TOKEN)');
-      }
-      if (!config.remoteNetworkOpen) {
-        throw new Error(
-          'remote docker mode ships shim traffic plaintext over DOCKER_ADDR (published ports) unless tunneled; ' +
-            'set REMOTE_NETWORK_OPEN=1 to explicitly consent to networkPolicy "open" for remote sessions',
-        );
-      }
-    }
     const id = randomUUID();
     const now = new Date().toISOString();
     const row: SessionRow = {
@@ -464,9 +438,8 @@ export class SessionManager {
       tenant_id: tenant,
       repo_id: repo.id,
       repo_full_name: repo.full_name,
-      adapter: msg.adapter,
-      provider: msg.provider,
-      model: msg.model,
+      provider,
+      model: typeof msg.model === 'string' ? msg.model : '',
       mode: msg.mode,
       status: 'creating',
       branch: `agent/${id}`,
@@ -496,9 +469,10 @@ export class SessionManager {
   }
 
   /**
-   * Progress channel of a provisioning run (image build takes minutes).
-   * A notice with a `phase` is live progress the app shows instead of its
-   * status line; one without stays an ordinary timeline entry.
+   * Progress channel of a provisioning run (the very first start on a host also
+   * builds the runner image, which takes minutes). A notice with a `phase` is
+   * live progress the app shows instead of its status line; one without stays an
+   * ordinary timeline entry.
    */
   private noticeFor(sessionId: string): NoticeFn {
     return (message, progress) =>
@@ -581,7 +555,7 @@ export class SessionManager {
       if (pat) await docker.injectCredsFile(cid, { githubPat: pat });
       await this.checkpoint(row.id, gen, cid);
       // Persist BEFORE the start: the egress proxy authorizes a session by its
-      // stored shim_token (egressTokenAllowed), and an 'allowlist' shim clones
+      // stored shim_token (egressTokenAllowed), and an 'allowlist' runner clones
       // through that proxy the moment its container runs - a token that is
       // still unknown then turns the first clone into a 407. Recording the
       // container id here also keeps a failed start cleanable.
@@ -589,13 +563,10 @@ export class SessionManager {
       notice('Container startet', { phase: 'container-start' });
       if (!(await docker.startContainer(cid))) throw new Error('failed to start session container');
       await this.checkpoint(row.id, gen, cid);
-      const endpoint = await docker.shimEndpoint(cid, row.id);
-      await this.checkpoint(row.id, gen, cid);
-      this.store.setShimEndpoint(row.id, endpoint);
-      const base = this.shimBase(row.id, endpoint);
+      const base = this.shimBase(row.id);
       await this.waitForShim(base, shimToken, 60_000, cid, notice);
       // The last gate before the session is declared ready: a stop during the
-      // shim wait must not be overwritten with 'idle' seconds later.
+      // runner wait must not be overwritten with 'idle' seconds later.
       await this.checkpoint(row.id, gen, cid);
       notice('Bereit', { phase: 'ready' });
       this.connectEvents(row.id, base, shimToken);
@@ -605,7 +576,7 @@ export class SessionManager {
       const message = err instanceof Error ? err.message : String(err);
       // Also on the server log: the app is not always in reach when a session
       // dies, and provisioning failures were previously invisible in `docker logs`.
-      console.error(`[sessions] provisioning failed for ${row.id.slice(0, 8)} (${row.adapter}): ${message}`);
+      console.error(`[sessions] provisioning failed for ${row.id.slice(0, 8)}: ${message}`);
       // A container that never became ready keeps its memory reservation and
       // may burn CPU in a crash loop; reapIdle never touches 'error' sessions.
       await this.stopFailedContainer(row.id, cid);
@@ -628,17 +599,17 @@ export class SessionManager {
     });
   }
 
+  /**
+   * Basis-URL des Runners. Regulär der Docker-Netz-Alias; die Spalte
+   * `shim_endpoint` überschreibt sie (Link-Sessions, Tests gegen einen
+   * gefälschten Runner).
+   */
   private shimBase(id: string, endpoint?: string | null): string {
-    return endpoint ?? this.store.getSession(id)?.shim_endpoint ?? `http://${id}:8080`;
+    return endpoint ?? this.store.getSession(id)?.shim_endpoint ?? docker.defaultRunnerBase(id);
   }
 
-  /**
-   * Shim client for a session base URL. In remote-gateway mode the base URL
-   * points at the gateway (`.../s/<id>`), which requires the shared-secret
-   * header; all local modes add no extra headers.
-   */
   private shimClient(base: string, token: string): ShimClient {
-    return new ShimClient(base, token, docker.gatewayHeaders());
+    return new ShimClient(base, token);
   }
 
   /**
@@ -649,40 +620,30 @@ export class SessionManager {
     return this.store.getSecretValue('github', row.tenant_id);
   }
 
+  /**
+   * Container-Umgebung einer Session. Die Ableitung selbst ist pur und liegt in
+   * runner.ts; hier kommt nur der Vault-Zugang dazu. `getSecretValue` (kein
+   * roher decrypt): Secrets sind seit der Vault-Migration AAD-gebunden, und nur
+   * dieser Pfad kennt AAD und Legacy-Fallback.
+   */
   private buildEnv(
     row: SessionRow,
     repo: RepoRow,
     shimToken: string,
     baseBranch: string,
   ): Record<string, string | undefined> {
-    const desc = getAdapter(row.adapter);
-    if (!desc) throw new Error(`unknown adapter "${row.adapter}"`);
-    const env: Record<string, string | undefined> = {
-      SHIM_TOKEN: shimToken,
-      WORK_DIR: '/work',
-      AGENT_MODE: row.mode,
-      ADAPTER: row.adapter,
-      SESSION_ID: row.id,
-      REPO_URL: `https://github.com/${repo.full_name}.git`,
-      REPO_BRANCH: baseBranch,
-      REPO_FULL_NAME: repo.full_name,
-      AUTO_PUSH: row.mode === 'yolo' ? '1' : '0',
-      // creds file injected via putArchive before container start (see githubPatFor)
-      PA_CREDS_FILE: '/run/secrets/pa/creds.json',
-    };
-    // getSecretValue (not a raw decrypt): secrets are AAD-bound since the
-    // vault migration, and only this path knows both the AAD and the legacy
-    // fallback - decrypting the row directly throws on every current key.
-    const setKey = (kind: string, key: string): void => {
-      const value = this.store.getSecretValue(kind, row.tenant_id);
-      if (value !== null) env[key] = value;
-    };
-    for (const [kind, vars] of Object.entries(desc.credentials ?? {})) {
-      for (const v of vars) setKey(kind, v);
-    }
-    const envVar = desc.providerEnv?.[row.provider];
-    if (envVar) setKey(row.provider, envVar);
-    return env;
+    return buildRunnerEnv(
+      {
+        sessionId: row.id,
+        shimToken,
+        mode: isAgentMode(row.mode) ? row.mode : DEFAULT_AGENT_MODE,
+        provider: row.provider,
+        model: row.model,
+        repoFullName: repo.full_name,
+        baseBranch,
+      },
+      (kind) => this.store.getSecretValue(kind, row.tenant_id),
+    );
   }
 
   private async waitForShim(
@@ -732,10 +693,10 @@ export class SessionManager {
   }
 
   /**
-   * (Re)build the shim event stream for a session.
+   * (Re)build the runner event stream for a session.
    *
    * A fresh container starts its event sequence at 0, so the dedup baseline is
-   * reset with it. `resumeCursor` is for reconnecting to a shim that kept
+   * reset with it. `resumeCursor` is for reconnecting to a runner that kept
    * running (an orchestrator redeploy): the highest seq already stored seeds
    * both the client's Last-Event-ID and the dedup baseline, so the events
    * emitted during the gap are replayed and land exactly once.
@@ -760,9 +721,9 @@ export class SessionManager {
 
   /**
    * Single write path into the stored timeline (noise never reaches the table).
-   * Deduplicated by the event's `seq`: a replayed event (same seq the shim
+   * Deduplicated by the event's `seq`: a replayed event (same seq the runner
    * already sent before a reconnect) is dropped instead of appended a second
-   * time. Events without a seq (older shim, link agent) are always written.
+   * time. Events without a seq (link agent) are always written.
    */
   private persistEvent(sessionId: string, ev: AgentEvent): void {
     if (!isHistoryEvent(ev)) return;
@@ -782,8 +743,8 @@ export class SessionManager {
     else if (ev.type === 'permission.request')
       void this.notifyPermission(sessionId, ev.permissionId, ev.title);
     else if (ev.type === 'turn.completed' || ev.type === 'turn.failed') {
-      // Close the per-turn resource from the shim's own terminal signal: the
-      // in-flight turn reaches 'completed' or 'failed' (carrying the shim's
+      // Close the per-turn resource from the runner's own terminal signal: the
+      // in-flight turn reaches 'completed' or 'failed' (carrying the runner's
       // error as the reason) so a reconnecting app reads its fate instead of
       // guessing it from the stream.
       if (ev.type === 'turn.completed') this.finishTurn(sessionId, 'completed');
@@ -868,7 +829,7 @@ export class SessionManager {
   /**
    * Move a session's current (queued/running) turn to a terminal state, if it
    * has one. Used when a terminal signal arrives without a turn id of its own:
-   * a shim `turn.completed`/`.failed`, an abort, or a restart that dropped the
+   * a runner `turn.completed`/`.failed`, an abort, or a restart that dropped the
    * turn. A no-op when nothing is in flight (e.g. a stray completed event).
    */
   private finishTurn(sessionId: string, state: 'completed' | 'failed' | 'interrupted', reason?: TurnFailureReason): void {
@@ -907,10 +868,10 @@ export class SessionManager {
   }
 
   /**
-   * Every shim request goes through here: `null` means the shim never answered,
-   * which after a redeploy simply means the new orchestrator container hangs on
-   * no session network any more. Re-attach it (and the event stream that died
-   * with the old attachment) once and retry before reporting a failure.
+   * Every runner request goes through here: `null` means the runner never
+   * answered, which after a redeploy simply means the new orchestrator container
+   * hangs on no session network any more. Re-attach it (and the event stream
+   * that died with the old attachment) once and retry before reporting a failure.
    */
   private async withShim<T>(id: string, call: (c: ShimClient) => Promise<T | null>): Promise<T | null> {
     const first = await call(this.client(id));
@@ -925,9 +886,9 @@ export class SessionManager {
     // Do NOT tear the event stream down here. A live client has its own
     // reconnect loop that recovers over the freshly re-attached network and
     // replays what it missed via Last-Event-ID; recreating it on every null
-    // (the old behaviour) reset that cursor mid-turn and dropped events - the
-    // aggravating half of the event-loss finding. Only stand a stream up when
-    // there is none, resuming its cursor from the stored history.
+    // (the old behaviour) reset that cursor mid-turn and dropped events. Only
+    // stand a stream up when there is none, resuming its cursor from the
+    // stored history.
     if (!this.clients.has(id)) {
       this.connectEvents(id, this.shimBase(id, row.shim_endpoint), row.shim_token, true);
     }
@@ -935,7 +896,7 @@ export class SessionManager {
   }
 
   /**
-   * Message for a shim that stayed unreachable even after the re-attach. The
+   * Message for a runner that stayed unreachable even after the re-attach. The
    * container's own state and log say what a bare "request failed" never could;
    * containerDiagnostics masks token-shaped words in that log.
    */
@@ -966,7 +927,7 @@ export class SessionManager {
 
   /**
    * Status-Gate für Prompts. Eine Session, die noch startet, hat schon einen
-   * shim_token, aber noch keinen antwortenden Shim: ein Prompt in diesem
+   * shim_token, aber noch keinen antwortenden Runner: ein Prompt in diesem
    * Fenster (zweites Gerät kennt die Session aus dem 'creating'-Broadcast)
    * setzte 'running', lief in den Transport-Timeout, meldete 'error' - und die
    * weiterlaufende Provisionierung setzte Sekunden später 'idle'. Die App sah
@@ -974,7 +935,7 @@ export class SessionManager {
    *
    * Eine gestoppte Session hat gar keinen laufenden Container; sie muss erst
    * fortgesetzt werden. 'running' bleibt bewusst erlaubt: mehrere Turns
-   * hintereinander sind Sache des Shims, nicht des Orchestrators.
+   * hintereinander sind Sache des Runners, nicht des Orchestrators.
    */
   private assertPromptable(row: SessionRow): void {
     if (row.status === 'creating') {
@@ -1003,7 +964,7 @@ export class SessionManager {
     const body: PromptRequest = { ...buildPromptBody(row, text, mode), ...(messageId ? { messageId } : {}) };
     const turn = this.startTurn(id, messageId);
     // The prompt itself, so a reloaded timeline shows the user's own message:
-    // no shim reports it back, and without this line the history would start
+    // no runner reports it back, and without this line the history would start
     // at the agent's answer. Stored only, never broadcast - the sending client
     // already has the message on screen and would draw it twice.
     this.persistEvent(id, { type: 'message.completed', role: 'user', text });
@@ -1036,15 +997,12 @@ export class SessionManager {
   }
 
   /**
-   * Persist switchable session settings. The next prompt carries them to the
-   * shim; the updated session is broadcast to every device as `session.status`.
-   *
-   * A harness switch (`adapter`) is validated and persisted synchronously too,
-   * but its container work is handed back as `reprovision`: the caller acks the
-   * request first, because the new agent's image may still have to be built
-   * (minutes on first use).
+   * Umschaltbare Session-Einstellungen persistieren. Der nächste Prompt trägt
+   * sie zum Runner; die aktualisierte Session geht als `session.status` an alle
+   * Geräte. Der Adapterwechsel aus v1 ist entfallen, deshalb gibt es hier
+   * keinen asynchronen Nachlauf mehr - der Aufruf ist vollständig synchron.
    */
-  updateSession(msg: UpdateMsg): { session: SessionInfo; reprovision: (() => Promise<void>) | null } {
+  updateSession(msg: UpdateMsg): SessionInfo {
     const row = this.requireSession(msg.sessionId);
     if (msg.mode !== undefined && !isAgentMode(msg.mode)) {
       throw new Error(`invalid mode "${String(msg.mode)}"`);
@@ -1055,118 +1013,15 @@ export class SessionManager {
     if (msg.reasoningEffort !== undefined && !isReasoningEffort(msg.reasoningEffort)) {
       throw new Error(`invalid reasoningEffort "${String(msg.reasoningEffort)}"`);
     }
-    // null => no harness change (also for an update that names the current one)
-    const nextAdapter = msg.adapter !== undefined && msg.adapter !== row.adapter ? msg.adapter : null;
-    if (nextAdapter !== null) this.assertAdapterSwitchable(row, nextAdapter);
     this.store.updateSessionSettings(row.id, {
       ...(msg.mode !== undefined ? { mode: msg.mode } : {}),
       ...(msg.model !== undefined ? { model: msg.model.trim() } : {}),
       ...(msg.reasoningEffort !== undefined ? { reasoningEffort: msg.reasoningEffort } : {}),
-      ...(nextAdapter !== null
-        ? {
-            adapter: nextAdapter,
-            provider: defaultProviderFor(nextAdapter),
-            clearSessionRef: true,
-            // harness-bound settings reset unless this very update replaces them
-            ...(msg.model === undefined ? { model: '' } : {}),
-            ...(msg.reasoningEffort === undefined ? { reasoningEffort: '' } : {}),
-          }
-        : {}),
     });
-    if (nextAdapter !== null) {
-      this.store.updateSessionStatus(row.id, 'creating');
-      this.emitEvent(row.id, {
-        type: 'notice',
-        message: `Agent gewechselt: ${row.adapter} → ${nextAdapter}. Der neue Agent startet frisch auf dem aktuellen Code-Stand.`,
-      });
-    }
-    const updated = this.requireSession(row.id);
-    const info = this.toInfo(updated);
-    this.broadcast({
-      type: 'session.status',
-      sessionId: info.id,
-      status: info.status,
-      session: info,
-    });
-    return {
-      session: info,
-      reprovision: nextAdapter !== null ? () => this.reprovisionAdapter(row.id) : null,
-    };
+    return this.broadcastSession(row.id);
   }
 
-  /** Preconditions of a harness switch; throws with the reason for the app. */
-  private assertAdapterSwitchable(row: SessionRow, adapter: string): void {
-    if (!getAdapter(adapter)) throw new Error(`unbekannter Adapter "${adapter}"`);
-    if (row.link_id) {
-      throw new Error('Agent-Wechsel ist für Link-Sessions nicht möglich – den Agenten auf dem Host neu starten.');
-    }
-    if (!config.dockerEnabled) {
-      throw new Error('Agent-Wechsel benötigt Docker – auf diesem Server ist Docker deaktiviert.');
-    }
-    if (!row.volume_name || !row.shim_token) {
-      throw new Error('Agent-Wechsel benötigt eine provisionierte Session.');
-    }
-    if (row.status !== 'idle' && row.status !== 'stopped' && row.status !== 'error') {
-      throw new Error(`Agent-Wechsel im Status "${row.status}" nicht möglich – bitte warten oder Turn abbrechen.`);
-    }
-  }
-
-  /**
-   * Recreate the session container for the newly selected adapter on the
-   * existing volume: the repo checkout and the session branch stay, only the
-   * harness is exchanged (the shims clone only into an empty /work).
-   */
-  private async reprovisionAdapter(id: string): Promise<void> {
-    const notice = this.noticeFor(id);
-    const gen = this.nextGeneration(id);
-    let cid: string | null = null;
-    try {
-      const row = this.requireSession(id);
-      if (!row.shim_token || !row.volume_name) throw new Error('Session ist nicht provisioniert.');
-      const repo = this.store.getRepo(row.repo_id);
-      if (!repo) throw new Error('repo missing');
-      this.clients.get(id)?.stop();
-      this.clients.delete(id);
-      if (row.container_id) {
-        await docker.stopContainer(row.container_id);
-        await docker.removeContainer(row.container_id); // volume survives on purpose
-      }
-      await docker.ensureNetwork();
-      await this.checkpoint(id, gen);
-      const env = this.buildEnv(row, repo, row.shim_token, repo.default_branch);
-      cid = await docker.createSessionContainer(row, env, notice);
-      await this.checkpoint(id, gen, cid);
-      const pat = this.githubPatFor(row);
-      if (pat) await docker.injectCredsFile(cid, { githubPat: pat });
-      await this.checkpoint(id, gen, cid);
-      // shim_token is already stored (the session keeps it across the switch),
-      // so only the container id has to be recorded before the start - see
-      // provision(): a container the row does not know cannot be cleaned up.
-      this.store.setContainer(id, cid);
-      notice('Container startet', { phase: 'container-start' });
-      if (!(await docker.startContainer(cid))) throw new Error('failed to start session container');
-      await this.checkpoint(id, gen, cid);
-      const endpoint = await docker.shimEndpoint(cid, id);
-      await this.checkpoint(id, gen, cid);
-      this.store.setShimEndpoint(id, endpoint);
-      const base = this.shimBase(id, endpoint);
-      await this.waitForShim(base, row.shim_token, 60_000, cid, notice);
-      await this.checkpoint(id, gen, cid);
-      notice('Bereit', { phase: 'ready' });
-      this.connectEvents(id, base, row.shim_token);
-      this.setStatus(id, 'idle');
-    } catch (err) {
-      if (err instanceof LifecycleAborted) return;
-      const message = err instanceof Error ? err.message : String(err);
-      console.error(`[sessions] adapter switch failed for ${id.slice(0, 8)}: ${message}`);
-      await this.stopFailedContainer(id, cid);
-      this.store.updateSessionStatus(id, 'error');
-      this.emitEvent(id, { type: 'error', message, fatal: true });
-      this.broadcastStatus(id, 'error');
-    }
-  }
-
-  /** Model catalog of the session's shim; unsupported/unreachable -> []. */
+  /** Model catalog of the session's runner; unreachable -> []. */
   async models(id: string): Promise<ModelInfo[]> {
     const row = this.requireSession(id);
     if (row.link_id) {
@@ -1307,11 +1162,7 @@ export class SessionManager {
         await this.checkpoint(id, gen, created);
       }
       if (cid && cid !== row.container_id) this.store.setContainer(id, cid);
-      // remote mode assigns a new published port per (re)created container
-      const endpoint = cid ? await docker.shimEndpoint(cid, id) : row.shim_endpoint;
-      await this.checkpoint(id, gen, created);
-      this.store.setShimEndpoint(id, endpoint);
-      const base = this.shimBase(id, endpoint);
+      const base = this.shimBase(id, row.shim_endpoint);
       await this.waitForShim(base, row.shim_token, 60_000, cid, notice);
       await this.checkpoint(id, gen, created);
       if (row.session_ref) {
@@ -1453,7 +1304,6 @@ export class SessionManager {
       id: row.id,
       repoId: row.repo_id,
       repoFullName: row.repo_full_name ?? undefined,
-      adapter: row.adapter as AdapterId,
       provider: row.provider,
       model: row.model,
       mode: row.mode as AgentMode,
@@ -1471,13 +1321,7 @@ export class SessionManager {
     };
   }
 
-  async stats(): Promise<{
-    sessionsActive: number;
-    sessionsTotal: number;
-    containersRunning: number;
-    uptimeSec: number;
-    versions: Record<string, string>;
-  }> {
+  async stats(): Promise<ServerStats> {
     const rows = this.store.listSessions(TENANT);
     const active = rows.filter((r) => r.status === 'running' || r.status === 'idle').length;
     const running = await docker.listRunning();
@@ -1522,9 +1366,9 @@ export class SessionManager {
   /**
    * Eine Zeile ohne Container-Id, die trotzdem 'creating'/'running' meldet: der
    * Orchestrator ist während der Provisionierung gestorben, bevor der Container
-   * überhaupt angelegt wurde (der erste Image-Build dauert Minuten). Ohne diese
-   * Behandlung zeigt die App für immer 'creating' - reconcileSession sieht die
-   * Zeile mangels Container gar nicht.
+   * überhaupt angelegt wurde (der erste Runner-Image-Bau dauert Minuten). Ohne
+   * diese Behandlung zeigt die App für immer 'creating' - reconcileSession sieht
+   * die Zeile mangels Container gar nicht.
    *
    * Der erholbare Zustand ist 'error': `session.resume` baut eine nie fertig
    * provisionierte Session danach von vorn auf (siehe runResume).
@@ -1606,12 +1450,12 @@ export class SessionManager {
     const failure = await docker.attachOrchestratorTo(row);
     if (failure !== null) throw new Error(failure);
     if (!row.shim_token) return;
-    // The container kept running across the redeploy, so its shim sequence
+    // The container kept running across the redeploy, so its runner sequence
     // continued: resume the replay cursor from the last stored seq to pick up
     // the events emitted during the restart gap.
     this.connectEvents(row.id, this.shimBase(row.id, row.shim_endpoint), row.shim_token, true);
     // A turn (or a start) that was in flight during the restart is lost: its
-    // shim events went nowhere, so the session would stay 'running' forever.
+    // runner events went nowhere, so the session would stay 'running' forever.
     const interrupted = row.status === 'running' || row.status === 'creating';
     this.emitEvent(row.id, {
       type: 'notice',
@@ -1633,9 +1477,6 @@ export class SessionManager {
       setInterval(() => void this.reapIdle().catch(() => {}), 60_000),
       setInterval(() => void this.resyncRunningStatuses().catch(() => {}), 60_000),
       setInterval(() => void this.gc().catch(() => {}), 24 * 3_600_000),
-      // Gateway-Modus: der Gateway hält die Session-Tabelle nur im Speicher,
-      // ein Neustart des Containers verliert sie (no-op ohne Gateway).
-      setInterval(() => void docker.syncGatewayEgress().catch(() => {}), 15_000),
     );
   }
 
@@ -1656,15 +1497,15 @@ export class SessionManager {
    * Backstop gegen eine fälschlich in 'running' hängende Session (die Folge
    * eines verlorenen turn.completed): Wird eine Session als laufend geführt,
    * hat aber seit RESYNC_STALE_MS kein Event mehr geliefert, fragt dieser Lauf
-   * den Shim direkt nach seinem busy-Status; meldet der Shim busy:false, wird
-   * die Session auf 'idle' korrigiert. Das Sequenz-/Replay-Verfahren verhindert
-   * den Event-Verlust bereits an der Wurzel - dieser Resync ist die zweite
+   * den Runner direkt nach seinem busy-Status; meldet er busy:false, wird die
+   * Session auf 'idle' korrigiert. Das Sequenz-/Replay-Verfahren verhindert den
+   * Event-Verlust bereits an der Wurzel - dieser Resync ist die zweite
    * Sicherung, falls je ein turn.completed doch nicht ankommt.
    *
    * Öffentlich, damit der Lauf testbar ist; regulär feuert ihn nur der Timer.
    * Nur Docker-Sessions mit einem bereits verbundenen Event-Client werden
    * geprüft (kein neuer Netz-Re-Attach im Timer), und die Staleness-Schranke
-   * verhindert, dass ein gerade gestarteter Turn - dessen busy-Flag der Shim
+   * verhindert, dass ein gerade gestarteter Turn - dessen busy-Flag der Runner
    * noch nicht gesetzt hat - vorzeitig auf idle gekippt wird.
    */
   async resyncRunningStatuses(): Promise<void> {
@@ -1681,7 +1522,7 @@ export class SessionManager {
       const current = this.store.getSession(row.id);
       if (!current || current.status !== 'running') continue;
       if (Date.parse(current.last_active_at) >= staleBefore) continue;
-      // The shim reports not busy, so the turn is over; a lost turn.completed
+      // The runner reports not busy, so the turn is over; a lost turn.completed
       // never closed it. Complete the in-flight turn to match the corrected
       // session status.
       this.finishTurn(row.id, 'completed');
@@ -1690,7 +1531,7 @@ export class SessionManager {
         type: 'notice',
         message: 'Turn abgeschlossen – der Status wurde nachträglich korrigiert (kein Abschluss-Event empfangen).',
       });
-      console.log(`[sessions] resynced ${row.id.slice(0, 8)} from a stale 'running' to 'idle' (shim reports not busy)`);
+      console.log(`[sessions] resynced ${row.id.slice(0, 8)} from a stale 'running' to 'idle' (runner reports not busy)`);
     }
   }
 

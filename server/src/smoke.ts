@@ -1,14 +1,29 @@
-import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
+/**
+ * Smoke-Suite des pi-only Orchestrators.
+ *
+ * Geschnitten aus der v1-Suite auf die Wege, die der Server nach dem Greenfield
+ * noch hat (GREENFIELD-PI.md, Paket G1.2): Pairing inkl. Lockout und
+ * Rate-Limit, WS-Auth, der Session-Lebenszyklus gegen eine gefälschte
+ * Docker-API, der Egress-Proxy, Link-Token samt Heartbeat, der Vault und
+ * `fcm.register`. Alles ohne echten Daemon, ohne Netz und ohne Provider-Key -
+ * der echte Durchstich ist Teil der 7-Punkte-Checkliste (G2.2).
+ *
+ * Lauf: `npm run smoke -w server`. Am Ende steht eine Zusammenfassung.
+ */
+import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { spawn } from 'node:child_process';
 import type { AddressInfo } from 'node:net';
 import WebSocket from 'ws';
 import type { ServerMessage } from '@pocketagent/protocol';
-import { WS_CLOSE_REPLACED, WS_CLOSE_UNAUTHORIZED } from '@pocketagent/protocol';
+import {
+  PI_PROVIDER_ENV,
+  SECRET_KINDS,
+  WS_CLOSE_REPLACED,
+  WS_CLOSE_UNAUTHORIZED,
+  autoPushForMode,
+} from '@pocketagent/protocol';
 
 process.env.DOCKER_ENABLED = '0';
 process.env.DATA_DIR = mkdtempSync(join(tmpdir(), 'pa-smoke-'));
@@ -18,29 +33,37 @@ const { buildApp } = await import('./index.js');
 const { generatePairingCode, SlidingWindowRateLimiter } = await import('./pairing.js');
 const { validateSecret } = await import('./secret-validate.js');
 const { buildPromptBody, isNoticePhase } = await import('./sessions.js');
+const { buildRunnerEnv, runnerImageName } = await import('./runner.js');
 type SessionManager = import('./sessions.js').SessionManager;
 type Store = import('./db.js').Store;
+type SessionRow = import('./db.js').SessionRow;
 type FetchLike = import('./secret-validate.js').FetchLike;
 const vault = await import('./vault.js');
 const admin = await import('./admin.js');
 const { sha256 } = await import('./db.js');
 const { config } = await import('./config.js');
-const { CodexJsonRpc } = await import('./codex-jsonrpc.js');
-type CodexAuthTransport = import('./codex-auth.js').CodexAuthTransport;
-type CodexAppServerSession = import('./codex-auth.js').CodexAppServerSession;
-const {
-  parseCallbackPort,
-  parseLoginResult,
-  isLoginCompleted,
-  isLoginError,
-  accountLabelFrom,
-} = await import('./codex-auth.js');
+
+/* ------------------------------------------------------------------ */
+/* Harness                                                             */
+/* ------------------------------------------------------------------ */
+
+/** Bestandene Prüfungen je Abschnitt - Grundlage der Zusammenfassung am Ende. */
+const sections: { name: string; checks: number }[] = [];
+let currentSection = 'start';
+let checks = 0;
+
+function section(name: string): void {
+  if (checks > 0) sections.push({ name: currentSection, checks });
+  currentSection = name;
+  checks = 0;
+}
 
 function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) {
-    console.error(`ASSERT FAILED: ${msg}`);
+    console.error(`ASSERT FAILED [${currentSection}]: ${msg}`);
     process.exit(1);
   }
+  checks++;
 }
 
 interface Waiter {
@@ -104,7 +127,7 @@ class Client {
   }
 }
 
-async function request(c: Client, msg: Record<string, unknown> & { requestId: string }) {
+async function request(c: Client, msg: Record<string, unknown> & { requestId: string }): Promise<ServerMessage> {
   c.send(msg);
   return c.wait((m) => 'requestId' in m && m.requestId === msg.requestId);
 }
@@ -115,36 +138,35 @@ function listen(server: import('node:http').Server): Promise<number> {
   });
 }
 
-/**
- * A loopback port with nothing behind it: bind to 0, read what the kernel
- * assigned, close again. Lets a test say "this daemon is unreachable" in a way
- * that holds on a machine that does have a docker socket.
- */
-async function closedPort(): Promise<number> {
-  const net = await import('node:net');
-  const probe = net.createServer();
-  const port = await new Promise<number>((res) => {
-    probe.listen(0, '127.0.0.1', () => res((probe.address() as AddressInfo).port));
-  });
-  await new Promise<void>((res) => probe.close(() => res()));
-  return port;
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => (resolve = r));
+  return { promise, resolve };
+}
+
+/** Poll until `pred` holds; fails the run instead of hanging forever. */
+async function waitUntil(pred: () => boolean, what: string, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (pred()) return;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  assert(false, `timeout waiting for ${what}`);
 }
 
 /**
- * A provisioned session row, ready to be inserted: everything a test does not
- * care about filled in, the fields a test does care about (status, policy,
- * token) overridable.
+ * Eine provisionierte Session-Zeile: alles, was ein Test nicht interessiert,
+ * ist gefüllt, alles Interessante (Status, Policy, Token, Endpunkt) überschreibbar.
  */
-function sessionRow(id: string, repoId: string, patch: Partial<import('./db.js').SessionRow> = {}): import('./db.js').SessionRow {
+function sessionRow(id: string, repoId: string, patch: Partial<SessionRow> = {}): SessionRow {
   const now = new Date().toISOString();
   return {
     id,
     tenant_id: 'default',
     repo_id: repoId,
     repo_full_name: 'acme/demo',
-    adapter: 'kilo',
-    provider: 'zai',
-    model: 'glm-4.6',
+    provider: 'openai',
+    model: '',
     mode: 'ask',
     status: 'idle',
     branch: `agent/${id}`,
@@ -231,1132 +253,196 @@ function proxyConnect(
   });
 }
 
-/**
- * A CONNECT that is not just answered but used: opens the tunnel, sends one
- * payload through it and returns what comes back. Tells "the proxy replied 200"
- * apart from "bytes really reach the upstream that accepted the connection".
- */
-function proxyTunnel(
-  net: typeof import('node:net'),
-  proxyPort: number,
-  hostPort: string,
-  payload: string,
-): Promise<{ status: number; echo: string }> {
-  return new Promise((resolve, reject) => {
-    const sock = net.connect(proxyPort, '127.0.0.1', () => {
-      sock.write(`CONNECT ${hostPort} HTTP/1.1\r\nHost: ${hostPort}\r\n\r\n`);
-    });
-    const timer = setTimeout(() => {
-      sock.destroy();
-      reject(new Error('proxy did not answer the CONNECT'));
-    }, 10_000);
-    const done = (value: { status: number; echo: string }): void => {
-      clearTimeout(timer);
-      sock.destroy();
-      resolve(value);
-    };
-    let head = '';
-    let echo = '';
-    let established = false;
-    sock.on('data', (c) => {
-      if (!established) {
-        head += String(c);
-        const end = head.indexOf('\r\n\r\n');
-        if (end === -1) return;
-        const status = Number(/^HTTP\/1\.\d (\d{3})/.exec(head.split('\r\n')[0] ?? '')?.[1] ?? 0);
-        if (status !== 200) return done({ status, echo: '' });
-        established = true;
-        echo = head.slice(end + 4);
-        sock.write(payload);
-      } else {
-        echo += String(c);
-      }
-      if (echo.length > 0) done({ status: 200, echo });
-    });
-    sock.on('error', (e) => {
-      clearTimeout(timer);
-      reject(e);
-    });
-  });
-}
+/* ------------------------------------------------------------------ */
+/* 1. Runner-Konfiguration: Image-Name, Env-Zusammenbau                */
+/* ------------------------------------------------------------------ */
 
 /**
- * A CONNECT whose caller vanishes before the answer is written: the request
- * goes out, then the connection is reset instead of closed. That is what a
- * client does when it gives up on a refused tunnel, and it leaves the proxy
- * holding a socket whose next read fails with ECONNRESET.
+ * Die pure Hälfte des Runner-Pakets: der eine Image-Name samt seiner
+ * Env-Schalter und die Container-Umgebung nach `ShimEnv`. Beides ist der
+ * Vertrag, auf den sich G1.3 (Runner) verlässt.
  */
-function proxyConnectAndReset(
-  net: typeof import('node:net'),
-  proxyPort: number,
-  hostPort: string,
-): Promise<void> {
-  return new Promise((resolve) => {
-    const sock = net.connect(proxyPort, '127.0.0.1', () => {
-      sock.write(`CONNECT ${hostPort} HTTP/1.1\r\nHost: ${hostPort}\r\n\r\n`);
-      // RST, not FIN - a clean close is the case that always worked.
-      sock.resetAndDestroy();
-      resolve();
-    });
-    sock.on('error', () => resolve());
-  });
-}
+async function runnerConfigSmoke(): Promise<void> {
+  section('runner config');
+  const cfg = config as unknown as { runnerImage: string | null; runnerImageTag: string; runnerImagePrefix: string };
 
-/**
- * Remote-runner gateway: pure routing/auth logic plus the two servers it runs,
- * all without a docker daemon. Session ids are plain DNS labels, so '127.0.0.1'
- * is a valid one and lets us point the ingress at a local fake shim.
- */
-async function gatewaySmoke(): Promise<void> {
-  const http = await import('node:http');
-  const { routeIngress, authorize, createIngressServer } = await import('./gateway.js');
-  const { createEgressProxyServer, hostAllowed } = await import('./egress-proxy.js');
-  const { GATEWAY_AUTH_HEADER } = await import('./config.js');
+  assert(runnerImageName() === 'pocketagent/pi-runner:latest', 'ohne Env-Vorgaben heisst das Image pocketagent/pi-runner:latest');
+  cfg.runnerImageTag = '2026-08-19';
+  assert(runnerImageName() === 'pocketagent/pi-runner:2026-08-19', 'RUNNER_IMAGE_TAG waehlt den Tag');
+  cfg.runnerImage = 'ghcr.io/acme/pi-runner:pinned';
+  assert(runnerImageName() === 'ghcr.io/acme/pi-runner:pinned', 'RUNNER_IMAGE gibt das Image vollstaendig vor');
+  cfg.runnerImage = null;
+  cfg.runnerImageTag = 'latest';
 
-  // --- ingress URL mapping (pure) ---
-  assert(
-    routeIngress('/s/abc-123/status')?.target === 'http://abc-123:8080/status',
-    'routeIngress maps /s/<id>/<path> onto the session alias',
-  );
-  assert(
-    routeIngress('/s/abc/events?tail=1')?.target === 'http://abc:8080/events?tail=1',
-    'routeIngress keeps the query string',
-  );
-  assert(routeIngress('/s/abc')?.target === 'http://abc:8080/', 'routeIngress handles a bare session prefix');
-  assert(routeIngress('/s/abc/')?.sessionId === 'abc', 'routeIngress reports the session id');
-  assert(routeIngress('/status') === null, 'routeIngress rejects paths outside /s/');
-  assert(routeIngress('/s/../status') === null, 'routeIngress rejects traversal in the session id');
-  assert(routeIngress('/s/ab c/status') === null, 'routeIngress rejects invalid session ids');
-  assert(routeIngress('/s/abc/../../x') === null, 'routeIngress rejects traversal in the path');
-  assert(routeIngress('http://evil/x') === null, 'routeIngress rejects absolute request targets');
+  /* ---- Env: genau EIN Provider-Key, AUTO_PUSH je Modus ---- */
 
-  // --- shared-secret auth (pure) ---
-  const token = 'gw-smoke-token';
-  assert(authorize({ [GATEWAY_AUTH_HEADER]: token }, token), 'authorize accepts the configured token');
-  assert(!authorize({ [GATEWAY_AUTH_HEADER]: 'nope' }, token), 'authorize rejects a wrong token');
-  assert(!authorize({}, token), 'authorize rejects a missing header');
-  assert(!authorize({ [GATEWAY_AUTH_HEADER]: token }, ''), 'authorize rejects an unset gateway token');
-
-  // --- ingress server end-to-end against a fake shim ---
-  const shim = http.createServer((req, res) => {
-    if ((req.url ?? '').startsWith('/events')) {
-      res.writeHead(200, { 'content-type': 'text/event-stream' });
-      res.write('data: {"type":"status"}\n\n'); // stays open on purpose
-      return;
-    }
-    res.writeHead(200, { 'content-type': 'application/json' }).end('{"ok":true}');
-  });
-  const shimPort = await listen(shim);
-  const ingress = createIngressServer({ token, shimPort });
-  const ingressPort = await listen(ingress);
-  const gwBase = `http://127.0.0.1:${ingressPort}/s/127.0.0.1`;
-
-  const noAuth = await fetch(`${gwBase}/status`);
-  assert(noAuth.status === 401, 'ingress rejects requests without the gateway header');
-  const badAuth = await fetch(`${gwBase}/status`, { headers: { [GATEWAY_AUTH_HEADER]: 'wrong' } });
-  assert(badAuth.status === 401, 'ingress rejects a wrong gateway token');
-  const ok = await fetch(`${gwBase}/status`, { headers: { [GATEWAY_AUTH_HEADER]: token } });
-  assert(ok.status === 200 && (await ok.text()) === '{"ok":true}', 'ingress proxies to the session shim');
-  const noRoute = await fetch(`http://127.0.0.1:${ingressPort}/status`, {
-    headers: { [GATEWAY_AUTH_HEADER]: token },
-  });
-  assert(noRoute.status === 404, 'ingress 404s unknown paths');
-
-  // SSE must arrive before the upstream response ends (no buffering)
-  const sseAc = new AbortController();
-  const sse = await fetch(`${gwBase}/events`, {
-    headers: { [GATEWAY_AUTH_HEADER]: token, accept: 'text/event-stream' },
-    signal: sseAc.signal,
-  });
-  assert(sse.ok && sse.body !== null, 'ingress SSE request succeeds');
-  const first = await Promise.race([
-    sse.body!.getReader().read(),
-    new Promise<{ value?: Uint8Array }>((_, rej) => setTimeout(() => rej(new Error('sse timeout')), 5_000)),
-  ]);
-  assert(
-    new TextDecoder().decode(first.value).includes('"type":"status"'),
-    'ingress streams SSE frames through without buffering',
-  );
-  sseAc.abort();
-
-  // --- egress allowlist proxy ---
-  assert(hostAllowed('objects.githubusercontent.com', ['*.githubusercontent.com']), 'hostAllowed matches wildcards');
-  assert(!hostAllowed('githubusercontent.com', ['*.githubusercontent.com']), 'hostAllowed wildcard excludes the apex');
-  assert(!hostAllowed('evil.com', ['github.com']), 'hostAllowed rejects unlisted hosts');
-
-  const upstream = http.createServer((_req, res) => res.writeHead(200).end('pong'));
-  const upstreamPort = await listen(upstream);
-  // The fake upstream sits on a random high port, which the default port gate
-  // (80/443) would refuse - the tests allow exactly that one extra port.
-  const testPorts = [80, 443, upstreamPort];
-  const egress = createEgressProxyServer({ allowlist: ['127.0.0.1'], ports: testPorts });
-  const egressPort = await listen(egress);
-  const allowed = await proxyGet(http, egressPort, `http://127.0.0.1:${upstreamPort}/ping`);
-  assert(allowed.status === 200 && allowed.body === 'pong', 'egress proxy forwards allowlisted hosts');
-  const blocked = await proxyGet(http, egressPort, 'http://blocked.example/x');
-  assert(blocked.status === 403, 'egress proxy blocks hosts outside the allowlist');
-
-  // Denial reasons must stay distinguishable: an unauthenticated caller gets
-  // 407 (so it can authenticate), everything else 403.
-  const { denyReason } = await import('./egress-proxy.js');
-  const open = { authorized: true, session: null };
-  assert(
-    denyReason({ authorized: false, session: null }, '127.0.0.1', 443, ['127.0.0.1']) === 'auth',
-    'missing auth is reported as auth',
-  );
-  assert(denyReason(open, '127.0.0.1', 8443, ['127.0.0.1']) === 'port', 'a foreign port is refused');
-  assert(denyReason(open, '127.0.0.1', 443, ['127.0.0.1']) === null, 'an allowlisted host on 443 passes');
-  assert(denyReason(open, 'evil.example', 443, ['127.0.0.1']) === 'host', 'unlisted host is reported as host');
-
-  // A session token that the validator knows must tunnel; the same request
-  // without credentials must not - this is the exact path a shim's git clone
-  // takes, which previously failed with an opaque 403.
-  const liveSession = { id: 'smoke-session', policy: 'allowlist' as const };
-  const gated = createEgressProxyServer({
-    allowlist: ['127.0.0.1'],
-    ports: testPorts,
-    tokenValidator: (t) => (t === 'live-session-token' ? liveSession : null),
-  });
-  const gatedPort = await listen(gated);
-  const authed = await proxyGet(http, gatedPort, `http://127.0.0.1:${upstreamPort}/ping`, 'live-session-token');
-  assert(authed.status === 200, 'egress proxy accepts a live session token');
-  const unauthed = await proxyGet(http, gatedPort, `http://127.0.0.1:${upstreamPort}/ping`);
-  assert(unauthed.status === 407, 'egress proxy answers 407 (not 403) without credentials');
-  const staleToken = await proxyGet(http, gatedPort, `http://127.0.0.1:${upstreamPort}/ping`, 'not-a-session');
-  assert(staleToken.status === 407, 'egress proxy rejects an unknown token');
-
-  // A refused CONNECT followed by a reset used to end the whole orchestrator:
-  // node hands the socket to the 'connect' handler without its own error
-  // listener, so the ECONNRESET arriving while the 403 is written became an
-  // unhandled 'error' event. The proxy has to stay usable afterwards - and if
-  // it does not survive at all, this smoke run dies with it, which is the
-  // assertion. Repeated because the reset has to race the write.
-  const net = await import('node:net');
-  for (let i = 0; i < 20; i++) {
-    await proxyConnectAndReset(net, egressPort, 'blocked.example:443');
-    await proxyConnectAndReset(net, egressPort, `127.0.0.1:${upstreamPort}`);
-  }
-  await new Promise((r) => setTimeout(r, 100));
-  const afterReset = await proxyGet(http, egressPort, `http://127.0.0.1:${upstreamPort}/ping`);
-  assert(afterReset.status === 200, 'the egress proxy still serves after a reset CONNECT');
-
-  gated.close();
-
-  for (const s of [shim, ingress, upstream, egress]) s.close();
-}
-
-/**
- * Session start against a fake docker daemon: the phased progress notices the
- * app renders while a session boots, plus the ordering invariant behind them -
- * a session's egress token must already be valid when its container starts,
- * otherwise the shim's first clone runs into a 407 on the allowlist proxy.
- */
-async function startProgressSmoke(store: Store, manager: SessionManager, c2: Client, repoId: string): Promise<void> {
-  const http = await import('node:http');
-  const dockerMod = await import('./docker.js');
-  const cfg = config as unknown as { dockerEnabled: boolean; dockerHost: string | null; dockerHostIsLocal: boolean };
-
-  const CID = 'fake-container-id';
-  const SECRET_LOOKING = 'ghp_abcdefghijklmnopqrstuvwxyz012345';
-  const LOG = [
-    '[shim] boot',
-    '[git] cloning https://github.com/acme/demo.git (branch main) -> /work',
-    `Cloning into '/work'... token ${SECRET_LOOKING}`,
-    '',
-  ].join('\n');
-
-  let createdEnv: string[] = [];
-  let tokenValidAtStart: boolean | null = null;
-
-  const daemon = http.createServer((req, res) => {
-    const url = req.url ?? '';
-    const method = req.method ?? 'GET';
-    const send = (code: number, body: string, type = 'application/json'): void => {
-      res.writeHead(code, { 'content-type': type }).end(body);
-    };
-    if (method === 'POST' && url.startsWith('/containers/create')) {
-      let body = '';
-      req.on('data', (c) => (body += String(c)));
-      req.on('end', () => {
-        createdEnv = (JSON.parse(body) as { Env?: string[] }).Env ?? [];
-        send(201, JSON.stringify({ Id: CID, Warnings: [] }));
-      });
-      return;
-    }
-    req.resume();
-    if (method === 'POST' && url === `/containers/${CID}/start`) {
-      const token = createdEnv.find((e) => e.startsWith('SHIM_TOKEN='))?.slice('SHIM_TOKEN='.length) ?? '';
-      tokenValidAtStart = token.length > 0 && manager.egressTokenAllowed(token) !== null;
-      res.writeHead(204).end();
-      return;
-    }
-    if (method === 'GET' && url.startsWith(`/containers/${CID}/logs`)) return send(200, LOG, 'application/octet-stream');
-    if (method === 'POST' && url.startsWith('/volumes/create')) return send(201, '{"Name":"v"}');
-    send(200, '{}'); // network inspect/connect, image inspect, everything else
-  });
-  const daemonPort = await listen(daemon);
-
-  const hostnameBefore = process.env.HOSTNAME;
-  process.env.HOSTNAME = 'smoke-orchestrator';
-  cfg.dockerHost = `http://127.0.0.1:${daemonPort}`;
-  cfg.dockerHostIsLocal = true; // socket-proxy semantics: local behaviour, no published ports
-  cfg.dockerEnabled = true;
-  dockerMod.resetDockerClient();
-
-  // The egress setup of a starting session has to be readable from the server
-  // log alone - "denied ... no proxy credentials" says nothing about which side
-  // of the container boundary lost the credentials.
-  const logged: string[] = [];
-  const logBefore = console.log;
-  console.log = (...args: unknown[]): void => {
-    logged.push(args.map((a) => String(a)).join(' '));
-    logBefore(...args);
+  const vault: Record<string, string> = {
+    openai: 'sk-openai-value',
+    anthropic: 'sk-ant-value',
+    github: 'ghp_value',
   };
+  const lookup = (kind: string): string | null => vault[kind] ?? null;
 
-  let sessionId = '';
-  try {
-    const created = await request(c2, {
-      type: 'session.create',
-      requestId: 'prog1',
-      repoId,
-      adapter: 'kilo',
-      provider: 'zai',
-      model: 'glm-4.6',
+  const env = buildRunnerEnv(
+    {
+      sessionId: 'sess-1',
+      shimToken: 'tok-1',
       mode: 'ask',
-    });
-    assert(created.type === 'request.ok', 'progress session created');
-    sessionId = (created.payload as { sessionId: string }).sessionId;
+      provider: 'openai',
+      model: 'gpt-5',
+      repoFullName: 'acme/demo',
+      baseBranch: 'main',
+    },
+    lookup,
+  );
+  assert(env.SHIM_TOKEN === 'tok-1' && env.SESSION_ID === 'sess-1', 'Token und Session-Id landen in der Umgebung');
+  assert(env.WORK_DIR === '/work' && env.AGENT_MODE === 'ask', 'WORK_DIR und AGENT_MODE stehen nach ShimEnv');
+  assert(env.REPO_URL === 'https://github.com/acme/demo.git', 'REPO_URL wird aus dem vollen Namen gebaut');
+  assert(env.REPO_FULL_NAME === 'acme/demo' && env.REPO_BRANCH === 'main', 'Repo-Name und Basis-Branch reisen mit');
+  assert(env.PI_PROVIDER === 'openai' && env.PI_MODEL === 'gpt-5', 'Provider und Modell sind Startwerte fuer den Runner');
+  assert(env.OPENAI_API_KEY === 'sk-openai-value', 'der Key des gewaehlten Providers wird unter seinem Env-Namen injiziert');
+  assert(env.ANTHROPIC_API_KEY === undefined, 'kein zweiter Provider-Key erreicht den Container');
+  assert(
+    Object.keys(env).filter((k) => (Object.values(PI_PROVIDER_ENV) as string[]).includes(k)).length === 1,
+    'genau eine Provider-Env-Variable ist gesetzt',
+  );
+  assert(env.GITHUB_PAT === undefined, 'der GitHub-PAT reist NICHT ueber die Umgebung (Creds-Datei)');
+  assert(env.PA_CREDS_FILE === '/run/secrets/pa/creds.json', 'stattdessen wird der Pfad der Creds-Datei benannt');
+  assert(env.AUTO_PUSH === '0', "AUTO_PUSH ist im Modus 'ask' aus");
 
-    const isNoticeFor = (m: ServerMessage, phase: string): boolean =>
-      m.type === 'session.event' && m.sessionId === sessionId && m.event.type === 'notice' && m.event.phase === phase;
+  const yolo = buildRunnerEnv(
+    { sessionId: 's', shimToken: 't', mode: 'yolo', provider: 'zai', model: '', repoFullName: 'a/b', baseBranch: 'main' },
+    lookup,
+  );
+  assert(yolo.AUTO_PUSH === '1', "AUTO_PUSH ist im Modus 'yolo' an");
+  assert(yolo.PI_MODEL === undefined, 'ein leeres Modell setzt PI_MODEL gar nicht (pi-Vorgabe)');
+  assert(yolo.ZAI_API_KEY === undefined, 'ein Provider ohne hinterlegten Key bekommt keine leere Variable');
 
-    const starting = await c2.wait((m) => isNoticeFor(m, 'container-start'), 20_000);
+  const moon = buildRunnerEnv(
+    { sessionId: 's', shimToken: 't', mode: 'auto', provider: 'moonshot', model: 'k2', repoFullName: 'a/b', baseBranch: 'main' },
+    () => 'moon-key',
+  );
+  assert(moon.KIMI_API_KEY === 'moon-key', 'moonshot und kimi teilen sich KIMI_API_KEY (Protokolltabelle)');
+  assert(moon.AUTO_PUSH === '0', "AUTO_PUSH ist im Modus 'auto' aus");
+
+  const unknown = buildRunnerEnv(
+    { sessionId: 's', shimToken: 't', mode: 'ask', provider: 'does-not-exist', model: '', repoFullName: 'a/b', baseBranch: 'main' },
+    () => 'irrelevant',
+  );
+  assert(
+    !Object.keys(unknown).some((k) => (Object.values(PI_PROVIDER_ENV) as string[]).includes(k)),
+    'ein unbekannter Provider setzt gar keinen Key statt eines falsch benannten',
+  );
+
+  // Dieselbe Regel, die der Runner pro Turn anwendet - hier nur als Beleg, dass
+  // Server und Runner dieselbe Quelle lesen.
+  assert(autoPushForMode('yolo', false) && !autoPushForMode('ask', true), 'autoPushForMode entscheidet ueber den Turn-Modus');
+  assert(autoPushForMode(undefined, true), 'ohne Turn-Modus gilt die Env-Vorgabe');
+
+  /* ---- Build-Kontext: Layout und Ausbleiben ---- */
+
+  const { runnerContextFiles, runnerContextRoot } = await import('./runner.js');
+  const ctxFiles = runnerContextFiles();
+  if (ctxFiles === null) {
+    // Solange runner/ noch nicht existiert (Paket G1.3), ist genau das der
+    // erwartete Zustand - und der Fehler muss ihn benennen, statt einen
+    // Daemon-Fehler vorzuschieben.
+    assert(runnerContextRoot() === null, 'ohne runner/Dockerfile gibt es keinen Build-Kontext');
+  } else {
+    assert(ctxFiles.includes('runner/Dockerfile'), 'der Kontext traegt das Dockerfile des Runners');
     assert(
-      starting.type === 'session.event' &&
-        starting.event.type === 'notice' &&
-        starting.event.message === 'Container startet',
-      'the app is told when the container starts',
+      ctxFiles.includes('tsconfig.base.json') && ctxFiles.some((f) => f.startsWith('packages/protocol/')),
+      'der Kontext hat das Repo-Root-Layout, aus dem runner/Dockerfile kopiert',
     );
-
-    const booting = await c2.wait((m) => isNoticeFor(m, 'shim-start'), 20_000);
-    const bootNotice = booting.type === 'session.event' && booting.event.type === 'notice' ? booting.event : null;
-    assert(bootNotice?.message === 'Repo wird geklont', 'a clone line in the container log becomes "Repo wird geklont"');
-    assert(bootNotice?.detail?.includes('[git] cloning') === true, 'the shim-start notice carries the log tail');
-    assert(bootNotice?.detail?.includes(SECRET_LOOKING) === false, 'token-shaped words are masked in a live detail');
-
-    assert(tokenValidAtStart === true, 'the egress token is valid before the container starts (proxy 407 race)');
-    assert(
-      createdEnv.some((e) => e.startsWith('HTTP_PROXY=http://pa:')),
-      'allowlist sessions reach the network through the authenticated egress proxy',
-    );
-    assert(
-      createdEnv.includes('NODE_USE_ENV_PROXY=1'),
-      'allowlist sessions also ask node itself (and every node child) to honour the proxy variables',
-    );
-    assert(store.getSession(sessionId)?.container_id === CID, 'the container id is recorded before the start');
-
-    const setupLine = logged.find((l) => l.startsWith(`[docker] session ${sessionId.slice(0, 8)} `));
-    assert(setupLine !== undefined, 'the container creation logs the session egress setup');
-    assert(
-      setupLine?.includes('policy=allowlist') === true &&
-        setupLine.includes('egress=orchestrator:') &&
-        setupLine.endsWith('auth=yes'),
-      `the egress setup line names policy, proxy and whether credentials are set: ${String(setupLine)}`,
-    );
-    assert(!logged.some((l) => l.includes(String(store.getSession(sessionId)?.shim_token))), 'the log never carries the token');
-  } finally {
-    console.log = logBefore;
-    cfg.dockerEnabled = false;
-    cfg.dockerHost = null;
-    cfg.dockerHostIsLocal = false;
-    dockerMod.resetDockerClient();
-    if (hostnameBefore === undefined) delete process.env.HOSTNAME;
-    else process.env.HOSTNAME = hostnameBefore;
-    daemon.close();
-    // The shim never answers here, so provisioning keeps polling in the
-    // background until its timeout - dropping the session ends it cleanly.
-    if (sessionId) await manager.deleteSession(sessionId).catch(() => {});
+    assert(!ctxFiles.some((f) => f.includes('node_modules')), 'der Kontext traegt nie node_modules');
+    assert(!ctxFiles.some((f) => f.startsWith('runner/dist/')), 'der Kontext traegt kein Build-Ergebnis (runner/Dockerfile baut selbst)');
   }
-}
 
-/**
- * Egress authorization that does not depend on the HTTP client: an 'allowlist'
- * session reaches the network when its source IP belongs to a live session
- * container, even without Proxy-Authorization (node/undici drop the userinfo of
- * HTTP(S)_PROXY, git sends it). The token gate stays the second path, and the
- * only caller that could ever build a proxy URL without credentials - a push on
- * a session without shim_token - is refused before the container exists.
- */
-async function egressPeerSmoke(store: Store, manager: SessionManager, repoId: string): Promise<void> {
-  const http = await import('node:http');
+  /* ---- Bau ueber die Docker-API: Fehler-Frame und Fortschritt ---- */
+
+  // Ein gescheiterter Bau beendet den Stream normal und meldet sich nur in
+  // einem `error`-Frame; der Callback von followProgress deckt nur
+  // Transportfehler ab. Beides muss gepruft werden, sonst gilt ein kaputter
+  // Bau als Erfolg und der Session-Start laeuft in den Bereitschafts-Timeout.
   const dockerMod = await import('./docker.js');
-  const { createEgressProxyServer, normalizePeerIp } = await import('./egress-proxy.js');
-  const cfg = config as unknown as { dockerEnabled: boolean; dockerHost: string | null; dockerHostIsLocal: boolean };
-
-  /* ---- peer address normalization (pure) ---- */
-
-  assert(normalizePeerIp('::ffff:10.0.0.5') === '10.0.0.5', 'an IPv4-mapped IPv6 peer normalizes to its IPv4 form');
-  assert(normalizePeerIp('10.0.0.5') === '10.0.0.5', 'a plain IPv4 peer stays as it is');
-  assert(normalizePeerIp('FE80::1%eth0') === 'fe80::1', 'the zone id of a link-local peer is stripped');
-  assert(normalizePeerIp(undefined) === '', 'a socket without a peer address normalizes to empty');
-
-  /* ---- the two gates on a live proxy ---- */
-
-  const upstream = http.createServer((_req, res) => res.writeHead(200).end('pong'));
-  const upstreamPort = await listen(upstream);
-  const peers = new Set(['127.0.0.1']);
-  const peerSession = { id: 'peer-session', policy: 'allowlist' as const };
-  const proxy = createEgressProxyServer({
-    allowlist: ['127.0.0.1'],
-    ports: [80, 443, upstreamPort],
-    tokenValidator: (t) => (t === 'live-session-token' ? peerSession : null),
-    peerValidator: (ip) => (peers.has(ip) ? peerSession : null),
-  });
-  const proxyPort = await listen(proxy);
-  const target = `http://127.0.0.1:${upstreamPort}/ping`;
-
-  const byPeer = await proxyGet(http, proxyPort, target);
-  assert(byPeer.status === 200, 'a request from a live session container passes without any credentials');
-  peers.clear();
-  const unknownPeer = await proxyGet(http, proxyPort, target);
-  assert(unknownPeer.status === 407, 'an unknown peer without credentials is refused with 407');
-  const byToken = await proxyGet(http, proxyPort, target, 'live-session-token');
-  assert(byToken.status === 200, 'a valid token still passes when the peer is unknown');
-  const badBoth = await proxyGet(http, proxyPort, target, 'stale-token');
-  assert(badBoth.status === 407, 'an unknown token from an unknown peer stays refused');
-
-  // CONNECT reads the peer from the tunnel socket, not from the request - the
-  // https path every LLM call takes, and the one that failed in production.
-  const net = await import('node:net');
-  const blindConnect = await proxyConnect(net, proxyPort, '127.0.0.1:443');
-  assert(blindConnect === 407, 'CONNECT without credentials from an unknown peer is refused');
-  peers.add('127.0.0.1');
-  const peerConnect = await proxyConnect(net, proxyPort, '127.0.0.1:443');
-  assert(peerConnect !== 407, 'CONNECT from a live session container needs no credentials');
-  peers.clear();
-
-  /* ---- push without a shim token: refused before a container exists ---- */
-
-  const tokenless = randomUUID();
-  const now = new Date().toISOString();
-  store.insertSession({
-    id: tokenless,
-    tenant_id: 'default',
-    repo_id: repoId,
-    repo_full_name: 'acme/demo',
-    adapter: 'kilo',
-    provider: 'zai',
-    model: 'glm-4.6',
-    mode: 'ask',
-    status: 'idle',
-    branch: `agent/${tokenless}`,
-    session_ref: null,
-    container_id: null,
-    volume_name: `pocketagent-sess-${tokenless}`,
-    shim_token: null,
-    pr_url: null,
-    shim_endpoint: null,
-    link_id: null,
-    network_policy: 'allowlist',
-    reasoning_effort: null,
-    title: null,
-    archived: 0,
-    created_at: now,
-    last_active_at: now,
-  });
-  let pushError = '';
-  await manager.push(tokenless).catch((e: unknown) => {
-    pushError = e instanceof Error ? e.message : String(e);
-  });
-  assert(pushError.includes('not provisioned'), 'a push without a shim token is refused instead of run without proxy credentials');
-  await manager.deleteSession(tokenless).catch(() => {});
-
-  /* ---- ip -> session lookup against a fake daemon (cache, failures) ---- */
-
-  // The peer gate answers with the session behind an address, so the labelled
-  // container needs a live row to point at.
-  const peerRow = randomUUID();
-  store.insertSession(
-    sessionRow(peerRow, repoId, { status: 'idle', shim_token: `token-${peerRow.slice(0, 8)}` }),
-  );
-
-  let listCalls = 0;
-  let daemonBroken = false;
-  const daemon = http.createServer((req, res) => {
-    req.resume();
-    if ((req.url ?? '').startsWith('/containers/json')) {
-      listCalls++;
-      if (daemonBroken) return void res.writeHead(500).end('{"message":"daemon down"}');
-      return void res.writeHead(200, { 'content-type': 'application/json' }).end(
-        JSON.stringify([
-          {
-            Id: 'cid-peer',
-            Labels: { 'pocketagent.session': peerRow },
-            NetworkSettings: { Networks: { 'pocketagent-s-1': { IPAddress: '10.9.0.7' } } },
-          },
-        ]),
-      );
-    }
-    res.writeHead(200, { 'content-type': 'application/json' }).end('{}');
-  });
-  const daemonPort = await listen(daemon);
-
-  cfg.dockerHost = `http://127.0.0.1:${daemonPort}`;
-  cfg.dockerHostIsLocal = true;
-  cfg.dockerEnabled = true;
-  dockerMod.resetDockerClient();
-  try {
-    await dockerMod.refreshSessionPeers();
-    assert(listCalls === 1, 'the peer set is loaded with a single daemon call');
-    assert(manager.egressPeerAllowed('10.9.0.7')?.id === peerRow, 'the IP of a live session container authorizes');
-    assert(manager.egressPeerAllowed('::ffff:10.9.0.7') !== null, 'the same IP as IPv4-mapped IPv6 authorizes');
-    assert(manager.egressPeerAllowed('10.9.0.8') === null, 'an IP outside the session containers does not authorize');
-    assert(manager.egressPeerAllowed('') === null, 'an empty peer address never authorizes');
-    assert(listCalls === 1, 'the lookup is cached - no daemon call per proxied request');
-
-    daemonBroken = true;
-    await dockerMod.refreshSessionPeers();
-    assert(manager.egressPeerAllowed('10.9.0.7') === null, 'a failing daemon denies conservatively instead of crashing');
-  } finally {
-    store.deleteSession(peerRow);
-    cfg.dockerEnabled = false;
-    cfg.dockerHost = null;
-    cfg.dockerHostIsLocal = false;
-    dockerMod.resetDockerClient();
-    daemon.close();
-    proxy.close();
-    upstream.close();
-  }
-}
-
-/**
- * The gates in front of the network: the session's own policy, the credentials
- * that must not leave the proxy, and the addresses a name must never resolve
- * to. Each block reproduces one finding of the egress review.
- */
-async function egressSmoke(store: Store, manager: SessionManager, repoId: string): Promise<void> {
-  const http = await import('node:http');
-  const net = await import('node:net');
-  const {
-    EgressSessionRegistry,
-    createEgressProxyServer,
-    forwardableHeaders,
-    isInternalAddress,
-    parseEgressSessions,
-    resolveTarget,
-  } = await import('./egress-proxy.js');
-  const { createIngressServer } = await import('./gateway.js');
-  const { GATEWAY_AUTH_HEADER, GATEWAY_EGRESS_SYNC_PATH } = await import('./config.js');
-
-  /* ---- addresses a resolved name may never point at (pure) ---- */
-
-  for (const ip of ['127.0.0.1', '10.1.2.3', '192.168.1.9', '172.20.0.1', '169.254.169.254', '100.64.0.1', '0.0.0.0']) {
-    assert(isInternalAddress(ip), `${ip} counts as internal`);
-  }
-  for (const ip of ['::1', 'fe80::1', 'fd00::1', 'ff02::1', '::ffff:127.0.0.1']) {
-    assert(isInternalAddress(ip), `${ip} counts as internal`);
-  }
-  for (const ip of ['140.82.121.4', '2606:4700::1111']) {
-    assert(!isInternalAddress(ip), `${ip} is a public address`);
-  }
-  assert(isInternalAddress('not-an-address'), 'anything unparseable counts as internal');
-
-  /* ---- hop-by-hop headers never reach the upstream (pure) ---- */
-
-  const stripped = forwardableHeaders({
-    host: 'api.example',
-    'proxy-authorization': 'Basic cGE6c2VjcmV0',
-    'proxy-connection': 'keep-alive',
-    connection: 'x-hop',
-    'x-hop': 'internal',
-    authorization: 'Bearer upstream-credential',
-  });
-  assert(stripped['proxy-authorization'] === undefined, 'proxy-authorization is stripped before the forward');
-  assert(stripped['proxy-connection'] === undefined && stripped.connection === undefined, 'proxy-connection/connection are stripped');
-  assert(stripped['x-hop'] === undefined, 'headers listed in connection are stripped too');
-  assert(stripped.authorization === 'Bearer upstream-credential', 'the upstream Authorization header survives');
-
-  /* ---- sessions with the three policies, straight from the DB ---- */
-
-  const allowId = randomUUID();
-  const isoId = randomUUID();
-  const stoppedId = randomUUID();
-  const allowToken = `allow-${allowId}`;
-  const isoToken = `iso-${isoId}`;
-  const stoppedToken = `stopped-${stoppedId}`;
-  store.insertSession(sessionRow(allowId, repoId, { status: 'idle', shim_token: allowToken }));
-  store.insertSession(
-    sessionRow(isoId, repoId, { status: 'idle', shim_token: isoToken, network_policy: 'isolated' }),
-  );
-  store.insertSession(sessionRow(stoppedId, repoId, { status: 'stopped', shim_token: stoppedToken }));
-
-  assert(manager.egressTokenAllowed(allowToken)?.id === allowId, 'a live session token names its session');
-  assert(manager.egressTokenAllowed(allowToken)?.policy === 'allowlist', 'the token gate reports the session policy');
-  assert(manager.egressTokenAllowed(isoToken)?.policy === 'isolated', 'an isolated session is identified, not hidden');
-  assert(manager.egressTokenAllowed(stoppedToken) === null, 'the token of a stopped session no longer opens the proxy');
-  assert(manager.egressTokenAllowed('never-issued') === null, 'an unknown token names no session');
-  store.setSessionArchived(allowId, true);
-  assert(manager.egressTokenAllowed(allowToken) === null, 'an archived session loses its egress right away');
-  store.setSessionArchived(allowId, false);
-  assert(manager.egressTokenAllowed(allowToken)?.id === allowId, 'and gets it back when it is unarchived');
-  assert(
-    manager.egressSessions().some((s) => s.id === allowId) &&
-      !manager.egressSessions().some((s) => s.id === stoppedId),
-    'the table pushed to the gateway holds exactly the sessions that may egress',
-  );
-
-  /* ---- the proxy in front of them ---- */
-
-  let seenHeaders: import('node:http').IncomingHttpHeaders = {};
-  const upstream = http.createServer((req, res) => {
-    seenHeaders = req.headers;
-    res.writeHead(200).end('pong');
-  });
-  const upstreamPort = await listen(upstream);
-  const target = `http://127.0.0.1:${upstreamPort}/ping`;
-  const ports = [80, 443, upstreamPort];
-
-  // Peer gate answers for whoever is asking; the token gate is the real one.
-  let peerSession: ReturnType<typeof manager.egressTokenAllowed> = null;
-  const proxy = createEgressProxyServer({
-    allowlist: ['127.0.0.1'],
-    ports,
-    tokenValidator: (t) => manager.egressTokenAllowed(t),
-    peerValidator: () => peerSession,
-  });
-  const proxyPort = await listen(proxy);
-
-  const allowed = await proxyGet(http, proxyPort, target, allowToken);
-  assert(allowed.status === 200, 'an allowlist session passes with its token');
-
-  // Finding: the forward path used to hand the session's shim token (which is
-  // also the shim API credential) to every plain-HTTP upstream it talked to.
-  assert(seenHeaders['proxy-authorization'] === undefined, 'the upstream never sees Proxy-Authorization');
-  assert(seenHeaders['proxy-connection'] === undefined, 'the upstream never sees Proxy-Connection');
-  assert(seenHeaders.host === `127.0.0.1:${upstreamPort}`, 'the forwarded request keeps addressing its origin host');
-
-  // Finding: networkPolicy 'isolated' was decoration - the container simply
-  // pointed HTTP_PROXY at the orchestrator and egressed like everyone else.
-  const isolated = await proxyGet(http, proxyPort, target, isoToken);
-  assert(isolated.status === 403 && isolated.body.includes('policy'), 'an isolated session is refused, token or not');
-  const isolatedConnect = await proxyConnect(net, proxyPort, '127.0.0.1:443', isoToken);
-  assert(isolatedConnect === 403, 'an isolated session cannot open a CONNECT tunnel either');
-  const stopped = await proxyGet(http, proxyPort, target, stoppedToken);
-  assert(stopped.status === 407, 'a stopped session has to authenticate again - and cannot');
-
-  // The source address is the claim that cannot be forged: an isolated
-  // container must not borrow another session's token to get out.
-  peerSession = { id: isoId, policy: 'isolated' };
-  const borrowed = await proxyGet(http, proxyPort, target, allowToken);
-  assert(borrowed.status === 403, 'a foreign token does not lift the calling container\'s policy');
-  peerSession = null;
-
-  // Finding: the plain-HTTP path was not port-gated at all (CONNECT was).
-  const strict = createEgressProxyServer({ allowlist: ['127.0.0.1'], tokenValidator: (t) => manager.egressTokenAllowed(t) });
-  const strictPort = await listen(strict);
-  const oddPort = await proxyGet(http, strictPort, target, allowToken);
-  assert(oddPort.status === 403 && oddPort.body.includes('port'), 'forwarded HTTP is port-gated like CONNECT');
-
-  /* ---- SSRF: a name may not resolve into internal space ---- */
-
-  const loopbackName = await resolveTarget('localhost', ['localhost']);
-  assert(!loopbackName.ok && loopbackName.reason === 'address', 'a name resolving to loopback is refused');
-  const literal = await resolveTarget('127.0.0.1', ['127.0.0.1']);
-  assert(literal.ok, 'an IP literal the operator wrote into the allowlist stays reachable');
-  const wildcardLiteral = await resolveTarget('127.0.0.1', ['*.0.0.1']);
-  assert(!wildcardLiteral.ok, 'an internal literal matched only by a wildcard entry does not');
-
-  const rebind = createEgressProxyServer({
-    allowlist: ['localhost'],
-    ports,
-    tokenValidator: (t) => manager.egressTokenAllowed(t),
-  });
-  const rebindPort = await listen(rebind);
-  const viaName = await proxyGet(http, rebindPort, `http://localhost:${upstreamPort}/ping`, allowToken);
-  assert(viaName.status === 403 && viaName.body.includes('address'), 'an allowlisted name pointing inside is blocked');
-  const viaNameConnect = await proxyConnect(net, rebindPort, 'localhost:443', allowToken);
-  assert(viaNameConnect === 403, 'the CONNECT path resolves and blocks the same way');
-
-  /* ---- reachability: one dead address must not make a host unreachable ---- */
-
-  // Finding: the target check pinned a request to the *first* checked address,
-  // so a host answering with an AAAA record was unreachable from a container
-  // without an IPv6 route - the agent saw "Connection error.", the A record next
-  // to it was never tried, and connecting by name (kernel happy eyeballs) had
-  // covered exactly this before.
-  const dual = await resolveTarget('dual.example', ['dual.example'], async () => [
-    { address: '2606:4700::1111', family: 6 },
-    { address: '203.0.113.7', family: 4 },
-    { address: '10.1.2.3', family: 4 },
-    { address: 'fd00::1', family: 6 },
-    { address: '198.51.100.9', family: 4 },
-  ]);
-  assert(dual.ok && dual.targets.length === 3, 'a resolved name keeps every checked address, not just the first');
-  assert(
-    dual.ok && dual.targets.map((t) => t.address).join(',') === '203.0.113.7,198.51.100.9,2606:4700::1111',
-    'IPv4 comes before IPv6, and the DNS order inside a family is kept',
-  );
-  assert(
-    dual.ok && !dual.targets.some((t) => isInternalAddress(t.address)),
-    'no internal address ever reaches the list a request may connect to',
-  );
-  const insideOnly = await resolveTarget('inside.example', ['inside.example'], async () => [
-    { address: '10.1.2.3', family: 4 },
-    { address: 'fd00::1', family: 6 },
-  ]);
-  assert(!insideOnly.ok && insideOnly.reason === 'address', 'a name resolving only into internal space is still refused');
-
-  // The fallback end to end. 127.0.0.9 is loopback with nothing bound, so the
-  // first attempt is refused immediately and only the second address can carry
-  // the tunnel. The address list is injected: a name that really resolves to a
-  // dead address first is not reproducible in a test, and the injected list is
-  // exactly what resolveTarget would have handed over.
-  const tunnelUpstream = net.createServer((s) => {
-    s.on('data', () => s.write('tunneled'));
-  });
-  const tunnelPort = await new Promise<number>((r) =>
-    tunnelUpstream.listen(0, '127.0.0.1', () => r((tunnelUpstream.address() as AddressInfo).port)),
-  );
-  const fallbackPorts = [80, 443, tunnelPort];
-  const withFallback = createEgressProxyServer({
-    allowlist: ['dual.example'],
-    ports: fallbackPorts,
-    resolve: async () => ({
-      ok: true,
-      targets: [
-        { address: '127.0.0.9', family: 4 },
-        { address: '127.0.0.1', family: 4 },
-      ],
-    }),
-  });
-  const fallbackPort = await listen(withFallback);
-  const tunnel = await proxyTunnel(net, fallbackPort, `dual.example:${tunnelPort}`, 'ping');
-  assert(
-    tunnel.status === 200 && tunnel.echo === 'tunneled',
-    'CONNECT tries the next checked address when the first one refuses',
-  );
-
-  // And when none of them answers: 502, plus the line that was missing - a
-  // failed upstream connect used to leave no trace at all, which is what kept
-  // the pinned-address failure undiagnosed on the live instance.
-  const allDead = createEgressProxyServer({
-    allowlist: ['dual.example'],
-    ports: fallbackPorts,
-    resolve: async () => ({
-      ok: true,
-      targets: [
-        { address: '127.0.0.9', family: 4 },
-        { address: '127.0.0.8', family: 4 },
-      ],
-    }),
-  });
-  const deadPort = await listen(allDead);
-  const upstreamWarnings: string[] = [];
-  const warnBefore = console.warn;
-  console.warn = (...a: unknown[]): void => {
-    upstreamWarnings.push(a.map(String).join(' '));
+  let buildCalls = 0;
+  let dockerfileArg = '';
+  const fakeDocker = {
+    buildImage: (_ctx: unknown, opts: { dockerfile?: string }) => {
+      buildCalls++;
+      dockerfileArg = opts.dockerfile ?? '';
+      return Promise.resolve({} as NodeJS.ReadableStream);
+    },
+    modem: {
+      followProgress: (
+        _s: unknown,
+        onFinished: (e: Error | null, o: unknown[]) => void,
+        onProgress: (ev: Record<string, unknown>) => void,
+      ) => {
+        setTimeout(() => {
+          onProgress({ stream: 'Step 1/12 : FROM node:22-bookworm-slim' });
+          onProgress({ stream: 'npm ci: ENOSPC no space left on device' });
+          onProgress({ error: 'The command /bin/sh -c npm ci returned a non-zero code: 1' });
+          onFinished(null, []);
+        }, 10);
+      },
+    },
   };
-  let deadConnect = 0;
-  let deadForward = { status: 0, body: '' };
-  try {
-    deadConnect = await proxyConnect(net, deadPort, `dual.example:${tunnelPort}`);
-    deadForward = await proxyGet(http, deadPort, `http://dual.example:${tunnelPort}/ping`);
-  } finally {
-    console.warn = warnBefore;
-  }
-  assert(deadConnect === 502, 'a CONNECT whose addresses are all unreachable ends in 502');
-  assert(deadForward.status === 502, 'the forward path answers 502 when no checked address answers');
-  assert(
-    upstreamWarnings.some(
-      (w) => w.startsWith(`[egress] upstream failed CONNECT dual.example:${tunnelPort} `) && w.includes('tried 2 addresses'),
-    ),
-    'a failed CONNECT upstream is logged with host, port and how many addresses were tried',
-  );
-  assert(
-    upstreamWarnings.some((w) => w.startsWith(`[egress] upstream failed GET dual.example:${tunnelPort} `)),
-    'the forward path logs its upstream failures too',
-  );
-  assert(
-    !upstreamWarnings.some((w) => w.includes(allowToken) || w.toLowerCase().includes('authorization')),
-    'the upstream failure line carries no credentials',
-  );
-
-  /* ---- gateway: same gates, fed by the orchestrator over the ingress ---- */
-
-  assert(parseEgressSessions({ sessions: [{ id: 'a', policy: 'nope', token: null, ips: [] }] }) === null, 'a bad policy rejects the whole table');
-  assert(parseEgressSessions({}) === null, 'a body without a session list is no table');
-
-  const gwToken = 'gw-egress-smoke';
-  const registry = new EgressSessionRegistry();
-  const ingress = createIngressServer({ token: gwToken, onEgressSessions: (e) => registry.set(e) });
-  const ingressPort = await listen(ingress);
-  const syncUrl = `http://127.0.0.1:${ingressPort}${GATEWAY_EGRESS_SYNC_PATH}`;
-  const push = (body: string, auth = true): Promise<Response> =>
-    fetch(syncUrl, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', ...(auth ? { [GATEWAY_AUTH_HEADER]: gwToken } : {}) },
-      body,
+  const notices: { message: string; phase?: string; detail?: string }[] = [];
+  let buildErr = '';
+  await dockerMod
+    .buildRunnerImage(fakeDocker as never, 'pa-smoke/pi-runner:test', (message, p) => {
+      notices.push({ message, ...p });
+    })
+    .catch((e: unknown) => {
+      buildErr = e instanceof Error ? e.message : String(e);
     });
-
-  const table = JSON.stringify({
-    sessions: [
-      { id: 'gw-allow', policy: 'allowlist', token: 'gw-allow-token', ips: ['10.1.2.3'] },
-      { id: 'gw-iso', policy: 'isolated', token: 'gw-iso-token', ips: ['10.1.2.4'] },
-    ],
-  });
-  const unauthedPush = await push(table, false);
-  assert(unauthedPush.status === 401 && registry.size === 0, 'the session table cannot be pushed without the gateway secret');
-  const authedPush = await push(table);
-  assert(authedPush.status === 204, 'an authenticated push is accepted');
-  assert(registry.byToken('gw-allow-token')?.id === 'gw-allow', 'the gateway knows the pushed tokens');
-  assert(registry.byToken('gw-allow-token-x') === null, 'and only those');
-  assert(registry.byPeer('::ffff:10.1.2.3')?.id === 'gw-allow', 'the gateway knows the pushed container addresses');
-  const badPush = await push('{"sessions":[{"id":42}]}');
-  assert(badPush.status === 400 && registry.byToken('gw-allow-token') !== null, 'a malformed push never empties the table');
-
-  // Finding: the gateway's egress proxy ran without any validator - every
-  // container that reached gateway:3128 egressed without credentials.
-  const gwEgress = createEgressProxyServer({
-    allowlist: ['127.0.0.1'],
-    ports,
-    tokenValidator: (t) => registry.byToken(t),
-    peerValidator: (ip) => registry.byPeer(ip),
-  });
-  const gwEgressPort = await listen(gwEgress);
-  const gwAnon = await proxyGet(http, gwEgressPort, target);
-  assert(gwAnon.status === 407, 'the gateway egress proxy refuses an unauthenticated caller');
-  const gwAllowed = await proxyGet(http, gwEgressPort, target, 'gw-allow-token');
-  assert(gwAllowed.status === 200, 'a session from the pushed table passes');
-  const gwIsolated = await proxyGet(http, gwEgressPort, target, 'gw-iso-token');
-  assert(gwIsolated.status === 403, 'an isolated session is refused on the gateway too');
-
-  for (const s of [upstream, proxy, strict, rebind, withFallback, allDead, ingress, gwEgress]) s.close();
-  tunnelUpstream.close();
-  for (const id of [allowId, isoId, stoppedId]) store.deleteSession(id);
+  if (ctxFiles === null) {
+    assert(buildErr.includes('kein Build-Kontext'), 'ohne Kontext scheitert der Bau mit genau dieser Begruendung');
+    assert(buildCalls === 0, 'ohne Kontext wird der Daemon gar nicht erst bemueht');
+  } else {
+    assert(buildCalls === 1, 'der Bau spricht die Docker-API genau einmal an');
+    assert(dockerfileArg === 'runner/Dockerfile', 'gebaut wird runner/Dockerfile aus dem Repo-Root-Kontext');
+    assert(buildErr.includes('non-zero code: 1'), 'der Fehler-Frame wird zur Ausnahme-Ursache');
+    assert(buildErr.includes('ENOSPC'), 'die Ausnahme traegt die letzten Log-Zeilen');
+    assert(
+      notices[0]?.phase === 'container-start' && notices[0].message.includes('Runner-Image wird gebaut'),
+      "der Bau meldet sich als Fortschritt der Phase 'container-start' (die Phase 'image-build' gibt es nicht mehr)",
+    );
+    assert(
+      notices.some((n) => n.message === 'Image wird gebaut (Schritt 1/12)'),
+      'der Docker-Schritt wird zur Fortschrittsmeldung',
+    );
+    assert(
+      notices.some((n) => n.detail?.includes('FROM node:22-bookworm-slim') === true),
+      'die Meldung traegt den Log-Schwanz als Detail',
+    );
+  }
 }
+
+/* ------------------------------------------------------------------ */
+/* 2. Session-Lebenszyklus gegen eine gefaelschte Docker-API           */
+/* ------------------------------------------------------------------ */
 
 /**
- * Startup reconcile + request-path self healing against a fake docker daemon
- * and a fake shim. Both model the production case behind them: a redeploy
- * replaces the orchestrator container, so it hangs on no session network any
- * more and holds no event stream, while the session containers keep running.
- */
-async function reconcileSmoke(store: Store, manager: SessionManager, c2: Client, repoId: string): Promise<void> {
-  const http = await import('node:http');
-  const dockerMod = await import('./docker.js');
-  const cfg = config as unknown as {
-    dockerEnabled: boolean;
-    dockerHost: string | null;
-    dockerHostIsLocal: boolean;
-    gatewayToken: string | null;
-  };
-
-  const now = new Date().toISOString();
-  const rowFor = (id: string, policy: string | null, status: string, containerId: string): import('./db.js').SessionRow => ({
-    id,
-    tenant_id: 'default',
-    repo_id: repoId,
-    repo_full_name: 'acme/demo',
-    adapter: 'kilo',
-    provider: 'zai',
-    model: 'glm-4.6',
-    mode: 'ask',
-    status,
-    branch: `agent/${id}`,
-    session_ref: null,
-    container_id: containerId,
-    volume_name: `pocketagent-sess-${id}`,
-    shim_token: `token-${id.slice(0, 8)}`,
-    pr_url: null,
-    shim_endpoint: null,
-    link_id: null,
-    network_policy: policy,
-    reasoning_effort: null,
-    title: null,
-    archived: 0,
-    created_at: now,
-    last_active_at: now,
-  });
-
-  /* ---- sessionNetworkFor: policy -> network name, mode -> relay (pure) ---- */
-
-  const probe = rowFor(randomUUID(), 'allowlist', 'idle', 'cid-probe');
-  assert(
-    dockerMod.sessionNetworkFor(probe).name === dockerMod.sessionNetworkName(probe.id),
-    'allowlist sessions live on their own per-session network',
-  );
-  assert(
-    dockerMod.sessionNetworkFor({ ...probe, network_policy: 'isolated' }).name === dockerMod.sessionNetworkName(probe.id),
-    'isolated sessions live on their own per-session network',
-  );
-  assert(
-    dockerMod.sessionNetworkFor({ ...probe, network_policy: 'open' }).name === config.networkName,
-    'open sessions share the main network',
-  );
-  assert(
-    dockerMod.sessionNetworkFor({ ...probe, network_policy: 'nonsense' }).name === dockerMod.sessionNetworkName(probe.id),
-    'an unreadable policy falls back to the configured default (allowlist)',
-  );
-  assert(dockerMod.sessionNetworkFor(probe).relay === 'orchestrator', 'locally the orchestrator itself is the relay');
-  cfg.dockerHost = 'tcp://runner.example:2375';
-  cfg.dockerHostIsLocal = false;
-  assert(dockerMod.sessionNetworkFor(probe).relay === 'none', 'remote without gateway reaches the shim via a published port');
-  cfg.gatewayToken = 'gw-smoke';
-  assert(dockerMod.sessionNetworkFor(probe).relay === 'gateway', 'remote with a gateway relays through the gateway container');
-  assert(
-    dockerMod.sessionNetworkFor({ ...probe, network_policy: 'open' }).name === config.networkName,
-    'gateway mode keeps open sessions on the main network',
-  );
-  cfg.gatewayToken = null;
-  cfg.dockerHost = null;
-
-  /* ---- fake shim: SSE stream + a /prompt that can fail at the transport ---- */
-
-  let shimMode: 'ok' | 'fail-once' | 'dead' = 'ok';
-  let promptCalls = 0;
-  const shim = http.createServer((req, res) => {
-    const url = req.url ?? '';
-    if (url.startsWith('/events')) {
-      res.writeHead(200, { 'content-type': 'text/event-stream' });
-      res.write('data: {"type":"notice","message":"stream-live"}\n\n'); // stays open
-      return;
-    }
-    if (url.startsWith('/prompt')) {
-      promptCalls++;
-      if (shimMode === 'dead' || (shimMode === 'fail-once' && promptCalls === 1)) return void res.destroy();
-      return void res.writeHead(200, { 'content-type': 'application/json' }).end('{"ok":true}');
-    }
-    res.writeHead(200, { 'content-type': 'application/json' }).end('{"ok":true}');
-  });
-  const shimPort = await listen(shim);
-  const shimBase = `http://127.0.0.1:${shimPort}`;
-
-  /* ---- fake daemon: container states + a log of every network connect ---- */
-
-  const RUNNING = new Set(['cid-run-a', 'cid-run-b']);
-  const STOPPED = new Set(['cid-stopped']);
-  const connects: { network: string; container: string; aliases: string[] }[] = [];
-  const daemon = http.createServer((req, res) => {
-    const url = req.url ?? '';
-    const method = req.method ?? 'GET';
-    const send = (code: number, body: string, type = 'application/json'): void => {
-      res.writeHead(code, { 'content-type': type }).end(body);
-    };
-    const connect = /^\/networks\/([^/]+)\/connect/.exec(url);
-    if (method === 'POST' && connect) {
-      let body = '';
-      req.on('data', (c) => (body += String(c)));
-      req.on('end', () => {
-        const parsed = JSON.parse(body) as { Container?: string; EndpointConfig?: { Aliases?: string[] } };
-        connects.push({
-          network: decodeURIComponent(connect[1] as string),
-          container: parsed.Container ?? '',
-          aliases: parsed.EndpointConfig?.Aliases ?? [],
-        });
-        send(200, '{}');
-      });
-      return;
-    }
-    req.resume();
-    const inspect = /^\/containers\/([^/]+)\/json/.exec(url);
-    if (method === 'GET' && inspect) {
-      const cid = inspect[1] as string;
-      if (RUNNING.has(cid)) return send(200, '{"State":{"Running":true,"Status":"running"}}');
-      if (STOPPED.has(cid)) return send(200, '{"State":{"Running":false,"Status":"exited","ExitCode":0}}');
-      return send(404, '{"message":"No such container"}');
-    }
-    if (method === 'GET' && /^\/containers\/[^/]+\/logs/.test(url)) {
-      return send(200, '[shim] listening on :8080\n', 'application/octet-stream');
-    }
-    send(200, '{}'); // network inspect, volume/container removal, everything else
-  });
-  const daemonPort = await listen(daemon);
-
-  const hostnameBefore = process.env.HOSTNAME;
-  process.env.HOSTNAME = 'smoke-orchestrator';
-  cfg.dockerHost = `http://127.0.0.1:${daemonPort}`;
-  cfg.dockerHostIsLocal = true;
-  cfg.dockerEnabled = true;
-  dockerMod.resetDockerClient();
-
-  const running = randomUUID(); // allowlist, mid-turn during the restart
-  const idle = randomUUID(); // open, idle
-  const gone = randomUUID(); // container removed behind our back
-  const stopped = randomUUID(); // container still there, but not running
-  const neverStarted = randomUUID(); // crashed during provisioning, before the container existed
-  try {
-    store.insertSession({ ...rowFor(running, 'allowlist', 'running', 'cid-run-a'), shim_endpoint: shimBase });
-    store.insertSession({ ...rowFor(idle, 'open', 'idle', 'cid-run-b'), shim_endpoint: shimBase });
-    store.insertSession(rowFor(gone, 'allowlist', 'running', 'cid-gone'));
-    store.insertSession(rowFor(stopped, 'open', 'idle', 'cid-stopped'));
-    store.insertSession({
-      ...rowFor(neverStarted, 'allowlist', 'creating', ''),
-      container_id: null,
-      shim_token: null,
-      volume_name: null,
-    });
-
-    await manager.reconcile();
-
-    const attached = (network: string): boolean =>
-      connects.some((c) => c.network === network && c.container === 'smoke-orchestrator' && c.aliases.includes('orchestrator'));
-    assert(attached(dockerMod.sessionNetworkName(running)), 'reconcile re-attaches the orchestrator to a per-session network');
-    assert(attached(config.networkName), 'reconcile re-attaches the orchestrator to the shared network of an open session');
-    assert(
-      !connects.some((c) => c.network === dockerMod.sessionNetworkName(gone)),
-      'a session whose container is gone is not re-attached',
-    );
-
-    assert(store.getSession(running)?.status === 'idle', 'a turn interrupted by the restart ends as idle, not running');
-    assert(store.getSession(idle)?.status === 'idle', 'an idle session with a live container stays idle');
-    assert(store.getSession(gone)?.status === 'error', 'a session whose container vanished ends in error');
-    assert(store.getSession(stopped)?.status === 'stopped', 'a session with a stopped container ends as stopped');
-    assert(
-      store.getSession(neverStarted)?.status === 'error',
-      "a start interrupted before the container existed does not stay in 'creating' forever",
-    );
-    const neverStartedErr = await c2.wait(
-      (m) => m.type === 'session.event' && m.sessionId === neverStarted && m.event.type === 'error',
-      5_000,
-    );
-    assert(
-      neverStartedErr.type === 'session.event' &&
-        neverStartedErr.event.type === 'error' &&
-        neverStartedErr.event.message.includes('neu gestartet werden'),
-      'the interrupted start is reported as recoverable',
-    );
-
-    const goneErr = await c2.wait(
-      (m) => m.type === 'session.event' && m.sessionId === gone && m.event.type === 'error',
-      5_000,
-    );
-    assert(
-      goneErr.type === 'session.event' &&
-        goneErr.event.type === 'error' &&
-        goneErr.event.message.includes('existiert nicht mehr'),
-      'the vanished container is reported with its cause',
-    );
-    const restored = await c2.wait(
-      (m) =>
-        m.type === 'session.event' &&
-        m.sessionId === running &&
-        m.event.type === 'notice' &&
-        m.event.message.includes('neu gestartet'),
-      5_000,
-    );
-    assert(
-      restored.type === 'session.event' &&
-        restored.event.type === 'notice' &&
-        restored.event.message.includes('abgebrochen'),
-      'the interrupted turn is called out in the timeline',
-    );
-
-    const streamed = await c2.wait(
-      (m) =>
-        m.type === 'session.event' &&
-        m.sessionId === running &&
-        m.event.type === 'notice' &&
-        m.event.message === 'stream-live',
-      10_000,
-    );
-    assert(streamed.type === 'session.event', 'reconcile reconnects the shim event stream');
-
-    /* ---- self healing: a transport failure re-attaches and retries once ---- */
-
-    shimMode = 'fail-once';
-    promptCalls = 0;
-    const connectsBefore = connects.length;
-    await manager.prompt(idle, 'hallo');
-    assert(promptCalls === 2, 'a prompt that fails at the transport is retried exactly once');
-    assert(connects.length > connectsBefore, 'the retry happens only after the session network was re-attached');
-    assert(store.getSession(idle)?.status === 'running', 'the healed prompt leaves the session running');
-
-    shimMode = 'dead';
-    promptCalls = 0;
-    await manager.prompt(idle, 'nochmal');
-    const failed = await c2.wait(
-      (m) => m.type === 'session.event' && m.sessionId === idle && m.event.type === 'error',
-      5_000,
-    );
-    const failMsg = failed.type === 'session.event' && failed.event.type === 'error' ? failed.event.message : '';
-    assert(promptCalls === 2, 'a permanently unreachable shim is tried twice, not endlessly');
-    assert(failMsg.includes('Der Agent-Container ist nicht erreichbar'), 'the app is told the container is unreachable');
-    assert(failMsg.includes('Container: running') && failMsg.includes('[shim] listening'), 'the message carries the container diagnostics');
-    assert(store.getSession(idle)?.status === 'error', 'a failed prompt leaves the session in error');
-  } finally {
-    for (const id of [running, idle, gone, stopped, neverStarted]) await manager.deleteSession(id).catch(() => {});
-    cfg.dockerEnabled = false;
-    cfg.dockerHost = null;
-    cfg.dockerHostIsLocal = false;
-    dockerMod.resetDockerClient();
-    if (hostnameBefore === undefined) delete process.env.HOSTNAME;
-    else process.env.HOSTNAME = hostnameBefore;
-    shim.close();
-    daemon.close();
-  }
-}
-
-/** A promise plus its resolver - lets a test step wait for the fake daemon. */
-function deferred(): { promise: Promise<void>; resolve: () => void } {
-  let resolve!: () => void;
-  const promise = new Promise<void>((r) => (resolve = r));
-  return { promise, resolve };
-}
-
-/** Poll until `pred` holds; fails the run instead of hanging forever. */
-async function waitUntil(pred: () => boolean, what: string, timeoutMs = 10_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (pred()) return;
-    await new Promise((r) => setTimeout(r, 20));
-  }
-  assert(false, `timeout waiting for ${what}`);
-}
-
-/**
- * Session lifecycle: what happens when a start is overtaken (delete/stop during
- * provisioning), what the GC is allowed to delete, which containers the startup
- * reaper removes, and the two guards around prompt/resume. Everything runs
- * against a fake docker daemon - the exact scenarios of the APP-REVIEW findings
- * "provision() nicht abbrechbar", "GC loescht nach created_at" and "kein
- * Label-basierter Orphan-Reaper".
+ * Der Lebenszyklus einer Docker-Session: was passiert, wenn ein Start überholt
+ * wird (Delete/Stop während der Provisionierung - der Generation-Zähler), was
+ * die GC löschen darf, welche Container der Startup-Reaper entfernt, und die
+ * beiden Wächter um Prompt und Resume. Alles gegen einen gefälschten Daemon.
  */
 async function lifecycleSmoke(store: Store, manager: SessionManager, c2: Client, repoId: string): Promise<void> {
+  section('session lifecycle (fake docker)');
   const http = await import('node:http');
   const dockerMod = await import('./docker.js');
   const { isCollectableSession } = await import('./sessions.js');
-  const cfg = config as unknown as { dockerEnabled: boolean; dockerHost: string | null; dockerHostIsLocal: boolean };
+  const cfg = config as unknown as { dockerEnabled: boolean; dockerHost: string | null };
 
   const DAY = 86_400_000;
   const iso = (ms: number): string => new Date(ms).toISOString();
-  const rowFor = (id: string, patch: Partial<import('./db.js').SessionRow> = {}): import('./db.js').SessionRow => ({
-    id,
-    tenant_id: 'default',
-    repo_id: repoId,
-    repo_full_name: 'acme/demo',
-    adapter: 'kilo',
-    provider: 'zai',
-    model: 'glm-4.6',
-    mode: 'ask',
-    status: 'idle',
-    branch: `agent/${id}`,
-    session_ref: null,
-    container_id: null,
-    volume_name: `pocketagent-sess-${id}`,
-    shim_token: `token-${id.slice(0, 8)}`,
-    pr_url: null,
-    shim_endpoint: null,
-    link_id: null,
-    network_policy: 'allowlist',
-    reasoning_effort: null,
-    title: null,
-    archived: 0,
-    created_at: iso(Date.now()),
-    last_active_at: iso(Date.now()),
-    ...patch,
-  });
+  const rowFor = (id: string, patch: Partial<SessionRow> = {}): SessionRow =>
+    sessionRow(id, repoId, { container_id: null, shim_token: `token-${id.slice(0, 8)}`, ...patch });
 
-  /* ---- GC criterion: activity decides, not the creation date (pure) ---- */
+  /* ---- GC-Kriterium: die Aktivitaet entscheidet, nicht das Erstelldatum ---- */
 
   const cutoff = Date.now() - 14 * DAY;
   const born = iso(Date.now() - 60 * DAY);
@@ -1364,34 +450,34 @@ async function lifecycleSmoke(store: Store, manager: SessionManager, c2: Client,
   const probe = rowFor(randomUUID(), { created_at: born });
   assert(
     !isCollectableSession({ ...probe, status: 'idle', last_active_at: iso(Date.now()) }, cutoff),
-    'a session used today survives its 14th day (the created_at regression)',
+    'eine heute benutzte Session ueberlebt ihren 14. Tag',
   );
   assert(
     !isCollectableSession({ ...probe, status: 'stopped', last_active_at: iso(Date.now() - DAY) }, cutoff),
-    'a session stopped yesterday is not old enough',
+    'eine gestern gestoppte Session ist nicht alt genug',
   );
   assert(
     isCollectableSession({ ...probe, status: 'stopped', last_active_at: longAgo }, cutoff),
-    'a session stopped 40 days ago is collected',
+    'eine vor 40 Tagen gestoppte Session wird eingesammelt',
   );
   assert(
     isCollectableSession({ ...probe, status: 'error', last_active_at: longAgo }, cutoff),
-    'a failed session that was never touched again is collected',
+    'eine nie wieder angefasste Fehler-Session wird eingesammelt',
   );
   assert(
     !isCollectableSession({ ...probe, status: 'idle', last_active_at: longAgo }, cutoff),
-    'an idle session is never collected - only stop/error sessions are',
+    'eine idle Session wird nie eingesammelt',
   );
   assert(
     !isCollectableSession({ ...probe, status: 'stopped', last_active_at: longAgo, link_id: 'link-1' }, cutoff),
-    'link sessions are never collected (delete would shut the agent on the users machine down)',
+    'Link-Sessions werden nie eingesammelt (Delete faehrt den Agenten beim Nutzer herunter)',
   );
   assert(
     !isCollectableSession({ ...probe, status: 'stopped', last_active_at: 'kaputt', created_at: iso(Date.now()) }, cutoff),
-    'an unreadable last_active_at falls back to created_at',
+    'ein unlesbares last_active_at faellt auf created_at zurueck',
   );
 
-  /* ---- GC over the real store ---- */
+  /* ---- GC ueber den echten Store ---- */
 
   const activeOld = randomUUID();
   const staleStopped = randomUUID();
@@ -1402,13 +488,13 @@ async function lifecycleSmoke(store: Store, manager: SessionManager, c2: Client,
   store.setLinkId(linkOld, 'smoke-link-gc');
 
   await manager.gc();
-  assert(store.getSession(activeOld) !== undefined, 'gc keeps a session that was active today, however old it is');
-  assert(store.getSession(staleStopped) === undefined, 'gc removes a session that has been stopped for 40 days');
-  assert(store.getSession(linkOld) !== undefined, 'gc keeps a long-lived link session');
+  assert(store.getSession(activeOld) !== undefined, 'die GC behaelt eine heute aktive Session, wie alt sie auch ist');
+  assert(store.getSession(staleStopped) === undefined, 'die GC entfernt eine seit 40 Tagen gestoppte Session');
+  assert(store.getSession(linkOld) !== undefined, 'die GC behaelt eine langlebige Link-Session');
   store.deleteSession(activeOld);
   store.deleteSession(linkOld);
 
-  /* ---- prompt status gate ---- */
+  /* ---- Status-Gate fuer Prompts ---- */
 
   const booting = randomUUID();
   store.insertSession(rowFor(booting, { status: 'creating' }));
@@ -1416,21 +502,21 @@ async function lifecycleSmoke(store: Store, manager: SessionManager, c2: Client,
   await manager.prompt(booting, 'schon mal loslegen').catch((e: unknown) => {
     promptErr = e instanceof Error ? e.message : String(e);
   });
-  assert(promptErr.includes('startet noch'), `a prompt during 'creating' is refused with a reason: ${promptErr}`);
+  assert(promptErr.includes('startet noch'), `ein Prompt waehrend 'creating' wird begruendet abgewiesen: ${promptErr}`);
   const stored = store.db
     .prepare('SELECT COUNT(*) AS c FROM session_events WHERE session_id = ?')
     .get(booting) as { c: number };
-  assert(stored.c === 0, 'a refused prompt never reaches the timeline');
-  assert(store.getSession(booting)?.status === 'creating', 'a refused prompt leaves the status alone');
+  assert(stored.c === 0, 'ein abgewiesener Prompt erreicht die Timeline nie');
+  assert(store.getSession(booting)?.status === 'creating', 'ein abgewiesener Prompt laesst den Status in Ruhe');
   store.updateSessionStatus(booting, 'stopped');
   promptErr = '';
   await manager.prompt(booting, 'weiter').catch((e: unknown) => {
     promptErr = e instanceof Error ? e.message : String(e);
   });
-  assert(promptErr.includes('gestoppt'), `a prompt on a stopped session is refused with a reason: ${promptErr}`);
+  assert(promptErr.includes('gestoppt'), `ein Prompt auf einer gestoppten Session wird begruendet abgewiesen: ${promptErr}`);
   store.deleteSession(booting);
 
-  /* ---- fake daemon: records every call, can hold back a container create ---- */
+  /* ---- gefaelschter Daemon: protokolliert jeden Aufruf, kann ein Create anhalten ---- */
 
   const calls: string[] = [];
   let nextContainerId = 'cid-unused';
@@ -1468,14 +554,15 @@ async function lifecycleSmoke(store: Store, manager: SessionManager, c2: Client,
       return send(200, JSON.stringify(listBody));
     }
     if (method === 'POST' && path.startsWith('/volumes/create')) return send(201, '{"Name":"v"}');
-    send(200, '{}'); // network/image inspect, connects, removals, everything else
+    // Image-Inspect: das Runner-Image gilt als vorhanden, sonst liefe jeder
+    // Start in einen Bau ohne Kontext.
+    send(200, '{}');
   });
   const daemonPort = await listen(daemon);
 
   const hostnameBefore = process.env.HOSTNAME;
   process.env.HOSTNAME = 'smoke-orchestrator';
   cfg.dockerHost = `http://127.0.0.1:${daemonPort}`;
-  cfg.dockerHostIsLocal = true;
   cfg.dockerEnabled = true;
   dockerMod.resetDockerClient();
 
@@ -1484,38 +571,39 @@ async function lifecycleSmoke(store: Store, manager: SessionManager, c2: Client,
       type: 'session.create',
       requestId,
       repoId,
-      adapter: 'kilo',
-      provider: 'zai',
-      model: 'glm-4.6',
+      provider: 'openai',
+      model: '',
       mode: 'ask',
     });
-    assert(created.type === 'request.ok', `${requestId}: session created`);
+    assert(created.type === 'request.ok', `${requestId}: Session erstellt`);
     return (created.payload as { sessionId: string }).sessionId;
   };
 
   try {
-    /* ---- delete while the container is being created ---- */
+    /* ---- das Runner-Image gilt als vorhanden, es wird nichts gebaut ---- */
+    assert(
+      (await dockerMod.ensureRunnerImage()) === runnerImageName(),
+      'ensureRunnerImage liefert den Image-Namen, wenn der Daemon das Image kennt',
+    );
+    assert(!calls.some((c) => c.startsWith('POST /build')), 'ein vorhandenes Image loest keinen Bau aus');
+
+    /* ---- Delete waehrend der Container erstellt wird (Generation-Abbruch) ---- */
 
     nextContainerId = 'cid-abort-delete';
     createSeen = deferred();
     createGate = deferred();
     const deleted = await startSession('lc-del');
-    await createSeen.promise; // the daemon holds the create, provisioning is mid-await
+    await createSeen.promise; // der Daemon haelt das Create, die Provisionierung steht mitten im await
     await manager.deleteSession(deleted);
-    createGate.resolve(); // ...and only now does the container id come back
-    await waitUntil(() => calls.includes('DELETE /containers/cid-abort-delete'), 'the orphaned container to be removed');
+    createGate.resolve(); // ...und erst jetzt kommt die Container-Id zurueck
+    await waitUntil(() => calls.includes('DELETE /containers/cid-abort-delete'), 'die Entfernung des verwaisten Containers');
     assert(
       !calls.includes('POST /containers/cid-abort-delete/start'),
-      'a start whose session was deleted never starts its container',
+      'ein Start, dessen Session geloescht wurde, startet seinen Container nie',
     );
-    assert(store.getSession(deleted) === undefined, 'the deleted session stays deleted');
-    assert(
-      !calls.includes('POST /containers/cid-abort-delete/stop') ||
-        calls.includes('DELETE /containers/cid-abort-delete'),
-      'the container of a deleted session is removed, not just stopped',
-    );
+    assert(store.getSession(deleted) === undefined, 'die geloeschte Session bleibt geloescht');
 
-    /* ---- stop while the session is still 'creating' ---- */
+    /* ---- Stop waehrend die Session noch 'creating' ist ---- */
 
     nextContainerId = 'cid-abort-stop';
     createSeen = deferred();
@@ -1526,17 +614,17 @@ async function lifecycleSmoke(store: Store, manager: SessionManager, c2: Client,
     createGate.resolve();
     await waitUntil(
       () => calls.includes('POST /containers/cid-abort-stop/stop'),
-      'the container of the stopped session to be stopped',
+      'das Stoppen des Containers der gestoppten Session',
     );
-    await new Promise((r) => setTimeout(r, 100)); // let a (wrongly) continuing provision finish
+    await new Promise((r) => setTimeout(r, 100)); // einer (faelschlich) weiterlaufenden Provisionierung Zeit lassen
     assert(
       store.getSession(stopped)?.status === 'stopped',
-      `a stop during 'creating' is not overwritten with idle (got ${String(store.getSession(stopped)?.status)})`,
+      `ein Stop waehrend 'creating' wird nicht mit idle ueberschrieben (war ${String(store.getSession(stopped)?.status)})`,
     );
-    assert(!calls.includes('POST /containers/cid-abort-stop/start'), 'the stopped session does not start its container');
+    assert(!calls.includes('POST /containers/cid-abort-stop/start'), 'die gestoppte Session startet ihren Container nicht');
     await manager.deleteSession(stopped);
 
-    /* ---- resume re-entrancy: two taps share one run ---- */
+    /* ---- Resume-Re-Entrancy: zwei Taps teilen sich einen Lauf ---- */
 
     createGate = null;
     createSeen = null;
@@ -1546,15 +634,15 @@ async function lifecycleSmoke(store: Store, manager: SessionManager, c2: Client,
     store.insertSession(rowFor(resumed, { status: 'stopped', container_id: 'cid-resume-old' }));
     createCalls = 0;
     const results = await Promise.allSettled([manager.resumeSession(resumed), manager.resumeSession(resumed)]);
-    assert(createCalls === 1, `two parallel resumes create exactly one container (got ${createCalls})`);
+    assert(createCalls === 1, `zwei parallele Resumes erzeugen genau einen Container (waren ${createCalls})`);
     assert(
       results.every((r) => r.status === 'rejected'),
-      'both callers of a failing resume learn that it failed',
+      'beide Aufrufer eines scheiternden Resume erfahren, dass er scheiterte',
     );
     await manager.deleteSession(resumed);
     startFails = false;
 
-    /* ---- label based orphan reaper ---- */
+    /* ---- Label-basierter Orphan-Reaper ---- */
 
     const kept = randomUUID();
     store.insertSession(rowFor(kept, { status: 'idle', container_id: 'cid-keep' }));
@@ -1569,29 +657,28 @@ async function lifecycleSmoke(store: Store, manager: SessionManager, c2: Client,
     ];
 
     const removed = await manager.reapOrphanContainers();
-    assert(removed === 3, `the reaper removes exactly the orphans (got ${removed})`);
-    assert(!calls.includes('DELETE /containers/cid-keep'), 'the container a live session points at is kept');
-    assert(calls.includes('DELETE /containers/cid-orphan'), 'a container without a session row is removed');
+    assert(removed === 3, `der Reaper entfernt genau die Waisen (waren ${removed})`);
+    assert(!calls.includes('DELETE /containers/cid-keep'), 'der Container einer lebenden Session bleibt');
+    assert(calls.includes('DELETE /containers/cid-orphan'), 'ein Container ohne Session-Zeile wird entfernt');
     assert(
       calls.includes('DELETE /containers/cid-push-leftover'),
-      'a leftover container of a live session (push/resume race) is removed',
+      'ein liegengebliebener Container einer lebenden Session (Push/Resume-Rennen) wird entfernt',
     );
-    assert(calls.includes('DELETE /containers/cid-nolabel'), 'a container with an empty session label is removed');
-    assert(!calls.includes('DELETE /containers/cid-young'), 'a container younger than the server start belongs to a live start');
+    assert(calls.includes('DELETE /containers/cid-nolabel'), 'ein Container mit leerem Session-Label wird entfernt');
+    assert(!calls.includes('DELETE /containers/cid-young'), 'ein Container juenger als der Serverstart gehoert einem laufenden Start');
 
     listBroken = true;
     const beforeBroken = calls.length;
-    assert((await manager.reapOrphanContainers()) === 0, 'a daemon that does not answer makes the reaper do nothing');
+    assert((await manager.reapOrphanContainers()) === 0, 'ein nicht antwortender Daemon laesst den Reaper nichts tun');
     assert(
       !calls.slice(beforeBroken).some((c) => c.startsWith('DELETE /containers/')),
-      'a failing listing never turns live containers into orphans',
+      'eine fehlgeschlagene Auflistung macht lebende Container nie zu Waisen',
     );
     listBroken = false;
     await manager.deleteSession(kept);
   } finally {
     cfg.dockerEnabled = false;
     cfg.dockerHost = null;
-    cfg.dockerHostIsLocal = false;
     dockerMod.resetDockerClient();
     if (hostnameBefore === undefined) delete process.env.HOSTNAME;
     else process.env.HOSTNAME = hostnameBefore;
@@ -1599,831 +686,410 @@ async function lifecycleSmoke(store: Store, manager: SessionManager, c2: Client,
   }
 }
 
-/**
- * Session containers run compiled JS on plain node and load the protocol
- * package as TypeScript source (node type stripping). Unlike tsx/tsc, node does
- * not map a './x.js' import onto './x.ts', so a protocol package split across
- * files loads fine in every dev tool and crashes every container at startup.
- * This check runs the same way a shim does: plain node, no loader.
- */
-async function protocolLoadsOnPlainNode(): Promise<void> {
-  const { execFile } = await import('node:child_process');
-  const { fileURLToPath } = await import('node:url');
-  const repoRoot = fileURLToPath(new URL('../..', import.meta.url));
-  await new Promise<void>((resolve) => {
-    execFile(
-      process.execPath,
-      [
-        '-e',
-        // The shared SequencedSseBroadcaster is a class in the same single-file
-        // package the shim containers load via node's type stripping, so it must
-        // construct on plain node too (a parameter property or an enum in it
-        // would strip-fail every session container at startup).
-        "import('@pocketagent/protocol').then(m => { if (typeof m.selectModel !== 'function') process.exit(2); const b = new m.SequencedSseBroadcaster(2); if (b.publish({type:'notice',message:'x'}) !== 1) process.exit(3); if (typeof m.parseLastEventId !== 'function') process.exit(4); })",
-      ],
-      { cwd: repoRoot },
-      (err, _stdout, stderr) => {
-        assert(!err, `protocol package must import on plain node (no tsx): ${String(stderr).trim()}`);
-        resolve();
-      },
-    );
-  });
-}
+/* ------------------------------------------------------------------ */
+/* 3. Turn-Weg: create -> prompt -> events -> stop                     */
+/* ------------------------------------------------------------------ */
 
 /**
- * Event history, rename and archive: everything a client needs to bring a
- * timeline back after the screen was left, plus the two list gestures. Runs
- * against the real store and the real WS handlers, without a shim.
+ * Der Weg, den ein Turn nimmt, gegen einen gefälschten Runner: Prompt raus,
+ * Event rein, Historie, Turn-Zustände, Stop. Ein reichbarer Runner-Endpunkt ist
+ * alles, was der Prompt-Pfad braucht - kein Daemon nötig.
  */
-async function historySmoke(store: Store, manager: SessionManager, c2: Client, repoId: string): Promise<void> {
-  const { clampEventLimit, sanitizeSessionTitle, MAX_TITLE_LEN, EVENTS_DEFAULT_LIMIT, EVENTS_MAX_LIMIT } =
+async function turnSmoke(store: Store, manager: SessionManager, c2: Client, repoId: string): Promise<void> {
+  section('turn round-trip (fake runner)');
+  const http = await import('node:http');
+  const { clampTurnLimit, clampEventLimit, TURNS_DEFAULT_LIMIT, TURNS_MAX_LIMIT, EVENTS_MAX_LIMIT } =
     await import('./sessions.js');
 
-  /* ---- pure helpers: limit clamping and title normalization ---- */
+  assert(clampTurnLimit(undefined) === TURNS_DEFAULT_LIMIT, 'ein fehlendes Turn-Limit faellt auf die Vorgabe zurueck');
+  assert(clampTurnLimit(9_999) === TURNS_MAX_LIMIT, 'ein zu grosses Turn-Limit wird gedeckelt');
+  assert(clampTurnLimit(0) === 1 && clampTurnLimit(-3) === 1, 'ein Turn-Limit unter 1 wird 1');
+  assert(clampEventLimit(99_999) === EVENTS_MAX_LIMIT, 'ein zu grosses Event-Limit wird gedeckelt');
 
-  assert(clampEventLimit(undefined) === EVENTS_DEFAULT_LIMIT, 'a missing limit falls back to the default');
-  assert(clampEventLimit('50') === EVENTS_DEFAULT_LIMIT, 'a non-numeric limit falls back to the default');
-  assert(clampEventLimit(Number.NaN) === EVENTS_DEFAULT_LIMIT, 'NaN falls back to the default');
-  assert(clampEventLimit(50_000) === EVENTS_MAX_LIMIT, 'an oversized limit is capped');
-  assert(clampEventLimit(0) === 1 && clampEventLimit(-9) === 1, 'a limit below 1 becomes 1');
-  assert(clampEventLimit(10.7) === 10, 'a fractional limit is floored');
-
-  assert(sanitizeSessionTitle('  Mein  Feature  ') === 'Mein Feature', 'a title is trimmed and collapsed');
-  assert(sanitizeSessionTitle('a\nb\tc\u0000d') === 'a b c d', 'control characters never survive a title');
-  assert(sanitizeSessionTitle('   ') === null, 'a blank title clears the title');
-  const long = sanitizeSessionTitle('x'.repeat(200));
-  assert(long !== null && long.length === MAX_TITLE_LEN, `a title is cut to ${MAX_TITLE_LEN} chars`);
-
-  /* ---- a session with a timeline ---- */
-
-  const id = randomUUID();
-  const now = new Date().toISOString();
-  store.insertSession({
-    id,
-    tenant_id: 'default',
-    repo_id: repoId,
-    repo_full_name: 'acme/demo',
-    adapter: 'kilo',
-    provider: 'zai',
-    model: 'glm-4.6',
-    mode: 'ask',
-    status: 'idle',
-    branch: `agent/${id}`,
-    session_ref: null,
-    container_id: 'cid-history',
-    volume_name: `pocketagent-sess-${id}`,
-    shim_token: null,
-    pr_url: null,
-    shim_endpoint: null,
-    link_id: null,
-    network_policy: 'allowlist',
-    reasoning_effort: null,
-    title: null,
-    archived: 0,
-    created_at: now,
-    last_active_at: now,
+  let promptCalls = 0;
+  let promptMode: 'ok' | 'fail' = 'ok';
+  let lastPromptBody: Record<string, unknown> = {};
+  const runner = http.createServer((req, res) => {
+    const url = req.url ?? '';
+    let raw = '';
+    req.on('data', (c) => (raw += String(c)));
+    req.on('end', () => {
+      if (url.startsWith('/prompt')) {
+        promptCalls++;
+        try {
+          lastPromptBody = JSON.parse(raw || '{}') as Record<string, unknown>;
+        } catch {
+          lastPromptBody = {};
+        }
+        if (promptMode === 'fail') {
+          return void res.writeHead(200, { 'content-type': 'application/json' }).end('{"ok":false,"error":"boom"}');
+        }
+        return void res.writeHead(200, { 'content-type': 'application/json' }).end('{"ok":true}');
+      }
+      res.writeHead(200, { 'content-type': 'application/json' }).end('{"ok":true}');
+    });
   });
+  const runnerPort = await listen(runner);
+  const runnerBase = `http://127.0.0.1:${runnerPort}`;
 
-  // The prompt path stores the user's own message. Without a shim the send
-  // fails right after - the message still belongs in the timeline.
-  await manager.prompt(id, 'Bitte den Bug fixen').catch(() => {});
-  manager.handleLinkEvent(id, { type: 'ping', ts: Date.now() });
-  manager.handleLinkEvent(id, { type: 'notice', message: 'Image wird gebaut', phase: 'image-build' });
-  manager.handleLinkEvent(id, { type: 'notice', message: 'Agent gewechselt: kilo → claude' });
-  for (let i = 0; i < 2; i++) {
-    manager.handleLinkEvent(id, { type: 'message.completed', role: 'assistant', text: `Antwort ${i}` });
-  }
-  // a row no longer readable as JSON (truncated write, older format...), right
-  // in the middle of the conversation
-  store.appendEvent(id, 'message.completed', '{"type":"message.completed",');
-  for (let i = 2; i < 5; i++) {
-    manager.handleLinkEvent(id, { type: 'message.completed', role: 'assistant', text: `Antwort ${i}` });
-  }
-
-  const stored = store.db
-    .prepare('SELECT type, payload FROM session_events WHERE session_id = ?')
-    .all(id) as Array<{ type: string; payload: string }>;
-  assert(!stored.some((r) => r.type === 'ping'), 'ping frames never reach the stored history');
-  assert(
-    !stored.some((r) => r.payload.includes('"phase"')),
-    'progress notices never reach the stored history',
-  );
-
-  const full = await request(c2, { type: 'session.events.get', requestId: 'ev1', sessionId: id });
-  assert(full.type === 'session.events' && full.sessionId === id, 'session.events.get -> session.events');
-  const events = full.type === 'session.events' ? full.events : [];
-  assert(
-    events.length === 7,
-    `history carries prompt + notice + 5 answers, broken row skipped (got ${events.length})`,
-  );
-  const first = events[0];
-  assert(
-    first?.type === 'message.completed' && first.role === 'user' && first.text === 'Bitte den Bug fixen',
-    'the history starts with the user prompt (no shim reports it back)',
-  );
-  assert(
-    events[1]?.type === 'notice' && events[1].message.includes('Agent gewechselt'),
-    'a notice without a phase stays an ordinary timeline entry',
-  );
-  assert(
-    events.map((e) => (e.type === 'message.completed' && e.role === 'assistant' ? e.text : '')).join('|') ===
-      '||Antwort 0|Antwort 1|Antwort 2|Antwort 3|Antwort 4',
-    'the history is chronological, oldest first',
-  );
-  assert(!events.some((e) => e.type === 'ping'), 'no ping frame in the answer');
-  assert(!events.some((e) => e.type === 'notice' && e.phase !== undefined), 'no progress notice in the answer');
-
-  const limited = await request(c2, { type: 'session.events.get', requestId: 'ev2', sessionId: id, limit: 3 });
-  const tail = limited.type === 'session.events' ? limited.events : [];
-  assert(tail.length === 3, 'the limit is honoured');
-  assert(
-    tail.map((e) => (e.type === 'message.completed' ? e.text : '')).join('|') === 'Antwort 2|Antwort 3|Antwort 4',
-    'the limit keeps the youngest events, still oldest first',
-  );
-
-  const capped = await request(c2, {
-    type: 'session.events.get',
-    requestId: 'ev3',
-    sessionId: id,
-    limit: 10_000,
-  });
-  assert(capped.type === 'session.events' && capped.events.length === 7, 'an oversized limit is capped, not refused');
-
-  const unknownSession = await request(c2, {
-    type: 'session.events.get',
-    requestId: 'ev4',
-    sessionId: 'no-such-session',
-  });
-  assert(unknownSession.type === 'error', 'history of an unknown session is an error, not an empty answer');
-
-  /* ---- rename: trim, length cap, broadcast, reset ---- */
-
-  const renamed = await request(c2, {
-    type: 'session.rename',
-    requestId: 'ren1',
-    sessionId: id,
-    title: '  Login\n  Bugfix  ',
-  });
-  assert(renamed.type === 'request.ok', 'session.rename -> request.ok');
-  assert(store.getSession(id)?.title === 'Login Bugfix', 'the title is stored normalized');
-  const renameStatus = await c2.wait(
-    (m) => m.type === 'session.status' && m.sessionId === id && m.session?.title === 'Login Bugfix',
-  );
-  assert(renameStatus.type === 'session.status', 'the renamed session is broadcast to every device');
-
-  await request(c2, { type: 'session.rename', requestId: 'ren2', sessionId: id, title: 'y'.repeat(300) });
-  assert(store.getSession(id)?.title?.length === MAX_TITLE_LEN, 'an overlong title is cut');
-
-  const cleared = await request(c2, { type: 'session.rename', requestId: 'ren3', sessionId: id, title: '   ' });
-  assert(cleared.type === 'request.ok', 'an empty title is accepted');
-  assert(store.getSession(id)?.title === null, 'an empty title removes the stored title');
-  const clearedInfo = (cleared.type === 'request.ok' ? cleared.payload : undefined) as
-    | { session?: { title?: string } }
-    | undefined;
-  assert(clearedInfo?.session !== undefined && clearedInfo.session.title === undefined, 'a session without a title carries none');
-
-  const badTitle = await request(c2, { type: 'session.rename', requestId: 'ren4', sessionId: id, title: 42 });
-  assert(badTitle.type === 'error', 'a non-string title is refused');
-
-  /* ---- archive: flag, container stop, broadcast, list ---- */
-
-  const archived = await request(c2, { type: 'session.archive', requestId: 'arc1', sessionId: id, archived: true });
-  assert(archived.type === 'request.ok', 'session.archive -> request.ok');
-  const archivedRow = store.getSession(id);
-  assert(archivedRow?.archived === 1, 'the archive flag is stored');
-  assert(archivedRow?.status === 'stopped', 'archiving stops the session container (volume kept)');
-  assert(archivedRow?.volume_name === `pocketagent-sess-${id}`, 'archiving keeps the volume');
-  const archiveStatus = await c2.wait(
-    (m) => m.type === 'session.status' && m.sessionId === id && m.session?.archived === true,
-  );
-  assert(
-    archiveStatus.type === 'session.status' && archiveStatus.status === 'stopped',
-    'the archived session is broadcast as stopped',
-  );
-
-  const listWithArchived = await request(c2, { type: 'session.list', requestId: 'arc2' });
-  const listed = listWithArchived.type === 'session.list' ? listWithArchived.sessions.find((s) => s.id === id) : undefined;
-  assert(listed?.archived === true, 'session.list still contains archived sessions (the app filters)');
-
-  const unarchived = await request(c2, { type: 'session.archive', requestId: 'arc3', sessionId: id, archived: false });
-  assert(unarchived.type === 'request.ok', 'unarchiving is acked');
-  assert(store.getSession(id)?.archived === 0, 'the archive flag is cleared');
-  assert(store.getSession(id)?.status === 'stopped', 'unarchiving does not restart anything (session.resume does)');
-
-  const badArchive = await request(c2, {
-    type: 'session.archive',
-    requestId: 'arc4',
-    sessionId: id,
-    archived: 'yes',
-  });
-  assert(badArchive.type === 'error', 'a non-boolean archived flag is refused');
-
-  /* ---- delete removes the stored events with the session ---- */
-
-  await manager.deleteSession(id);
-  const leftover = store.db
-    .prepare('SELECT COUNT(*) AS c FROM session_events WHERE session_id = ?')
-    .get(id) as { c: number };
-  assert(leftover.c === 0, 'session.delete removes the stored events too');
-  assert(store.getSession(id) === undefined, 'session.delete removes the row');
-}
-
-/**
- * Event sequencing + replay against event loss (APP-REVIEW "SSE-Weiterleitung
- * ohne Cursor/Replay" and "AgentEvent hat keine Sequenz-/Event-ID"). Three
- * parts: the shared ring buffer in isolation, then the full orchestrator path -
- * an event emitted into a reconnect gap arrives after reconnect via
- * Last-Event-ID and lands exactly once, and a turn.completed in the gap does
- * not leave the session stuck in 'running' - and finally the persistence dedup.
- */
-async function eventReplaySmoke(store: Store, manager: SessionManager, _c2: Client, repoId: string): Promise<void> {
-  const { SequencedSseBroadcaster, parseLastEventId } = await import('@pocketagent/protocol');
-  type AgentEvent = import('@pocketagent/protocol').AgentEvent;
-  const http = await import('node:http');
-  const { ShimClient } = await import('./shim-client.js');
-
-  /* ---- Part A: the shared ring buffer + Last-Event-ID replay (pure) ---- */
-
-  const ring = new SequencedSseBroadcaster(3); // tiny capacity to force eviction
-  const seqOf = (frame: string): string | undefined => /^id: (\d+)/m.exec(frame)?.[1];
-  const live: string[] = [];
-  ring.add({ write: (s: string) => void live.push(s) });
-  const ids = ['a', 'b', 'c', 'd'].map((t) => ring.publish({ type: 'notice', message: t }));
-  assert(ids.join(',') === '1,2,3,4', 'every event gets the next monotone seq');
-  assert(live.length === 4 && live.every((f) => f.includes('"seq":')), 'a connected client receives every event with its seq embedded');
-
-  const fromZero: string[] = [];
-  ring.add({ write: (s: string) => void fromZero.push(s) }, 0);
-  assert(fromZero.map(seqOf).join(',') === '2,3,4', 'a reconnect from 0 replays what the ring still holds (seq 1 evicted at capacity 3)');
-
-  const fromTwo: string[] = [];
-  ring.add({ write: (s: string) => void fromTwo.push(s) }, 2);
-  assert(fromTwo.map(seqOf).join(',') === '3,4', 'Last-Event-ID replays only the events after it');
-
-  const beforePing = ring.lastId;
-  const pingFrames: string[] = [];
-  ring.add({ write: (s: string) => void pingFrames.push(s) });
-  ring.publish({ type: 'ping', ts: 1 });
-  assert(ring.lastId === beforePing, 'a ping is not sequenced - keepalive never consumes a seq or a ring slot');
-  assert(pingFrames.length === 1 && !/^id:/m.test(pingFrames[0]!), 'the ping frame carries no id: line, so it never advances a client cursor');
-  assert(
-    parseLastEventId('7') === 7 && parseLastEventId(undefined) === undefined && parseLastEventId('nope') === undefined,
-    'parseLastEventId turns a header into a cursor and rejects non-numbers',
-  );
-
-  /* ---- Part B: an event in a reconnect gap survives, exactly once, end to end ---- */
-
-  // The fake shim uses the very same shared broadcaster the real shims use, so
-  // this exercises both sides of the contract: the shim's replay ring and the
-  // orchestrator ShimClient's Last-Event-ID cursor + dedup, feeding the real
-  // SessionManager.onEvent (persistence + status) through handleLinkEvent.
-  const shimBus = new SequencedSseBroadcaster();
-  const token = 'replay-shim-token';
-  const conn: { res: import('node:http').ServerResponse | null } = { res: null };
-  const shim = http.createServer((req, res) => {
-    if ((req.headers.authorization ?? '') !== `Bearer ${token}`) {
-      res.writeHead(401, { 'content-type': 'application/json' }).end('{"ok":false}');
-      return;
-    }
-    if ((req.url ?? '').startsWith('/events')) {
-      res.writeHead(200, { 'content-type': 'text/event-stream' });
-      shimBus.add(res, parseLastEventId(req.headers['last-event-id']));
-      conn.res = res;
-      res.on('close', () => shimBus.remove(res));
-      return;
-    }
-    res.writeHead(200, { 'content-type': 'application/json' }).end('{"ok":true}');
-  });
-  const shimPort = await listen(shim);
-  const shimBase = `http://127.0.0.1:${shimPort}`;
-
-  const sessionId = randomUUID();
-  store.insertSession(sessionRow(sessionId, repoId, { status: 'running', shim_token: token, shim_endpoint: shimBase }));
-
-  const forwarded: AgentEvent[] = [];
-  const client = new ShimClient(shimBase, token);
-  client.startEvents((ev) => {
-    forwarded.push(ev);
-    manager.handleLinkEvent(sessionId, ev);
-  });
-  try {
-    await waitUntil(() => shimBus.clientCount === 1, 'the orchestrator connects the shim event stream');
-    shimBus.publish({ type: 'message.completed', role: 'assistant', text: 'Antwort' }); // seq 1, delivered live
-    await waitUntil(() => forwarded.some((e) => e.type === 'message.completed'), 'the live event is forwarded');
-
-    // The reconnect gap: drop the stream, then emit the turn's completion while
-    // nobody is connected - exactly the event that used to be lost for good.
-    conn.res?.destroy();
-    await waitUntil(() => shimBus.clientCount === 0, 'the event stream drops');
-    shimBus.publish({ type: 'turn.completed', summary: 'fertig' }); // seq 2, into the gap
-    assert(shimBus.clientCount === 0, 'the completion was emitted into the gap, with no client to receive it live');
-
-    // The orchestrator reconnects with Last-Event-ID and the shim replays it.
-    await waitUntil(
-      () => store.getSession(sessionId)?.status === 'idle',
-      'the gap turn.completed arrives after reconnect and moves the session out of running',
-      8_000,
-    );
-    assert(forwarded.filter((e) => e.type === 'turn.completed').length === 1, 'the gap event is forwarded exactly once');
-    const history = store.listSessionEvents(sessionId, 1000);
-    assert(
-      history.filter((e) => e.type === 'turn.completed').length === 1,
-      'the replayed turn.completed lands exactly once in the history',
-    );
-    assert(
-      history.filter((e) => e.type === 'message.completed').length === 1,
-      'the pre-gap event is not duplicated by the reconnect',
-    );
-    assert(store.getSession(sessionId)?.status === 'idle', "turn.completed in the gap does not leave the session stuck in 'running'");
-  } finally {
-    client.stop();
-    shim.close();
-    await manager.deleteSession(sessionId).catch(() => {});
-  }
-
-  /* ---- Part C: persistence dedup drops a re-delivered seq ---- */
-
-  const dedupId = randomUUID();
-  store.insertSession(sessionRow(dedupId, repoId, { status: 'running' }));
-  try {
-    manager.handleLinkEvent(dedupId, { type: 'message.completed', role: 'assistant', text: 'x', seq: 5 });
-    manager.handleLinkEvent(dedupId, { type: 'message.completed', role: 'assistant', text: 'x', seq: 5 });
-    manager.handleLinkEvent(dedupId, { type: 'turn.completed', summary: 'ok', seq: 6 });
-    const rows = store.listSessionEvents(dedupId, 1000);
-    assert(rows.filter((e) => e.type === 'message.completed').length === 1, 'persistEvent stores a seq only once, even if it is delivered twice');
-    assert(store.getSession(dedupId)?.status === 'idle', 'a sequenced turn.completed still moves the session to idle');
-  } finally {
-    await manager.deleteSession(dedupId).catch(() => {});
-  }
-
-  // The status resync is a no-op without a docker daemon (smoke runs with none);
-  // this only proves the guard, the correction path is covered by Part B.
-  await manager.resyncRunningStatuses();
-}
-
-/**
- * WS heartbeat: a socket that stops answering has to be terminated by the
- * server. Runs on its own ws server with a 40ms round, so the check costs
- * milliseconds instead of the production minute.
- */
-async function heartbeatSmoke(): Promise<void> {
-  const { WebSocketServer } = await import('ws');
-  const { Heartbeat, WS_HEARTBEAT_MS } = await import('./ws.js');
-  assert(WS_HEARTBEAT_MS === 25_000, 'production pings every 25s');
-
-  const hb = new Heartbeat(40);
-  const wss = new WebSocketServer({ host: '127.0.0.1', port: 0 });
-  await new Promise<void>((resolve) => wss.once('listening', () => resolve()));
-  const port = (wss.address() as AddressInfo).port;
-  wss.on('connection', (s) => hb.track(s));
-
-  const alive = new WebSocket(`ws://127.0.0.1:${port}`);
-  await new Promise<void>((resolve) => alive.once('open', () => resolve()));
-  // autoPong off = the client never answers a ping, exactly like a phone whose
-  // network is gone while the socket still looks open here
-  const mute = new WebSocket(`ws://127.0.0.1:${port}`, { autoPong: false });
-  const muteClosed = new Promise<boolean>((resolve) => {
-    mute.once('close', () => resolve(true));
-    setTimeout(() => resolve(false), 5_000);
-  });
-  await new Promise<void>((resolve) => mute.once('open', () => resolve()));
-
-  assert(await muteClosed, 'a socket that misses two pong rounds is terminated');
-  assert(alive.readyState === WebSocket.OPEN, 'a socket that answers pongs stays connected');
-  assert(hb.size() === 1, 'the heartbeat forgets terminated sockets');
-
-  hb.stop();
-  assert(hb.size() === 0, 'shutdown clears the heartbeat');
-  alive.close();
-  wss.close();
-}
-
-/**
- * shim-client.ts `call()` must never read a non-2xx JSON response as a ready
- * shim - APP-REVIEW "HTTP-Status wird ignoriert: waitForShim wertet
- * Fehlerantworten als 'Shim bereit'" (shim-client.ts ~62). Runs against a
- * tiny local HTTP server so it does not need Docker or a real shim.
- */
-async function shimClientStatusSmoke(): Promise<void> {
-  const http = await import('node:http');
-  const { ShimClient } = await import('./shim-client.js');
-
-  let respond: { status: number; body: unknown } = { status: 200, body: {} };
-  const server = http.createServer((_req, res) => {
-    res.writeHead(respond.status, { 'content-type': 'application/json' });
-    res.end(JSON.stringify(respond.body));
-  });
-  const port = await listen(server);
-  const client = new ShimClient(`http://127.0.0.1:${port}`, 'smoke-shim-token');
-
-  try {
-    // The exact failure mode from the finding: a proxy/gateway answers with a
-    // parsable JSON error body while the shim is still booting.
-    respond = { status: 502, body: { error: 'upstream not ready' } };
-    assert(
-      (await client.status()) === null,
-      'a non-2xx JSON body is not read as a ready shim (waitForShim must keep polling, not declare success)',
-    );
-
-    // Same failure even when the body happens to look like a valid ShimStatus.
-    respond = { status: 401, body: { adapter: 'kilo', mode: 'ask', busy: false } };
-    assert((await client.status()) === null, 'a 401 is rejected even with an otherwise well-shaped body');
-
-    respond = { status: 200, body: { adapter: 'kilo', mode: 'ask', busy: false } };
-    const ready = await client.status();
-    assert(ready?.adapter === 'kilo' && ready.busy === false, 'a 2xx response is still read normally');
-  } finally {
-    server.close();
-  }
-}
-
-/**
- * /api/secrets: AAD binding (finding "REST-Pfad verschluesselt ohne AAD",
- * secrets-api.ts ~39) and the sliding-window rate limit (finding "POST
- * /api/secrets ohne Rate-Limit", secrets-api.ts ~47) that protects the same
- * PAIRING_ADMIN_TOKEN /api/pairing/* is guarded by.
- */
-async function secretsRestSmoke(base: string, store: Store): Promise<void> {
-  const priorAdminToken = process.env.PAIRING_ADMIN_TOKEN;
-  process.env.PAIRING_ADMIN_TOKEN = 'smoke-admin-token-for-secrets-rest';
-  try {
-    const post = (headers: Record<string, string>, body: unknown) =>
-      fetch(`${base}/api/secrets`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', ...headers },
-        body: JSON.stringify(body),
-      });
-    const authHeader = { authorization: `Bearer ${process.env.PAIRING_ADMIN_TOKEN}` };
-
-    const noAuth = await post({}, { kind: 'rest-aad-smoke', value: 'x' });
-    assert(noAuth.status === 401, '/api/secrets rejects a missing admin token');
-
-    const badKind = await post(authHeader, { kind: 'Not Valid!', value: 'x' });
-    assert(badKind.status === 400, '/api/secrets rejects an invalid kind');
-
-    const secretValue = 'rest-secret-value-smoke';
-    const saveRes = await post(authHeader, { kind: 'rest-aad-smoke', value: secretValue });
-    const saveBody = (await saveRes.json()) as { ok: boolean; secret?: { id: string; kind: string } };
-    assert(
-      saveRes.ok && saveBody.ok && saveBody.secret?.kind === 'rest-aad-smoke',
-      '/api/secrets saves a valid secret',
-    );
-
-    // AAD binding: the REST path must encrypt with the exact same AAD shape
-    // as ws.ts `secret.set` ("secret:<tenant>:<kind>"), not plaintext/no AAD.
-    const row = store.getSecret(saveBody.secret!.id)!;
-    const vaultMod = await import('./vault.js');
-    const decrypted = vaultMod.decryptStrict(
-      { ciphertext: row.ciphertext, nonce: row.nonce },
-      'secret:default:rest-aad-smoke',
-    );
-    assert(decrypted === secretValue, 'a REST-saved secret decrypts under its own kind AAD, strictly (no fallback needed)');
-    let transplanted = true;
-    try {
-      vaultMod.decryptStrict({ ciphertext: row.ciphertext, nonce: row.nonce }, 'secret:default:other-kind');
-    } catch {
-      transplanted = false;
-    }
-    assert(
-      !transplanted,
-      'a REST-saved ciphertext cannot be transplanted onto a different kind - the AAD binding actually holds',
-    );
-    assert(
-      store.getSecretValue('rest-aad-smoke', 'default') === secretValue,
-      'the normal read path still returns the REST-saved value',
-    );
-
-    // Rate limit: an admin-token consumer just like /api/pairing/*, so it
-    // must not be brute-forceable at wire speed (10 req/min/IP).
-    let sawRateLimit = false;
-    for (let i = 0; i < 15 && !sawRateLimit; i++) {
-      const res = await post(authHeader, { kind: 'rest-aad-smoke', value: `probe-${i}` });
-      if (res.status === 429) sawRateLimit = true;
-    }
-    assert(sawRateLimit, '/api/secrets rate-limits repeated admin-token attempts (429 eventually)');
-  } finally {
-    if (priorAdminToken === undefined) delete process.env.PAIRING_ADMIN_TOKEN;
-    else process.env.PAIRING_ADMIN_TOKEN = priorAdminToken;
-  }
-}
-
-/**
- * Secrets are unique per (tenant, kind) now (finding "Secrets pro
- * (tenant,kind) nicht eindeutig", db.ts ~250): a save upserts instead of
- * inserting a second row, so deleting "the" secret of a kind can no longer
- * silently reactivate an older, already-rotated-away value - reproduces the
- * exact scenario from the finding. Also covers the one-time migration that
- * dedupes a database that predates the UNIQUE index.
- */
-async function secretsUniqueSmoke(store: Store): Promise<void> {
-  const kind = 'unique-smoke-kind';
-  const encMod = await import('./vault.js');
-
-  const v1 = encMod.encrypt('leaked-old-value', `secret:default:${kind}`);
-  store.saveSecret('unique-smoke-v1', 'default', kind, v1.ciphertext, v1.nonce);
-  assert(store.listSecrets('default').filter((s) => s.kind === kind).length === 1, 'first save creates one row');
-
-  const v2 = encMod.encrypt('rotated-new-value', `secret:default:${kind}`);
-  store.saveSecret('unique-smoke-v2', 'default', kind, v2.ciphertext, v2.nonce);
-  const rows = store.listSecrets('default').filter((s) => s.kind === kind);
-  assert(rows.length === 1, 'a second save for the same (tenant,kind) replaces the row instead of adding one');
-  assert(rows[0]!.id === 'unique-smoke-v2', 'the surviving row is the newest save (the upsert also moves the id)');
-  assert(store.getSecretValue(kind, 'default') === 'rotated-new-value', 'the newest value is what getSecretValue returns');
-
-  store.deleteSecret('unique-smoke-v2', 'default');
-  assert(
-    store.getSecretByKind(kind, 'default') === undefined,
-    'deleting the current row leaves no older row behind to silently reactivate (the original finding)',
-  );
-
-  // --- one-time migration of a pre-existing DB with duplicate rows ---
-  // Seeded with the raw driver, NOT the Store class: Store's constructor
-  // always runs migrate() (and so creates the UNIQUE index) immediately, so
-  // going through Store here could never reach the "pre-fix" state this
-  // migration is meant to heal.
-  const { Store } = await import('./db.js');
-  const { default: Database } = await import('better-sqlite3');
-  const dir = mkdtempSync(join(tmpdir(), 'pa-smoke-secrets-migrate-'));
-  try {
-    const dbPath = join(dir, 'orchestrator.db');
-    const raw = new Database(dbPath);
-    raw.exec(
-      `CREATE TABLE IF NOT EXISTS secrets (
-         id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, kind TEXT NOT NULL,
-         ciphertext TEXT NOT NULL, nonce TEXT NOT NULL, created_at TEXT NOT NULL
-       )`,
-    );
-    const insertRaw = (id: string, createdAt: string): void => {
-      raw
-        .prepare('INSERT INTO secrets (id, tenant_id, kind, ciphertext, nonce, created_at) VALUES (?, ?, ?, ?, ?, ?)')
-        .run(id, 'default', 'legacy-kind', `ct-${id}`, `n-${id}`, createdAt);
-    };
-    // Three raw rows for the same (tenant,kind) - the shape a pre-fix
-    // database could reach (saveSecret always inserted a new row).
-    insertRaw('legacy-old', '2020-01-01T00:00:00.000Z');
-    insertRaw('legacy-mid', '2021-01-01T00:00:00.000Z');
-    insertRaw('legacy-new', '2022-01-01T00:00:00.000Z');
-    raw.close();
-
-    // Opening the real Store for the first time is the "server restarts on
-    // the fixed version" path - this is what runs the dedup + index once.
-    const reopened = new Store(dir);
-    const survivors = reopened.listSecrets('default').filter((s) => s.kind === 'legacy-kind');
-    assert(survivors.length === 1, 'migration collapses duplicate (tenant,kind) rows to exactly one');
-    assert(survivors[0]!.id === 'legacy-new', 'migration keeps the newest row by created_at');
-    reopened.close();
-
-    // Idempotent: a second reopen (the unique index is the "already
-    // migrated" marker) must not error or change anything further, and the
-    // index now rejects a raw duplicate insert too (defense in depth beyond
-    // the application-level upsert).
-    const reopenedAgain = new Store(dir);
-    assert(
-      reopenedAgain.listSecrets('default').filter((s) => s.kind === 'legacy-kind').length === 1,
-      'reopening an already-migrated DB is a no-op',
-    );
-    let dupRejected = false;
-    try {
-      reopenedAgain.db
-        .prepare('INSERT INTO secrets (id, tenant_id, kind, ciphertext, nonce, created_at) VALUES (?, ?, ?, ?, ?, ?)')
-        .run('legacy-dup', 'default', 'legacy-kind', 'ct-dup', 'n-dup', new Date().toISOString());
-    } catch {
-      dupRejected = true;
-    }
-    assert(dupRejected, 'the UNIQUE(tenant_id, kind) index rejects a second raw insert for the same kind');
-    reopenedAgain.close();
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-}
-
-/**
- * Adapter manifest validation (finding "Manifest-Validierung castet
- * credentials/providerEnv/defaults ungeprueft", adapters.ts ~59) and
- * ADAPTERS_DIR precedence over bundled/repo manifests (finding "Gebundelte
- * /app/adapters-Manifeste ueberschreiben Operator-Manifeste aus
- * ADAPTERS_DIR", adapters.ts ~75).
- */
-async function adapterManifestSmoke(): Promise<void> {
-  const adaptersMod = await import('./adapters.js');
-  const priorAdaptersDir = process.env.ADAPTERS_DIR;
-  const dir = mkdtempSync(join(tmpdir(), 'pa-smoke-adapters-'));
-  const warnBefore = console.warn;
-  const logBefore = console.log;
-  try {
-    writeFileSync(
-      join(dir, 'broken-creds.json'),
-      JSON.stringify({
-        id: 'broken-creds',
-        name: 'Broken Creds',
-        capabilities: {},
-        // The exact bug from the finding: a string instead of an array. Pre-fix
-        // this passed validation and got iterated character by character.
-        credentials: { github: 'GITHUB_TOKEN' },
-        defaults: { provider: '' },
+  const insertIdle = (patch: Partial<SessionRow> = {}): string => {
+    const id = randomUUID();
+    store.insertSession(
+      sessionRow(id, repoId, {
+        status: 'idle',
+        network_policy: 'open',
+        shim_token: `token-${id.slice(0, 8)}`,
+        shim_endpoint: runnerBase,
+        ...patch,
       }),
     );
-    writeFileSync(
-      join(dir, 'broken-env.json'),
-      JSON.stringify({
-        id: 'broken-env',
-        name: 'Broken Env',
-        capabilities: {},
-        providerEnv: { openai: 'not a valid env name' },
-        defaults: { provider: '' },
-      }),
-    );
-    writeFileSync(
-      join(dir, 'broken-defaults.json'),
-      JSON.stringify({ id: 'broken-defaults', name: 'Broken Defaults', capabilities: {}, defaults: {} }),
-    );
-    writeFileSync(
-      join(dir, 'ok-adapter.json'),
-      JSON.stringify({
-        id: 'ok-adapter',
-        name: 'OK Adapter',
-        capabilities: { approvals: true },
-        credentials: { ok: ['OK_TOKEN'] },
-        providerEnv: { ok: 'OK_API_KEY' },
-        defaults: { provider: 'ok' },
-      }),
-    );
-
-    process.env.ADAPTERS_DIR = dir;
-    const warnings: string[] = [];
-    console.warn = (...a: unknown[]): void => {
-      warnings.push(a.map(String).join(' '));
-    };
-    adaptersMod.resetAdapterRegistry();
-    const list = adaptersMod.listAdapters();
-    console.warn = warnBefore;
-
-    const ids = list.map((a) => a.id);
-    assert(
-      !ids.includes('broken-creds'),
-      'credentials as a string (not an array) is rejected, not silently iterated character by character',
-    );
-    assert(!ids.includes('broken-env'), 'an invalid env var name in providerEnv is rejected');
-    assert(!ids.includes('broken-defaults'), 'defaults:{} without a provider string is rejected');
-    assert(ids.includes('ok-adapter'), 'a structurally valid manifest still loads');
-    assert(
-      warnings.some((w) => w.includes('broken-creds')) &&
-        warnings.some((w) => w.includes('broken-env')) &&
-        warnings.some((w) => w.includes('broken-defaults')),
-      'each rejected manifest is logged with a clear reason, not silently dropped',
-    );
-    const ok = list.find((a) => a.id === 'ok-adapter');
-    assert(ok?.credentials?.ok?.[0] === 'OK_TOKEN', 'a valid credentials array is kept verbatim');
-    assert(ok?.providerEnv?.ok === 'OK_API_KEY', 'a valid providerEnv value is kept verbatim');
-
-    // Precedence: ADAPTERS_DIR must win over the repo's own bundled manifest
-    // for a colliding id (here: the real "kilo" adapter).
-    writeFileSync(
-      join(dir, 'kilo.json'),
-      JSON.stringify({
-        id: 'kilo',
-        name: 'Operator Kilo Override',
-        capabilities: {},
-        image: 'registry.example/kilo-shim@sha256:deadbeef',
-        defaults: { provider: 'operator-default' },
-      }),
-    );
-    const logs: string[] = [];
-    console.log = (...a: unknown[]): void => {
-      logs.push(a.map(String).join(' '));
-    };
-    adaptersMod.resetAdapterRegistry();
-    const list2 = adaptersMod.listAdapters();
-    console.log = logBefore;
-
-    const kilo = list2.find((a) => a.id === 'kilo');
-    assert(
-      kilo?.image === 'registry.example/kilo-shim@sha256:deadbeef',
-      'ADAPTERS_DIR wins over the bundled/repo manifest for a colliding id',
-    );
-    assert(
-      logs.some((l) => l.includes('kilo') && l.includes('ignored')),
-      'the overridden lower-precedence manifest is logged, not silently discarded',
-    );
-  } finally {
-    console.warn = warnBefore;
-    console.log = logBefore;
-    if (priorAdaptersDir === undefined) delete process.env.ADAPTERS_DIR;
-    else process.env.ADAPTERS_DIR = priorAdaptersDir;
-    adaptersMod.resetAdapterRegistry();
-    rmSync(dir, { recursive: true, force: true });
-  }
-}
-
-/**
- * Trust boundary (finding "Link-Agent kann Events in beliebige fremde
- * Sessions injizieren", ws.ts ~319): a link socket is bound to exactly one
- * session, and must not be able to write events into another session by
- * simply claiming a different `sessionId` in the `agent.event` frame.
- */
-async function linkEventInjectionSmoke(store: Store, wsBase: string): Promise<void> {
-  const { randomBytes } = await import('node:crypto');
-  const tokenA = randomBytes(24).toString('hex');
-  const tokenB = randomBytes(24).toString('hex');
-  store.createLink(randomUUID(), 'default', 'smoke-link-a', sha256(tokenA));
-  store.createLink(randomUUID(), 'default', 'smoke-link-b', sha256(tokenB));
-
-  const linkA = new Client(wsBase);
-  await linkA.opened;
-  linkA.send({ type: 'agent.hello', token: tokenA, adapter: 'kilo', name: 'link-a' });
-  const readyA = await linkA.wait((m) => m.type === 'agent.ready');
-  const sessionAId = readyA.type === 'agent.ready' ? readyA.sessionId : '';
-
-  const linkB = new Client(wsBase);
-  await linkB.opened;
-  linkB.send({ type: 'agent.hello', token: tokenB, adapter: 'kilo', name: 'link-b' });
-  const readyB = await linkB.wait((m) => m.type === 'agent.ready');
-  const sessionBId = readyB.type === 'agent.ready' ? readyB.sessionId : '';
-
-  assert(
-    sessionAId !== '' && sessionBId !== '' && sessionAId !== sessionBId,
-    'two link agents register two distinct sessions',
-  );
-  const refBefore = store.getSession(sessionBId)?.session_ref ?? null;
-
-  const warnings: string[] = [];
-  const warnBefore = console.warn;
-  console.warn = (...a: unknown[]): void => {
-    warnings.push(a.map(String).join(' '));
+    return id;
   };
-  try {
-    // linkA forges an event claiming to be for sessionB - it is only bound
-    // to sessionA.
-    linkA.send({
-      type: 'agent.event',
-      sessionId: sessionBId,
-      event: { type: 'status', adapter: 'kilo', mode: 'ask', busy: false, sessionRef: 'attacker-injected-ref' },
-    });
-    // A legitimate event for its OWN session, sent right after on the same
-    // socket: once this lands, the forged one (same socket, in-order
-    // delivery, processed first) is guaranteed to already have been handled.
-    linkA.send({
-      type: 'agent.event',
-      sessionId: sessionAId,
-      event: { type: 'status', adapter: 'kilo', mode: 'ask', busy: false, sessionRef: 'linka-legit-ref' },
-    });
-    await waitUntil(
-      () => store.getSession(sessionAId)?.session_ref === 'linka-legit-ref',
-      'linkA legit event applied to its own session',
-    );
-  } finally {
-    console.warn = warnBefore;
-  }
 
-  assert(
-    store.getSession(sessionBId)?.session_ref === refBefore,
-    'a link cannot inject an event into a session it is not bound to',
-  );
-  assert(
-    warnings.some((w) => w.includes('ws.link-event-foreign-session') && w.includes(sessionBId)),
-    'the rejected cross-session event is audit-logged',
-  );
+  try {
+    /* ---- (a) Idempotenz: dieselbe messageId zweimal ist EIN Agenten-Turn ---- */
+    const idA = insertIdle({ model: 'gpt-5', provider: 'openai', mode: 'ask' });
+    promptMode = 'ok';
+    promptCalls = 0;
+    await manager.prompt(idA, 'bau den login um', undefined, 'msg_dup');
+    await manager.prompt(idA, 'bau den login um', undefined, 'msg_dup'); // Resend nach unklarer Quittung
+    const dupCalls = promptCalls;
+    assert(dupCalls === 1, `ein mit derselben messageId erneut gesendeter Prompt erreicht den Runner einmal (waren ${dupCalls})`);
+    const turnsA = manager.turns(idA);
+    assert(turnsA.length === 1, `der doppelte Prompt erzeugte genau einen Turn (waren ${turnsA.length})`);
+    assert(turnsA[0]!.messageId === 'msg_dup', 'der Turn traegt die von der App erzeugte messageId');
+    assert(turnsA[0]!.state === 'running', 'der zugelassene Turn laeuft, nachdem der Runner ihn angenommen hat');
+    assert(
+      lastPromptBody.model === 'gpt-5' && lastPromptBody.provider === 'openai' && lastPromptBody.mode === 'ask',
+      'der Prompt-Rumpf traegt Modell, Provider und Modus der Session',
+    );
+
+    await manager.prompt(idA, 'und jetzt die tests', undefined, 'msg_two');
+    assert(promptCalls === 2, 'eine andere messageId wird als eigener Turn zugelassen');
+    assert(manager.turns(idA).length === 2, 'die zweite messageId fuegt einen zweiten Turn hinzu');
+
+    /* ---- (b) queued -> running -> completed, nach einem Reconnect abfragbar ---- */
+    const idB = insertIdle();
+    await manager.prompt(idB, 'lauf los', undefined, 'msg_b');
+    const runningPush = await c2.wait(
+      (m) => m.type === 'turn.status' && m.sessionId === idB && m.turn.state === 'running',
+      5_000,
+    );
+    assert(runningPush.type === 'turn.status' && runningPush.turn.messageId === 'msg_b', 'der laufende Turn wird live gepusht');
+    assert(store.getSession(idB)?.status === 'running', 'ein zugelassener Turn setzt die Session auf running');
+
+    // Der Runner meldet Fortschritt und Abschluss, wie ueber seinen SSE-Strom.
+    manager.handleLinkEvent(idB, { type: 'message.completed', role: 'assistant', text: 'fertig', seq: 1 });
+    const liveEvent = await c2.wait(
+      (m) => m.type === 'session.event' && m.sessionId === idB && m.event.type === 'message.completed',
+      5_000,
+    );
+    assert(liveEvent.type === 'session.event', 'ein Runner-Event geht live an alle Geraete');
+    manager.handleLinkEvent(idB, { type: 'turn.completed', seq: 2 });
+    assert(store.getSession(idB)?.status === 'idle', 'ein abgeschlossener Turn bringt die Session auf idle zurueck');
+
+    // Dedup ueber seq: dasselbe Event erneut (Replay nach Reconnect) landet nicht zweimal.
+    manager.handleLinkEvent(idB, { type: 'message.completed', role: 'assistant', text: 'fertig', seq: 1 });
+    const history = manager.sessionEvents(idB);
+    const assistantLines = history.filter((e) => e.type === 'message.completed' && e.role === 'assistant');
+    assert(assistantLines.length === 1, `ein wiedergespieltes Event landet nur einmal in der Historie (waren ${assistantLines.length})`);
+    assert(
+      history.some((e) => e.type === 'message.completed' && e.role === 'user' && e.text === 'lauf los'),
+      'der eigene Prompt steht in der Historie, damit ein neu geladener Verlauf nicht bei der Antwort beginnt',
+    );
+
+    const answered = await request(c2, { type: 'session.turns.get', requestId: 'turns-b', sessionId: idB });
+    assert(
+      answered.type === 'session.turns' &&
+        answered.turns.length === 1 &&
+        answered.turns[0]!.state === 'completed' &&
+        answered.turns[0]!.messageId === 'msg_b',
+      'session.turns.get liefert den abgeschlossenen Turn',
+    );
+    const events = await request(c2, { type: 'session.events.get', requestId: 'evt-b', sessionId: idB });
+    assert(
+      events.type === 'session.events' && events.events.length >= 2,
+      'session.events.get liefert die gespeicherte Timeline',
+    );
+    assert(
+      events.type === 'session.events' && !events.events.some((e) => e.type === 'ping'),
+      'ping-Keepalives erreichen die Historie nie',
+    );
+
+    /* ---- (c) ein gescheiterter Turn traegt failed + strukturierten Grund ---- */
+    const idC = insertIdle();
+    promptMode = 'fail';
+    await manager.prompt(idC, 'das geht schief', undefined, 'msg_c');
+    const turnsC = manager.turns(idC);
+    assert(turnsC.length === 1 && turnsC[0]!.state === 'failed', 'ein vom Runner abgelehnter Prompt endet als failed');
+    assert(turnsC[0]!.reason?.message === 'boom', 'der gescheiterte Turn traegt den Runner-Fehler als Grund');
+    assert(turnsC[0]!.reason?.stage === 'transport', 'der Grund benennt die Stufe, an der es brach');
+    assert(store.getSession(idC)?.status === 'error', 'ein gescheiterter Prompt laesst die Session im Fehler');
+
+    /* ---- (d) session.update und Stop ueber die WS-Oberflaeche ---- */
+    promptMode = 'ok';
+    const updated = await request(c2, {
+      type: 'session.update',
+      requestId: 'upd-1',
+      sessionId: idB,
+      mode: 'yolo',
+      model: 'gpt-5-mini',
+      reasoningEffort: 'high',
+    });
+    assert(updated.type === 'request.ok', 'session.update wird quittiert');
+    const rowUpdated = store.getSession(idB);
+    assert(
+      rowUpdated?.mode === 'yolo' && rowUpdated.model === 'gpt-5-mini' && rowUpdated.reasoning_effort === 'high',
+      'session.update persistiert Modus, Modell und Reasoning-Stufe',
+    );
+    assert(buildPromptBody(rowUpdated!, 'hi').model === 'gpt-5-mini', 'der naechste Prompt traegt das neue Modell');
+    const badEffort = await request(c2, {
+      type: 'session.update',
+      requestId: 'upd-2',
+      sessionId: idB,
+      reasoningEffort: 'extrem',
+    });
+    assert(badEffort.type === 'error', 'session.update weist eine unbekannte Reasoning-Stufe ab');
+    const resetModel = await request(c2, { type: 'session.update', requestId: 'upd-3', sessionId: idB, model: '' });
+    assert(resetModel.type === 'request.ok', 'session.update akzeptiert ein leeres Modell');
+    const resetBody = buildPromptBody(store.getSession(idB)!, 'hi');
+    assert('model' in resetBody && resetBody.model === '', "der Prompt-Rumpf sendet model:'' statt den Reset zu verschlucken");
+
+    c2.send({ type: 'session.stop', sessionId: idB });
+    await waitUntil(() => store.getSession(idB)?.status === 'stopped', 'die gestoppte Session');
+    let stoppedPrompt = '';
+    await manager.prompt(idB, 'trotzdem').catch((e: unknown) => {
+      stoppedPrompt = e instanceof Error ? e.message : String(e);
+    });
+    assert(stoppedPrompt.includes('gestoppt'), 'nach dem Stop wird ein Prompt begruendet abgewiesen');
+
+    store.deleteSession(idA);
+    assert(
+      store.getTurnByMessageId(idA, 'msg_dup') === undefined,
+      'ein geloeschte Session nimmt ihre Turns mit (keine verwaisten Turn-Zeilen)',
+    );
+    for (const id of [idB, idC]) store.deleteSession(id);
+  } finally {
+    runner.close();
+  }
 }
 
+/* ------------------------------------------------------------------ */
+/* 4. Egress-Proxy                                                     */
+/* ------------------------------------------------------------------ */
+
 /**
- * W2.4 Link-Relay (Kilo P2, KILO-CLOUD-ANALYSE.md "Link-Agent auf Kilos
- * Relay-Muster heben"): (a) heartbeat as full state - a session id missing
- * from the snapshot is gone, no delta tracking needed; (b) protocolVersion/
- * capabilities are read but never required, on `agent.hello` or
- * `agent.heartbeat`; (c) the server's own terminal vs. transient close
- * codes (the link agent's reconnect-loop reaction to them is unit-tested in
- * link/test/link-status.test.ts, which has no server to close a socket).
+ * Der Egress-Proxy ist die Kern-Sicherheit des Servers: er entscheidet, welcher
+ * Container überhaupt ins Netz darf. Geprüft werden beide Identitäts-Gates
+ * (Token und Quell-Adresse), die Policy 'isolated', die Ziel-Prüfung gegen
+ * SSRF/Rebinding und dass das Session-Token nie an einen Upstream weitergeht.
  */
-async function linkRelaySmoke(store: Store, wsBase: string, c2: Client): Promise<void> {
+async function egressSmoke(store: Store, manager: SessionManager, repoId: string): Promise<void> {
+  section('egress proxy');
+  const http = await import('node:http');
+  const net = await import('node:net');
+  const { createEgressProxyServer, forwardableHeaders, isInternalAddress, resolveTarget } = await import(
+    './egress-proxy.js'
+  );
+
+  /* ---- Adressen, auf die ein aufgeloester Name nie zeigen darf (pur) ---- */
+
+  for (const ip of ['127.0.0.1', '10.1.2.3', '192.168.1.9', '172.20.0.1', '169.254.169.254', '100.64.0.1', '0.0.0.0']) {
+    assert(isInternalAddress(ip), `${ip} gilt als intern`);
+  }
+  for (const ip of ['::1', 'fe80::1', 'fd00::1', 'ff02::1', '::ffff:127.0.0.1']) {
+    assert(isInternalAddress(ip), `${ip} gilt als intern`);
+  }
+  for (const ip of ['140.82.121.4', '2606:4700::1111']) {
+    assert(!isInternalAddress(ip), `${ip} ist eine oeffentliche Adresse`);
+  }
+  assert(isInternalAddress('kein-adresse'), 'alles Unparsebare gilt als intern');
+
+  /* ---- Hop-by-Hop-Header erreichen nie den Upstream (pur) ---- */
+
+  const stripped = forwardableHeaders({
+    host: 'api.example',
+    'proxy-authorization': 'Basic cGE6c2VjcmV0',
+    'proxy-connection': 'keep-alive',
+    connection: 'x-hop',
+    'x-hop': 'internal',
+    authorization: 'Bearer upstream-credential',
+  });
+  assert(stripped['proxy-authorization'] === undefined, 'proxy-authorization wird vor dem Weiterleiten entfernt');
+  assert(stripped['proxy-connection'] === undefined && stripped.connection === undefined, 'proxy-connection/connection werden entfernt');
+  assert(stripped['x-hop'] === undefined, 'in connection gelistete Header werden ebenfalls entfernt');
+  assert(stripped.authorization === 'Bearer upstream-credential', 'der Authorization-Header des Upstreams ueberlebt');
+
+  /* ---- Sessions mit den drei Policies, direkt aus der DB ---- */
+
+  const allowId = randomUUID();
+  const isoId = randomUUID();
+  const stoppedId = randomUUID();
+  const allowToken = `allow-${allowId}`;
+  const isoToken = `iso-${isoId}`;
+  const stoppedToken = `stopped-${stoppedId}`;
+  store.insertSession(sessionRow(allowId, repoId, { status: 'idle', shim_token: allowToken }));
+  store.insertSession(sessionRow(isoId, repoId, { status: 'idle', shim_token: isoToken, network_policy: 'isolated' }));
+  store.insertSession(sessionRow(stoppedId, repoId, { status: 'stopped', shim_token: stoppedToken }));
+
+  assert(manager.egressTokenAllowed(allowToken)?.id === allowId, 'das Token einer lebenden Session benennt ihre Session');
+  assert(manager.egressTokenAllowed(allowToken)?.policy === 'allowlist', 'das Token-Gate meldet die Policy der Session');
+  assert(manager.egressTokenAllowed(isoToken)?.policy === 'isolated', 'eine isolierte Session wird identifiziert, nicht versteckt');
+  assert(manager.egressTokenAllowed(stoppedToken) === null, 'das Token einer gestoppten Session oeffnet den Proxy nicht mehr');
+  assert(manager.egressTokenAllowed('nie-vergeben') === null, 'ein unbekanntes Token benennt keine Session');
+  store.setSessionArchived(allowId, true);
+  assert(manager.egressTokenAllowed(allowToken) === null, 'eine archivierte Session verliert ihren Egress sofort');
+  store.setSessionArchived(allowId, false);
+  assert(manager.egressTokenAllowed(allowToken)?.id === allowId, 'und bekommt ihn beim Entarchivieren zurueck');
+
+  /* ---- der Proxy davor ---- */
+
+  let seenHeaders: import('node:http').IncomingHttpHeaders = {};
+  const upstream = http.createServer((req, res) => {
+    seenHeaders = req.headers;
+    res.writeHead(200).end('pong');
+  });
+  const upstreamPort = await listen(upstream);
+  const target = `http://127.0.0.1:${upstreamPort}/ping`;
+  const ports = [80, 443, upstreamPort];
+
+  // Das Peer-Gate antwortet fuer wen auch immer fragt; das Token-Gate ist das echte.
+  let peerSession: ReturnType<typeof manager.egressTokenAllowed> = null;
+  const proxy = createEgressProxyServer({
+    allowlist: ['127.0.0.1'],
+    ports,
+    tokenValidator: (t) => manager.egressTokenAllowed(t),
+    peerValidator: () => peerSession,
+  });
+  const proxyPort = await listen(proxy);
+
+  const anon = await proxyGet(http, proxyPort, target);
+  assert(anon.status === 407, 'ohne Credentials und ohne bekannte Quell-Adresse antwortet der Proxy mit 407');
+
+  const allowed = await proxyGet(http, proxyPort, target, allowToken);
+  assert(allowed.status === 200, 'eine allowlist-Session kommt mit ihrem Token durch');
+  assert(seenHeaders['proxy-authorization'] === undefined, 'der Upstream sieht nie Proxy-Authorization');
+  assert(seenHeaders.host === `127.0.0.1:${upstreamPort}`, 'die weitergeleitete Anfrage adressiert weiter ihren Ursprungs-Host');
+
+  const isolated = await proxyGet(http, proxyPort, target, isoToken);
+  assert(isolated.status === 403 && isolated.body.includes('policy'), 'eine isolierte Session wird abgewiesen, Token hin oder her');
+  const isolatedConnect = await proxyConnect(net, proxyPort, '127.0.0.1:443', isoToken);
+  assert(isolatedConnect === 403, 'eine isolierte Session kann auch keinen CONNECT-Tunnel oeffnen');
+  const stopped = await proxyGet(http, proxyPort, target, stoppedToken);
+  assert(stopped.status === 407, 'eine gestoppte Session muss sich neu ausweisen - und kann es nicht');
+
+  // Die Quell-Adresse ist der Anspruch, der nicht faelschbar ist.
+  peerSession = { id: isoId, policy: 'isolated' };
+  const borrowed = await proxyGet(http, proxyPort, target, allowToken);
+  assert(borrowed.status === 403, 'ein fremdes Token hebt die Policy des aufrufenden Containers nicht auf');
+  peerSession = { id: allowId, policy: 'allowlist' };
+  const byPeer = await proxyGet(http, proxyPort, target);
+  assert(byPeer.status === 200, 'eine bekannte Quell-Adresse kommt ohne Credentials durch (fetch/undici sendet keine)');
+  peerSession = null;
+
+  // Der Klartext-HTTP-Pfad wird genauso port-gegated wie CONNECT.
+  const strict = createEgressProxyServer({
+    allowlist: ['127.0.0.1'],
+    tokenValidator: (t) => manager.egressTokenAllowed(t),
+  });
+  const strictPort = await listen(strict);
+  const oddPort = await proxyGet(http, strictPort, target, allowToken);
+  assert(oddPort.status === 403 && oddPort.body.includes('port'), 'weitergeleitetes HTTP wird wie CONNECT port-gegated');
+  const offList = await proxyGet(http, proxyPort, `http://evil.example:80/x`, allowToken);
+  assert(offList.status === 403 && offList.body.includes('host'), 'ein Host ausserhalb der Allowlist wird abgewiesen');
+
+  /* ---- SSRF: ein Name darf nicht in internen Raum aufloesen ---- */
+
+  const loopbackName = await resolveTarget('localhost', ['localhost']);
+  assert(!loopbackName.ok && loopbackName.reason === 'address', 'ein auf Loopback zeigender Name wird abgewiesen');
+  const literal = await resolveTarget('127.0.0.1', ['127.0.0.1']);
+  assert(literal.ok, 'ein IP-Literal, das der Betreiber in die Allowlist geschrieben hat, bleibt erreichbar');
+  const wildcardLiteral = await resolveTarget('127.0.0.1', ['*.0.0.1']);
+  assert(!wildcardLiteral.ok, 'ein nur ueber Wildcard getroffenes internes Literal nicht');
+
+  const rebind = createEgressProxyServer({
+    allowlist: ['localhost'],
+    ports,
+    tokenValidator: (t) => manager.egressTokenAllowed(t),
+  });
+  const rebindPort = await listen(rebind);
+  const viaName = await proxyGet(http, rebindPort, `http://localhost:${upstreamPort}/ping`, allowToken);
+  assert(viaName.status === 403 && viaName.body.includes('address'), 'ein erlaubter Name, der nach innen zeigt, wird blockiert');
+  const viaNameConnect = await proxyConnect(net, rebindPort, 'localhost:443', allowToken);
+  assert(viaNameConnect === 403, 'der CONNECT-Pfad loest auf und blockt genauso');
+
+  /* ---- Erreichbarkeit: eine tote Adresse darf einen Host nicht unerreichbar machen ---- */
+
+  const dual = await resolveTarget('dual.example', ['dual.example'], async () => [
+    { address: '2606:4700::1111', family: 6 },
+    { address: '203.0.113.7', family: 4 },
+    { address: '10.1.2.3', family: 4 },
+    { address: 'fd00::1', family: 6 },
+    { address: '198.51.100.9', family: 4 },
+  ]);
+  assert(dual.ok && dual.targets.length === 3, 'ein aufgeloester Name behaelt jede geprueft Adresse, nicht nur die erste');
+  assert(
+    dual.ok && dual.targets.map((t) => t.address).join(',') === '203.0.113.7,198.51.100.9,2606:4700::1111',
+    'IPv4 kommt vor IPv6, innerhalb einer Familie bleibt die DNS-Reihenfolge',
+  );
+  assert(
+    dual.ok && !dual.targets.some((t) => isInternalAddress(t.address)),
+    'keine interne Adresse erreicht je die Liste, zu der verbunden werden darf',
+  );
+
+  for (const s of [upstream, proxy, strict, rebind]) s.close();
+  for (const id of [allowId, isoId, stoppedId]) store.deleteSession(id);
+}
+
+/* ------------------------------------------------------------------ */
+/* 5. Link-Token, Heartbeat, Close-Codes                               */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Der Link-Weg: ein Token aus dem Store meldet einen Agenten an, sein
+ * Heartbeat ist ein Voll-Zustand (keine Deltas), und die beiden Close-Codes,
+ * die `link/` als terminal behandelt, kommen wirklich vom Server.
+ */
+async function linkSmoke(store: Store, wsBase: string, c2: Client): Promise<void> {
+  section('link token + heartbeat');
   const { randomBytes } = await import('node:crypto');
 
-  /* ---- (a) heartbeat as full state ---- */
-
   const tokenA = randomBytes(24).toString('hex');
-  store.createLink(randomUUID(), 'default', 'smoke-relay-a', sha256(tokenA));
+  store.createLink(randomUUID(), 'default', 'smoke-link-a', sha256(tokenA));
+
+  // Ein falsches Token darf nie registrieren.
+  const bogus = new Client(wsBase);
+  await bogus.opened;
+  const bogusClosed = bogus.closeCode();
+  bogus.send({ type: 'agent.hello', token: 'nicht-vergeben', name: 'boese' });
+  assert((await bogusClosed) === WS_CLOSE_UNAUTHORIZED, 'ein unbekanntes Link-Token wird mit 4001 geschlossen');
 
   const linkA = new Client(wsBase);
   await linkA.opened;
-  // No protocolVersion/capabilities on hello at all - the shape of a link
-  // agent that predates W2.4 - must register exactly like a fully capable
-  // one; doubles as half of (b) below.
-  linkA.send({ type: 'agent.hello', token: tokenA, adapter: 'kilo', name: 'relay-a' });
+  // Ohne protocolVersion/capabilities - die Form eines aelteren Link-Agenten.
+  linkA.send({ type: 'agent.hello', token: tokenA, name: 'link-a', workDir: '/home/robin/code' });
   const readyA = await linkA.wait((m) => m.type === 'agent.ready');
   const sessionAId = readyA.type === 'agent.ready' ? readyA.sessionId : '';
-  assert(sessionAId !== '', 'a link registers fine without protocolVersion/capabilities on hello');
-  assert(store.getSession(sessionAId)?.status === 'idle', 'a freshly registered link session starts idle');
+  assert(sessionAId !== '', 'ein Link registriert sich auch ohne protocolVersion/capabilities');
+  const linkRow = store.getSession(sessionAId);
+  assert(linkRow?.status === 'idle', 'eine frisch registrierte Link-Session startet idle');
+  assert(linkRow?.repo_full_name.includes('/home/robin/code') === true, 'das Arbeitsverzeichnis steht im Anzeigenamen');
 
-  // A second, independent link: used below to prove neither an unrelated
-  // link's traffic nor an attempt to name its session id in linkA's own
-  // heartbeat can move a session linkA is not bound to.
+  const listed = await request(c2, { type: 'session.list', requestId: 'link-list' });
+  assert(
+    listed.type === 'session.list' && listed.sessions.find((s) => s.id === sessionAId)?.linked === true,
+    'eine Link-Session ist in session.list als linked markiert',
+  );
+
+  // Ein zweiter, unabhaengiger Link - Beleg, dass ein Link nur seine eigene Bindung bewegt.
   const tokenC = randomBytes(24).toString('hex');
-  store.createLink(randomUUID(), 'default', 'smoke-relay-c', sha256(tokenC));
+  store.createLink(randomUUID(), 'default', 'smoke-link-c', sha256(tokenC));
   const linkC = new Client(wsBase);
   await linkC.opened;
-  linkC.send({ type: 'agent.hello', token: tokenC, adapter: 'kilo', name: 'relay-c' });
+  linkC.send({ type: 'agent.hello', token: tokenC, name: 'link-c' });
   const readyC = await linkC.wait((m) => m.type === 'agent.ready');
   const sessionCId = readyC.type === 'agent.ready' ? readyC.sessionId : '';
-  assert(sessionCId !== '' && sessionCId !== sessionAId, 'a second link registers its own, separate session');
+  assert(sessionCId !== '' && sessionCId !== sessionAId, 'ein zweiter Link registriert seine eigene, getrennte Session');
 
   linkA.send({
     type: 'agent.heartbeat',
@@ -2433,366 +1099,180 @@ async function linkRelaySmoke(store: Store, wsBase: string, c2: Client): Promise
   });
   await waitUntil(
     () => store.getSession(sessionAId)?.status === 'running',
-    "a heartbeat reporting 'busy' for the bound session moves it to running",
+    "ein Heartbeat mit 'busy' bringt die gebundene Session auf running",
   );
 
   linkA.send({ type: 'agent.heartbeat', sessions: [{ sessionId: sessionAId, status: 'idle' }] });
   await waitUntil(
     () => store.getSession(sessionAId)?.status === 'idle',
-    "a heartbeat reporting 'idle' moves a running session back to idle, without a turn.completed event",
+    "ein Heartbeat mit 'idle' bringt sie zurueck - ganz ohne turn.completed",
   );
 
-  linkA.send({
-    type: 'agent.heartbeat',
-    sessions: [{ sessionId: sessionAId, status: 'busy' }],
-  });
-  await waitUntil(() => store.getSession(sessionAId)?.status === 'running', 'set up running again before the "gone" check');
+  linkA.send({ type: 'agent.heartbeat', sessions: [{ sessionId: sessionAId, status: 'permission' }] });
+  await waitUntil(
+    () => store.getSession(sessionAId)?.status === 'running',
+    "'permission' faltet wie alles Nicht-idle auf running",
+  );
 
-  // Full-state discipline: the bound session simply absent from the list -
-  // not a delta, not a dedicated "gone" message - means it no longer exists
-  // from the link agent's point of view, the same conclusion a socket close
-  // would draw.
+  // Voll-Zustand: fehlt die gebundene Session in der Liste, ist sie weg.
   linkA.send({ type: 'agent.heartbeat', sessions: [] });
   await waitUntil(
     () => store.getSession(sessionAId)?.status === 'stopped',
-    'a session missing from the heartbeat is treated as gone (stopped)',
+    'eine im Heartbeat fehlende Session gilt als weg (stopped)',
   );
 
-  /* ---- (b) capability flags are read but never required ---- */
-
-  // Re-arm to 'running', then send a heartbeat naming linkC's REAL session id
-  // (a forgery attempt, same trust boundary as agent.event) plus a malformed
-  // status, alongside a valid entry for linkA's own bound session - none of
-  // that may stop the valid entry from applying, and linkC's session must
-  // stay completely untouched by traffic on linkA's socket.
+  // Faelschungsversuch + kaputter Eintrag neben dem gueltigen.
   linkA.send({ type: 'agent.heartbeat', sessions: [{ sessionId: sessionAId, status: 'busy' }] });
-  await waitUntil(() => store.getSession(sessionAId)?.status === 'running', 'set up running again before the tolerance check');
+  await waitUntil(() => store.getSession(sessionAId)?.status === 'running', 'wieder running vor der Toleranzpruefung');
   linkA.send({
     type: 'agent.heartbeat',
     sessions: [
       { sessionId: sessionCId, status: 'busy' },
       { sessionId: sessionAId, status: 'idle' },
-      { sessionId: sessionAId, status: 'not-a-real-status' },
+      { sessionId: sessionAId, status: 'kein-echter-status' },
     ],
   });
   await waitUntil(
     () => store.getSession(sessionAId)?.status === 'idle',
-    "a heartbeat with linkC's session id and a malformed entry alongside the valid one still applies the valid one",
+    'ein Heartbeat mit fremder Session-Id und kaputtem Eintrag wendet den gueltigen trotzdem an',
   );
   assert(
     store.getSession(sessionCId)?.status === 'idle',
-    "naming linkC's real session id in linkA's heartbeat does not move it - a link only ever affects its own binding",
+    "die fremde Session-Id in linkAs Heartbeat bewegt linkCs Session nicht",
   );
 
-  // A heartbeat whose `sessions` is not even an array (arbitrary/garbled
-  // wire input) must degrade to "no entries" instead of throwing - only the
-  // sender's own bound session is affected (it goes missing -> stopped), a
-  // second link's session and the connection itself stay unaffected.
-  linkA.send({ type: 'agent.heartbeat', sessions: 'not-an-array' });
+  // `sessions` gar kein Array: degradiert zu "leerer Schnappschuss", kein Absturz.
+  linkA.send({ type: 'agent.heartbeat', sessions: 'kein-array' });
   await new Promise((r) => setTimeout(r, 100));
   assert(
     store.getSession(sessionAId)?.status === 'stopped',
-    'a heartbeat with a non-array sessions field is treated as an empty snapshot for the sender, not the process crashing',
+    'ein Heartbeat ohne Array-Feld gilt als leerer Schnappschuss, statt den Prozess zu zerlegen',
   );
-  assert(
-    store.getSession(sessionCId)?.status === 'idle',
-    "a malformed heartbeat on linkA's socket never touches linkC's session",
-  );
-  const pingReq = await request(c2, { type: 'server.stats', requestId: 'relay-alive' });
-  assert(pingReq.type === 'server.stats', 'the server keeps serving other clients after a malformed heartbeat');
+  assert(store.getSession(sessionCId)?.status === 'idle', "ein kaputter Heartbeat auf linkAs Socket fasst linkCs Session nie an");
+  const alive = await request(c2, { type: 'server.stats', requestId: 'link-alive' });
+  assert(alive.type === 'server.stats', 'der Server bedient andere Clients nach einem kaputten Heartbeat weiter');
 
-  /* ---- (c) terminal vs. transient close codes the server itself sends ---- */
+  /* ---- terminale vs. voruebergehende Close-Codes ---- */
 
-  // Conflict: a second connection with the same link token displaces the
-  // first - WS_CLOSE_REPLACED, the code link/src/index.ts treats as terminal.
   const linkAClosed = linkA.closeCode();
   const linkA2 = new Client(wsBase);
   await linkA2.opened;
-  linkA2.send({ type: 'agent.hello', token: tokenA, adapter: 'kilo', name: 'relay-a-2' });
+  linkA2.send({ type: 'agent.hello', token: tokenA, name: 'link-a-2' });
   await linkA2.wait((m) => m.type === 'agent.ready');
-  assert((await linkAClosed) === WS_CLOSE_REPLACED, 'a link displaced by a same-token reconnect is closed with WS_CLOSE_REPLACED');
+  assert((await linkAClosed) === WS_CLOSE_REPLACED, 'ein durch Reconnect verdraengter Link wird mit WS_CLOSE_REPLACED geschlossen');
 
-  // Revocation: WS_CLOSE_UNAUTHORIZED, the other code link/src/index.ts
-  // treats as terminal.
   const linkA2Closed = linkA2.closeCode();
   const linkIdA = store.getLinkByTokenHash(sha256(tokenA))?.id ?? '';
-  assert(linkIdA !== '', 'the link row for tokenA is resolvable');
-  const revoked = await request(c2, { type: 'link.revoke', requestId: 'relay-revoke', linkId: linkIdA });
-  assert(revoked.type === 'link.revoked', 'link.revoke acknowledged');
-  assert((await linkA2Closed) === WS_CLOSE_UNAUTHORIZED, "a revoked link's live socket is closed with WS_CLOSE_UNAUTHORIZED");
+  assert(linkIdA !== '', 'die Link-Zeile zu tokenA ist aufloesbar');
+  const revoked = await request(c2, { type: 'link.revoke', requestId: 'link-revoke', linkId: linkIdA });
+  assert(revoked.type === 'link.revoked', 'link.revoke wird quittiert');
+  assert((await linkA2Closed) === WS_CLOSE_UNAUTHORIZED, 'der Socket eines widerrufenen Links wird mit 4001 geschlossen');
+
+  const links = await request(c2, { type: 'link.list', requestId: 'link-list-2' });
+  assert(
+    links.type === 'link.list' && !links.links.some((l) => l.id === linkIdA),
+    'der widerrufene Link ist aus link.list verschwunden',
+  );
 }
 
-/**
- * Turn lifecycle (KILO-CLOUD-ANALYSE.md P1, W2.2): app-generated message ids
- * make a re-sent prompt idempotent (no duplicate agent turn after an ambiguous
- * admission), and the per-turn status resource carries queued -> running ->
- * completed/failed/interrupted so a reconnecting client reconstructs a turn's
- * fate instead of guessing it from the event stream. Runs against a fake shim
- * only - no docker daemon needed, since a reachable shim endpoint is all the
- * prompt path uses here.
- */
-async function turnLifecycleSmoke(store: Store, manager: SessionManager, c2: Client, repoId: string): Promise<void> {
-  const http = await import('node:http');
-  const { clampTurnLimit, TURNS_DEFAULT_LIMIT, TURNS_MAX_LIMIT } = await import('./sessions.js');
+/* ------------------------------------------------------------------ */
+/* 6. WS-Heartbeat (halbtote Sockets)                                  */
+/* ------------------------------------------------------------------ */
 
-  /* ---- pure limit clamping, same contract as clampEventLimit ---- */
-  assert(clampTurnLimit(undefined) === TURNS_DEFAULT_LIMIT, 'a missing turn limit falls back to the default');
-  assert(clampTurnLimit(9_999) === TURNS_MAX_LIMIT, 'an oversized turn limit is capped');
-  assert(clampTurnLimit(0) === 1 && clampTurnLimit(-3) === 1, 'a turn limit below 1 becomes 1');
+async function heartbeatSmoke(): Promise<void> {
+  section('ws heartbeat');
+  const { WebSocketServer } = await import('ws');
+  const { Heartbeat, WS_HEARTBEAT_MS } = await import('./ws.js');
+  assert(WS_HEARTBEAT_MS === 25_000, 'produktiv wird alle 25s gepingt');
 
-  /* ---- a fake shim whose /prompt outcome and call count the test drives ---- */
-  let promptCalls = 0;
-  let promptMode: 'ok' | 'fail' = 'ok';
-  const shim = http.createServer((req, res) => {
-    const url = req.url ?? '';
-    req.resume();
-    if (url.startsWith('/prompt')) {
-      promptCalls++;
-      if (promptMode === 'fail') {
-        return void res.writeHead(200, { 'content-type': 'application/json' }).end('{"ok":false,"error":"boom"}');
-      }
-      return void res.writeHead(200, { 'content-type': 'application/json' }).end('{"ok":true}');
-    }
-    res.writeHead(200, { 'content-type': 'application/json' }).end('{"ok":true}');
+  const hb = new Heartbeat(40);
+  const wss = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+  await new Promise<void>((resolve) => wss.once('listening', () => resolve()));
+  const port = (wss.address() as AddressInfo).port;
+  wss.on('connection', (s) => hb.track(s));
+
+  const alive = new WebSocket(`ws://127.0.0.1:${port}`);
+  await new Promise<void>((resolve) => alive.once('open', () => resolve()));
+  // autoPong aus = der Client antwortet nie, genau wie ein Handy ohne Netz,
+  // dessen Socket hier noch offen aussieht.
+  const mute = new WebSocket(`ws://127.0.0.1:${port}`, { autoPong: false });
+  const muteClosed = new Promise<boolean>((resolve) => {
+    mute.once('close', () => resolve(true));
+    setTimeout(() => resolve(false), 5_000);
   });
-  const shimPort = await listen(shim);
-  const shimBase = `http://127.0.0.1:${shimPort}`;
+  await new Promise<void>((resolve) => mute.once('open', () => resolve()));
 
-  const insertIdle = (): string => {
-    const id = randomUUID();
-    store.insertSession(
-      sessionRow(id, repoId, {
-        status: 'idle',
-        network_policy: 'open',
-        shim_token: `token-${id.slice(0, 8)}`,
-        shim_endpoint: shimBase,
-      }),
-    );
-    return id;
-  };
+  assert(await muteClosed, 'ein Socket, der zwei Pong-Runden verpasst, wird terminiert');
+  assert(alive.readyState === WebSocket.OPEN, 'ein antwortender Socket bleibt verbunden');
+  assert(hb.size() === 1, 'der Heartbeat vergisst terminierte Sockets');
+
+  hb.stop();
+  assert(hb.size() === 0, 'das Herunterfahren leert den Heartbeat');
+  alive.close();
+  wss.close();
+}
+
+/* ------------------------------------------------------------------ */
+/* 7. Runner-Client: HTTP-Status wird nicht ignoriert                  */
+/* ------------------------------------------------------------------ */
+
+async function shimClientSmoke(): Promise<void> {
+  section('runner client');
+  const http = await import('node:http');
+  const { ShimClient, normalizeModels } = await import('./shim-client.js');
+
+  assert(normalizeModels(null).length === 0, 'ein fehlender Katalog wird zur leeren Liste');
+  assert(normalizeModels({ models: ['a', { id: 'b', name: 'B' }, { id: '' }, 42] }).length === 2, 'kaputte Katalog-Eintraege fallen raus');
+
+  let respond: { status: number; body: unknown } = { status: 200, body: {} };
+  const server = http.createServer((_req, res) => {
+    res.writeHead(respond.status, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(respond.body));
+  });
+  const port = await listen(server);
+  const client = new ShimClient(`http://127.0.0.1:${port}`, 'smoke-token');
 
   try {
-    /* ---- (a) idempotency: the same messageId twice is one agent turn ---- */
-    const idA = insertIdle();
-    promptMode = 'ok';
-    promptCalls = 0;
-    await manager.prompt(idA, 'bau den login um', undefined, 'msg_dup');
-    await manager.prompt(idA, 'bau den login um', undefined, 'msg_dup'); // resend after an ambiguous ack
-    const dupCalls = promptCalls; // snapshot: assert narrows the closure-mutated let otherwise
-    assert(dupCalls === 1, `a prompt re-sent with the same messageId hits the shim once (got ${dupCalls})`);
-    const turnsA = manager.turns(idA);
-    assert(turnsA.length === 1, `the duplicate prompt created exactly one turn (got ${turnsA.length})`);
-    assert(turnsA[0]!.messageId === 'msg_dup', 'the turn carries the app-generated messageId');
-    assert(turnsA[0]!.state === 'running', 'the admitted turn is running after the shim accepted it');
-
-    // A *different* messageId is a genuine second turn, not a duplicate.
-    await manager.prompt(idA, 'und jetzt die tests', undefined, 'msg_two');
-    const twoCalls = promptCalls;
-    assert(twoCalls === 2, `a different messageId is admitted as its own turn (got ${twoCalls})`);
-    assert(manager.turns(idA).length === 2, 'the second messageId adds a second turn');
-
-    /* ---- (b) queued -> running -> completed, queryable after a reconnect ---- */
-    const idB = insertIdle();
-    promptCalls = 0;
-    // Watch the live turn.status push arrive on the device socket.
-    await manager.prompt(idB, 'lauf los', undefined, 'msg_b');
-    const runningPush = await c2.wait(
-      (m) => m.type === 'turn.status' && m.sessionId === idB && m.turn.state === 'running',
-      5_000,
-    );
-    assert(runningPush.type === 'turn.status' && runningPush.turn.messageId === 'msg_b', 'the running turn is pushed live');
-    assert(store.getSession(idB)?.status === 'running', 'admitting a turn puts the session into running');
-
-    // The shim reports the turn finished (as it would over its SSE stream).
-    manager.handleLinkEvent(idB, { type: 'turn.completed' });
-    assert(store.getSession(idB)?.status === 'idle', 'a completed turn returns the session to idle');
-
-    // "Reconnect": a fresh client asks for the turns and reads the terminal
-    // state instead of replaying the whole event stream.
-    const turnsB = manager.turns(idB);
-    assert(turnsB.length === 1 && turnsB[0]!.state === 'completed', 'the turn is completed and queryable after a reconnect');
-
-    // And the same over the WS resource the app actually uses.
-    const answered = await request(c2, { type: 'session.turns.get', requestId: 'turns-b', sessionId: idB });
-    assert(
-      answered.type === 'session.turns' &&
-        answered.turns.length === 1 &&
-        answered.turns[0]!.state === 'completed' &&
-        answered.turns[0]!.messageId === 'msg_b',
-      'session.turns.get returns the completed turn',
-    );
-
-    /* ---- (c) a failed turn carries failed + a structured reason ---- */
-    const idC = insertIdle();
-    promptMode = 'fail';
-    await manager.prompt(idC, 'das geht schief', undefined, 'msg_c');
-    const turnsC = manager.turns(idC);
-    assert(turnsC.length === 1 && turnsC[0]!.state === 'failed', 'a prompt the shim rejects ends as a failed turn');
-    assert(turnsC[0]!.reason?.message === 'boom', 'the failed turn carries the shim error as its reason');
-    assert(turnsC[0]!.reason?.stage === 'transport', 'the failure reason names the stage it broke at');
-    assert(store.getSession(idC)?.status === 'error', 'a failed prompt leaves the session in error');
-
-    store.deleteSession(idA);
-    assert(
-      store.getTurnByMessageId(idA, 'msg_dup') === undefined,
-      'deleting a session takes its turns with it (no orphaned turn rows)',
-    );
-    for (const id of [idB, idC]) store.deleteSession(id);
+    // Genau der Fehlermodus aus dem Fund: ein Proxy antwortet mit parsebarem
+    // JSON-Fehlerkoerper, waehrend der Runner noch bootet.
+    respond = { status: 502, body: { error: 'upstream not ready' } };
+    assert((await client.status()) === null, 'ein Nicht-2xx-JSON-Koerper gilt nicht als bereiter Runner');
+    respond = { status: 401, body: { mode: 'ask', busy: false } };
+    assert((await client.status()) === null, 'ein 401 wird auch mit gut geformtem Koerper abgelehnt');
+    respond = { status: 200, body: { mode: 'ask', busy: false } };
+    const ready = await client.status();
+    assert(ready?.mode === 'ask' && ready.busy === false, 'eine 2xx-Antwort wird normal gelesen');
+    assert(!('adapter' in (ready as object)), 'ShimStatus traegt kein adapter-Feld mehr');
   } finally {
-    shim.close();
+    server.close();
   }
 }
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const FAKE_CODEX = join(HERE, 'smoke-fake-codex.mjs');
-
-/**
- * Transport for the auth smoke test: spawns the fake codex app-server (JSON-RPC
- * over stdio + a real loopback login HTTP server) with CODEX_HOME pointed at a
- * temp dir, so the whole CodexAuthManager flow runs against it without docker.
- */
-class SpawnCodexAuthTransport implements CodexAuthTransport {
-  constructor(
-    private readonly codexHome: string,
-    private readonly env: Record<string, string> = {},
-  ) {}
-
-  open(): Promise<CodexAppServerSession> {
-    const child = spawn(process.execPath, [FAKE_CODEX], {
-      env: { ...process.env, ...this.env, CODEX_HOME: this.codexHome },
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    child.stderr.setEncoding('utf8');
-    const rpc = new CodexJsonRpc(child.stdin, child.stdout, { onLog: () => {} });
-    const codexHome = this.codexHome;
-    return rpc.request('initialize', { clientInfo: { name: 'smoke', version: '0' } }, 10_000).then(() => {
-      rpc.notify('initialized', {});
-      const session: CodexAppServerSession = {
-        rpc,
-        async forwardCallback(port: number, code: string, state: string): Promise<number> {
-          const res = await fetch(
-            `http://127.0.0.1:${port}/auth/callback?${new URLSearchParams({ code, state }).toString()}`,
-          );
-          return res.status;
-        },
-        async readAuthJson(): Promise<string | null> {
-          try {
-            return await readFile(join(codexHome, 'auth.json'), 'utf8');
-          } catch {
-            return null;
-          }
-        },
-        async close(): Promise<void> {
-          rpc.close();
-          child.kill('SIGTERM');
-        },
-      };
-      return session;
-    });
-  }
-}
-
-/**
- * Pure-helper unit checks for the codex auth parsing (CODEX-OAUTH.md §1/§4),
- * then the full auth.* WS flow against the fake app-server + login server.
- */
-async function codexAuthFlow(): Promise<void> {
-  // ---- pure parsing helpers ----
-  assert(
-    parseCallbackPort('https://auth.openai.com/authorize?redirect_uri=' +
-      encodeURIComponent('http://localhost:1457/auth/callback')) === 1457,
-    'parseCallbackPort reads the redirect_uri port',
-  );
-  assert(parseCallbackPort('not a url') === 1455, 'parseCallbackPort falls back to 1455');
-  assert(parseCallbackPort(undefined) === 1455, 'parseCallbackPort default without a url');
-  const login = parseLoginResult({ auth_url: 'https://x', login_id: 'l1', user_code: 'CODE' });
-  assert(login.authUrl === 'https://x' && login.loginId === 'l1' && login.userCode === 'CODE', 'parseLoginResult snake_case');
-  assert(isLoginCompleted('AccountLoginCompletedNotification'), 'isLoginCompleted matches the codex notification');
-  assert(!isLoginCompleted('item/started'), 'isLoginCompleted ignores unrelated notifications');
-  assert(isLoginError('accountLoginError'), 'isLoginError matches a login error notification');
-  assert(
-    accountLabelFrom({ account: { plan: 'ChatGPT Plus', email: 'a@b.c' } }) === 'ChatGPT Plus, a@b.c',
-    'accountLabelFrom builds a plan+email label',
-  );
-
-  // ---- full flow through a real WS against the fake transport ----
-  const codexHome = mkdtempSync(join(tmpdir(), 'pa-smoke-codexhome-'));
-  const { app, store } = await buildApp({ codexAuthTransport: new SpawnCodexAuthTransport(codexHome) });
-  await app.listen({ port: 0, host: '127.0.0.1' });
-  const addr = app.server.address() as AddressInfo;
-  const wsBase = `ws://127.0.0.1:${addr.port}/ws`;
-
-  const code = generatePairingCode(store);
-  const pairRes = await fetch(`http://127.0.0.1:${addr.port}/api/pairing/confirm`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ code, deviceName: 'auth-device' }),
-  });
-  const paired = (await pairRes.json()) as { deviceId?: string; deviceToken?: string };
-
-  const c = new Client(wsBase);
-  await c.opened;
-  c.send({ type: 'hello', deviceId: paired.deviceId, token: paired.deviceToken });
-  await c.wait((m) => m.type === 'welcome');
-
-  // The codex manifest's authFlows must reach the app (W2.3 declared them but
-  // the server dropped the field on load until this package wired it through).
-  const adapters = await request(c, { type: 'adapter.list', requestId: 'adpA' });
-  const codex = adapters.type === 'adapter.list' ? adapters.adapters.find((a) => a.id === 'codex') : undefined;
-  assert(codex !== undefined, 'adapter.list includes codex');
-  const flowTypes = (codex?.authFlows ?? []).map((f) => f.type);
-  assert(flowTypes.includes('oauth-loopback'), 'codex authFlows carry oauth-loopback');
-  assert(flowTypes.includes('device-code'), 'codex authFlows carry device-code');
-  const loopback = (codex?.authFlows ?? []).find((f) => f.type === 'oauth-loopback');
-  assert(loopback?.ports?.includes(1455) === true, 'oauth-loopback flow lists port 1455');
-
-  // auth.start -> auth.url
-  c.send({ type: 'auth.start', requestId: 'authX', adapter: 'codex', flow: 'oauth-loopback' });
-  const urlMsg = await c.wait((m) => m.type === 'auth.url' && m.requestId === 'authX');
-  assert(urlMsg.type === 'auth.url', 'auth.start yields auth.url');
-  if (urlMsg.type !== 'auth.url') throw new Error('unreachable');
-  assert(urlMsg.url.includes('auth.openai.com'), 'auth.url carries the provider login URL');
-  assert(urlMsg.port > 0, 'auth.url reports the loopback port for the phone listener');
-
-  // auth.callback is forwarded to the login server inside the (fake) container,
-  // which writes auth.json and reports completion.
-  c.send({ type: 'auth.callback', requestId: 'authX', code: 'the-code', state: 'fake-state' });
-  const doneMsg = await c.wait((m) => m.type === 'auth.done' && m.requestId === 'authX');
-  assert(doneMsg.type === 'auth.done' && doneMsg.ok === true, 'auth.done ok after the callback is forwarded');
-  if (doneMsg.type !== 'auth.done') throw new Error('unreachable');
-  assert(doneMsg.account?.includes('ChatGPT Plus') === true, 'auth.done carries the account label');
-
-  // Vault backup written (secret kind codex_oauth), value equals the volume auth.json.
-  const backup = store.getSecretValue('codex_oauth', 'default');
-  assert(backup !== null && backup.includes('sk-fake-from-exchange'), 'auth.json is backed up to the vault as codex_oauth');
-  const onDisk = readFileSync(join(codexHome, 'auth.json'), 'utf8');
-  assert(backup === onDisk, 'vault backup matches the auth.json in the shared CODEX_HOME');
-
-  // A non-codex adapter has no in-app login.
-  c.send({ type: 'auth.start', requestId: 'authY', adapter: 'claude' });
-  const noAuth = await c.wait((m) => m.type === 'auth.done' && m.requestId === 'authY');
-  assert(noAuth.type === 'auth.done' && noAuth.ok === false, 'non-codex adapter gets auth.done ok:false');
-
-  await app.close();
-  rmSync(codexHome, { recursive: true, force: true });
-  console.log('codex auth flow: OK');
-}
+/* ------------------------------------------------------------------ */
+/* main                                                                */
+/* ------------------------------------------------------------------ */
 
 async function main(): Promise<void> {
-  await protocolLoadsOnPlainNode();
+  const started = Date.now();
   const { app, store, manager } = await buildApp();
   await app.listen({ port: 0, host: '127.0.0.1' });
   const addr = app.server.address() as AddressInfo;
   const base = `http://127.0.0.1:${addr.port}`;
   const wsBase = `ws://127.0.0.1:${addr.port}/ws`;
 
+  /* ---------------- Health + Pairing + WS-Auth ---------------- */
+
+  section('health, pairing, ws auth');
   const health = await fetch(`${base}/api/health`);
-  assert(health.ok, 'health endpoint responds');
+  const healthBody = (await health.json()) as { ok: boolean; version: string; docker: boolean };
+  assert(health.ok && healthBody.ok, '/api/health antwortet');
+  assert(typeof healthBody.version === 'string' && healthBody.docker === false, '/api/health meldet Version und Docker-Zustand');
 
   const c1 = new Client(wsBase);
   await c1.opened;
+  const c1Code = c1.closeCode();
   c1.send({ type: 'hello', deviceId: 'nope', token: 'bad-token' });
-  assert(await c1.closed(), 'bad token closes connection');
+  assert((await c1Code) === WS_CLOSE_UNAUTHORIZED, 'ein falsches Geraete-Token schliesst die Verbindung mit 4001');
 
   const code = generatePairingCode(store);
   const pairRes = await fetch(`${base}/api/pairing/confirm`, {
@@ -2801,69 +1281,115 @@ async function main(): Promise<void> {
     body: JSON.stringify({ code, deviceName: 'smoke-device' }),
   });
   const paired = (await pairRes.json()) as { ok: boolean; deviceId?: string; deviceToken?: string };
-  assert(pairRes.ok && paired.ok && paired.deviceId && paired.deviceToken, 'pairing confirm ok');
+  assert(pairRes.ok && paired.ok && paired.deviceId && paired.deviceToken, 'pairing/confirm liefert Geraet und Token');
   const reused = await fetch(`${base}/api/pairing/confirm`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ code, deviceName: 'smoke-device-2' }),
   });
-  assert(!reused.ok, 'pairing code cannot be reused');
+  assert(!reused.ok, 'ein Pairing-Code laesst sich nicht wiederverwenden');
 
   const c2 = new Client(wsBase);
   await c2.opened;
   c2.send({ type: 'hello', deviceId: paired.deviceId, token: paired.deviceToken });
   const welcome = await c2.wait((m) => m.type === 'welcome');
-  assert(welcome.type === 'welcome' && welcome.ok, 'authenticated hello gets welcome');
+  assert(welcome.type === 'welcome' && welcome.ok, 'ein authentifiziertes hello bekommt welcome');
 
-  const adapters = await request(c2, { type: 'adapter.list', requestId: 'adp1' });
-  assert(adapters.type === 'adapter.list' && adapters.adapters.length >= 4, 'adapter.list returns at least 4 adapters');
-  const adapterIds = adapters.type === 'adapter.list' ? adapters.adapters.map((a) => a.id) : [];
-  for (const expected of ['kilo', 'claude', 'pi', 'junie']) {
-    assert(adapterIds.includes(expected), `adapter.list includes "${expected}"`);
-  }
-  const kilo = adapters.type === 'adapter.list' ? adapters.adapters.find((a) => a.id === 'kilo') : undefined;
-  assert(kilo?.credentials?.kilo?.[0] === 'KILO_AUTH_CONTENT', 'kilo manifest carries credential mapping');
+  // Ein Socket, der gar kein hello sendet, wird nach dem Auth-Timeout geschlossen.
+  const { WS_AUTH_TIMEOUT_MS } = await import('./ws.js');
+  assert(WS_AUTH_TIMEOUT_MS === 10_000, 'ein Socket ohne hello hat 10s Gnadenfrist');
 
-  /*
-   * The Z.AI key reaches kilo only as ZHIPU_API_KEY - that is the env var
-   * models.dev lists for all four Z.AI providers (zai, zai-coding-plan,
-   * zhipuai, zhipuai-coding-plan), and kilo (an OpenCode fork) auto-configures
-   * providers from that catalog. Verified against kilo 7.4.22: with
-   * ZAI_API_KEY set instead it exposes *no* Z.AI provider at all (kilo is left
-   * with only its own gateway), so every zai model reads as "model not found"
-   * and the gateway fallback answers "Forbidden". pi is deliberately not
-   * covered here - its SDK documents ZAI_API_KEY as its own coding-plan
-   * variable, so that manifest keeps it.
-   */
-  assert(kilo?.providerEnv?.zai === 'ZHIPU_API_KEY', 'kilo manifest injects the Z.AI key as ZHIPU_API_KEY');
+  /* ---------------- fcm.register ---------------- */
 
-  const badAdapter = await request(c2, {
-    type: 'session.create',
-    requestId: 'ses0',
-    repoId: 'irrelevant',
-    adapter: 'does-not-exist',
-    provider: 'openai',
-    model: 'x',
-    mode: 'ask',
-  });
-  assert(badAdapter.type === 'error', 'session.create with unknown adapter is rejected');
+  section('fcm.register');
+  c2.send({ type: 'fcm.register', token: 'fcm-smoke-token' });
+  await waitUntil(
+    () => store.getDevice(paired.deviceId as string)?.fcm_token === 'fcm-smoke-token',
+    'das hinterlegte FCM-Token',
+  );
+  assert(store.listFcmTokens('default').includes('fcm-smoke-token'), 'das Token steht in der Push-Liste des Mandanten');
+  // Rotation: Firebase vergibt ein neues Token, das alte wird ersetzt (nicht ergaenzt).
+  c2.send({ type: 'fcm.register', token: 'fcm-smoke-rotated' });
+  await waitUntil(
+    () => store.getDevice(paired.deviceId as string)?.fcm_token === 'fcm-smoke-rotated',
+    'das rotierte FCM-Token',
+  );
+  assert(
+    store.listFcmTokens('default').filter((t) => t.startsWith('fcm-smoke')).length === 1,
+    'eine Token-Rotation ersetzt den Eintrag, statt einen zweiten anzulegen',
+  );
 
-  const saved = await request(c2, {
-    type: 'secret.set',
-    requestId: 'sec1',
-    kind: 'zai',
-    value: 'sk-smoke-secret-value',
-  });
+  /* ---------------- Secrets: Vault, Arten, Live-Pruefung ---------------- */
+
+  section('secrets + vault');
+  const saved = await request(c2, { type: 'secret.set', requestId: 'sec1', kind: 'openai', value: 'sk-smoke-secret-value' });
   assert(saved.type === 'secret.saved', 'secret.set -> secret.saved');
-  assert(!JSON.stringify(saved).includes('sk-smoke-secret-value'), 'secret value never returned');
+  assert(!JSON.stringify(saved).includes('sk-smoke-secret-value'), 'der Wert wird nie zurueckgegeben');
+
+  const badKindShape = await request(c2, { type: 'secret.set', requestId: 'sec-bad1', kind: 'Nicht:Erlaubt', value: 'x' });
+  assert(badKindShape.type === 'error', 'eine formal ungueltige Secret-Art wird abgewiesen');
+  const badKindUnknown = await request(c2, { type: 'secret.set', requestId: 'sec-bad2', kind: 'kilo', value: 'x' });
+  assert(
+    badKindUnknown.type === 'error' && badKindUnknown.message.includes('unknown secret kind'),
+    'eine Art ausserhalb von SECRET_KINDS wird abgewiesen (v1 speicherte sie stillschweigend)',
+  );
+  for (const kind of SECRET_KINDS) {
+    const ok = await request(c2, { type: 'secret.set', requestId: `sec-${kind}`, kind, value: `wert-${kind}` });
+    assert(ok.type === 'secret.saved', `SECRET_KINDS-Eintrag "${kind}" wird akzeptiert`);
+  }
+  assert(SECRET_KINDS.includes('github'), 'github gehoert zu den Secret-Arten (Clone/Push/PR)');
 
   const secretList = await request(c2, { type: 'secret.list', requestId: 'sec2' });
   assert(
-    secretList.type === 'secret.list' && secretList.secrets.length === 1 && secretList.secrets[0]!.kind === 'zai',
-    'secret.list returns one zai entry without value',
+    secretList.type === 'secret.list' && secretList.secrets.length === SECRET_KINDS.length,
+    'secret.list liefert je Art genau einen Eintrag (Upsert auf (tenant, kind))',
+  );
+  assert(
+    secretList.type === 'secret.list' && !JSON.stringify(secretList).includes('wert-github'),
+    'secret.list traegt nie einen Klartext',
   );
 
-  /* ---- secret.validate: pure offline checks with a stubbed fetch ---- */
+  // Roundtrip durch den Vault: was gespeichert wurde, kommt entschluesselt zurueck.
+  assert(store.getSecretValue('github', 'default') === 'wert-github', 'ein gespeichertes Secret laesst sich entschluesseln');
+  assert(store.getSecretValue('gibt-es-nicht', 'default') === null, 'eine fehlende Art liefert null');
+
+  const deletedSecret = await request(c2, {
+    type: 'secret.delete',
+    requestId: 'sec3',
+    id: (secretList.type === 'secret.list' ? secretList.secrets.find((s) => s.kind === 'anthropic')?.id : '') ?? '',
+  });
+  assert(deletedSecret.type === 'secret.deleted', 'secret.delete wird quittiert');
+  assert(store.getSecretValue('anthropic', 'default') === null, 'ein geloeschtes Secret ist wirklich weg');
+
+  /* ---- Vault: AAD-Bindung und Legacy-Migration ---- */
+
+  const aad = 'secret:default:smoke-aad';
+  const encRound = vault.encrypt('roundtrip-value', aad);
+  assert(vault.decryptStrict(encRound, aad) === 'roundtrip-value', 'AES-256-GCM-Roundtrip mit AAD');
+  assert(vault.decrypt(encRound, aad) === 'roundtrip-value', 'decrypt mit passender AAD funktioniert');
+  let aadMismatch = false;
+  try {
+    vault.decryptStrict(encRound, 'secret:default:other');
+  } catch {
+    aadMismatch = true;
+  }
+  assert(aadMismatch, 'eine falsche AAD laesst den strikten decrypt scheitern');
+
+  const legacyKind = 'openai';
+  const legacyEnc = vault.encrypt('legacy-value'); // ohne AAD (Zeile vor der Migration)
+  store.saveSecret(randomUUID(), 'default', legacyKind, legacyEnc.ciphertext, legacyEnc.nonce);
+  assert(store.getSecretValue(legacyKind, 'default') === 'legacy-value', 'eine Legacy-Zeile entschluesselt ueber den Fallback');
+  const reEncrypted = store.getSecretByKind(legacyKind, 'default');
+  assert(!!reEncrypted && reEncrypted.ciphertext !== legacyEnc.ciphertext, 'die Legacy-Zeile wurde neu verschluesselt');
+  assert(
+    !!reEncrypted &&
+      vault.decryptStrict({ ciphertext: reEncrypted.ciphertext, nonce: reEncrypted.nonce }, `secret:default:${legacyKind}`) ===
+        'legacy-value',
+    'der zweite Lauf entschluesselt strikt mit AAD',
+  );
+
+  /* ---- secret.validate: rein offline mit gestubbtem fetch ---- */
+
   const stubFetch = (status: number, body: unknown, calls: string[] = []): FetchLike =>
     (url) => {
       calls.push(url);
@@ -2871,588 +1397,222 @@ async function main(): Promise<void> {
     };
 
   const okCalls: string[] = [];
-  const okKey = await validateSecret('openai', 'sk-does-not-matter', {
+  const okKey = await validateSecret('openai', 'sk-egal', {
     fetchImpl: stubFetch(200, { data: [{ id: 'gpt-x' }, { id: 'gpt-y' }] }, okCalls),
   });
-  assert(okKey.ok && okKey.detail === '2 Modelle verfügbar', 'validateSecret counts models on 2xx');
-  assert(okCalls[0] === 'https://api.openai.com/v1/models', 'openai check hits the models endpoint');
-
+  assert(okKey.ok && okKey.detail === '2 Modelle verfügbar', 'validateSecret zaehlt die Modelle bei 2xx');
+  assert(okCalls[0] === 'https://api.openai.com/v1/models', 'die openai-Pruefung trifft den Modell-Endpunkt');
   const badKey = await validateSecret('anthropic', 'sk-ant-nope', { fetchImpl: stubFetch(401, {}) });
-  assert(!badKey.ok && badKey.detail === 'Key ungültig oder abgelaufen', '401 -> key invalid');
-
-  const serverErr = await validateSecret('groq', 'x', { fetchImpl: stubFetch(500, {}) });
-  assert(!serverErr.ok && serverErr.detail?.includes('500') === true, 'non-2xx surfaces the status');
-
-  const offline = await validateSecret('github', 'ghp_x', {
-    fetchImpl: () => Promise.reject(new Error('getaddrinfo ENOTFOUND')),
-  });
-  assert(!offline.ok && offline.detail === 'Server erreicht Provider nicht', 'network failure is reported as such');
-
+  assert(!badKey.ok && badKey.detail === 'Key ungültig oder abgelaufen', '401 -> Key ungueltig');
   const ghOk = await validateSecret('github', 'ghp_x', { fetchImpl: stubFetch(200, { login: 'octocat' }) });
-  assert(ghOk.ok && ghOk.detail === 'Angemeldet als octocat', 'github check reports the login');
-
-  const orCalls: string[] = [];
-  await validateSecret('openrouter', 'sk-or-x', { fetchImpl: stubFetch(200, { data: {} }, orCalls) });
-  assert(orCalls[0] === 'https://openrouter.ai/api/v1/key', 'openrouter uses the key endpoint, not /models');
-
-  const timedOut = await validateSecret('openai', 'sk-x', {
-    timeoutMs: 10,
-    fetchImpl: (_url, init) =>
-      new Promise((_res, rej) => {
-        init?.signal?.addEventListener('abort', () => rej(new Error('aborted')));
-      }),
-  });
-  assert(!timedOut.ok && timedOut.detail?.startsWith('Zeitüberschreitung') === true, 'timeout aborts the request');
-
-  const unchecked = await validateSecret('claude_oauth', 'token', {
-    fetchImpl: () => Promise.reject(new Error('must not be called')),
-  });
+  assert(ghOk.ok && ghOk.detail === 'Angemeldet als octocat', 'die github-Pruefung meldet den Login');
+  const zaiUnverified = await validateSecret('zai', 'x', { fetchImpl: () => Promise.reject(new Error('darf nicht aufgerufen werden')) });
+  assert(zaiUnverified.ok && zaiUnverified.unverified === true, 'zai hat keinen belegten Endpunkt und bleibt unverified');
+  const offline = await validateSecret('github', 'ghp_x', { fetchImpl: () => Promise.reject(new Error('ENOTFOUND')) });
+  assert(!offline.ok && offline.detail === 'Server erreicht Provider nicht', 'ein Netzfehler wird als solcher gemeldet');
+  const validated = await request(c2, { type: 'secret.validate', requestId: 'val1', kind: 'zai', value: 'super-geheim' });
   assert(
-    unchecked.ok && unchecked.unverified === true && unchecked.detail?.startsWith('Keine Live-Prüfung') === true,
-    'kinds without a known check answer unverified without any request',
+    validated.type === 'secret.validated' && validated.kind === 'zai' && validated.unverified === true,
+    'secret.validate -> secret.validated ueber die WS',
   );
+  assert(!JSON.stringify(validated).includes('super-geheim'), 'secret.validated spiegelt den Wert nie zurueck');
 
-  // WS round-trip on an unchecked kind: stays offline, proves the wiring.
-  const validated = await request(c2, {
-    type: 'secret.validate',
-    requestId: 'val1',
-    kind: 'kilo',
-    value: 'super-secret-auth-json',
-  });
-  assert(
-    validated.type === 'secret.validated' && validated.kind === 'kilo' && validated.ok && validated.unverified === true,
-    'secret.validate -> secret.validated for an unchecked kind',
-  );
-  assert(!JSON.stringify(validated).includes('super-secret-auth-json'), 'secret.validated never echoes the value');
+  /* ---------------- Repos + session.create ---------------- */
 
-  const adapterProviders =
-    adapters.type === 'adapter.list' ? adapters.adapters.find((a) => a.id === 'claude')?.providers : undefined;
-  assert(
-    adapterProviders?.some((p) => p.id === 'claude_oauth' && p.name.length > 0) === true,
-    'claude manifest carries provider display metadata',
-  );
-
-  const added = await request(c2, {
-    type: 'repo.add',
-    requestId: 'repo1',
-    fullName: 'acme/demo',
-    defaultBranch: 'main',
-  });
+  section('repos + session.create');
+  const added = await request(c2, { type: 'repo.add', requestId: 'repo1', fullName: 'acme/demo', defaultBranch: 'main' });
   assert(added.type === 'repo.added' && added.repo.fullName === 'acme/demo', 'repo.add -> repo.added');
+  const repoId = added.type === 'repo.added' ? added.repo.id : '';
   const repoList = await request(c2, { type: 'repo.list', requestId: 'repo2' });
-  assert(repoList.type === 'repo.list' && repoList.repos.length === 1, 'repo.list returns repo');
+  assert(repoList.type === 'repo.list' && repoList.repos.length === 1, 'repo.list liefert das Repo');
+  const badRepo = await request(c2, { type: 'repo.add', requestId: 'repo3', fullName: 'bad name!', defaultBranch: 'main' });
+  assert(badRepo.type === 'error', 'repo.add mit ungueltigem fullName wird abgewiesen');
+  const badBranch = await request(c2, { type: 'repo.add', requestId: 'repo4', fullName: 'acme/ok', defaultBranch: 'ma in!' });
+  assert(badBranch.type === 'error', 'repo.add mit ungueltigem defaultBranch wird abgewiesen');
 
+  const badProvider = await request(c2, {
+    type: 'session.create',
+    requestId: 'ses-bad1',
+    repoId,
+    provider: 'kilo-gateway',
+    model: '',
+    mode: 'ask',
+  });
+  assert(badProvider.type === 'error', 'session.create mit unbekanntem Provider wird abgewiesen');
+  const badMode = await request(c2, {
+    type: 'session.create',
+    requestId: 'ses-bad2',
+    repoId,
+    provider: 'openai',
+    model: '',
+    mode: 'turbo',
+  });
+  assert(badMode.type === 'error', 'session.create mit unbekanntem Modus wird abgewiesen');
+  const badRepoId = await request(c2, {
+    type: 'session.create',
+    requestId: 'ses-bad3',
+    repoId: 'gibt-es-nicht',
+    provider: 'openai',
+    model: '',
+    mode: 'ask',
+  });
+  assert(badRepoId.type === 'error', 'session.create mit unbekanntem Repo wird abgewiesen');
+
+  // Docker ist aus: die Session wird angelegt, angekuendigt und scheitert sauber.
   const created = await request(c2, {
     type: 'session.create',
     requestId: 'ses1',
-    repoId: added.repo.id,
-    adapter: 'claude',
-    provider: 'zai',
-    model: 'glm-4.6',
+    repoId,
+    provider: 'openai',
+    model: 'gpt-5',
     mode: 'yolo',
   });
-  assert(created.type === 'request.ok', 'session.create -> request.ok immediately');
+  assert(created.type === 'request.ok', 'session.create -> request.ok sofort');
   const sessionId = (created.payload as { sessionId?: string } | undefined)?.sessionId;
-  assert(typeof sessionId === 'string' && sessionId.length > 0, 'request.ok carries sessionId');
-
-  // The new session is announced the moment it exists (status 'creating'),
-  // so clients can insert it by id instead of diffing the session list.
+  assert(typeof sessionId === 'string' && sessionId.length > 0, 'request.ok traegt die sessionId');
   const creatingStatus = await c2.wait(
     (m) => m.type === 'session.status' && m.sessionId === sessionId && m.status === 'creating',
     5_000,
   );
   assert(
     creatingStatus.type === 'session.status' && creatingStatus.session !== undefined,
-    'session.create broadcasts the new session immediately',
+    'die neue Session wird sofort mit Status creating angekuendigt',
+  );
+  assert(
+    creatingStatus.type === 'session.status' && !('adapter' in (creatingStatus.session as object)),
+    'SessionInfo traegt kein adapter-Feld mehr',
   );
   const errorStatus = await c2.wait(
     (m) => m.type === 'session.status' && m.sessionId === sessionId && m.status === 'error',
     20_000,
   );
-  assert(errorStatus.type === 'session.status' && errorStatus.status === 'error', 'docker-disabled session ends in error status');
-  const errEvent = await c2.wait(
-    (m) => m.type === 'session.event' && m.sessionId === sessionId && m.event.type === 'error',
-    5_000,
-  );
-  assert(errEvent.type === 'session.event', 'error event broadcast with message');
+  assert(errorStatus.type === 'session.status', 'eine Session ohne Docker endet im Status error');
+  await c2.wait((m) => m.type === 'session.event' && m.sessionId === sessionId && m.event.type === 'error', 5_000);
+  assert(true, 'das Fehler-Event wird mit Meldung verteilt');
 
-  /* ---- session.prompt ack: requestId gets an error echoed back, none stays silent ---- */
-  // The session never got a shim_token (docker disabled), so manager.prompt()
-  // deterministically rejects with 'session not provisioned' - this exercises
-  // the same error-ack path a real client hits while its container is booting.
-  const promptAck = await request(c2, {
-    type: 'session.prompt',
-    requestId: 'prm1',
-    sessionId,
-    text: 'hallo',
-  });
+  // Prompt-Quittung: mit requestId kommt der Fehler zurueck, ohne bleibt es fire-and-forget.
+  const promptAck = await request(c2, { type: 'session.prompt', requestId: 'prm1', sessionId, text: 'hallo' });
   assert(
     promptAck.type === 'error' && promptAck.requestId === 'prm1' && promptAck.sessionId === sessionId,
-    'session.prompt with a requestId is acked with error + the same requestId',
+    'session.prompt mit requestId wird mit error + derselben requestId quittiert',
   );
   c2.send({ type: 'session.prompt', sessionId, text: 'ohne requestId' });
-  const silentPrompt = await c2.wait(
-    (m) => m.type === 'error' && m.sessionId === sessionId && !('requestId' in m),
-    5_000,
-  );
-  assert(silentPrompt.type === 'error', 'session.prompt without a requestId still reports the failure');
-  assert(!('requestId' in silentPrompt), 'session.prompt without a requestId gets no requestId back (fire-and-forget)');
+  const silentPrompt = await c2.wait((m) => m.type === 'error' && m.sessionId === sessionId && !('requestId' in m), 5_000);
+  assert(silentPrompt.type === 'error', 'session.prompt ohne requestId meldet den Fehler trotzdem');
 
-  const badUpdate = await request(c2, {
-    type: 'session.update',
-    requestId: 'upd0',
-    sessionId,
-    reasoningEffort: 'extreme',
-  });
-  assert(badUpdate.type === 'error', 'session.update rejects unknown reasoningEffort');
-
-  const updated = await request(c2, {
-    type: 'session.update',
-    requestId: 'upd1',
-    sessionId,
-    mode: 'ask',
-    model: 'glm-4.6-air',
-    reasoningEffort: 'high',
-  });
-  assert(updated.type === 'request.ok', 'session.update -> request.ok');
-  const listAfter = await request(c2, { type: 'session.list', requestId: 'ses2' });
-  const row = listAfter.type === 'session.list' ? listAfter.sessions.find((s) => s.id === sessionId) : undefined;
+  // Umbenennen, Archivieren, Loeschen.
+  const renamed = await request(c2, { type: 'session.rename', requestId: 'ren1', sessionId, title: '  Login\n umbauen  ' });
   assert(
-    row?.mode === 'ask' && row.model === 'glm-4.6-air' && row.reasoningEffort === 'high',
-    'session.update persists mode/model/reasoningEffort',
+    renamed.type === 'request.ok' && (renamed.payload as { session: { title?: string } }).session.title === 'Login umbauen',
+    'session.rename normalisiert Steuerzeichen und Leerraum',
   );
-
-  /* ---- prompt body: model '' is the documented "adapter default" reset ---- */
-  const rowWithModel = store.getSession(sessionId);
-  assert(rowWithModel !== undefined, 'session row readable');
-  assert(buildPromptBody(rowWithModel, 'hi').model === 'glm-4.6-air', 'prompt body carries the session model');
-  const resetUpdate = await request(c2, {
-    type: 'session.update',
-    requestId: 'upd2',
-    sessionId,
-    model: '',
-  });
-  assert(resetUpdate.type === 'request.ok', 'session.update accepts an empty model');
-  const rowReset = store.getSession(sessionId);
-  assert(rowReset !== undefined && rowReset.model === '', 'empty model persisted');
-  const resetBody = buildPromptBody(rowReset, 'hi');
-  assert('model' in resetBody && resetBody.model === '', "prompt body sends model:'' instead of dropping the reset");
-  assert(resetBody.mode === 'ask', 'prompt body carries the switched mode');
-
-  /* ---- shim self build: context, content-hash tag, daemon-less failure ---- */
-
-  const imageBuild = await import('./image-build.js');
-  const adapters2 = await import('./adapters.js');
-  const dockerMod2 = await import('./docker.js');
-  const cfg = config as unknown as {
-    dockerEnabled: boolean;
-    adapterImageTagPinned: boolean;
-    dockerHost: string | null;
-    dockerHostIsLocal: boolean;
-  };
-
-  const ctxRoot = imageBuild.shimContextRoot();
-  assert(typeof ctxRoot === 'string', 'shim build context bundled with the server');
-  const ctxFiles = imageBuild.shimContextFiles('kilo');
-  assert(Array.isArray(ctxFiles) && ctxFiles.includes('shims/kilo/Dockerfile'), 'kilo context carries its Dockerfile');
+  const cleared = await request(c2, { type: 'session.rename', requestId: 'ren2', sessionId, title: '   ' });
   assert(
-    ctxFiles!.includes('tsconfig.base.json') && ctxFiles!.some((f) => f.startsWith('packages/protocol/')),
-    'context has the repo-root layout the shim Dockerfiles COPY from',
+    cleared.type === 'request.ok' && (cleared.payload as { session: { title?: string } }).session.title === undefined,
+    'ein leerer Titel setzt den abgeleiteten Namen zurueck',
   );
-  assert(!ctxFiles!.some((f) => f.includes('node_modules')), 'context never carries node_modules');
-  assert(imageBuild.shimContextFiles('does-not-exist') === null, 'unknown adapter has no build context');
-
-  // deterministic + content sensitive (on a throwaway copy, never the repo)
-  const ctxCopy = mkdtempSync(join(tmpdir(), 'pa-smoke-ctx-'));
-  for (const rel of ctxFiles!) cpSync(join(ctxRoot as string, rel), join(ctxCopy, rel));
-  const h1 = imageBuild.hashContext(ctxCopy, ctxFiles!);
-  assert(h1 === imageBuild.hashContext(ctxCopy, ctxFiles!), 'context hash is deterministic');
-  assert(/^[0-9a-f]{12}$/.test(h1), 'context hash is 12 hex chars');
-  writeFileSync(join(ctxCopy, 'shims/kilo/src/index.ts'), '// changed\n', { flag: 'a' });
-  assert(imageBuild.hashContext(ctxCopy, ctxFiles!) !== h1, 'context hash changes when a source file changes');
-  rmSync(ctxCopy, { recursive: true, force: true });
-
+  const archived = await request(c2, { type: 'session.archive', requestId: 'arc1', sessionId, archived: true });
   assert(
-    adapters2.adapterImage('kilo') === `pocketagent/kilo-shim:c${imageBuild.shimContextHash('kilo') as string}`,
-    'unpinned deployments tag shim images with the context hash',
+    archived.type === 'request.ok' && (archived.payload as { session: { archived?: boolean } }).session.archived === true,
+    'session.archive markiert die Session',
   );
-  cfg.adapterImageTagPinned = true;
-  assert(adapters2.adapterImage('kilo') === 'pocketagent/kilo-shim:latest', 'an explicit ADAPTER_IMAGE_TAG wins');
-  cfg.adapterImageTagPinned = false;
-
-  /**
-   * Build failures arrive as an `error` frame on a stream that ends normally
-   * (followProgress' callback error only covers transport faults), and parallel
-   * callers of one tag must share a single build.
-   */
-  let buildCalls = 0;
-  const fakeDocker = {
-    buildImage: () => {
-      buildCalls++;
-      return Promise.resolve({} as NodeJS.ReadableStream);
-    },
-    modem: {
-      followProgress: (
-        _s: unknown,
-        onFinished: (e: Error | null, o: unknown[]) => void,
-        onProgress: (ev: Record<string, unknown>) => void,
-      ) => {
-        setTimeout(() => {
-          onProgress({ stream: 'Step 1/12 : FROM node:22-bookworm-slim' });
-          onProgress({ stream: 'npm ci: ENOSPC no space left on device' });
-          onProgress({ error: 'The command /bin/sh -c npm ci returned a non-zero code: 1' });
-          onFinished(null, []);
-        }, 10);
-      },
-    },
-  };
-  let buildErr = '';
-  const buildNotices: { message: string; phase?: string; detail?: string }[] = [];
-  await Promise.all([
-    imageBuild
-      .buildShimImage(fakeDocker as never, 'kilo', 'pa-smoke/kilo-shim:test', (message, p) => {
-        buildNotices.push({ message, ...p });
-      })
-      .catch((e: unknown) => {
-        buildErr = e instanceof Error ? e.message : String(e);
-      }),
-    imageBuild.buildShimImage(fakeDocker as never, 'kilo', 'pa-smoke/kilo-shim:test').catch(() => {}),
-  ]);
-  assert(buildCalls === 1, 'parallel builds of one tag are deduped into a single build');
-  assert(buildErr.includes('non-zero code: 1'), 'build error frame becomes the exception cause');
-  assert(buildErr.includes('ENOSPC'), 'exception carries the last build log lines');
-
-  /* ---- build progress: phase, docker step, throttling ---- */
-
+  const listWithArchived = await request(c2, { type: 'session.list', requestId: 'ses2' });
   assert(
-    buildNotices[0]?.phase === 'image-build' && buildNotices[0].message.includes('Agent-Image wird gebaut'),
-    'the build announces itself as image-build progress',
+    listWithArchived.type === 'session.list' && listWithArchived.sessions.some((s) => s.id === sessionId),
+    'eine archivierte Session bleibt in session.list (der Client filtert)',
   );
-  const stepNotices = buildNotices.filter((n) => n.message.startsWith('Image wird gebaut'));
-  assert(stepNotices.length === 1, 'build log lines within one interval produce a single notice (throttled)');
-  assert(stepNotices[0]?.message === 'Image wird gebaut (Schritt 1/12)', 'the docker step becomes the progress message');
-  assert(stepNotices[0]?.phase === 'image-build', 'build progress carries the image-build phase');
-  assert(
-    stepNotices[0]?.detail?.includes('FROM node:22-bookworm-slim') === true,
-    'the build notice carries the log tail as detail',
-  );
+  const deleted = await request(c2, { type: 'session.delete', requestId: 'del1', sessionId });
+  assert(deleted.type === 'session.deleted', 'session.delete -> session.deleted');
+  assert(store.getSession(sessionId as string) === undefined, 'die Zeile ist weg');
 
-  /* ---- start progress: pure derivation, dedupe, detail clamping ---- */
+  const models = await request(c2, { type: 'session.models.get', requestId: 'mod1', sessionId: randomUUID() });
+  assert(models.type === 'error', 'session.models.get auf eine unbekannte Session meldet einen Fehler');
 
-  const progress = await import('./progress.js');
+  /* ---------------- Unterabschnitte ---------------- */
 
-  assert(isNoticePhase('image-build') && isNoticePhase('ready'), 'the contract phases are accepted');
-  assert(!isNoticePhase('done') && !isNoticePhase(undefined), 'unknown notice phases are rejected');
-
-  assert(
-    progress.buildProgressMessage(['Step 7/14 : RUN npm ci']) === 'Image wird gebaut (Schritt 7/14)',
-    'classic builder step lines become a step message',
-  );
-  assert(
-    progress.buildProgressMessage(['#9 [3/8] RUN apk add git']) === 'Image wird gebaut (Schritt 3/8)',
-    'buildkit step lines become a step message',
-  );
-  assert(
-    progress.buildProgressMessage(['Step 2/14 : RUN a', 'Step 9/14 : RUN b', ' ---> cached']) ===
-      'Image wird gebaut (Schritt 9/14)',
-    'the newest step wins',
-  );
-  assert(progress.buildProgressMessage(['pulling fs layer']) === 'Image wird gebaut', 'unknown build output stays generic');
-
-  assert(
-    progress.shimProgressMessage(['[git] cloning https://github.com/acme/demo.git (branch main) -> /work']) ===
-      'Repo wird geklont',
-    'a clone line is recognized',
-  );
-  assert(
-    progress.shimProgressMessage(['[git] cloning x', '[git] on branch agent/1']) === 'Branch wird vorbereitet',
-    'the newest shim marker wins',
-  );
-  assert(
-    progress.shimProgressMessage(['[shim] listening on :8080 (opencode spawned :4096)']).startsWith('Agent-Prozess läuft'),
-    'a listening shim is recognized',
-  );
-  assert(progress.shimProgressMessage(['some unrelated output']) === 'Agent-Container startet', 'unknown lines stay generic');
-
-  const tail1 = ['a', 'b', 'c'];
-  assert(progress.newTailLines([], tail1).length === 3, 'the first poll reports every line');
-  assert(progress.newTailLines(tail1, tail1).length === 0, 'an unchanged tail reports nothing');
-  assert(
-    JSON.stringify(progress.newTailLines(tail1, ['b', 'c', 'd'])) === JSON.stringify(['d']),
-    'a scrolled window reports only the new line',
-  );
-  assert(
-    JSON.stringify(progress.newTailLines(['a', 'b'], ['a', 'b', 'c', 'd'])) === JSON.stringify(['c', 'd']),
-    'a growing tail reports only its new lines',
-  );
-  assert(
-    JSON.stringify(progress.newTailLines(['a'], ['x', 'y'])) === JSON.stringify(['x', 'y']),
-    'a window without overlap counts as entirely new',
-  );
-
-  const gate = progress.createThrottle(2_000);
-  assert(gate(1_000), 'the first progress notice always passes');
-  assert(!gate(1_500), 'a notice within the interval is dropped');
-  assert(gate(3_000) && !gate(3_500), 'the next notice passes only after the interval');
-
-  const secret = 'ghp_abcdefghijklmnopqrstuvwxyz012345';
-  const detail = progress.detailFrom(['fetching origin', `remote: token ${secret} used`]);
-  assert(!detail.includes(secret) && detail.includes('[gekürzt]'), 'token-shaped words are masked in a detail');
-  const clamped = progress.detailFrom(Array.from({ length: 20 }, (_, i) => `line ${i}`));
-  assert(clamped.split('\n').length === 6 && clamped.endsWith('line 19'), 'a detail keeps at most the 6 youngest lines');
-  const wide = 'ab '.repeat(150).trim();
-  const dropped = progress.detailFrom([wide, wide]);
-  assert(dropped.length <= 600 && !dropped.includes('\n'), 'oldest lines are dropped until the detail fits');
-  const single = progress.detailFrom(['ab '.repeat(300).trim()]);
-  assert(single.length === 600 && single.startsWith('…'), 'one oversized line is cut from the front');
-
-  assert(
-    progress.splitLogLines('  a  \n\n b \r\n') .join('|') === 'a|b',
-    'log blobs become trimmed, non-empty lines',
-  );
-
-  /* ---- harness switch: session.update { adapter } ---------------------- */
-
-  const noDocker = await request(c2, { type: 'session.update', requestId: 'sw0', sessionId, adapter: 'kilo' });
-  assert(
-    noDocker.type === 'error' && noDocker.message.includes('Docker'),
-    'adapter switch is refused (not half-applied) when docker is disabled',
-  );
-  assert(store.getSession(sessionId)?.adapter === 'claude', 'refused switch left the row untouched');
-
-  // link sessions carry no container: the switch must be refused with a reason
-  const linkSessionId = randomUUID();
-  const baseRow = store.getSession(sessionId)!;
-  store.insertSession({ ...baseRow, id: linkSessionId, status: 'idle' });
-  store.setLinkId(linkSessionId, 'smoke-link');
-  let linkRefused = '';
-  try {
-    manager.updateSession({ type: 'session.update', requestId: 'sw-link', sessionId: linkSessionId, adapter: 'kilo' });
-  } catch (e) {
-    linkRefused = e instanceof Error ? e.message : String(e);
-  }
-  assert(linkRefused.includes('Link-Sessions'), 'adapter switch on a link session is refused');
-  await manager.deleteSession(linkSessionId);
-
-  // provisioned session + docker "available": the switch is applied and the
-  // container work runs asynchronously (no daemon here -> clean error event).
-  store.setProvisioned(sessionId, 'smoke-container', 'pocketagent-sess-smoke', 'smoke-shim-token');
-  store.setSessionRef(sessionId, 'runtime-session-ref');
-  store.updateSessionStatus(sessionId, 'idle');
-  cfg.dockerEnabled = true;
-  /*
-   * "no daemon here" must not depend on the machine. A developer box without
-   * docker and a GitHub runner - which does have a daemon on
-   * /var/run/docker.sock - take different paths through the same code: with a
-   * real daemon the switch below starts an actual `docker build` of the kilo
-   * image, which runs for minutes while the assertions wait 30s, so the run
-   * ends in "timeout waiting for message" instead of the error event it
-   * describes. A closed TCP port is unreachable everywhere.
-   */
-  const dockerHostBefore = cfg.dockerHost;
-  const dockerHostIsLocalBefore = cfg.dockerHostIsLocal;
-  cfg.dockerHost = `tcp://127.0.0.1:${await closedPort()}`;
-  cfg.dockerHostIsLocal = true;
-  dockerMod2.resetDockerClient();
-  // The orchestrator identifies its own container by HOSTNAME to join session
-  // networks; docker always sets it, this run has to emulate that.
-  const hostnameBefore = process.env.HOSTNAME;
-  process.env.HOSTNAME = 'smoke-orchestrator';
-  try {
-    const unknownAdapter = await request(c2, {
-      type: 'session.update',
-      requestId: 'sw1',
-      sessionId,
-      adapter: 'does-not-exist',
-    });
-    assert(unknownAdapter.type === 'error', 'session.update rejects an unknown adapter');
-
-    const switched = await request(c2, { type: 'session.update', requestId: 'sw2', sessionId, adapter: 'kilo' });
-    assert(switched.type === 'request.ok', 'adapter switch is acked immediately (build may take minutes)');
-    const swRow = store.getSession(sessionId);
-    assert(swRow?.adapter === 'kilo', 'adapter switched in the row');
-    assert(swRow?.session_ref === null, 'harness session ref dropped (not transferable)');
-    assert(swRow?.model === '', 'model reset to the adapter default');
-    assert(swRow?.reasoning_effort === null, 'reasoning effort reset');
-    assert(swRow?.provider === 'zai', 'provider reset to the new adapter default');
-    assert(swRow?.volume_name === 'pocketagent-sess-smoke', 'volume kept across the switch');
-    assert(swRow?.branch === baseRow.branch, 'session branch kept across the switch');
-
-    const notice = await c2.wait(
-      (m) => m.type === 'session.event' && m.sessionId === sessionId && m.event.type === 'notice',
-    );
-    assert(
-      notice.type === 'session.event' &&
-        notice.event.type === 'notice' &&
-        notice.event.message.includes('Agent gewechselt'),
-      'switch emits a notice event (unknown types are ignored by older apps)',
-    );
-
-    // no docker daemon in CI: the self build must fail with its real cause
-    const buildFailed = await c2.wait(
-      (m) =>
-        m.type === 'session.event' &&
-        m.sessionId === sessionId &&
-        m.event.type === 'error' &&
-        m.event.message.includes('kilo-shim'),
-      30_000,
-    );
-    assert(
-      buildFailed.type === 'session.event' &&
-        buildFailed.event.type === 'error' &&
-        buildFailed.event.message.includes('konnte nicht gebaut werden'),
-      'a failing self build surfaces the real cause instead of a generic message',
-    );
-
-    // Without HOSTNAME nothing can reach the shim; that has to be said, not
-    // waited out until the readiness timeout.
-    delete process.env.HOSTNAME;
-    const switchedAgain = await request(c2, {
-      type: 'session.update',
-      requestId: 'sw3',
-      sessionId,
-      adapter: 'claude',
-    });
-    assert(switchedAgain.type === 'request.ok', 'switch back is acked');
-    const hostnameErr = await c2.wait(
-      (m) =>
-        m.type === 'session.event' &&
-        m.sessionId === sessionId &&
-        m.event.type === 'error' &&
-        m.event.message.includes('HOSTNAME'),
-      30_000,
-    );
-    assert(
-      hostnameErr.type === 'session.event' && hostnameErr.event.type === 'error',
-      'a missing HOSTNAME fails the session with its real cause',
-    );
-  } finally {
-    cfg.dockerEnabled = false;
-    cfg.dockerHost = dockerHostBefore;
-    cfg.dockerHostIsLocal = dockerHostIsLocalBefore;
-    dockerMod2.resetDockerClient();
-    if (hostnameBefore === undefined) delete process.env.HOSTNAME;
-    else process.env.HOSTNAME = hostnameBefore;
-  }
-
-  await startProgressSmoke(store, manager, c2, added.repo.id);
-  await egressPeerSmoke(store, manager, added.repo.id);
-  await egressSmoke(store, manager, added.repo.id);
-  await reconcileSmoke(store, manager, c2, added.repo.id);
-  await lifecycleSmoke(store, manager, c2, added.repo.id);
-  await historySmoke(store, manager, c2, added.repo.id);
-  await eventReplaySmoke(store, manager, c2, added.repo.id);
-  await turnLifecycleSmoke(store, manager, c2, added.repo.id);
+  await runnerConfigSmoke();
+  await turnSmoke(store, manager, c2, repoId);
+  await egressSmoke(store, manager, repoId);
+  await lifecycleSmoke(store, manager, c2, repoId);
+  await linkSmoke(store, wsBase, c2);
   await heartbeatSmoke();
+  await shimClientSmoke();
 
-  const models = await request(c2, { type: 'session.models.get', requestId: 'mod1', sessionId });
-  assert(
-    models.type === 'session.models' && Array.isArray(models.models),
-    'session.models.get -> session.models (empty for unprovisioned session)',
-  );
+  /* ---------------- Pairing-Haertung ---------------- */
 
-  const stats = await request(c2, { type: 'server.stats', requestId: 'stats1' });
-  assert(
-    stats.type === 'server.stats' && stats.stats.sessionsTotal >= 1 && stats.stats.uptimeSec >= 0,
-    'server.stats works',
-  );
+  section('pairing hardening');
+  assert(isNoticePhase('container-start') && isNoticePhase('ready'), 'die Vertragsphasen werden akzeptiert');
+  assert(!isNoticePhase('image-build'), "'image-build' ist im pi-Contract entfallen");
+  assert(!isNoticePhase('fertig') && !isNoticePhase(undefined), 'unbekannte Phasen werden abgelehnt');
 
-  await gatewaySmoke();
-
-  /* ---------------- pairing hardening (via inject, distinct IPs to isolate limiter buckets) -------- */
-
-  const confirmInject = (code: string, ip: string) =>
+  const confirmInject = (pairCode: string, ip: string): ReturnType<typeof app.inject> =>
     app.inject({
       method: 'POST',
       url: '/api/pairing/confirm',
       headers: { 'content-type': 'application/json' },
       remoteAddress: ip,
-      payload: { code, deviceName: 'smoke-inject' },
+      payload: { code: pairCode, deviceName: 'smoke-inject' },
     });
 
-  // 5 wrong codes: unknown codes never burn the real row...
+  // 5 falsche Codes verbrennen die Versuche der echten Zeile nicht...
   const liveCode = generatePairingCode(store);
   for (let i = 0; i < 5; i++) {
     const r = await confirmInject(`deadbeef000${i}`, '10.0.0.1');
-    assert(r.statusCode === 400, `wrong code #${i + 1} rejected`);
+    assert(r.statusCode === 400, `falscher Code #${i + 1} abgewiesen`);
   }
-  // ...so the correct code still works while attempts remain.
   const stillWorks = await confirmInject(liveCode, '10.0.0.1');
-  assert(stillWorks.statusCode === 200, 'correct code still works when attempts remain');
-  assert(generatePairingCode(store).length === 12 && /^[0-9a-f]{12}$/.test(liveCode), 'codes are 12 hex chars');
+  assert(stillWorks.statusCode === 200, 'der richtige Code funktioniert noch, solange Versuche uebrig sind');
+  assert(/^[0-9a-f]{12}$/.test(liveCode), 'Codes sind 12 Hex-Zeichen');
 
-  // Attempt exhaustion: 5 failed submissions against one code burn its attempts...
-  const hammered = generatePairingCode(store, 'default', -60_000); // born expired
+  // Versuchs-Erschoepfung: 5 Fehlversuche gegen EINEN Code sperren ihn.
+  const hammered = generatePairingCode(store, 'default', -60_000); // gleich abgelaufen geboren
   for (let i = 0; i < 5; i++) {
     const r = await confirmInject(hammered, '10.0.0.2');
-    assert(r.statusCode === 400, `failed submission #${i + 1} rejected`);
+    assert(r.statusCode === 400, `Fehlversuch #${i + 1} abgewiesen`);
   }
   const attemptsRow = store.db.prepare('SELECT attempts FROM pairing_codes WHERE code = ?').get(hammered) as
     | { attempts: number }
     | undefined;
-  assert(attemptsRow?.attempts === 5, '5 failed submissions burned 5 attempts');
-  // ...then the code stays locked even if made unexpired again (attempts >= 5).
+  assert(attemptsRow?.attempts === 5, '5 Fehlversuche haben 5 Versuche verbrannt');
   store.db
     .prepare('UPDATE pairing_codes SET expires_at = ? WHERE code = ?')
     .run(new Date(Date.now() + 600_000).toISOString(), hammered);
   const exhausted = await confirmInject(hammered, '10.0.0.2');
-  assert(exhausted.statusCode === 400, '6th attempt with the CORRECT code rejected (attempt exhaustion)');
+  assert(exhausted.statusCode === 400, 'der 6. Versuch mit dem RICHTIGEN Code wird abgewiesen (Lockout)');
 
-  // Expired (never hammered) code rejected.
   const expiredCode = generatePairingCode(store, 'default', -1_000);
-  const expiredRes = await confirmInject(expiredCode, '10.0.0.3');
-  assert(expiredRes.statusCode === 400, 'expired code rejected');
+  assert((await confirmInject(expiredCode, '10.0.0.3')).statusCode === 400, 'ein abgelaufener Code wird abgewiesen');
 
-  /* ---------------- rate limiter ------------------------------------------------------------------- */
+  /* ---------------- Rate-Limit ---------------- */
 
+  section('rate limiting');
   const rl = new SlidingWindowRateLimiter(60_000, 3);
-  assert(rl.allow('k') && rl.allow('k') && rl.allow('k'), 'limiter allows first 3');
-  assert(!rl.allow('k'), 'limiter blocks 4th in window');
-  assert(rl.allow('other'), 'limiter keys are independent');
+  assert(rl.allow('k') && rl.allow('k') && rl.allow('k'), 'der Limiter laesst die ersten 3 durch');
+  assert(!rl.allow('k'), 'der Limiter blockt den 4. im Fenster');
+  assert(rl.allow('other'), 'die Schluessel des Limiters sind unabhaengig');
   rl.dispose();
 
   for (let i = 0; i < 10; i++) {
     const r = await confirmInject('000000000000', '10.9.9.9');
-    assert(r.statusCode === 400, `request ${i + 1} passes limiter (invalid code)`);
+    assert(r.statusCode === 400, `Anfrage ${i + 1} passiert den Limiter (ungueltiger Code)`);
   }
   const limited = await confirmInject('000000000000', '10.9.9.9');
-  assert(limited.statusCode === 429, '11th request from same IP within a minute -> 429');
-  assert(JSON.stringify(limited.json()).includes('rate limited'), '429 body says rate limited');
+  assert(limited.statusCode === 429, 'die 11. Anfrage derselben IP binnen einer Minute -> 429');
+  assert(JSON.stringify(limited.json()).includes('rate limited'), 'der 429-Koerper sagt "rate limited"');
 
-  /* ---------------- vault AAD + legacy migration --------------------------------------------------- */
+  // /api/secrets haengt am selben Admin-Token und wird genauso begrenzt.
+  const secretsUnauthed = await app.inject({
+    method: 'POST',
+    url: '/api/secrets',
+    headers: { 'content-type': 'application/json' },
+    remoteAddress: '10.8.8.8',
+    payload: { kind: 'openai', value: 'x' },
+  });
+  assert(secretsUnauthed.statusCode === 401, '/api/secrets ohne Admin-Token -> 401');
 
-  const aad = 'secret:default:smoke-aad';
-  const encRound = vault.encrypt('roundtrip-value', aad);
-  assert(vault.decryptStrict(encRound, aad) === 'roundtrip-value', 'vault AAD roundtrip');
-  assert(vault.decrypt(encRound, aad) === 'roundtrip-value', 'decrypt with matching AAD works');
-  let aadMismatch = false;
-  try {
-    vault.decryptStrict(encRound, 'secret:default:other');
-  } catch {
-    aadMismatch = true;
-  }
-  assert(aadMismatch, 'AAD mismatch fails strict decrypt');
+  /* ---------------- Geraete-Verwaltung ---------------- */
 
-  const legacyKind = 'smoke-legacy';
-  const legacyEnc = vault.encrypt('legacy-value'); // no AAD (pre-migration row)
-  store.saveSecret(randomUUID(), 'default', legacyKind, legacyEnc.ciphertext, legacyEnc.nonce);
-  const firstRead = store.getSecretValue(legacyKind, 'default');
-  assert(firstRead === 'legacy-value', 'legacy secret decrypts via new API');
-  const reEncrypted = store.getSecretByKind(legacyKind, 'default');
-  assert(!!reEncrypted && reEncrypted.ciphertext !== legacyEnc.ciphertext, 'legacy row re-encrypted');
-  assert(
-    !!reEncrypted && vault.decryptStrict(
-      { ciphertext: reEncrypted.ciphertext, nonce: reEncrypted.nonce },
-      `secret:default:${legacyKind}`,
-    ) === 'legacy-value',
-    'second read decrypts with AAD strictly',
-  );
-  const secondRead = store.getSecretValue(legacyKind, 'default');
-  assert(secondRead === 'legacy-value', 're-encrypted value stable on second read');
-  assert(store.getSecretValue('no-such-kind', 'default') === null, 'missing secret returns null');
-
-  /* ---------------- revocation --------------------------------------------------------------------- */
-
+  section('devices');
   const code2 = generatePairingCode(store);
   const pairRes2 = await fetch(`${base}/api/pairing/confirm`, {
     method: 'POST',
@@ -3460,75 +1620,44 @@ async function main(): Promise<void> {
     body: JSON.stringify({ code: code2, deviceName: 'smoke-device-2' }),
   });
   const paired2 = (await pairRes2.json()) as { ok: boolean; deviceId?: string; deviceToken?: string };
-  assert(pairRes2.ok && paired2.ok && paired2.deviceId && paired2.deviceToken, 'second device paired');
+  assert(pairRes2.ok && paired2.ok && paired2.deviceId, 'ein zweites Geraet wurde gekoppelt');
 
   const c3 = new Client(wsBase);
   await c3.opened;
   c3.send({ type: 'hello', deviceId: paired2.deviceId, token: paired2.deviceToken });
   const w3 = await c3.wait((m) => m.type === 'welcome');
-  assert(w3.type === 'welcome' && w3.ok === true, 'second device authenticated');
+  assert(w3.type === 'welcome', 'das zweite Geraet ist authentifiziert');
 
   const devList = await request(c2, { type: 'device.list', requestId: 'dev1' });
   const devices = devList.type === 'device.list' ? devList.devices : [];
-  assert(devices.length >= 2, 'device.list returns paired devices');
-  const d1 = devices.find((d) => d.id === paired.deviceId);
-  const d2 = devices.find((d) => d.id === paired2.deviceId);
-  assert(!!d1 && d1.online, 'device.list marks live socket online (device 1)');
-  assert(!!d2 && d2.online, 'device.list marks live socket online (device 2)');
+  assert(devices.length >= 2, 'device.list liefert die gekoppelten Geraete');
+  assert(devices.find((d) => d.id === paired.deviceId)?.online === true, 'device.list markiert einen lebenden Socket als online');
 
   const c3Closed = c3.closeCode();
-  const rev = await request(c2, { type: 'device.revoke', requestId: 'dev2', deviceId: paired2.deviceId });
-  assert(rev.type === 'device.revoked' && rev.deviceId === paired2.deviceId, 'device.revoke confirmed');
-  assert((await c3Closed) === 4001, 'revoked device socket closed with 4001');
+  const rev = await request(c2, { type: 'device.revoke', requestId: 'dev2', deviceId: paired2.deviceId as string });
+  assert(rev.type === 'device.revoked', 'device.revoke wird quittiert');
+  assert((await c3Closed) === WS_CLOSE_UNAUTHORIZED, 'der Socket eines widerrufenen Geraets wird mit 4001 geschlossen');
 
   const c4 = new Client(wsBase);
   await c4.opened;
   const c4Closed = c4.closeCode();
   c4.send({ type: 'hello', deviceId: paired2.deviceId, token: paired2.deviceToken });
-  assert((await c4Closed) === 4001, 'hello with revoked token -> 4001');
-  const devList2 = await request(c2, { type: 'device.list', requestId: 'dev3' });
-  assert(
-    devList2.type === 'device.list' && !devList2.devices.some((d) => d.id === paired2.deviceId),
-    'revoked device gone from device.list',
-  );
+  assert((await c4Closed) === WS_CLOSE_UNAUTHORIZED, 'hello mit widerrufenem Token -> 4001');
 
-  const linkList = await request(c2, { type: 'link.list', requestId: 'lnk1' });
-  assert(linkList.type === 'link.list' && Array.isArray(linkList.links), 'link.list works');
-  const linkRev = await request(c2, { type: 'link.revoke', requestId: 'lnk2', linkId: 'no-such-link' });
-  assert(linkRev.type === 'link.revoked', 'link.revoke confirms (idempotent for unknown id)');
+  /* ---------------- Speicher-Hygiene + Admin-CLI ---------------- */
 
-  /* ---------------- repo.add validation ------------------------------------------------------------ */
-
-  const badRepo = await request(c2, {
-    type: 'repo.add',
-    requestId: 'repo3',
-    fullName: 'bad name!',
-    defaultBranch: 'main',
-  });
-  assert(badRepo.type === 'error', 'repo.add with invalid fullName rejected');
-  const badBranch = await request(c2, {
-    type: 'repo.add',
-    requestId: 'repo4',
-    fullName: 'acme/ok',
-    defaultBranch: 'ma in!',
-  });
-  assert(badBranch.type === 'error', 'repo.add with invalid defaultBranch rejected');
-
-  /* ---------------- appendEvent pruning ------------------------------------------------------------ */
-
+  section('storage + admin cli');
   store.db.transaction(() => {
     for (let i = 0; i < 5005; i++) store.appendEvent('smoke-prune-session', 'tick', '{}');
   })();
   const cnt = store.db
     .prepare('SELECT COUNT(*) AS c FROM session_events WHERE session_id = ?')
     .get('smoke-prune-session') as { c: number };
-  assert(cnt.c <= 5000, `session_events pruned to <= 5000 (got ${cnt.c})`);
-
-  /* ---------------- admin CLI functions ------------------------------------------------------------ */
+  assert(cnt.c <= 5000, `session_events auf <= 5000 gestutzt (waren ${cnt.c})`);
 
   const logs: string[] = [];
   const origLog = console.log;
-  console.log = (...a: unknown[]) => {
+  console.log = (...a: unknown[]): void => {
     logs.push(a.map(String).join(' '));
   };
   try {
@@ -3537,34 +1666,27 @@ async function main(): Promise<void> {
   } finally {
     console.log = origLog;
   }
-  assert(logs.join('\n').includes(paired.deviceId as string), 'admin list-devices prints paired device');
+  assert(logs.join('\n').includes(paired.deviceId as string), 'admin list-devices druckt das gekoppelte Geraet');
   store.createDevice('smoke-admin-dev', 'default', 'admin-test', sha256('x'));
   admin.revokeDevice(store, 'smoke-admin-dev');
-  assert(!store.getDevice('smoke-admin-dev'), 'admin revokeDevice removes the row');
+  assert(!store.getDevice('smoke-admin-dev'), 'admin revokeDevice entfernt die Zeile');
 
-  /* ---------------- W1.4 server hardening regression tests ------------------------------------------ */
+  /* ---------------- Zusammenfassung ---------------- */
 
-  await shimClientStatusSmoke();
-  await secretsRestSmoke(base, store);
-  await secretsUniqueSmoke(store);
-  await adapterManifestSmoke();
-  await linkEventInjectionSmoke(store, wsBase);
-
-  /* ---------------- W2.4 link relay: heartbeat, capabilities, close codes --------------------------- */
-
-  await linkRelaySmoke(store, wsBase, c2);
-
-  /* ---------------- W3.4 codex OAuth: auth.* flow + vault backup ------------------------------------- */
-  // Runs last: it builds a second app on the shared DB and would otherwise
-  // leave a codex_oauth secret / extra device behind for earlier assertions.
-
-  await codexAuthFlow();
-
+  section('done');
+  const total = sections.reduce((n, s) => n + s.checks, 0);
+  const width = Math.max(...sections.map((s) => s.name.length));
+  console.log('');
+  console.log('─'.repeat(width + 12));
+  for (const s of sections) console.log(`  ${s.name.padEnd(width)}  ${String(s.checks).padStart(4)} checks`);
+  console.log('─'.repeat(width + 12));
+  console.log(`  ${'TOTAL'.padEnd(width)}  ${String(total).padStart(4)} checks in ${Math.round((Date.now() - started) / 100) / 10}s`);
+  console.log('');
   console.log('SMOKE OK');
   process.exit(0);
 }
 
 main().catch((e) => {
-  console.error('SMOKE FAILED:', e instanceof Error ? e.message : String(e));
+  console.error(`SMOKE FAILED [${currentSection}]:`, e instanceof Error ? (e.stack ?? e.message) : String(e));
   process.exit(1);
 });

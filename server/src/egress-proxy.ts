@@ -50,8 +50,8 @@ export function hostAllowed(host: string, allowlist: string[]): boolean {
 /**
  * The session behind a request, as far as the proxy can tell. Its policy is
  * what decides whether the request may leave at all - the network alone cannot
- * decide it, because orchestrator and gateway hang on the internal networks of
- * *every* session, isolated ones included.
+ * decide it, because the orchestrator hangs on the internal networks of *every*
+ * session, isolated ones included.
  */
 export interface EgressSession {
   id: string;
@@ -82,7 +82,7 @@ export interface EgressProxyOptions {
   ports?: readonly number[];
   /** Per-session token gate (Proxy-Authorization); unset = accept unauthenticated. */
   tokenValidator?: TokenValidator;
-  /** Peer-IP gate; unset (remote gateway: no docker access) = token only. */
+  /** Peer-IP gate; unset (no docker access) = token only. */
   peerValidator?: PeerValidator;
 }
 
@@ -449,11 +449,10 @@ function logUpstreamFailure(method: string, host: string, port: number, err: unk
 }
 
 /**
- * Build the proxy server without binding it. Used in-process by the
- * orchestrator (local mode, with a per-session token validator and the peer-IP
- * gate the daemon feeds) and standalone by the remote gateway container
- * (server/src/gateway.ts, whose session table the orchestrator pushes over the
- * authenticated ingress) — identical filtering logic in both.
+ * Build the proxy server without binding it. The orchestrator runs it in
+ * process, with a per-session token validator and the peer-IP gate the docker
+ * daemon feeds (index.ts). Kept separate from `startEgressProxy` so the whole
+ * filtering logic can be exercised on an ephemeral port in the smoke suite.
  */
 export function createEgressProxyServer(opts: EgressGateOptions): http.Server {
   const { allowlist, tokenValidator, peerValidator } = opts;
@@ -644,68 +643,4 @@ export function startEgressProxy(opts: EgressProxyOptions = {}): http.Server {
   });
   server.listen(port, '0.0.0.0');
   return server;
-}
-
-/**
- * One live session as the remote gateway has to know it. The gateway has
- * neither database nor docker access, so the orchestrator pushes this table to
- * it over the authenticated ingress (see gateway.ts, docker.publishEgressTable).
- */
-export interface EgressSessionEntry {
-  id: string;
-  policy: NetworkPolicy;
-  /** proxy credential (the session's shim token); null while it has none */
-  token: string | null;
-  /** source addresses of the session's containers, as the daemon reports them */
-  ips: string[];
-}
-
-/** Parse a pushed session table; null when the body is not one. */
-export function parseEgressSessions(raw: unknown): EgressSessionEntry[] | null {
-  const body = raw as { sessions?: unknown } | null;
-  const list = body?.sessions;
-  if (!Array.isArray(list)) return null;
-  const out: EgressSessionEntry[] = [];
-  for (const item of list) {
-    const e = item as { id?: unknown; policy?: unknown; token?: unknown; ips?: unknown };
-    if (typeof e.id !== 'string' || e.id.length === 0) return null;
-    if (!isNetworkPolicy(e.policy)) return null;
-    if (e.token !== null && typeof e.token !== 'string') return null;
-    if (!Array.isArray(e.ips) || e.ips.some((ip) => typeof ip !== 'string')) return null;
-    out.push({ id: e.id, policy: e.policy, token: e.token, ips: (e.ips as string[]).map(normalizePeerIp) });
-  }
-  return out;
-}
-
-/**
- * The pushed session table, in the shape the two gates need it. Replacing it is
- * atomic: a half-applied table would deny live sessions.
- */
-export class EgressSessionRegistry {
-  private tokens: TokenEntry<EgressSession>[] = [];
-  private peers = new Map<string, EgressSession>();
-
-  set(entries: EgressSessionEntry[]): void {
-    const tokens: TokenEntry<EgressSession>[] = [];
-    const peers = new Map<string, EgressSession>();
-    for (const e of entries) {
-      const session: EgressSession = { id: e.id, policy: e.policy };
-      if (e.token) tokens.push({ digest: tokenDigest(e.token), value: session });
-      for (const ip of e.ips) if (ip) peers.set(ip, session);
-    }
-    this.tokens = tokens;
-    this.peers = peers;
-  }
-
-  get size(): number {
-    return this.peers.size + this.tokens.length;
-  }
-
-  byToken(token: string): EgressSession | null {
-    return matchTokenDigest(token, this.tokens);
-  }
-
-  byPeer(ip: string): EgressSession | null {
-    return this.peers.get(normalizePeerIp(ip)) ?? null;
-  }
 }

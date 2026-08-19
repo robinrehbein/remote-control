@@ -1,9 +1,14 @@
 # PocketAgent – Android-App
 
 Android-Client (Kotlin + Jetpack Compose) für den PocketAgent-Orchestrator.
-Steht per WebSocket mit dem Orchestrator in Verbindung, verwaltet
-Coding-Agent-Sessions (kilo, claude, pi, junie) in Docker-Containern und
-zeigt die normalisierte Event-Timeline (Chat, Tools, Approvals, Diffs, Push/PRs).
+Steht per WebSocket mit dem Orchestrator in Verbindung, verwaltet pi-Sessions
+(Docker-Container auf dem Server oder Link-Agent auf dem Heim-PC) und zeigt die
+normalisierte Event-Timeline (Chat, Tools, Approvals, Diffs, Push/PRs).
+
+Es gibt genau einen Agenten (pi, siehe `GREENFIELD-PI.md` im Repo-Root): keine
+Adapter-Auswahl, keine Adapter-Manifeste. Die Zugänge sind die feste
+pi-Provider-Tabelle in `data/PiCatalog.kt`; der Modellkatalog kommt weiterhin
+zur Laufzeit über `session.models`.
 
 ## Architektur
 
@@ -13,6 +18,7 @@ app/src/main/java/com/pocketagent/app/
 ├── MainActivity.kt          Einstieg, NavHost-Gate (paired/unpaired), Deep-Links pocketagent://session/<id>
 ├── data/
 │   ├── Protocol.kt          Alle Contract-Typen (packages/protocol), manueller JSON-Decode/Encode
+│   ├── PiCatalog.kt         Feste pi-Provider-Tabelle (Zugänge) + Agent-Id fürs Wire-Format
 │   ├── TokenStore.kt        DataStore + Android-Keystore AES-GCM (deviceToken verschlüsselt)
 │   ├── PairingApi.kt        POST /api/pairing/confirm, URL-Normalisierung, WS-URL
 │   ├── WsClient.kt          OkHttp-WebSocket, hello, StateFlow<ConnState>, Backoff 1s–60s + Jitter
@@ -26,8 +32,9 @@ app/src/main/java/com/pocketagent/app/
 └── ui/
     ├── Nav.kt               NavHost: main → newSession → session/{id} → diff/{id}, settings
     ├── theme/Theme.kt       Material3, dynamische Farben ab Android 12
-    └── screens/             Pairing, SessionList, NewSession, Session (Timeline/Approvals),
-                             Diff, Settings (Stats, Secrets, Logout) – je ViewModel (StateFlow)
+    └── screens/             Pairing, SessionList, NewSession (Repo/Branch/Modus/Provider/Modell),
+                             Session (Timeline/Approvals), Diff, Settings (Stats, Secrets,
+                             Diagnose, App-Update, Logout) – je ViewModel (StateFlow)
 ```
 
 Protokoll-Details: siehe `packages/protocol/src/index.ts` im Repo-Root.

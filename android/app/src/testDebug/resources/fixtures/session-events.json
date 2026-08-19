@@ -5,9 +5,9 @@
   "events": [
     {
       "type": "status",
-      "adapter": "claude-code",
-      "provider": "anthropic",
-      "model": "claude-sonnet",
+      "adapter": "pi",
+      "provider": "zai",
+      "model": "zai/glm-4.6",
       "mode": "auto",
       "busy": true,
       "seq": 1
@@ -93,7 +93,7 @@
     },
     {
       "type": "notice",
-      "message": "Agent gewechselt: claude-code",
+      "message": "Arbeitsverzeichnis vorbereitet",
       "seq": 13
     },
     {
@@ -112,12 +112,12 @@
     },
     {
       "type": "turn.failed",
-      "error": "adapter exited with code 1",
+      "error": "pi wurde mit Code 1 beendet",
       "seq": 16
     },
     {
       "type": "error",
-      "message": "Verbindung zum Shim verloren",
+      "message": "Verbindung zum Runner verloren",
       "fatal": false,
       "seq": 17
     },

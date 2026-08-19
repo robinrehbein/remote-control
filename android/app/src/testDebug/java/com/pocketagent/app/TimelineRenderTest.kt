@@ -99,14 +99,14 @@ class TimelineRenderTest {
         // Systemzeilen: Turn-Ende mit gekürztem SHA, Notice ohne Phase drin,
         // Start-Fortschritt (Notice mit Phase) draußen.
         compose.onNodeWithText("Fertig · a1b2c3d").assertExists()
-        compose.onNodeWithText("Agent gewechselt: claude-code").assertExists()
+        compose.onNodeWithText("Arbeitsverzeichnis vorbereitet").assertExists()
         compose.onAllNodesWithText("Image wird gebaut…").assertCountEquals(0)
 
         // Push-Karte mit PR, Fehlerkarten.
         compose.onNodeWithText("Automatisch gepusht", substring = true).assertExists()
         compose.onNodeWithText("pocketagent/markdown-fix").assertExists()
-        compose.onNodeWithText("adapter exited with code 1", substring = true).assertExists()
-        compose.onNodeWithText("Verbindung zum Shim verloren").assertExists()
+        compose.onNodeWithText("pi wurde mit Code 1 beendet", substring = true).assertExists()
+        compose.onNodeWithText("Verbindung zum Runner verloren").assertExists()
     }
 
     @Test

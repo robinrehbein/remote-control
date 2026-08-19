@@ -52,24 +52,21 @@ class AppRepository(
     private val _repos = MutableStateFlow<List<RepoInfo>>(emptyList())
     val repos: StateFlow<List<RepoInfo>> = _repos
 
-    private val _adapters = MutableStateFlow<List<AdapterDescriptor>>(emptyList())
-    val adapters: StateFlow<List<AdapterDescriptor>> = _adapters
-
     private val _secrets = MutableStateFlow<List<SecretInfo>>(emptyList())
     val secrets: StateFlow<List<SecretInfo>> = _secrets
 
     /**
-     * Modellkatalog je Adapter, aus früheren `session.models.get`-Antworten
-     * gesammelt. Vor dem Anlegen einer Session existiert noch kein Shim, der
-     * einen Katalog liefern könnte (`session.models.get` braucht eine
-     * `sessionId`) — dieser Cache ist die einzige Quelle, aus der der
+     * Zuletzt gesehener Modellkatalog, aus früheren `session.models.get`-
+     * Antworten gesammelt. Vor dem Anlegen einer Session existiert noch kein
+     * Runner, der einen Katalog liefern könnte (`session.models.get` braucht
+     * eine `sessionId`) — dieser Cache ist die einzige Quelle, aus der der
      * Anlege-Screen echte Modellnamen statt Freitext-Raten anbieten kann
      * (Fund: "Modell beim Anlegen nur Freitext mit Format-Raten"). Nur ein
-     * Vorschlag aus einer früheren Session desselben Agenten — kein
-     * vollständiger, garantiert aktueller Katalog.
+     * Vorschlag aus einer früheren Session — kein vollständiger, garantiert
+     * aktueller Katalog.
      */
-    private val _modelsByAdapter = MutableStateFlow<Map<String, List<ModelInfo>>>(emptyMap())
-    val modelsByAdapter: StateFlow<Map<String, List<ModelInfo>>> = _modelsByAdapter
+    private val _knownModels = MutableStateFlow<List<ModelInfo>>(emptyList())
+    val knownModels: StateFlow<List<ModelInfo>> = _knownModels
 
     private val _stats = MutableStateFlow<ServerStats?>(null)
     val stats: StateFlow<ServerStats?> = _stats
@@ -82,23 +79,6 @@ class AppRepository(
 
     private val _lastError = MutableStateFlow<String?>(null)
     val lastError: StateFlow<String?> = _lastError
-
-    /**
-     * In-App-Login-Ereignisse (auth.url/auth.done, CODEX-OAUTH.md). Passt nicht
-     * ins Request/Response-Muster von [pending] — es ist ein mehrstufiger
-     * Austausch (start → url → callback → done) —, deshalb ein eigener Fluss,
-     * den [CodexOAuthController] nach requestId filtert.
-     */
-    private val _authEvents = MutableSharedFlow<CodexAuthEvent>(
-        // Kleiner Replay-Puffer: der Controller abonniert per scope.launch (mit
-        // Dispatch-Verzögerung), das erste auth.url könnte sonst vor dem Abo
-        // eintreffen. Replay ist gefahrlos — der Controller filtert nach der pro
-        // Flow eindeutigen requestId, alte Ereignisse passen nie.
-        replay = 4,
-        extraBufferCapacity = 16,
-        onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST,
-    )
-    val authEvents: SharedFlow<CodexAuthEvent> = _authEvents
 
     private val pending = ConcurrentHashMap<String, CompletableDeferred<ServerMessage>>()
 
@@ -132,7 +112,6 @@ class AppRepository(
                 if (st is WsClient.ConnState.Connected) {
                     refreshSessions()
                     refreshRepos()
-                    refreshAdapters()
                     fcmToken?.let { ws.send(encodeFcmRegister(it)) }
                 }
             }
@@ -149,11 +128,6 @@ class AppRepository(
 
             is ServerMessage.RepoListMsg -> {
                 _repos.value = msg.repos
-                completePending(msg.requestId, msg)
-            }
-
-            is ServerMessage.AdapterListMsg -> {
-                _adapters.value = msg.adapters
                 completePending(msg.requestId, msg)
             }
 
@@ -230,15 +204,6 @@ class AppRepository(
                 msg.requestId?.let { completePending(it, msg) }
             }
 
-            is ServerMessage.AuthUrlMsg -> _authEvents.tryEmit(
-                CodexAuthEvent.Url(msg.requestId, msg.url, msg.port, msg.flow, msg.userCode),
-            )
-
-            is ServerMessage.AuthDoneMsg -> {
-                _authEvents.tryEmit(CodexAuthEvent.Done(msg.requestId, msg.ok, msg.account, msg.error))
-                if (msg.ok) scope.launch { refreshSecretsQuiet() }
-            }
-
             is ServerMessage.RequestOk -> completePending(msg.requestId, msg)
             is ServerMessage.Welcome -> Unit
         }
@@ -277,10 +242,6 @@ class AppRepository(
         request { id -> encodeRepoList(id) }
     }
 
-    suspend fun refreshAdapters() {
-        request { id -> encodeAdapterList(id) }
-    }
-
     suspend fun refreshStats() {
         request { id -> encodeServerStats(id) }
     }
@@ -302,7 +263,6 @@ class AppRepository(
      */
     suspend fun createSession(
         repoId: String,
-        adapter: String,
         provider: String,
         model: String,
         mode: AgentMode,
@@ -310,7 +270,7 @@ class AppRepository(
         networkPolicy: String? = null,
     ): Result<String?> {
         val response = request { id ->
-            encodeSessionCreate(id, repoId, adapter, provider, model, mode, branch, networkPolicy)
+            encodeSessionCreate(id, repoId, provider, model, mode, branch, networkPolicy)
         }
         return when (response) {
             is ServerMessage.ErrorMsg -> Result.failure(IllegalStateException(response.message))
@@ -387,18 +347,15 @@ class AppRepository(
      * Modus/Modell/Reasoning einer laufenden Session setzen. Der Server
      * antwortet zusätzlich mit session.status an alle Geräte, die Liste
      * aktualisiert sich also über das bestehende Handling.
-     * [adapter] wechselt den Agenten; das passiert serverseitig asynchron,
-     * der Fortschritt kommt ebenfalls als session.status.
      */
     suspend fun updateSession(
         sessionId: String,
         mode: AgentMode? = null,
         model: String? = null,
         reasoningEffort: ReasoningEffort? = null,
-        adapter: String? = null,
     ): Result<Unit> {
         val response = request { id ->
-            encodeSessionUpdate(id, sessionId, mode, model, reasoningEffort, adapter)
+            encodeSessionUpdate(id, sessionId, mode, model, reasoningEffort)
         }
         return when (response) {
             is ServerMessage.ErrorMsg -> Result.failure(IllegalStateException(response.message))
@@ -408,21 +365,17 @@ class AppRepository(
     }
 
     /**
-     * Modellkatalog des Session-Shims; leere Liste ist gültig.
+     * Modellkatalog des Session-Runners; leere Liste ist gültig.
      *
-     * Ein nicht-leeres Ergebnis landet zusätzlich im [modelsByAdapter]-Cache,
-     * unter dem Adapter dieser Session — die einzige Quelle für Modell-
-     * vorschläge beim Anlegen einer neuen Session, wo noch kein Shim läuft.
+     * Ein nicht-leeres Ergebnis landet zusätzlich im [knownModels]-Cache —
+     * die einzige Quelle für Modellvorschläge beim Anlegen einer neuen
+     * Session, wo noch kein Runner läuft.
      */
     suspend fun loadModels(sessionId: String): Result<List<ModelInfo>> {
         val response = request { id -> encodeSessionModelsGet(id, sessionId) }
         return when (response) {
             is ServerMessage.SessionModelsMsg -> {
-                if (response.models.isNotEmpty()) {
-                    _sessions.value.firstOrNull { it.id == sessionId }?.adapter?.let { adapter ->
-                        _modelsByAdapter.value = _modelsByAdapter.value + (adapter to response.models)
-                    }
-                }
+                if (response.models.isNotEmpty()) _knownModels.value = response.models
                 Result.success(response.models)
             }
             is ServerMessage.ErrorMsg -> Result.failure(IllegalStateException(response.message))
@@ -542,20 +495,6 @@ class AppRepository(
 
     suspend fun deleteSecret(id: String): Boolean =
         request { requestId -> encodeSecretDelete(requestId, id) } is ServerMessage.SecretDeletedMsg
-
-    /* ---------------- In-App-Login (CODEX-OAUTH.md) ---------------- */
-
-    /** Startet einen Codex-Login; die Antworten kommen als [authEvents]. */
-    fun startCodexAuth(requestId: String, flow: String?): Boolean =
-        ws.send(encodeAuthStart(requestId, "codex", flow))
-
-    /** Reicht den abgefangenen Loopback-Callback (code+state) durch. */
-    fun sendAuthCallback(requestId: String, code: String, state: String): Boolean =
-        ws.send(encodeAuthCallback(requestId, code, state))
-
-    /** Bricht einen laufenden Login-Flow ab. */
-    fun cancelCodexAuth(requestId: String): Boolean =
-        ws.send(encodeAuthCancel(requestId))
 
     suspend fun addRepo(fullName: String, defaultBranch: String): Result<RepoInfo> {
         val response = request { id -> encodeRepoAdd(id, fullName, defaultBranch) }

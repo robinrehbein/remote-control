@@ -119,7 +119,7 @@ class ProtocolDecodeTest {
                   "id": "s1",
                   "repoId": "r1",
                   "repoFullName": "acme/api",
-                  "adapter": "kilo",
+                  "adapter": "pi",
                   "provider": "zai",
                   "model": "glm-4.6",
                   "mode": "acceptEdits",
@@ -140,47 +140,33 @@ class ProtocolDecodeTest {
         assertEquals(1, list.size)
         val session = list.first()
         assertEquals("acme/api", session.repoFullName)
-        assertEquals("kilo", session.adapter)
+        assertEquals("pi", session.adapter)
         assertEquals(com.pocketagent.app.data.AgentMode.ACCEPT_EDITS, session.mode)
         assertEquals(com.pocketagent.app.data.SessionStatus.RUNNING, session.status)
     }
 
+    /**
+     * Die Multi-Adapter-Nachrichten sind aus dem Vertrag raus (GREENFIELD-PI):
+     * ein Server, der sie noch schickt, darf die App nicht aus dem Tritt
+     * bringen — sie fallen wie jeder unbekannte Typ still heraus.
+     */
     @Test
-    fun `decodes adapter list with plugin adapter and capabilities`() {
-        val raw = """
-            {
-              "type": "adapter.list",
-              "requestId": "req-adp",
-              "adapters": [
-                {
-                  "id": "kilo",
-                  "name": "Kilo Code",
-                  "description": "Kilo CLI fork",
-                  "capabilities": { "approvals": true, "resume": true, "streaming": true, "autoPush": true },
-                  "credentials": { "kilo": ["KILO_AUTH_CONTENT"] },
-                  "providerEnv": { "zai": "ZAI_API_KEY" },
-                  "defaults": { "provider": "zai", "model": "" },
-                  "unknownExtra": "ignored"
-                }
-              ]
-            }
-        """.trimIndent()
-
-        val msg = parseServerMessage(raw)
-        assertTrue(msg is ServerMessage.AdapterListMsg)
-        val adapters = (msg as ServerMessage.AdapterListMsg).adapters
-        assertEquals(1, adapters.size)
-        val kilo = adapters.first()
-        assertEquals("kilo", kilo.id)
-        assertEquals("Kilo Code", kilo.name)
-        assertTrue(kilo.capabilities.approvals)
-        assertEquals(listOf("KILO_AUTH_CONTENT"), kilo.credentials["kilo"])
-        assertEquals("ZAI_API_KEY", kilo.providerEnv["zai"])
-        assertEquals("zai", kilo.defaults.provider)
+    fun `ignores removed multi agent messages`() {
+        assertNull(
+            parseServerMessage(
+                """{ "type": "adapter.list", "requestId": "req-adp", "adapters": [] }""",
+            ),
+        )
+        assertNull(
+            parseServerMessage(
+                """{ "type": "auth.url", "requestId": "req-a", "url": "https://example.test", "port": 1455 }""",
+            ),
+        )
+        assertNull(parseServerMessage("""{ "type": "auth.done", "requestId": "req-a", "ok": true }"""))
     }
 
     @Test
-    fun `decodes session models and capability flags for switchers`() {
+    fun `decodes session models`() {
         val models = parseServerMessage(
             """
             {
@@ -201,35 +187,6 @@ class ProtocolDecodeTest {
         assertEquals(2, list.size)
         assertEquals("zai/glm-4.6", list.first().id)
         assertNull(list[1].name)
-
-        val adapters = parseServerMessage(
-            """
-            {
-              "type": "adapter.list",
-              "requestId": "req-caps",
-              "adapters": [
-                {
-                  "id": "claude",
-                  "name": "Claude Code",
-                  "capabilities": { "approvals": true, "reasoning": true, "modelSwitch": true },
-                  "defaults": { "provider": "anthropic" }
-                },
-                {
-                  "id": "junie",
-                  "name": "Junie",
-                  "capabilities": { "autoPush": true },
-                  "defaults": { "provider": "openai" }
-                }
-              ]
-            }
-            """.trimIndent(),
-        )
-        val caps = (adapters as ServerMessage.AdapterListMsg).adapters
-        assertTrue(caps[0].capabilities.reasoning)
-        assertTrue(caps[0].capabilities.modelSwitch)
-        // fehlende Flags bleiben false (abwaertskompatibel zu alten Servern)
-        assertFalse(caps[1].capabilities.reasoning)
-        assertFalse(caps[1].capabilities.modelSwitch)
     }
 
     @Test
@@ -241,7 +198,7 @@ class ProtocolDecodeTest {
               "sessionId": "s1",
               "status": "idle",
               "session": {
-                "id": "s1", "repoId": "r1", "adapter": "claude", "provider": "anthropic",
+                "id": "s1", "repoId": "r1", "adapter": "pi", "provider": "anthropic",
                 "model": "claude-opus-5", "mode": "auto", "status": "idle", "branch": "agent/s1",
                 "createdAt": "2026-01-01T10:00:00Z", "lastActiveAt": "2026-01-01T11:00:00Z",
                 "reasoningEffort": "high"
@@ -253,45 +210,6 @@ class ProtocolDecodeTest {
         val session = (msg as ServerMessage.SessionStatusMsg).session
         assertEquals("high", session?.reasoningEffort)
         assertEquals("claude-opus-5", session?.model)
-    }
-
-    @Test
-    fun `decodes provider metadata and stays empty without it`() {
-        val msg = parseServerMessage(
-            """
-            {
-              "type": "adapter.list",
-              "requestId": "req-prov",
-              "adapters": [
-                {
-                  "id": "claude",
-                  "name": "Claude Code",
-                  "capabilities": {},
-                  "credentials": { "claude_oauth": ["CLAUDE_CODE_OAUTH_TOKEN"] },
-                  "providers": [
-                    { "id": "claude_oauth", "name": "Claude Abo (Setup-Token)", "hint": "claude setup-token" },
-                    { "id": "anthropic", "name": "Anthropic", "keyUrl": "https://console.anthropic.com/settings/keys" }
-                  ],
-                  "defaults": { "provider": "anthropic" }
-                },
-                {
-                  "id": "legacy",
-                  "name": "Alter Adapter",
-                  "capabilities": {},
-                  "defaults": { "provider": "openai" }
-                }
-              ]
-            }
-            """.trimIndent(),
-        )
-        val adapters = (msg as ServerMessage.AdapterListMsg).adapters
-        val claude = adapters.first()
-        assertEquals(2, claude.providers.size)
-        assertEquals("Claude Abo (Setup-Token)", claude.providers[0].name)
-        assertNull(claude.providers[0].keyUrl)
-        assertEquals("https://console.anthropic.com/settings/keys", claude.providers[1].keyUrl)
-        // Server ohne das Feld -> leere Liste, App faellt auf ihre Tabelle zurueck
-        assertTrue(adapters[1].providers.isEmpty())
     }
 
     @Test
@@ -311,7 +229,7 @@ class ProtocolDecodeTest {
         assertFalse(bad.ok)
 
         val unverified = parseServerMessage(
-            """{"type":"secret.validated","requestId":"v3","kind":"kilo","ok":true,"unverified":true}""",
+            """{"type":"secret.validated","requestId":"v3","kind":"moonshot","ok":true,"unverified":true}""",
         ) as ServerMessage.SecretValidatedMsg
         assertTrue(unverified.unverified)
         assertNull(unverified.detail)
@@ -328,7 +246,7 @@ class ProtocolDecodeTest {
               "sessionId": "s1",
               "event": {
                 "type": "notice",
-                "message": "Agent gewechselt: kilo → claude …",
+                "message": "Arbeitsverzeichnis vorbereitet …",
                 "futureField": 1
               }
             }
@@ -336,7 +254,7 @@ class ProtocolDecodeTest {
         )
         assertTrue(msg is ServerMessage.SessionEventMsg)
         val notice = (msg as ServerMessage.SessionEventMsg).event as AgentEvent.Notice
-        assertEquals("Agent gewechselt: kilo → claude …", notice.message)
+        assertEquals("Arbeitsverzeichnis vorbereitet …", notice.message)
         // Ohne phase bleibt es eine gewoehnliche Systemzeile in der Timeline
         assertNull(notice.phase)
         assertNull(StartPhase.fromRaw(notice.phase))
@@ -372,6 +290,8 @@ class ProtocolDecodeTest {
         // Die uebrigen Phasen des Vertrags
         assertEquals(StartPhase.CONTAINER_START, StartPhase.fromRaw("container-start"))
         assertEquals(StartPhase.SHIM_START, StartPhase.fromRaw("shim-start"))
+        // v2 nennt denselben Schritt Runner statt Shim — beides zaehlt.
+        assertEquals(StartPhase.SHIM_START, StartPhase.fromRaw("runner-start"))
         assertEquals(StartPhase.READY, StartPhase.fromRaw("ready"))
 
         // phase ohne detail ist erlaubt — dann gibt es eben keinen Log
@@ -420,7 +340,7 @@ class ProtocolDecodeTest {
               "sessionId": "s1",
               "status": "starting",
               "session": {
-                "id": "s1", "repoId": "r1", "adapter": "claude", "provider": "anthropic",
+                "id": "s1", "repoId": "r1", "adapter": "pi", "provider": "anthropic",
                 "model": "", "mode": "auto", "status": "starting", "branch": "agent/s1",
                 "createdAt": "2026-01-01T10:00:00Z", "lastActiveAt": "2026-01-01T11:00:00Z"
               }
@@ -431,29 +351,55 @@ class ProtocolDecodeTest {
         val status = msg as ServerMessage.SessionStatusMsg
         assertEquals(com.pocketagent.app.data.SessionStatus.CREATING, status.status)
         assertEquals(com.pocketagent.app.data.SessionStatus.CREATING, status.session?.status)
-        assertEquals("claude", status.session?.adapter)
+        assertEquals("pi", status.session?.adapter)
     }
 
+    /**
+     * `session.update` kennt keinen Agentenwechsel mehr: nur noch Modus,
+     * Modell und Reasoning, und jedes Feld bleibt weg, wenn es nicht gesetzt
+     * wurde — der Server ändert dann nichts daran.
+     */
     @Test
-    fun `encodes session update with adapter switch`() {
-        val switch = com.pocketagent.app.data.encodeSessionUpdate(
-            requestId = "req-1",
-            sessionId = "s1",
-            adapter = "claude",
-        )
-        assertTrue(switch.contains(""""type":"session.update""""))
-        assertTrue(switch.contains(""""adapter":"claude""""))
-        assertFalse(switch.contains("\"mode\""))
-        assertFalse(switch.contains("\"model\""))
-
-        // Ohne Adapter bleibt das Feld weg — der Server ändert dann nichts daran.
+    fun `encodes session update without an agent switch`() {
         val modeOnly = com.pocketagent.app.data.encodeSessionUpdate(
-            requestId = "req-2",
+            requestId = "req-1",
             sessionId = "s1",
             mode = com.pocketagent.app.data.AgentMode.ACCEPT_EDITS,
         )
+        assertTrue(modeOnly.contains(""""type":"session.update""""))
         assertTrue(modeOnly.contains(""""mode":"acceptEdits""""))
         assertFalse(modeOnly.contains("\"adapter\""))
+        assertFalse(modeOnly.contains("\"model\""))
+
+        val modelOnly = com.pocketagent.app.data.encodeSessionUpdate(
+            requestId = "req-2",
+            sessionId = "s1",
+            model = "zai/glm-4.6",
+        )
+        assertTrue(modelOnly.contains(""""model":"zai/glm-4.6""""))
+        assertFalse(modelOnly.contains("\"mode\""))
+        assertFalse(modelOnly.contains("\"adapter\""))
+    }
+
+    /**
+     * `session.create` trägt weiterhin den Agenten im Wire-Format (Vertrag
+     * unverändert zu v1) — er ist nur keine Wahl mehr, sondern immer pi.
+     */
+    @Test
+    fun `encodes session create with the one agent`() {
+        val json = com.pocketagent.app.data.encodeSessionCreate(
+            requestId = "req-3",
+            repoId = "r1",
+            provider = "zai",
+            model = "",
+            mode = com.pocketagent.app.data.AgentMode.AUTO,
+            branch = null,
+            networkPolicy = "allowlist",
+        )
+        assertTrue(json.contains(""""type":"session.create""""))
+        assertTrue(json.contains(""""adapter":"pi""""))
+        assertTrue(json.contains(""""provider":"zai""""))
+        assertFalse(json.contains("\"branch\""))
     }
 
     /* -------------------- session.events (Verlauf) -------------------- */
@@ -521,13 +467,13 @@ class ProtocolDecodeTest {
               "requestId": "req-t",
               "sessions": [
                 {
-                  "id": "s1", "repoId": "r1", "adapter": "claude", "provider": "anthropic",
+                  "id": "s1", "repoId": "r1", "adapter": "pi", "provider": "anthropic",
                   "model": "", "mode": "auto", "status": "idle", "branch": "agent/s1",
                   "createdAt": "2026-01-01T10:00:00Z", "lastActiveAt": "2026-01-01T11:00:00Z",
                   "title": "Login-Timeout", "archived": true
                 },
                 {
-                  "id": "s2", "repoId": "r1", "adapter": "claude", "provider": "anthropic",
+                  "id": "s2", "repoId": "r1", "adapter": "pi", "provider": "anthropic",
                   "model": "", "mode": "auto", "status": "idle", "branch": "agent/s2",
                   "createdAt": "2026-01-01T10:00:00Z", "lastActiveAt": "2026-01-01T11:00:00Z"
                 }
@@ -555,13 +501,13 @@ class ProtocolDecodeTest {
               "sessions": [
                 {
                   "id": "s1", "repoId": "", "repoFullName": "link:devbox (/work/app)",
-                  "adapter": "kilo", "provider": "", "model": "",
+                  "adapter": "pi", "provider": "", "model": "",
                   "mode": "ask", "status": "stopped", "branch": "local",
                   "createdAt": "2026-01-01T10:00:00Z", "lastActiveAt": "2026-01-01T11:00:00Z",
                   "linked": true
                 },
                 {
-                  "id": "s2", "repoId": "r1", "adapter": "claude", "provider": "anthropic",
+                  "id": "s2", "repoId": "r1", "adapter": "pi", "provider": "anthropic",
                   "model": "", "mode": "auto", "status": "idle", "branch": "agent/s2",
                   "createdAt": "2026-01-01T10:00:00Z", "lastActiveAt": "2026-01-01T11:00:00Z"
                 }
@@ -694,12 +640,12 @@ class ProtocolDecodeTest {
               "requestId": "req-u1",
               "sessions": [
                 {
-                  "id": "s1", "repoId": "r1", "adapter": "claude", "provider": "anthropic",
+                  "id": "s1", "repoId": "r1", "adapter": "pi", "provider": "anthropic",
                   "model": "opus", "mode": "auto", "status": "paused", "branch": "agent/s1",
                   "createdAt": "2026-01-01T10:00:00Z", "lastActiveAt": "2026-01-01T11:00:00Z"
                 },
                 {
-                  "id": "s2", "repoId": "r1", "adapter": "claude", "provider": "anthropic",
+                  "id": "s2", "repoId": "r1", "adapter": "pi", "provider": "anthropic",
                   "model": "opus", "mode": "futureMode", "status": "idle", "branch": "agent/s2",
                   "createdAt": "2026-01-01T10:00:00Z", "lastActiveAt": "2026-01-01T11:00:00Z"
                 }
@@ -729,7 +675,7 @@ class ProtocolDecodeTest {
               "sessionId": "s1",
               "status": "paused",
               "session": {
-                "id": "s1", "repoId": "r1", "adapter": "claude", "provider": "anthropic",
+                "id": "s1", "repoId": "r1", "adapter": "pi", "provider": "anthropic",
                 "model": "opus", "mode": "auto", "status": "paused", "branch": "agent/s1",
                 "createdAt": "2026-01-01T10:00:00Z", "lastActiveAt": "2026-01-01T11:00:00Z"
               }
@@ -756,7 +702,7 @@ class ProtocolDecodeTest {
               "sessionId": "s1",
               "event": {
                 "type": "status",
-                "adapter": "claude",
+                "adapter": "pi",
                 "mode": "futureMode",
                 "busy": true
               }
@@ -773,7 +719,7 @@ class ProtocolDecodeTest {
             {
               "type": "session.event",
               "sessionId": "s1",
-              "event": { "type": "status", "adapter": "claude", "mode": "acceptEdits", "busy": false }
+              "event": { "type": "status", "adapter": "pi", "mode": "acceptEdits", "busy": false }
             }
             """.trimIndent(),
         )

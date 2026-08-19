@@ -507,7 +507,7 @@ private fun EmptySessions(onNewSession: () -> Unit) {
             modifier = Modifier.padding(top = 20.dp),
         )
         Text(
-            text = "Wähle ein Repository und einen Agenten – ab dann arbeitest du vom Telefon aus: " +
+            text = "Wähle ein Repository – ab dann arbeitest du vom Telefon aus: " +
                 "Aufgabe stellen, Rückfragen beantworten, Diff prüfen, pushen.",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -541,13 +541,11 @@ private fun SessionCard(
 ) {
     val haptics = LocalHapticFeedback.current
     val uriHandler = LocalUriHandler.current
-    // Der Adapter steht als Wort in der Unterzeile statt als eigener Chip —
-    // "welches Harness in welchem Modus" beantwortet in einer Liste kaum
-    // eine Frage; "welche Session, was ist ihr Zustand" schon (Fund:
-    // "Session-Karte trägt bis zu 6 Metadaten-Elemente").
+    // Die Unterzeile beantwortet "welche Session, was ist ihr Zustand" —
+    // nicht mehr (Fund: "Session-Karte trägt bis zu 6 Metadaten-Elemente").
+    // Der Agent steht nicht dabei: es gibt nur einen.
     val second = listOfNotNull(
         sessionSubtitle(session),
-        session.adapter.takeIf { it.isNotBlank() },
         if (session.status == SessionStatus.CREATING) {
             "Container wird gestartet …"
         } else {
@@ -591,8 +589,8 @@ private fun SessionCard(
                 SessionStatusBadge(session = session)
             }
             // Ausnahmebasiert: nur eine Abweichung vom sicheren Netzwerk-
-            // Default verdient hier noch einen Chip — Adapter und Modus
-            // stehen bereits oben bzw. im Session-Screen.
+            // Default verdient hier noch einen Chip — der Modus steht im
+            // Session-Screen.
             session.networkPolicy
                 ?.takeIf { it != "allowlist" }
                 ?.let { policy ->

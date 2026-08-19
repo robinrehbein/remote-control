@@ -1,8 +1,21 @@
+# PocketAgent v2 (pi-only). Ein Dienst: der Orchestrator.
+#
+# Das Runner-Image ist hier bewusst KEIN Pflicht-Service — der Orchestrator
+# baut `pocketagent/pi-runner:<RUNNER_IMAGE_TAG>` beim ersten Session-Start
+# selbst über die Docker-API (server/src/docker.ts, ensureRunnerImage), aus dem
+# Build-Kontext, den sein eigenes Image unter /app/build-context mitbringt. Wer
+# ihn lieber vorbaut (der erste Start dauert sonst einige Minuten), nimmt das
+# optionale Profil unten.
 services:
   orchestrator:
     build:
       context: .
       dockerfile: server/Dockerfile
+      args:
+        # Hochzählen, wenn sich runner/ geändert hat: ensureRunnerImage findet
+        # dann kein Image dieses Namens und baut neu. Das ist die ganze
+        # Invalidierung, die v2 hat (Content-Hash-Tags gibt es nicht mehr).
+        RUNNER_IMAGE_TAG: ${RUNNER_IMAGE_TAG:-latest}
     image: pocketagent/orchestrator:latest
     container_name: pocketagent-orchestrator
     restart: unless-stopped
@@ -23,50 +36,33 @@ services:
       GC_DAYS: ${GC_DAYS:-14}
       # Hinter Coolify/Traefik auf 1 setzen (.env): req.ip löst dann den
       # echten Client aus X-Forwarded-For auf — sonst teilen sich alle Geräte
-      # die Proxy-Adresse und der WS-Verbindungslimit (10/IP) trifft Unbeteiligte.
+      # die Proxy-Adresse und das WS-Verbindungslimit (10/IP) trifft Unbeteiligte.
       TRUST_PROXY: ${TRUST_PROXY:-}
-      ADAPTER_IMAGE_PREFIX: pocketagent
-      # Shim image tag. UNGESETZT lassen (empfohlen): der Orchestrator taggt
-      # dann mit einem Content-Hash der mitgelieferten Shim-Quellen und baut
-      # fehlende Images selbst über die Docker-API (kein Registry-Push nötig).
-      # Gesetzt = gepinnt: der Tag wird unverändert benutzt, Images müssen
-      # dann lokal vorliegen oder pullbar sein.
-      # ADAPTER_IMAGE_TAG: ${ADAPTER_IMAGE_TAG:-latest}
+      # ---- Das eine Runner-Image -----------------------------------------
+      # Namensraum und Tag des selbst gebauten Images.
+      RUNNER_IMAGE_PREFIX: ${RUNNER_IMAGE_PREFIX:-pocketagent}
+      RUNNER_IMAGE_TAG: ${RUNNER_IMAGE_TAG:-latest}
+      # Vollständig vorgegebenes Registry-Image (z. B.
+      # ghcr.io/acme/pi-runner:2026-08). GESETZT heißt: nur pullen, nie bauen —
+      # der Betreiber besitzt das Artefakt. Leer lassen für den Selbstbau.
+      RUNNER_IMAGE: ${RUNNER_IMAGE:-}
       # Optional per-session CPU limit in docker NanoCPUs (e.g. 1000000000 = 1 CPU)
       SESSION_CPU_QUOTA: ${SESSION_CPU_QUOTA:-}
-      # Remote-docker mode only (DOCKER_HOST=tcp://...): explicit consent that
-      # remote sessions run with networkPolicy 'open' over plaintext shim ports
-      # REMOTE_NETWORK_OPEN: "1"
-      # Remote-docker mode only: host IP shim ports are published on
-      # (default 127.0.0.1 = reachable only via tunnel from the orchestrator)
-      # DOCKER_PUBLISH_IP: 127.0.0.1
+      # Erlaubt entfernte Pairing-Code-Erzeugung (POST /api/pairing/create)
+      PAIRING_ADMIN_TOKEN: ${PAIRING_ADMIN_TOKEN:-}
       # Optional: FCM service account JSON (single line) for push notifications
       FCM_SERVICE_ACCOUNT_JSON: ${FCM_SERVICE_ACCOUNT_JSON:-}
-      # ---- Härtung Stufe 2 (Socket-Proxy), siehe RUNBOOK ------------------
+      # ---- Härtung Stufe 2 (Socket-Proxy), siehe RUNBOOK-PI ---------------
       # Statt des rohen Socket-Mounts unten den Proxy ansprechen. Der Proxy
-      # redet mit DEMSELBEN lokalen Daemon, deshalb DOCKER_HOST_IS_LOCAL=1:
-      # Session-Netze + Egress-Proxy bleiben aktiv, keine Port-Publishes.
+      # redet mit DEMSELBEN lokalen Daemon — einen echten Fremd-Daemon
+      # (Fly-/Gateway-Modus aus v1) gibt es in v2 nicht mehr, deshalb braucht
+      # es auch kein DOCKER_HOST_IS_LOCAL mehr.
       # DOCKER_HOST: http://socket-proxy:2375
-      # DOCKER_HOST_IS_LOCAL: "1"
-      # ---- Remote-Runner (echter fremder Daemon), siehe FLY.md/RUNBOOK ----
-      # Hier ist DOCKER_HOST_IS_LOCAL bewusst NICHT gesetzt. Ohne GATEWAY_TOKEN
-      # gilt dann Policy 'open' + veröffentlichte Shim-Ports. Mit Token startet
-      # der Orchestrator auf dem Runner den Container 'pocketagent-gateway'
-      # (Ingress :8443 published, Egress :3128 nur in den Session-Netzen) und
-      # Session-Netze/Allowlist funktionieren auch remote.
-      # DOCKER_HOST: tcp://runner.example.com:2376
-      # DOCKER_ADDR: runner.example.com
-      # DOCKER_CLIENT_CA_B64: ${DOCKER_CLIENT_CA_B64:-}
-      # DOCKER_CLIENT_CERT_B64: ${DOCKER_CLIENT_CERT_B64:-}
-      # DOCKER_CLIENT_KEY_B64: ${DOCKER_CLIENT_KEY_B64:-}
-      # GATEWAY_TOKEN: ${GATEWAY_TOKEN:-}        # openssl rand -hex 32, stabil halten
-      # GATEWAY_PORT: "8443"                     # Host-Port des Gateways am Runner
-      # GATEWAY_IMAGE: pocketagent/orchestrator:latest  # muss AUF DEM RUNNER liegen
     volumes:
       - orchestrator-data:/data
       # Härtung: diesen Mount entfernen und stattdessen DOCKER_HOST=http://socket-proxy:2375
-      # + DOCKER_HOST_IS_LOCAL=1 setzen; Start mit --profile socketproxy
-      # (dann zusätzlich den networks-Block unten aktivieren).
+      # setzen; Start mit --profile socketproxy (dann zusätzlich den
+      # networks-Block unten aktivieren).
       - /var/run/docker.sock:/var/run/docker.sock
     # networks:
     #   - default
@@ -83,9 +79,8 @@ services:
   # Socket liegt dann nur noch im Proxy (read-only gemountet). Freigeschaltet
   # ist genau das, was server/src/docker.ts braucht: Container create/start/
   # stop/remove/inspect/wait, Netzwerke inkl. connect/disconnect, Volumes,
-  # Image-Pull/-Inspect sowie BUILD=1 für POST /build, das der Selfbuild
-  # fehlender Shim-Images braucht (server/src/image-build.ts).
-  # Kein EXEC, kein SWARM, kein SYSTEM.
+  # Image-Pull/-Inspect sowie BUILD=1 für POST /build, das der Selbstbau des
+  # Runner-Images braucht. Kein EXEC, kein SWARM, kein SYSTEM.
   socket-proxy:
     profiles: ["socketproxy"]
     image: tecnativa/docker-socket-proxy:latest
@@ -98,7 +93,7 @@ services:
       VOLUMES: "1"
       POST: "1"
       EXEC: "0"
-      # Selfbuild fehlender Shim-Images (POST /build)
+      # Selbstbau des Runner-Images (POST /build)
       BUILD: "1"
       SWARM: "0"
       SYSTEM: "0"
@@ -108,36 +103,15 @@ services:
     networks:
       - socketproxy
 
-  # ---- adapter shim images (build-only, never run) --------------------
-  # Optional: der Orchestrator baut fehlende Shim-Images inzwischen selbst.
-  # Wer sie hier vorbaut, muss ADAPTER_IMAGE_TAG=latest setzen, damit die
-  # Sessions genau diese Tags benutzen (sonst gilt der Content-Hash-Tag).
-  # Build all:  docker compose --profile shims build
-  # Rebuild one: docker compose --profile shims build --no-cache kilo-shim
-  kilo-shim:
-    profiles: ["shims"]
-    build: { context: ., dockerfile: shims/kilo/Dockerfile }
-    image: pocketagent/kilo-shim:latest
-    entrypoint: ["true"]
-  claude-shim:
-    profiles: ["shims"]
-    build: { context: ., dockerfile: shims/claude/Dockerfile }
-    image: pocketagent/claude-shim:latest
-    entrypoint: ["true"]
-  pi-shim:
-    profiles: ["shims"]
-    build: { context: ., dockerfile: shims/pi/Dockerfile }
-    image: pocketagent/pi-shim:latest
-    entrypoint: ["true"]
-  junie-shim:
-    profiles: ["shims"]
-    build: { context: ., dockerfile: shims/junie/Dockerfile }
-    image: pocketagent/junie-shim:latest
-    entrypoint: ["true"]
-  codex-shim:
-    profiles: ["shims"]
-    build: { context: ., dockerfile: shims/codex/Dockerfile }
-    image: pocketagent/codex-shim:latest
+  # ---- Runner-Image vorbauen (optional, build-only, läuft nie) ---------
+  # Nur eine Abkürzung: baut dasselbe Image unter demselben Namen, den
+  # ensureRunnerImage erwartet, damit der erste Session-Start nicht minutenlang
+  # auf den Bau wartet.
+  #   docker compose --profile runner build pi-runner
+  pi-runner:
+    profiles: ["runner"]
+    build: { context: ., dockerfile: runner/Dockerfile }
+    image: ${RUNNER_IMAGE_PREFIX:-pocketagent}/pi-runner:${RUNNER_IMAGE_TAG:-latest}
     entrypoint: ["true"]
 
 volumes:

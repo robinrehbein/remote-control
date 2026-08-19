@@ -22,7 +22,6 @@ local.properties
 google-services.json
 .claude/
 .opencode/
-.kilo/
 .tools/
 dist/
 

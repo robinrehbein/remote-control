@@ -1,18 +1,16 @@
-name: Server & Shims CI
+name: Server, Runner & Link CI
 
-# Bis hierher hatte nur android/** eine PR-CI. Änderungen am Orchestrator und an
-# den Shims wurden erst nach dem Merge gebaut (images.yml, push auf main) — ein
-# Fehler darin fiel also erst im Deployment auf. Genau so ist ein unbehandeltes
-# 'error' auf einem Socket im Egress-Proxy in Produktion gelandet und hat den
-# Prozess beendet, obwohl der Smoke-Test ihn lokal reproduziert.
+# Bis v1 hatte nur android/** eine PR-CI. Änderungen am Orchestrator wurden erst
+# nach dem Merge gebaut — ein Fehler darin fiel also erst im Deployment auf.
+# Genau so ist ein unbehandeltes 'error' auf einem Socket im Egress-Proxy in
+# Produktion gelandet, obwohl der Smoke-Test ihn lokal reproduziert.
 on:
   pull_request:
     paths:
       - "server/**"
-      - "shims/**"
+      - "runner/**"
       - "packages/protocol/**"
       - "link/**"
-      - "cli/**"
       - "package.json"
       - "package-lock.json"
       - ".github/workflows/server.yml"
@@ -20,10 +18,9 @@ on:
     branches: [main]
     paths:
       - "server/**"
-      - "shims/**"
+      - "runner/**"
       - "packages/protocol/**"
       - "link/**"
-      - "cli/**"
       - ".github/workflows/server.yml"
   workflow_dispatch:
 
@@ -44,6 +41,13 @@ jobs:
           cache: npm
 
       - run: npm ci
+
+      # runner/ ist bewusst KEIN Root-Workspace (eigenes package-lock.json, das
+      # auch runner/Dockerfile benutzt). Ohne diesen Schritt fehlen typecheck
+      # und Smoke des Runners ihre Abhängigkeiten.
+      - name: install - runner (eigener Workspace)
+        run: npm ci --no-audit --no-fund
+        working-directory: runner
 
       # Ein echtes NUL-Byte in einer Quelldatei lässt git sie als binär
       # einordnen: kein Diff im Review, kein `git grep`, `--numstat` meldet
@@ -75,16 +79,20 @@ jobs:
           print('no NUL bytes in tracked sources')
           PY
 
+      # protocol, server, link und runner in einem Lauf
       - run: npm run typecheck
 
-      - name: test - link
-        run: npm run test -w link
+      - name: test - protocol & link
+        run: npm test
 
+      # Deckt auch die Kopplung Orchestrator <-> runner/Dockerfile statisch ab
+      # (jede COPY-Quelle liegt im gebündelten Build-Kontext, Tap-Push-Pfad) —
+      # Docker steht in der CI nicht zur Verfügung.
       - name: smoke - orchestrator
         run: npm run smoke:server
 
-      - name: smoke - shims
-        run: npm run smoke:shims
+      - name: smoke - runner
+        run: npm run smoke:runner
 
       - name: smoke - link
         run: npm run smoke:link

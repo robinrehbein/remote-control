@@ -1,6 +1,6 @@
 # Security Policy
 
-PocketAgent is a self-hosted, single-tenant mobile agent platform: an Android client pairs with an orchestrator server, which manages coding-agent sessions (opencode, claude, pi, junie) inside per-session Docker containers and streams normalized events back over a WebSocket. This document records a known security debt that must be resolved before public launch, the residual risks we explicitly accept, and how to report issues. It complements the Security section in [README.md](README.md) and the remote-mode hardening notes in [FLY.md](FLY.md).
+PocketAgent is a self-hosted, single-tenant remote control for the **pi** coding agent: an Android client pairs with an orchestrator server, which manages pi sessions inside per-session Docker containers — or, for link sessions, next to your code on your own machine — and streams normalized events back over a WebSocket. This document records a known security debt that must be resolved before public launch, the residual risks we explicitly accept, and how to report issues. It complements the Security section in [README.md](README.md) and the operational hardening notes in [RUNBOOK-PI.md](RUNBOOK-PI.md).
 
 ## Rotate before launch (DEBT)
 
@@ -50,8 +50,8 @@ Anyone with read access to the repository can sign a malicious APK that Android 
 - **yolo-mode deny-lists are advisory.** The git-push / `rm -rf` deny-lists applied in yolo mode are best-effort and bypassable; they are not a security control.
 - **Provider API keys are visible to the agent process** inside its session container by design (same uid).
 - **The GitHub PAT is readable by the agent process** (same uid), although it is no longer placed in the container env or `.git/config`.
-- **Remote mode (DOCKER_HOST / Fly) transports shim HTTP in cleartext** unless an SSH or WireGuard tunnel is used, and requires explicit `REMOTE_NETWORK_OPEN=1` consent — see [FLY.md](FLY.md).
-- **`docker.sock` in the orchestrator is root-equivalent.** Single-tenant deployment; accepted.
+- **`docker.sock` in the orchestrator is root-equivalent.** Single-tenant deployment; accepted. The optional socket-proxy profile shrinks the exposed API surface but is not a security boundary — see [RUNBOOK-PI.md](RUNBOOK-PI.md). The remote-daemon mode of v1 (`DOCKER_HOST` on a foreign host, plaintext shim HTTP, `REMOTE_NETWORK_OPEN=1`) is gone; it lives on in tag `v0.13.0`.
+- **Link sessions run with the privileges of the user who started the link agent** on that machine — outside any container, directly on `PA_WORKDIR`. Provider keys and the GitHub PAT are read from that process's environment and never leave it.
 - **Pairing codes are short-lived, single-use secrets.** Treat the server URL and the channel used to transmit a pairing code as sensitive.
 
 ## Reporting

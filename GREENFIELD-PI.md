@@ -21,6 +21,16 @@ Kilo-/Claude-/Junie-/Codex-Adapter, Adapter-Registry + Manifest-Plugins, Content
 Image-Builds, Codex-OAuth (Loopback + Device-Code), Fly-Modus (`DOCKER_HOST` remote),
 Gateway/Remote-Runner mit Netzwerk-Policies über zweite Maschine, Multi-Tenant, Web-UI.
 
+## Entfallene Dokumente (Tag `v0.13.0`)
+
+Mit dem Schnitt sind die Multi-Adapter- und Analyse-Dokumente aus dem Repo-Root
+verschwunden. Quellcode-Kommentare verweisen weiterhin auf sie, weil sie die
+Herkunft einer Entscheidung belegen — nachzulesen sind sie im Tag **`v0.13.0`**:
+
+`ADAPTERS.md`, `APP-REVIEW.md`, `CODEX-OAUTH.md`, `DEPLOY-HANDOFF.md`,
+`ENTWICKLUNGSPLAN.md`, `FLY.md`, `HOMEPC.md`, `KILO-CLOUD-ANALYSE.md`,
+`RUNBOOK.md` (ersetzt durch `RUNBOOK-PI.md`).
+
 ## Architektur v2
 
 ```

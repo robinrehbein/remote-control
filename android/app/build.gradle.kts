@@ -13,8 +13,11 @@ android {
         applicationId = "com.pocketagent.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 19
-        versionName = "0.13.0"
+        // Greenfield-Marke (GREENFIELD-PI.md): deutlicher Sprung, aber gleiche
+        // applicationId und Signierung — nur so liefert der In-App-Updater das
+        // Update an die installierte 0.13.0 aus.
+        versionCode = 20
+        versionName = "0.20.0"
 
         buildConfigField("String", "FBM_PROJECT_ID", "\"replace-me\"")
         buildConfigField("String", "FBM_APPLICATION_ID", "\"replace-me\"")

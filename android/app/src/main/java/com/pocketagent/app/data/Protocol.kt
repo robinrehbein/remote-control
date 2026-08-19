@@ -42,20 +42,6 @@ enum class AgentMode {
     }
 }
 
-/** AdapterId is an open string in the contract (server-side plugin registry) -> plain String. */
-
-@Serializable
-data class AdapterCapabilities(
-    val approvals: Boolean = false,
-    val resume: Boolean = false,
-    val streaming: Boolean = false,
-    val autoPush: Boolean = false,
-    /** Adapter maps reasoningEffort onto a runtime option. */
-    val reasoning: Boolean = false,
-    /** Adapter honours a per-prompt model override. */
-    val modelSwitch: Boolean = false,
-)
-
 /** Normalized reasoning budget accepted by session.update. */
 @Serializable
 enum class ReasoningEffort { @SerialName("low") LOW, @SerialName("medium") MEDIUM, @SerialName("high") HIGH;
@@ -68,58 +54,11 @@ enum class ReasoningEffort { @SerialName("low") LOW, @SerialName("medium") MEDIU
 
 fun ReasoningEffort.wireName(): String = name.lowercase()
 
-/** One entry of a shim's model catalog (session.models). */
+/** One entry of the runner's model catalog (session.models). */
 @Serializable
 data class ModelInfo(
     val id: String,
     val name: String? = null,
-)
-
-@Serializable
-data class AdapterDefaults(val provider: String = "", val model: String? = null)
-
-/**
- * Anzeige-Metadaten zu einem Zugang eines Adapters (id == Secret-Art).
- * Rein kosmetisch; ältere Server liefern das Feld nicht.
- */
-@Serializable
-data class ProviderDescriptor(
-    val id: String,
-    val name: String,
-    val keyUrl: String? = null,
-    val hint: String? = null,
-)
-
-/**
- * Wie sich ein Adapter anmelden lässt (CODEX-OAUTH.md §5). Aus dem Manifest, damit
- * die App die richtige Login-Fläche generisch rendert statt eine Adapter-Tabelle
- * fest zu verdrahten. `type` ist ein offener String; unbekannte Typen ignoriert
- * die App einfach. Fehlt das Feld (alter Server), bleibt nur der Zugang-Einfügen-Weg.
- */
-@Serializable
-data class AuthFlow(
-    val type: String,
-    /** oauth-loopback: erlaubte localhost-Ports der Redirect-Allowlist (Codex: 1455/1457). */
-    val ports: List<Int> = emptyList(),
-    /** token-paste: Name des CLI-Befehls, der den Token erzeugt. */
-    val hint: String? = null,
-    /** api-key: Seite zum Erstellen des Keys. */
-    val keyUrl: String? = null,
-)
-
-@Serializable
-data class AdapterDescriptor(
-    val id: String,
-    val name: String,
-    val description: String? = null,
-    val image: String? = null,
-    val capabilities: AdapterCapabilities = AdapterCapabilities(),
-    val credentials: Map<String, List<String>> = emptyMap(),
-    @SerialName("providerEnv") val providerEnv: Map<String, String> = emptyMap(),
-    val providers: List<ProviderDescriptor> = emptyList(),
-    /** Login-Verfahren des Adapters; leer bei älteren Servern (nur Zugang-Einfügen). */
-    val authFlows: List<AuthFlow> = emptyList(),
-    val defaults: AdapterDefaults = AdapterDefaults(),
 )
 
 @Serializable
@@ -171,6 +110,8 @@ enum class StartPhase {
     /** Image wird gebaut — der langsame Fall, dauert beim ersten Mal Minuten. */
     IMAGE_BUILD,
     CONTAINER_START,
+
+    /** Der Agenten-Prozess im Container startet (Wire: `shim-start`/`runner-start`). */
     SHIM_START,
 
     /** Start abgeschlossen — die Fortschrittsanzeige verschwindet. */
@@ -183,7 +124,9 @@ enum class StartPhase {
             raw.isNullOrBlank() -> null
             raw.equals("image-build", ignoreCase = true) -> IMAGE_BUILD
             raw.equals("container-start", ignoreCase = true) -> CONTAINER_START
+            // Beide Schreibweisen: v1 nannte den Prozess Shim, v2 Runner.
             raw.equals("shim-start", ignoreCase = true) -> SHIM_START
+            raw.equals("runner-start", ignoreCase = true) -> SHIM_START
             raw.equals("ready", ignoreCase = true) -> READY
             else -> UNKNOWN
         }
@@ -206,6 +149,10 @@ data class SessionInfo(
     val id: String,
     val repoId: String,
     val repoFullName: String? = null,
+    /**
+     * Bleibt Teil des Wire-Formats (der Server nennt weiterhin den Agenten,
+     * heute immer [PI_AGENT_ID]); die Oberfläche verzweigt nicht mehr darauf.
+     */
     val adapter: String,
     val provider: String,
     val model: String,
@@ -426,10 +373,6 @@ sealed interface ServerMessage {
         override val type: String get() = "session.models"
     }
 
-    data class AdapterListMsg(val requestId: String, val adapters: List<AdapterDescriptor>) : ServerMessage {
-        override val type: String get() = "adapter.list"
-    }
-
     data class RepoListMsg(val requestId: String, val repos: List<RepoInfo>) : ServerMessage {
         override val type: String get() = "repo.list"
     }
@@ -468,32 +411,6 @@ sealed interface ServerMessage {
     data class ServerStatsMsg(val requestId: String, val stats: ServerStats) : ServerMessage {
         override val type: String get() = "server.stats"
     }
-
-    /**
-     * Antwort auf `auth.start` (CODEX-OAUTH.md): die im Browser zu öffnende
-     * Login-URL und der Loopback-Port, auf dem der Redirect landet — die App
-     * muss ihren Loopback-Listener auf genau diesem Port betreiben. Bei einem
-     * Device-Code-Flow ist [port] 0 (kein Listener) und [userCode] der Code.
-     */
-    data class AuthUrlMsg(
-        val requestId: String,
-        val url: String,
-        val port: Int,
-        val flow: String? = null,
-        val userCode: String? = null,
-    ) : ServerMessage {
-        override val type: String get() = "auth.url"
-    }
-
-    /** Endergebnis eines Auth-Flows: ok (+ optional Account-Label) oder ein Fehler. */
-    data class AuthDoneMsg(
-        val requestId: String,
-        val ok: Boolean,
-        val account: String? = null,
-        val error: String? = null,
-    ) : ServerMessage {
-        override val type: String get() = "auth.done"
-    }
 }
 
 fun requestIdOf(msg: ServerMessage): String? = when (msg) {
@@ -504,7 +421,6 @@ fun requestIdOf(msg: ServerMessage): String? = when (msg) {
     is ServerMessage.SessionEventsMsg -> msg.requestId
     is ServerMessage.SessionDeletedMsg -> msg.requestId
     is ServerMessage.SessionModelsMsg -> msg.requestId
-    is ServerMessage.AdapterListMsg -> msg.requestId
     is ServerMessage.RepoListMsg -> msg.requestId
     is ServerMessage.RepoAddedMsg -> msg.requestId
     is ServerMessage.SecretListMsg -> msg.requestId
@@ -512,8 +428,6 @@ fun requestIdOf(msg: ServerMessage): String? = when (msg) {
     is ServerMessage.SecretDeletedMsg -> msg.requestId
     is ServerMessage.SecretValidatedMsg -> msg.requestId
     is ServerMessage.ServerStatsMsg -> msg.requestId
-    is ServerMessage.AuthUrlMsg -> msg.requestId
-    is ServerMessage.AuthDoneMsg -> msg.requestId
     else -> null
 }
 
@@ -724,13 +638,6 @@ fun parseServerMessage(raw: String): ServerMessage? {
                 sessionId = root.optString("sessionId") ?: return null,
             )
 
-            "adapter.list" -> ServerMessage.AdapterListMsg(
-                requestId = root.optString("requestId") ?: return null,
-                adapters = root["adapters"]?.jsonArray?.mapNotNull { el ->
-                    runCatching { ProtocolJson.decodeFromJsonElement(AdapterDescriptor.serializer(), el) }.getOrNull()
-                } ?: emptyList(),
-            )
-
             "repo.list" -> ServerMessage.RepoListMsg(
                 requestId = root.optString("requestId") ?: return null,
                 repos = root["repos"]?.jsonArray?.mapNotNull { el ->
@@ -766,21 +673,6 @@ fun parseServerMessage(raw: String): ServerMessage? {
                 ok = root["ok"]?.jsonPrimitive?.booleanOrNullCompat() ?: false,
                 detail = root.optString("detail"),
                 unverified = root["unverified"]?.jsonPrimitive?.booleanOrNullCompat() ?: false,
-            )
-
-            "auth.url" -> ServerMessage.AuthUrlMsg(
-                requestId = root.optString("requestId") ?: return null,
-                url = root.optString("url") ?: return null,
-                port = root["port"]?.jsonPrimitive?.intOrNull ?: 0,
-                flow = root.optString("flow"),
-                userCode = root.optString("userCode"),
-            )
-
-            "auth.done" -> ServerMessage.AuthDoneMsg(
-                requestId = root.optString("requestId") ?: return null,
-                ok = root["ok"]?.jsonPrimitive?.booleanOrNullCompat() ?: false,
-                account = root.optString("account"),
-                error = root.optString("error"),
             )
 
             "server.stats" -> ServerMessage.ServerStatsMsg(
@@ -827,10 +719,13 @@ fun encodeHello(deviceId: String, token: String): String = buildJsonObject {
     put("token", token)
 }.toString()
 
+/**
+ * Session anlegen. `adapter` bleibt im Wire-Format (unverändert zu v1), ist
+ * aber keine Wahl mehr: es gibt genau einen Agenten ([PI_AGENT_ID]).
+ */
 fun encodeSessionCreate(
     requestId: String,
     repoId: String,
-    adapter: String,
     provider: String,
     model: String,
     mode: AgentMode,
@@ -840,7 +735,7 @@ fun encodeSessionCreate(
     put("type", "session.create")
     put("requestId", requestId)
     put("repoId", repoId)
-    put("adapter", adapter)
+    put("adapter", PI_AGENT_ID)
     put("provider", provider)
     put("model", model)
     put("mode", mode.wireName())
@@ -876,11 +771,8 @@ fun encodeSessionPrompt(
 }.toString()
 
 /**
- * Mode/Modell/Reasoning/Agent einer laufenden Session ändern. Alle Felder
- * optional; leerer Modell-String setzt auf den Adapter-Default zurück.
- * [adapter] wechselt den Agenten auf dem aktuellen Code-Stand: der Server
- * bestätigt mit request.ok und meldet den Fortschritt als session.status
- * ('starting' → 'idle'); Modell und Reasoning setzt er dabei zurück.
+ * Modus/Modell/Reasoning einer laufenden Session ändern. Alle Felder
+ * optional; leerer Modell-String setzt auf den Standard des Agenten zurück.
  */
 fun encodeSessionUpdate(
     requestId: String,
@@ -888,7 +780,6 @@ fun encodeSessionUpdate(
     mode: AgentMode? = null,
     model: String? = null,
     reasoningEffort: ReasoningEffort? = null,
-    adapter: String? = null,
 ): String = buildJsonObject {
     put("type", "session.update")
     put("requestId", requestId)
@@ -896,7 +787,6 @@ fun encodeSessionUpdate(
     mode?.let { put("mode", it.wireName()) }
     model?.let { put("model", it) }
     reasoningEffort?.let { put("reasoningEffort", it.wireName()) }
-    adapter?.let { put("adapter", it) }
 }.toString()
 
 fun encodeSessionModelsGet(requestId: String, sessionId: String): String = buildJsonObject {
@@ -960,7 +850,6 @@ private fun requestCommand(type: String, requestId: String): String = buildJsonO
 }.toString()
 
 fun encodeSessionList(requestId: String): String = requestCommand("session.list", requestId)
-fun encodeAdapterList(requestId: String): String = requestCommand("adapter.list", requestId)
 fun encodeRepoList(requestId: String): String = requestCommand("repo.list", requestId)
 fun encodeSecretList(requestId: String): String = requestCommand("secret.list", requestId)
 fun encodeServerStats(requestId: String): String = requestCommand("server.stats", requestId)
@@ -1005,37 +894,4 @@ fun encodeSecretDelete(requestId: String, id: String): String = buildJsonObject 
 fun encodeFcmRegister(token: String): String = buildJsonObject {
     put("type", "fcm.register")
     put("token", token)
-}.toString()
-
-/* ------------------------------------------------------------------ */
-/* In-App-Login (CODEX-OAUTH.md): auth.start / auth.callback / auth.cancel */
-/* ------------------------------------------------------------------ */
-
-/**
- * Startet den In-App-Login für [adapter] (heute nur codex). [flow] wählt das
- * Manifest-Verfahren (oauth-loopback vs. device-code); ohne Angabe entscheidet
- * der Server. [requestId] korreliert den ganzen Austausch (auth.url/callback/done).
- */
-fun encodeAuthStart(requestId: String, adapter: String, flow: String? = null): String = buildJsonObject {
-    put("type", "auth.start")
-    put("requestId", requestId)
-    put("adapter", adapter)
-    flow?.let { put("flow", it) }
-}.toString()
-
-/**
- * Reicht den vom Loopback-Listener abgefangenen OAuth-Callback (code+state) an
- * den Login-Server im Auth-Container weiter. Werte sind einmalig verwendbar und
- * laufen über den ohnehin Device-Token-authentifizierten WSS.
- */
-fun encodeAuthCallback(requestId: String, code: String, state: String): String = buildJsonObject {
-    put("type", "auth.callback")
-    put("requestId", requestId)
-    put("code", code)
-    put("state", state)
-}.toString()
-
-fun encodeAuthCancel(requestId: String): String = buildJsonObject {
-    put("type", "auth.cancel")
-    put("requestId", requestId)
 }.toString()

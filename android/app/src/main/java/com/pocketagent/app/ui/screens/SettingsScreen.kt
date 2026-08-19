@@ -31,7 +31,6 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.outlined.AccountCircle
 import androidx.compose.material.icons.outlined.BugReport
 import androidx.compose.material.icons.outlined.CheckCircleOutline
 import androidx.compose.material.icons.outlined.Delete
@@ -88,13 +87,11 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.pocketagent.app.PocketAgentApp
-import com.pocketagent.app.data.AdapterDescriptor
 import com.pocketagent.app.data.AppRepository
-import com.pocketagent.app.data.CodexAuthUiState
-import com.pocketagent.app.data.CodexOAuthController
 import com.pocketagent.app.data.CrashLog
+import com.pocketagent.app.data.PI_DEFAULT_PROVIDER
+import com.pocketagent.app.data.PI_PROVIDERS
 import com.pocketagent.app.data.PairingApi
-import com.pocketagent.app.data.ProviderDescriptor
 import com.pocketagent.app.data.ReleaseInfo
 import com.pocketagent.app.data.SecretInfo
 import com.pocketagent.app.data.SecretValidation
@@ -137,7 +134,6 @@ class SettingsViewModel : ViewModel() {
             repository.loadSecrets()
             repository.refreshSessions()
             repository.refreshRepos()
-            repository.refreshAdapters()
         }
     }
 
@@ -191,46 +187,32 @@ private data class SecretMeta(
     val displayName: String,
     val description: String,
     val multiline: Boolean = false,
-    /** Seite zum Erstellen des Keys — kommt aus dem Adapter-Manifest. */
+    /** Seite zum Erstellen des Keys. */
     val keyUrl: String? = null,
 )
 
-private val SECRET_CATALOG = listOf(
-    SecretMeta("github", "GitHub", "Personal Access Token mit repo-Scope — für private Repos, Push & PRs"),
-    SecretMeta("claude_oauth", "Claude Abo (Setup-Token)", "Auf dem Laptop `claude setup-token` ausführen und Token einfügen (Pro/Max, ~1 Jahr gültig)"),
-    SecretMeta("anthropic", "Anthropic API", "API-Key von console.anthropic.com (sk-ant-…)"),
-    SecretMeta("openai", "OpenAI", "API-Key von platform.openai.com (sk-…)"),
-    SecretMeta("zai", "Z.AI", "API-Key aus dem Z.AI-Dashboard"),
-    // "moonshot" und "kimi" waren zwei Katalog-Einträge für denselben
-    // Zugang — mancher Adapter (z. B. pi) mappt beide Provider-Ids sogar auf
-    // dieselbe Umgebungsvariable. Fund: "Secret-Katalog … Duplikat
-    // (moonshot/kimi)". Ein Eintrag, Alias über [SECRET_KIND_ALIASES].
-    SecretMeta("moonshot", "Moonshot / Kimi", "API-Key von platform.moonshot.ai"),
-    SecretMeta("google", "Google Gemini", "API-Key aus Google AI Studio"),
-    SecretMeta("groq", "Groq", "API-Key von console.groq.com"),
-    SecretMeta("openrouter", "OpenRouter", "API-Key von openrouter.ai (sk-or-…)"),
-    SecretMeta("xai", "xAI", "API-Key von console.x.ai"),
-    SecretMeta("junie", "JetBrains Junie", "Junie API-Key (usage-based)"),
-    SecretMeta("kilo", "Kilo Gateway", "Kompletter Inhalt der Gateway-auth.json einfügen", multiline = true),
-)
-
 /**
- * Kind-Ids, die serverseitig zwei Provider-Ids desselben Zugangs sind
- * (siehe SECRET_CATALOG-Kommentar zu "moonshot"/"kimi"). Rein clientseitige
- * Anzeige-Zusammenführung — ein bereits unter dem Alias gespeicherter Secret
- * bleibt unter seiner echten Kind-Id funktionsfähig (Löschen läuft über die
- * Id, nicht die Art), zeigt aber denselben Anzeigenamen wie der Kanon.
+ * Was sich hinterlegen lässt: der GitHub-Zugang und die sechs Zugänge aus der
+ * pi-Provider-Tabelle ([PI_PROVIDERS]) — mehr kennt der Server nicht. Fest
+ * statt vom Server geladen, weil es nur einen Agenten mit einer festen
+ * Tabelle gibt; „Eigene Art …" im Dialog bleibt trotzdem möglich.
  */
-private val SECRET_KIND_ALIASES = mapOf("kimi" to "moonshot")
-
-private fun canonicalKind(kind: String): String = SECRET_KIND_ALIASES[kind] ?: kind
+private val SECRET_CATALOG: List<SecretMeta> = listOf(
+    SecretMeta("github", "GitHub", "Personal Access Token mit repo-Scope — für private Repos, Push & PRs"),
+) + PI_PROVIDERS.map { provider ->
+    SecretMeta(
+        kind = provider.id,
+        displayName = provider.name,
+        description = provider.hint,
+        keyUrl = provider.keyUrl,
+    )
+}
 
 /** Soft format hints per kind — warn, never block. */
 private val KIND_PREFIXES = mapOf(
     "github" to listOf("ghp_", "github_pat_"),
     "anthropic" to listOf("sk-ant-"),
     "openai" to listOf("sk-"),
-    "openrouter" to listOf("sk-or-"),
 )
 
 /**
@@ -247,74 +229,22 @@ private fun prefixHint(displayName: String, prefixes: List<String>): String {
     return "Ein $displayName-Token beginnt mit $joined."
 }
 
-/**
- * Der statische Katalog bleibt die Grundlage (er kennt auch Arten, die kein
- * installierter Adapter meldet), wird aber pro Art mit den Manifest-Angaben
- * des Servers überschrieben — der Server weiß besser, wie sein Adapter den
- * Zugang nennt und wo man den Key holt.
- */
-private fun buildCatalog(adapters: List<AdapterDescriptor>): List<SecretMeta> {
-    val manifest = LinkedHashMap<String, ProviderDescriptor>()
-    adapters.forEach { adapter ->
-        adapter.providers.forEach { provider ->
-            if (provider.id !in manifest) manifest[provider.id] = provider
-        }
-    }
-
-    val enriched = SECRET_CATALOG.map { meta ->
-        val provider = manifest[meta.kind] ?: return@map meta
-        meta.copy(
-            displayName = provider.name.ifBlank { meta.displayName },
-            description = provider.hint?.takeIf { it.isNotBlank() } ?: meta.description,
-            keyUrl = provider.keyUrl,
-        )
-    }
-
-    // Alias-Ids (z. B. "kimi") zählen als bekannt, sonst würde ein Adapter,
-    // der sie als eigene providerEnv-Id führt, den Katalog-Eintrag erneut
-    // duplizieren, den SECRET_KIND_ALIASES gerade zusammengeführt hat.
-    val known = SECRET_CATALOG.map { it.kind }.toSet() + SECRET_KIND_ALIASES.keys
-    val dynamic = adapters
-        .flatMap { it.credentials.keys + it.providerEnv.keys }
-        .distinct()
-        .filter { it !in known }
-        .sorted()
-        .map { kind ->
-            val provider = manifest[kind]
-            SecretMeta(
-                kind = kind,
-                displayName = provider?.name?.takeIf { it.isNotBlank() } ?: kind,
-                description = provider?.hint?.takeIf { it.isNotBlank() }
-                    ?: "Wird von einem installierten Adapter genutzt",
-                keyUrl = provider?.keyUrl,
-            )
-        }
-    return enriched + dynamic
-}
-
-/** Kanonisiert Alias-Kinds (siehe [SECRET_KIND_ALIASES]) vor dem Nachschlagen —
- *  ein bereits unter "kimi" gespeicherter Zugang zeigt so denselben Namen
- *  wie ein neu unter "moonshot" angelegter. */
-private fun metaFor(kind: String, catalog: List<SecretMeta>): SecretMeta =
-    catalog.firstOrNull { it.kind == canonicalKind(kind) } ?: SecretMeta(kind, kind, "")
-
-/** Adapter ids that consume a secret kind (credential or provider env). */
-private fun adaptersUsing(kind: String, adapters: List<AdapterDescriptor>): List<String> =
-    adapters.filter { kind in it.credentials.keys || kind in it.providerEnv.keys }.map { it.id }
+/** Eine frei eingetippte Art behält ihre Id als Namen. */
+private fun metaFor(kind: String): SecretMeta =
+    SECRET_CATALOG.firstOrNull { it.kind == kind } ?: SecretMeta(kind, kind, "")
 
 /**
- * Kinds worth adding: github (if missing) plus every adapter credential
- * group that has no stored alternative yet (e.g. claude is satisfied by
- * claude_oauth OR anthropic).
+ * Was noch fehlt, um überhaupt loslegen zu können: der GitHub-Zugang und —
+ * solange gar kein Provider-Key hinterlegt ist — der Standard-Zugang von pi.
+ * Ohne einen der sechs Keys startet jede Session ohne Schlüssel; ohne diesen
+ * Hinweis stünde das nirgends, bevor es zu spät ist. Liegt schon irgendein
+ * Provider-Key vor, wird hier keiner mehr empfohlen — welcher der richtige
+ * ist, entscheidet der Anlege-Screen.
  */
-private fun recommendedKinds(adapters: List<AdapterDescriptor>, existing: Set<String>): List<String> {
+private fun recommendedKinds(existing: Set<String>): List<String> {
     val rec = LinkedHashSet<String>()
     if ("github" !in existing) rec += "github"
-    adapters.forEach { adapter ->
-        val group = adapter.credentials.keys
-        if (group.isNotEmpty() && group.none { it in existing }) rec += group
-    }
-    rec.removeAll(existing)
+    if (PI_PROVIDERS.none { it.id in existing }) rec += PI_DEFAULT_PROVIDER
     return rec.toList()
 }
 
@@ -331,15 +261,13 @@ fun SettingsScreen(onBack: () -> Unit) {
     val stats by repository.stats.collectAsState()
     val secrets by repository.secrets.collectAsState()
     val repos by repository.repos.collectAsState()
-    val adapters by repository.adapters.collectAsState()
     val biometric by repository.tokenStore.biometricEnabled.collectAsState(initial = false)
     val connState by repository.connState.collectAsState()
     val error by vm.error.collectAsState()
     val connected = connState is WsClient.ConnState.Connected
 
-    val catalog = buildCatalog(adapters)
     val existingKinds = secrets.map { it.kind }.toSet()
-    val recommended = recommendedKinds(adapters, existingKinds)
+    val recommended = recommendedKinds(existingKinds)
 
     // Faltbare Geräte: ein Faltvorgang darf die offenen Dialoge nicht
     // schließen. Boolean/String überleben das ohne eigenen Saver.
@@ -357,16 +285,6 @@ fun SettingsScreen(onBack: () -> Unit) {
     LaunchedEffect(Unit) {
         lastCrash = withContext(Dispatchers.IO) { CrashLog.latest(app) }
     }
-
-    // In-App-Login (CODEX-OAUTH.md): der Controller treibt den Flow, öffnet die
-    // Login-URL im Browser (LocalUriHandler) und lauscht auf dem Loopback-Port.
-    val uriHandler = LocalUriHandler.current
-    val authScope = rememberCoroutineScope()
-    val codexAuth = remember {
-        CodexOAuthController(authScope, repository) { url -> runCatching { uriHandler.openUri(url) } }
-    }
-    val authState by codexAuth.state.collectAsState()
-    val loginAdapters = adapters.filter { adapter -> adapter.authFlows.any { it.type == "oauth-loopback" || it.type == "device-code" } }
 
     LaunchedEffect(Unit) { vm.refresh() }
 
@@ -480,17 +398,12 @@ fun SettingsScreen(onBack: () -> Unit) {
                     Column(Modifier.padding(vertical = 4.dp)) {
                         recommended.forEachIndexed { index, kind ->
                             if (index > 0) ListDivider()
-                            val meta = metaFor(kind, catalog)
-                            val users = adaptersUsing(kind, adapters)
+                            val meta = metaFor(kind)
                             SettingsTile(
                                 icon = Icons.Outlined.Key,
                                 title = meta.displayName,
                                 // The long how-to belongs in the dialog, not here.
-                                subtitle = if (users.isEmpty()) {
-                                    "Noch nicht hinterlegt"
-                                } else {
-                                    "Wird von ${users.joinToString(", ")} gebraucht"
-                                },
+                                subtitle = "Noch nicht hinterlegt",
                                 onClick = {
                                     secretDialogKind = kind
                                     showSecretDialog = true
@@ -509,51 +422,16 @@ fun SettingsScreen(onBack: () -> Unit) {
                 }
             }
 
-            /* ---------- Anmelden (In-App-OAuth) ---------- */
-            if (loginAdapters.isNotEmpty()) {
-                SectionHeader("Anmelden")
-                GroupCard {
-                    Column(Modifier.padding(vertical = 4.dp)) {
-                        loginAdapters.forEachIndexed { index, adapter ->
-                            if (index > 0) ListDivider()
-                            val hasLoopback = adapter.authFlows.any { it.type == "oauth-loopback" }
-                            val hasDevice = adapter.authFlows.any { it.type == "device-code" }
-                            val subtitle = when {
-                                hasLoopback -> "Im Browser mit dem Abo anmelden – kein Key nötig"
-                                else -> "Code auf einem anderen Gerät eingeben"
-                            }
-                            SettingsTile(
-                                icon = Icons.Outlined.AccountCircle,
-                                title = "${adapter.name}: Mit ChatGPT anmelden",
-                                subtitle = subtitle,
-                                onClick = { codexAuth.begin(if (hasLoopback) "oauth-loopback" else "device-code") },
-                                trailing = if (hasLoopback && hasDevice) {
-                                    {
-                                        TextButton(onClick = { codexAuth.begin("device-code") }) {
-                                            Text("Code", style = MaterialTheme.typography.labelLarge)
-                                        }
-                                    }
-                                } else {
-                                    null
-                                },
-                            )
-                        }
-                    }
-                }
-                SectionNote("Der Login läuft im Browser; die App fängt nur den Rücksprung ab und speichert nichts im Klartext.")
-            }
-
             /* ---------- Zugänge ---------- */
             SectionHeader("Zugänge")
             GroupCard {
                 Column(Modifier.padding(vertical = 4.dp)) {
                     if (secrets.isEmpty()) {
-                        EmptyRow("Noch nichts hinterlegt – nötig für private Repos und Agenten")
+                        EmptyRow("Noch nichts hinterlegt – nötig für private Repos und den Modell-Anbieter")
                     }
                     secrets.forEachIndexed { index, secret ->
                         if (index > 0) ListDivider()
-                        val meta = metaFor(secret.kind, catalog)
-                        val users = adaptersUsing(secret.kind, adapters)
+                        val meta = metaFor(secret.kind)
                         val age = relativeTime(secret.createdAt)
                         val ageText = if (age == "jetzt") "gerade hinterlegt" else "hinterlegt vor $age"
                         // Wisch fragt statt sofort zu löschen — dasselbe
@@ -565,11 +443,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                             SettingsTile(
                                 icon = Icons.Outlined.Key,
                                 title = meta.displayName,
-                                subtitle = if (users.isEmpty()) {
-                                    ageText
-                                } else {
-                                    "für ${users.joinToString(", ")} · $ageText"
-                                },
+                                subtitle = ageText,
                                 onClick = { manageSecret = secret },
                                 modifier = Modifier.background(MaterialTheme.colorScheme.surfaceContainer),
                             )
@@ -660,7 +534,6 @@ fun SettingsScreen(onBack: () -> Unit) {
 
     if (showSecretDialog) {
         SecretDialog(
-            catalog = catalog,
             initialKind = secretDialogKind,
             onDismiss = { showSecretDialog = false },
             onSave = { kind, value -> vm.addSecret(kind, value) { showSecretDialog = false } },
@@ -668,7 +541,7 @@ fun SettingsScreen(onBack: () -> Unit) {
         )
     }
     manageSecret?.let { secret ->
-        val meta = metaFor(secret.kind, catalog)
+        val meta = metaFor(secret.kind)
         // Per-item Optionen sind ein Menü, kein betitelter Dialog — dieselbe
         // Form wie das Kontextmenü der Session-Liste (SettingSheet + GroupCard).
         SettingSheet(title = meta.displayName, onDismiss = { manageSecret = null }) {
@@ -692,11 +565,11 @@ fun SettingsScreen(onBack: () -> Unit) {
         }
     }
     confirmDeleteSecret?.let { secret ->
-        val meta = metaFor(secret.kind, catalog)
+        val meta = metaFor(secret.kind)
         OneUiDialog(
             onDismissRequest = { confirmDeleteSecret = null },
             title = "„${meta.displayName}“ löschen?",
-            text = { Text("Der Zugang wird vom Server-Vault entfernt. Adapter, die ihn nutzen, können danach nicht mehr starten.") },
+            text = { Text("Der Zugang wird vom Server-Vault entfernt. Sessions, die ihn nutzen, können danach nicht mehr starten.") },
             confirmButton = {
                 TextButton(onClick = {
                     vm.deleteSecret(secret.id)
@@ -727,82 +600,6 @@ fun SettingsScreen(onBack: () -> Unit) {
             },
         )
     }
-    if (authState !is CodexAuthUiState.Idle) {
-        CodexAuthDialog(
-            state = authState,
-            onReopen = { url -> runCatching { uriHandler.openUri(url) } },
-            onDismiss = { codexAuth.cancel() },
-        )
-    }
-}
-
-/**
- * Fortschritt/Ergebnis eines In-App-Logins (CODEX-OAUTH.md). Zeigt bei
- * device-code den Code, bei oauth-loopback den Wartezustand, und schließlich
- * „Codex verbunden" bzw. den Fehler. Schließen bricht einen laufenden Flow ab.
- */
-@Composable
-private fun CodexAuthDialog(
-    state: CodexAuthUiState,
-    onReopen: (String) -> Unit,
-    onDismiss: () -> Unit,
-) {
-    val title = when (state) {
-        is CodexAuthUiState.Success -> "Codex verbunden"
-        is CodexAuthUiState.Failed -> "Login fehlgeschlagen"
-        else -> "Mit ChatGPT anmelden"
-    }
-    OneUiDialog(
-        onDismissRequest = onDismiss,
-        title = title,
-        text = {
-            when (state) {
-                is CodexAuthUiState.Starting ->
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
-                        Spacer(Modifier.width(12.dp))
-                        Text("Login wird vorbereitet …")
-                    }
-
-                is CodexAuthUiState.AwaitingBrowser ->
-                    if (state.userCode != null) {
-                        Column {
-                            Text("Öffne die Seite und gib diesen Code ein:")
-                            Spacer(Modifier.height(8.dp))
-                            Text(
-                                state.userCode,
-                                style = MaterialTheme.typography.headlineSmall,
-                                fontWeight = FontWeight.SemiBold,
-                            )
-                        }
-                    } else {
-                        Text("Melde dich im Browser an. Danach kehrst du automatisch zur App zurück.")
-                    }
-
-                is CodexAuthUiState.Success ->
-                    Text(state.account?.let { "Angemeldet: $it" } ?: "Der Login ist abgeschlossen.")
-
-                is CodexAuthUiState.Failed -> Text(state.error)
-                CodexAuthUiState.Idle -> Unit
-            }
-        },
-        confirmButton = {
-            when (state) {
-                is CodexAuthUiState.Success, is CodexAuthUiState.Failed ->
-                    TextButton(onClick = onDismiss) { Text("Fertig") }
-
-                is CodexAuthUiState.AwaitingBrowser ->
-                    TextButton(onClick = { onReopen(state.url) }) { Text("Browser öffnen") }
-
-                else -> Unit
-            }
-        },
-        dismissButton = if (state is CodexAuthUiState.Success || state is CodexAuthUiState.Failed) {
-            null
-        } else {
-            { TextButton(onClick = onDismiss) { Text("Abbrechen") } }
-        },
-    )
 }
 
 /* ------------------------------------------------------------------ */
@@ -1165,7 +962,6 @@ private const val CUSTOM_KIND = "__custom__"
 
 @Composable
 private fun SecretDialog(
-    catalog: List<SecretMeta>,
     initialKind: String?,
     onDismiss: () -> Unit,
     onSave: (kind: String, value: String) -> Unit,
@@ -1189,7 +985,7 @@ private fun SecretDialog(
     }
 
     val customMode = selectedKind == CUSTOM_KIND
-    val selectedMeta = selectedKind?.takeIf { it != CUSTOM_KIND }?.let { metaFor(it, catalog) }
+    val selectedMeta = selectedKind?.takeIf { it != CUSTOM_KIND }?.let { metaFor(it) }
     val effectiveKind = if (customMode) customKind.trim() else selectedKind.orEmpty()
     val multiline = !customMode && selectedMeta?.multiline == true
 
@@ -1230,7 +1026,7 @@ private fun SecretDialog(
                         expanded = expanded,
                         onDismissRequest = { expanded = false },
                     ) {
-                        catalog.forEach { meta ->
+                        SECRET_CATALOG.forEach { meta ->
                             DropdownMenuItem(
                                 text = {
                                     Column {

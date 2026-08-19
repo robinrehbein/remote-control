@@ -63,13 +63,15 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.pocketagent.app.PocketAgentApp
-import com.pocketagent.app.data.AdapterDescriptor
 import com.pocketagent.app.data.AgentMode
 import com.pocketagent.app.data.AppRepository
 import com.pocketagent.app.data.ModelInfo
+import com.pocketagent.app.data.PI_DEFAULT_PROVIDER
+import com.pocketagent.app.data.PI_PROVIDERS
 import com.pocketagent.app.data.ReasoningEffort
 import com.pocketagent.app.data.RepoInfo
 import com.pocketagent.app.data.WsClient
+import com.pocketagent.app.data.piProviderName
 import com.pocketagent.app.ui.sheetPickListMaxHeight
 import com.pocketagent.app.ui.theme.CardInset
 import com.pocketagent.app.ui.theme.ChipSpacing
@@ -96,8 +98,7 @@ class NewSessionViewModel : ViewModel() {
 
     data class UiState(
         val repoId: String? = null,
-        val adapter: String = "",
-        val provider: String = "",
+        val provider: String = PI_DEFAULT_PROVIDER,
         /**
          * Hat der Nutzer den Zugang selbst gewählt? Nur dann darf die
          * Vorauswahl ihn nicht mehr überschreiben, wenn Zugänge nachladen.
@@ -133,41 +134,18 @@ class NewSessionViewModel : ViewModel() {
     }
 
     /**
-     * Erstauswahl und Nachziehen der Vorauswahl.
+     * Nachziehen der Vorauswahl.
      *
      * Die Zugänge kommen asynchron nach. Solange der Nutzer selbst keinen
      * gewählt hat, darf die Vorauswahl sich noch korrigieren — sonst bliebe
      * ein Provider ohne Zugang stehen, nur weil die Liste der Zugänge einen
      * Wimpernschlag später eintraf.
      */
-    fun syncAdapterDefaults(adapters: List<AdapterDescriptor>, secretKinds: Set<String>) {
-        if (adapters.isEmpty()) return
+    fun syncProviderDefault(secretKinds: Set<String>) {
         val s = _state.value
-        if (s.adapter.isBlank()) {
-            val first = adapters.first()
-            _state.value = s.copy(
-                adapter = first.id,
-                provider = preselectedProvider(first, secretKinds),
-            )
-            return
-        }
         if (s.providerTouched || s.provider in secretKinds) return
-        val current = adapters.firstOrNull { it.id == s.adapter } ?: return
-        val better = preselectedProvider(current, secretKinds)
+        val better = preselectedProvider(secretKinds)
         if (better != s.provider) _state.value = s.copy(provider = better)
-    }
-
-    /** Agentwechsel setzt Zugang und Modell auf den Standard des Adapters zurück. */
-    fun onAdapterSelected(adapter: AdapterDescriptor, secretKinds: Set<String>) {
-        _state.value = _state.value.copy(
-            adapter = adapter.id,
-            provider = preselectedProvider(adapter, secretKinds),
-            providerTouched = false,
-            model = "",
-            // Kann der neue Agent kein Reasoning, ist eine gewählte Stufe
-            // gegenstandslos — sie darf nicht unsichtbar weiterwirken.
-            reasoning = _state.value.reasoning.takeIf { adapter.capabilities.reasoning },
-        )
     }
 
     /** Ergebnis des Modell-Sheets: Zugang, Modell und Stufe in einem Schritt. */
@@ -222,12 +200,10 @@ class NewSessionViewModel : ViewModel() {
         viewModelScope.launch {
             // Vorher merken, was es schon gibt: Fällt die Id aus der
             // Bestätigung weg (alter Server), ist die neue Session die, die
-            // vorher nicht da war — und nicht irgendeine mit demselben Repo
-            // und Agenten.
+            // vorher nicht da war — und nicht irgendeine mit demselben Repo.
             val known = repository.sessions.value.map { it.id }.toSet()
             val result = repository.createSession(
                 repoId = repoId,
-                adapter = s.adapter,
                 provider = s.provider.trim(),
                 model = s.model.trim(),
                 mode = s.mode,
@@ -244,9 +220,7 @@ class NewSessionViewModel : ViewModel() {
                 finish(sessionId)
                 return@launch
             }
-            val matching = repository.sessions.value.filter { sess ->
-                sess.repoId == repoId && sess.adapter == s.adapter
-            }
+            val matching = repository.sessions.value.filter { sess -> sess.repoId == repoId }
             val created = matching.firstOrNull { it.id !in known } ?: matching.firstOrNull()
             if (created == null) {
                 _state.value = _state.value.copy(
@@ -317,118 +291,42 @@ class NewSessionViewModel : ViewModel() {
 }
 
 /* ------------------------------------------------------------------ */
-/* Provider display names                                              */
+/* Zugänge                                                             */
 /* ------------------------------------------------------------------ */
-
-/**
- * Anzeigenamen kommen aus dem Adapter-Manifest (`providers`). Die Tabelle
- * hier greift nur noch bei Adaptern ohne dieses Feld (ältere Server) und bei
- * frei eingetippten Providern.
- */
-private fun fallbackProviderName(key: String): String = when (key) {
-    "openai" -> "OpenAI"
-    "anthropic" -> "Anthropic"
-    "zai" -> "Z.AI"
-    "moonshot" -> "Moonshot/Kimi"
-    "kimi" -> "Kimi"
-    "google" -> "Google Gemini"
-    "groq" -> "Groq"
-    "openrouter" -> "OpenRouter"
-    "xai" -> "xAI"
-    else -> key
-}
-
-private fun providerDisplayName(key: String, descriptor: AdapterDescriptor?): String =
-    descriptor?.providers?.firstOrNull { it.id == key }?.name ?: fallbackProviderName(key)
-
-/**
- * Provider keys in display order: default provider first, then the rest.
- * Quelle ist das Manifest (`providers`), sonst die Env-Tabelle.
- */
-private fun orderedProviderKeys(descriptor: AdapterDescriptor): List<String> {
-    val keys = descriptor.providers.map { it.id }
-        .ifEmpty { descriptor.providerEnv.keys.toList() }
-        .ifEmpty { descriptor.credentials.keys.toList() }
-    val def = descriptor.defaults.provider
-    return if (def.isNotBlank() && def in keys) {
-        listOf(def) + keys.filterNot { it == def }
-    } else {
-        keys
-    }
-}
 
 /**
  * Welcher Zugang beim Anlegen vorgewählt wird.
  *
  * Der Server spielt nur den Schlüssel des **einen** gewählten Providers in
- * den Container (`sessions.ts`: `providerEnv[row.provider]`). Ein Provider,
- * für den kein Zugang hinterlegt ist, führt damit zu einer Session, die ohne
- * Schlüssel startet — auch wenn für einen anderen Provider desselben Agenten
- * längst einer da ist. Genau das passierte bei pi: das Manifest nennt
- * `openai` als Default, hinterlegt war aber Z.AI, und im Container fehlte
+ * den Container. Ein Provider, für den kein Zugang hinterlegt ist, führt
+ * damit zu einer Session, die ohne Schlüssel startet — auch wenn für einen
+ * anderen längst einer da ist. Genau das passierte bei pi: die Tabelle nennt
+ * `openai` als Standard, hinterlegt war aber Z.AI, und im Container fehlte
  * `ZAI_API_KEY`.
  *
- * Ein vorhandener Zugang schlägt deshalb den Default aus dem Manifest. Die
- * Reihenfolge bleibt sonst die des Manifests, damit die Wahl vorhersagbar
- * ist; gibt es nirgends einen Zugang, bleibt es beim Default.
+ * Ein vorhandener Zugang schlägt deshalb den Standard. Die Reihenfolge
+ * bleibt sonst die der Tabelle, damit die Wahl vorhersagbar ist; gibt es
+ * nirgends einen Zugang, bleibt es beim Standard.
  */
-fun preselectedProvider(adapter: AdapterDescriptor, secretKinds: Set<String>): String {
-    val ordered = orderedProviderKeys(adapter)
-    return ordered.firstOrNull { it in secretKinds }
-        ?: adapter.defaults.provider.ifBlank { ordered.firstOrNull().orEmpty() }
-}
-
-/**
- * True when a usable secret for this adapter exists (card-level status).
- * Auch der Agent-Wechsel im SessionScreen fragt hierüber.
- */
-fun adapterKeyPresent(descriptor: AdapterDescriptor, secretKinds: Set<String>): Boolean = when {
-    descriptor.credentials.isNotEmpty() -> descriptor.credentials.keys.any { it in secretKinds }
-    descriptor.providerEnv.isNotEmpty() -> descriptor.providerEnv.keys.any { it in secretKinds }
-    else -> true
-}
+fun preselectedProvider(secretKinds: Set<String>): String =
+    PI_PROVIDERS.map { it.id }.firstOrNull { it in secretKinds } ?: PI_DEFAULT_PROVIDER
 
 /* ------------------------------------------------------------------ */
 /* Was auf den Chips steht                                             */
 /* ------------------------------------------------------------------ */
 
 /**
- * Kurzkennzeichen der Zugangsart, wie es der Modell-Chip trägt: „Abo“ für
- * ein Abo-Token, „API“ für einen Schlüssel.
- *
- * Die Unterscheidung steht im Manifest in keinem eigenen Feld — nur die
- * Namen der Umgebungsvariablen verraten sie (`CLAUDE_CODE_OAUTH_TOKEN`
- * gegen `ANTHROPIC_API_KEY`). Also werden die gelesen, statt aus der
- * Provider-Id geraten zu werden.
- *
- * null heißt: diesen Zugang kennt der Adapter nicht (frei eingetippt) —
- * dann trägt der Chip kein Kennzeichen, statt eines zu erfinden.
+ * Was auf dem Modell-Chip steht: das Modell und — wenn eine Reasoning-Stufe
+ * gewählt ist — die Stufe dahinter. Ohne Wahl bleibt es beim Modell allein;
+ * „Standard“ dazuzuschreiben sagt nichts.
  */
-fun accessLabel(descriptor: AdapterDescriptor, provider: String): String? {
-    val key = provider.trim()
-    if (key.isBlank()) return null
-    val envNames = descriptor.credentials[key]
-        ?: descriptor.providerEnv[key]?.let { listOf(it) }
-        ?: return null
-    return if (envNames.any { it.contains("OAUTH", ignoreCase = true) }) "Abo" else "API"
-}
-
-/**
- * Was auf dem Modell-Chip steht: das Modell und — wenn der Agent Reasoning
- * kann und eine Stufe gewählt ist — die Stufe dahinter. Ohne Wahl bleibt es
- * beim Modell allein; „Standard“ dazuzuschreiben sagt nichts.
- */
-fun modelChipValue(model: String, reasoning: ReasoningEffort?, canReason: Boolean): String {
+fun modelChipValue(model: String, reasoning: ReasoningEffort?): String {
     val name = model.trim().ifBlank { "Standardmodell" }
-    return if (canReason && reasoning != null) {
-        "$name · ${reasoningLabel(reasoning)}"
-    } else {
-        name
-    }
+    return if (reasoning != null) "$name · ${reasoningLabel(reasoning)}" else name
 }
 
 /** Welches Sheet gerade über dem Anlege-Screen liegt. */
-enum class NewSessionSheet { AGENT, MODEL, MODE, ADVANCED }
+enum class NewSessionSheet { MODEL, MODE, ADVANCED }
 
 /**
  * Was auf dem "Erweitert"-Chip steht: "Standard", solange Netzwerk und
@@ -460,9 +358,8 @@ fun NewSessionScreen(
     val vm: NewSessionViewModel = viewModel { NewSessionViewModel().also { it.repository = repository } }
     val state by vm.state.collectAsState()
     val repos by repository.repos.collectAsState()
-    val adapters by repository.adapters.collectAsState()
     val secrets by repository.secrets.collectAsState()
-    val modelsByAdapter by repository.modelsByAdapter.collectAsState()
+    val knownModels by repository.knownModels.collectAsState()
     val connState by repository.connState.collectAsState()
 
     // Ohne Verbindung kann der Startknopf sein Versprechen nicht halten —
@@ -484,10 +381,9 @@ fun NewSessionScreen(
     LaunchedEffect(Unit) {
         repository.refreshRepos()
         repository.refreshSessions()
-        repository.refreshAdapters()
         repository.loadSecrets()
     }
-    LaunchedEffect(adapters, secretKinds) { vm.syncAdapterDefaults(adapters, secretKinds) }
+    LaunchedEffect(secretKinds) { vm.syncProviderDefault(secretKinds) }
     LaunchedEffect(state.createdSessionId) { state.createdSessionId?.let { onCreated(it) } }
     LaunchedEffect(repos) {
         if (repos.isNotEmpty() && state.repoId == null && repos.none { it.id == state.repoId }) {
@@ -495,7 +391,6 @@ fun NewSessionScreen(
         }
     }
 
-    val selectedDescriptor = adapters.firstOrNull { it.id == state.adapter }
     val accessMissing = state.provider.trim().let { it.isNotBlank() && it !in secretKinds }
 
     OneUiScaffold(
@@ -588,8 +483,8 @@ fun NewSessionScreen(
 
             /* -------- Chip-Zeile -------- */
             // Jede Einstellung ist ein Chip: der Wert steht drauf, die Auswahl
-            // steckt im Sheet. Vier Listen à sechs Zeilen werden so zu zwei
-            // Zeilen, ohne dass ein einziger Wert unsichtbar wird.
+            // steckt im Sheet. Drei Listen werden so zu einer Zeile, ohne dass
+            // ein einziger Wert unsichtbar wird.
             FlowRow(
                 horizontalArrangement = Arrangement.spacedBy(ChipSpacing),
                 verticalArrangement = Arrangement.spacedBy(ChipSpacing),
@@ -598,35 +493,14 @@ fun NewSessionScreen(
                     .padding(start = ScreenGutter, end = ScreenGutter, top = 4.dp),
             ) {
                 SettingChip(
-                    label = "Agent",
-                    value = if (adapters.isEmpty()) {
-                        "Lädt …"
-                    } else {
-                        adapterLabel(adapters, state.adapter)
-                    },
-                    enabled = adapters.isNotEmpty(),
-                    onClick = { sheet = NewSessionSheet.AGENT },
+                    label = "Modell",
+                    value = modelChipValue(model = state.model, reasoning = state.reasoning),
+                    // Fehlt der Zugang, sagt das Kennzeichen es hier — ein
+                    // eigenes Banner sagt nichts, was hier nicht schon steht.
+                    tag = if (accessMissing) "Kein Zugang" else piProviderName(state.provider),
+                    tagWarning = accessMissing,
+                    onClick = { sheet = NewSessionSheet.MODEL },
                 )
-                selectedDescriptor?.let { descriptor ->
-                    SettingChip(
-                        label = "Modell",
-                        value = modelChipValue(
-                            model = state.model,
-                            reasoning = state.reasoning,
-                            canReason = descriptor.capabilities.reasoning,
-                        ),
-                        // Fehlt der Zugang, wird das Kennzeichen zur Warnung
-                        // — ein eigenes Banner sagt nichts, was hier nicht
-                        // schon steht.
-                        tag = if (accessMissing) {
-                            "Kein Zugang"
-                        } else {
-                            accessLabel(descriptor, state.provider)
-                        },
-                        tagWarning = accessMissing,
-                        onClick = { sheet = NewSessionSheet.MODEL },
-                    )
-                }
                 SettingChip(
                     label = "Autonomie",
                     value = modeLabel(state.mode),
@@ -634,7 +508,7 @@ fun NewSessionScreen(
                 )
                 // Netzwerk und Basis-Branch sind sicherheitsrelevant, aber
                 // ihr Default ist der empfohlene Fall — sie stehen darum
-                // nicht mehr gleichrangig neben Agent/Modell/Autonomie,
+                // nicht mehr gleichrangig neben Modell/Autonomie,
                 // sondern hinter einem benannten Chip statt einem anonymen
                 // Zahnrad (Fund: "'Erweitert' hinter anonymem Icon-Chip").
                 // Weicht die Wahl vom Default ab, sagt der Wert das.
@@ -643,18 +517,6 @@ fun NewSessionScreen(
                     value = advancedSummary(state.networkPolicy, state.branch),
                     onClick = { sheet = NewSessionSheet.ADVANCED },
                 )
-            }
-
-            // Der einzige Hinweis, der auf dem Screen bleibt: er gilt nicht
-            // für einen Wert, sondern für die Kombination aus Agent und
-            // Modus — und die sieht man nur hier zusammen.
-            selectedDescriptor?.let { selected ->
-                if (!selected.capabilities.approvals && state.mode != AgentMode.YOLO) {
-                    SectionNote(
-                        "${selected.name} kann nicht remote nachfragen – Ask und Accept Edits " +
-                            "laufen bei diesem Agenten ohne Rückfragen durch.",
-                    )
-                }
             }
 
             /* -------- Repository -------- */
@@ -683,38 +545,19 @@ fun NewSessionScreen(
     when (sheet) {
         null -> Unit
 
-        NewSessionSheet.AGENT -> SettingSheet(title = "Agent", onDismiss = { sheet = null }) {
-            // Erstauswahl statt Wechsel: hier gibt es noch keinen laufenden
-            // Agenten, dessen Kontext verloren gehen könnte. Ein Tipp
-            // genügt, deshalb kein Bestätigungsknopf.
-            AgentPickList(
-                adapters = adapters,
-                picked = state.adapter,
-                secretKinds = secretKinds,
-                compact = false,
-                onPick = { id ->
-                    adapters.firstOrNull { it.id == id }?.let { vm.onAdapterSelected(it, secretKinds) }
-                    sheet = null
-                },
-            )
-        }
-
-        NewSessionSheet.MODEL -> selectedDescriptor?.let { descriptor ->
-            ModelAccessSheet(
-                descriptor = descriptor,
-                provider = state.provider,
-                model = state.model,
-                reasoning = state.reasoning,
-                secretKinds = secretKinds,
-                knownModels = modelsByAdapter[descriptor.id].orEmpty(),
-                onDismiss = { sheet = null },
-                onOpenSettings = onOpenSettings,
-                onApply = { provider, model, reasoning ->
-                    vm.onModelPicked(provider, model, reasoning)
-                    sheet = null
-                },
-            )
-        }
+        NewSessionSheet.MODEL -> ModelAccessSheet(
+            provider = state.provider,
+            model = state.model,
+            reasoning = state.reasoning,
+            secretKinds = secretKinds,
+            knownModels = knownModels,
+            onDismiss = { sheet = null },
+            onOpenSettings = onOpenSettings,
+            onApply = { provider, model, reasoning ->
+                vm.onModelPicked(provider, model, reasoning)
+                sheet = null
+            },
+        )
 
         NewSessionSheet.MODE -> ModeSheet(
             current = state.mode,
@@ -738,22 +581,19 @@ fun NewSessionScreen(
 /* ------------------------------------------------------------------ */
 
 /**
- * Zugang, Modell und — wo der Agent es kann — die Reasoning-Stufe: alles,
- * was am Modell hängt, in einem Sheet. Für dieselbe Entscheidung soll es
- * keine zweite Stelle geben.
+ * Zugang, Modell und Reasoning-Stufe: alles, was am Modell hängt, in einem
+ * Sheet. Für dieselbe Entscheidung soll es keine zweite Stelle geben.
  *
  * Der echte Modell-Katalog kommt erst über `session.models.get` aus dem
- * laufenden Shim, und der existiert vor dem Anlegen noch nicht — [knownModels]
- * ist darum kein vollständiger, garantiert aktueller Katalog, sondern ein
- * Cache aus der letzten Session desselben Agenten (Fund: "Modell beim
- * Anlegen nur Freitext mit Format-Raten"). Gibt es noch keinen (erster
- * Agent-Start überhaupt), bleibt es beim Freitext — bewusst ohne eine
- * konkrete Modell-Id als Beispiel, die im nächsten Adapter-Release schon
- * veraltet wäre.
+ * laufenden Runner, und der existiert vor dem Anlegen noch nicht —
+ * [knownModels] ist darum kein vollständiger, garantiert aktueller Katalog,
+ * sondern ein Cache aus der letzten Session (Fund: "Modell beim Anlegen nur
+ * Freitext mit Format-Raten"). Gibt es noch keinen (erster Start überhaupt),
+ * bleibt es beim Freitext — bewusst ohne eine konkrete Modell-Id als
+ * Beispiel, die im nächsten pi-Release schon veraltet wäre.
  */
 @Composable
 private fun ModelAccessSheet(
-    descriptor: AdapterDescriptor,
     provider: String,
     model: String,
     reasoning: ReasoningEffort?,
@@ -763,8 +603,8 @@ private fun ModelAccessSheet(
     onOpenSettings: () -> Unit,
     onApply: (provider: String, model: String, reasoning: ReasoningEffort?) -> Unit,
 ) {
-    val known = remember(descriptor) { orderedProviderKeys(descriptor) }
-    // „Anderer …“ ist gewählt, sobald der Provider nicht aus dem Manifest kommt.
+    val known = remember { PI_PROVIDERS.map { it.id } }
+    // „Anderer …“ ist gewählt, sobald der Provider nicht aus der Tabelle kommt.
     var custom by remember(provider) { mutableStateOf(provider.isNotBlank() && provider !in known) }
     var picked by remember(provider) { mutableStateOf(provider.takeIf { it in known }.orEmpty()) }
     var typed by remember(provider) { mutableStateOf(if (provider in known) "" else provider) }
@@ -805,10 +645,11 @@ private fun ModelAccessSheet(
                     .heightIn(max = sheetPickListMaxHeight())
                     .verticalScroll(rememberScrollState()),
             ) {
-                known.forEach { key ->
+                PI_PROVIDERS.forEach { entry ->
+                    val key = entry.id
                     SelectableTile(
-                        title = providerDisplayName(key, descriptor),
-                        subtitle = accessLabel(descriptor, key),
+                        title = entry.name,
+                        subtitle = entry.hint,
                         selected = !custom && picked == key,
                         onClick = { custom = false; picked = key },
                         trailing = if (key !in secretKinds) {
@@ -892,13 +733,12 @@ private fun ModelAccessSheet(
                 }
             }
             SectionNote(
-                "Vorschläge aus einer früheren Session mit diesem Agenten – " +
-                    "nicht zwingend vollständig oder aktuell.",
+                "Vorschläge aus einer früheren Session – nicht zwingend vollständig oder aktuell.",
             )
         } else {
             SectionNote(
-                "Noch keine Modell-Vorschläge für diesen Agenten – sie erscheinen nach der " +
-                    "ersten Session. Leer lassen für den Standard des Agenten.",
+                "Noch keine Modell-Vorschläge – sie erscheinen nach der ersten Session. " +
+                    "Leer lassen für den Standard des Agenten.",
             )
         }
         AnimatedVisibility(
@@ -932,15 +772,13 @@ private fun ModelAccessSheet(
             }
         }
 
-        if (descriptor.capabilities.reasoning) {
-            SectionHeader("Reasoning")
-            ReasoningPickList(
-                current = effort,
-                onPick = { effort = it },
-                onDefault = { effort = null },
-            )
-            SectionNote("Wird gesetzt, sobald die Session steht.")
-        }
+        SectionHeader("Reasoning")
+        ReasoningPickList(
+            current = effort,
+            onPick = { effort = it },
+            onDefault = { effort = null },
+        )
+        SectionNote("Wird gesetzt, sobald die Session steht.")
 
         if (keyMissing && effectiveProvider.isNotBlank()) {
             // Auswahl vorher übernehmen, damit sie den Abstecher überlebt.

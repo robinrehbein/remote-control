@@ -24,7 +24,7 @@ function expect(cond: unknown, msg: string): asserts cond {
 
 expect(INITIAL_LINK_SESSION_STATUS === 'idle', 'a link session starts idle before any event');
 
-const statusEv = (busy: boolean): AgentEvent => ({ type: 'status', adapter: 'kilo', mode: 'ask', busy });
+const statusEv = (busy: boolean): AgentEvent => ({ type: 'status', mode: 'ask', busy });
 
 expect(nextLinkSessionStatus('idle', statusEv(true)) === 'busy', "a 'status' event with busy=true reports busy");
 expect(nextLinkSessionStatus('busy', statusEv(false)) === 'idle', "a 'status' event with busy=false reports idle");

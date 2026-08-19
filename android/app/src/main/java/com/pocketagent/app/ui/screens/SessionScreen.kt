@@ -15,13 +15,11 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
@@ -99,8 +97,6 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.pocketagent.app.PocketAgentApp
-import com.pocketagent.app.data.AdapterCapabilities
-import com.pocketagent.app.data.AdapterDescriptor
 import com.pocketagent.app.data.AgentEvent
 import com.pocketagent.app.data.AgentMode
 import com.pocketagent.app.data.AppRepository
@@ -127,20 +123,24 @@ import com.pocketagent.app.ui.theme.MotionMedium
 import com.pocketagent.app.ui.theme.MotionShort
 import com.pocketagent.app.ui.theme.OneUiEasing
 import com.pocketagent.app.ui.theme.PillShape
-import com.pocketagent.app.ui.theme.PrimaryButtonHeight
 import com.pocketagent.app.ui.theme.RadioRowDividerInset
 import com.pocketagent.app.ui.theme.ScreenGutter
 import com.pocketagent.app.ui.theme.semantic
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 /* ------------------------------------------------------------------ */
 /* Timeline: Modell und Reduktion liegen in Timeline.kt                */
 /* ------------------------------------------------------------------ */
+
+/**
+ * Textmarke des Runner-Image-Baus in den Fortschrittsmeldungen des Servers
+ * („Runner-Image wird gebaut …", „Image wird gebaut (Schritt 7/14)" —
+ * server/src/progress.ts: BUILD_MESSAGE). Der Bau hat in v2 keine eigene Phase
+ * mehr, läuft aber weiterhin minutenlang; daran hängt der Geduldshinweis.
+ */
+private const val IMAGE_BUILD_MARKER = "Image wird gebaut"
 
 /**
  * Was gerade beim Start passiert — immer nur der jüngste Stand, nie ein
@@ -198,17 +198,8 @@ class SessionViewModel : ViewModel() {
     private val _deleted = MutableStateFlow(false)
     val deleted: StateFlow<Boolean> = _deleted
 
-    private val _adapters = MutableStateFlow<List<AdapterDescriptor>>(emptyList())
-    val adapters: StateFlow<List<AdapterDescriptor>> = _adapters
-
     private val _models = MutableStateFlow<ModelsState>(ModelsState.Idle)
     val models: StateFlow<ModelsState> = _models
-
-    /** Capabilities des Adapters dieser Session (leer, solange nichts geladen ist). */
-    val capabilities: StateFlow<AdapterCapabilities> =
-        combine(_session, _adapters) { session, adapters ->
-            adapters.firstOrNull { it.id == session?.adapter }?.capabilities ?: AdapterCapabilities()
-        }.stateIn(viewModelScope, SharingStarted.Eagerly, AdapterCapabilities())
 
     fun bind(id: String, repo: AppRepository) {
         if (sessionId == id) return
@@ -228,9 +219,6 @@ class SessionViewModel : ViewModel() {
                 if (envelope.sessionId == id) applyEvent(envelope.event)
             }
         }
-        viewModelScope.launch {
-            repository.adapters.collect { list -> _adapters.value = list }
-        }
         // Beim Öffnen und nach jedem erfolgreichen (Wieder-)Verbinden den
         // gespeicherten Verlauf holen. connState ist ein StateFlow, der
         // aktuelle Wert kommt also sofort — steht die Verbindung schon,
@@ -244,7 +232,6 @@ class SessionViewModel : ViewModel() {
             }
         }
         viewModelScope.launch { repository.refreshSessions() }
-        viewModelScope.launch { if (repository.adapters.value.isEmpty()) repository.refreshAdapters() }
     }
 
     /* ---------------- Verlauf ---------------- */
@@ -373,17 +360,16 @@ class SessionViewModel : ViewModel() {
         }
     }
 
-    /* ---------------- Agent / Modus / Modell / Reasoning ---------------- */
+    /* ---------------- Modus / Modell / Reasoning ---------------- */
 
     private fun update(
         mode: AgentMode? = null,
         model: String? = null,
         reasoningEffort: ReasoningEffort? = null,
-        adapter: String? = null,
     ) {
         viewModelScope.launch {
             // Erfolgsfall aktualisiert die UI über das session.status-Handling
-            repository.updateSession(sessionId, mode, model, reasoningEffort, adapter)
+            repository.updateSession(sessionId, mode, model, reasoningEffort)
                 .onFailure {
                     // Kopfzeile bleibt handlungsleitend; der Servertext – falls
                     // vorhanden – steht nur als Nebensatz dahinter.
@@ -395,22 +381,10 @@ class SessionViewModel : ViewModel() {
 
     fun setMode(mode: AgentMode) = update(mode = mode)
 
-    /** Leerer String setzt auf den Adapter-Default zurück. */
+    /** Leerer String setzt auf den Standard des Agenten zurück. */
     fun setModel(model: String) = update(model = model.trim())
 
     fun setReasoning(effort: ReasoningEffort) = update(reasoningEffort = effort)
-
-    /**
-     * Agent der laufenden Session wechseln. Der Server startet den neuen
-     * Agenten asynchron auf dem aktuellen Code-Stand und meldet den
-     * Fortschritt als session.status ('starting' → 'idle').
-     */
-    fun setAdapter(adapterId: String) = update(adapter = adapterId)
-
-    /** Für die Zugangs-Punkte im Agent-Sheet. */
-    fun loadSecrets() {
-        viewModelScope.launch { repository.loadSecrets() }
-    }
 
     fun loadModels() {
         if (_models.value is ModelsState.Loading) return
@@ -462,11 +436,7 @@ fun SessionScreen(
     val busy by vm.busy.collectAsState()
     val progress by vm.progress.collectAsState()
     val deleted by vm.deleted.collectAsState()
-    val capabilities by vm.capabilities.collectAsState()
     val models by vm.models.collectAsState()
-    val adapters by vm.adapters.collectAsState()
-    val secrets by repository.secrets.collectAsState()
-    val secretKinds = remember(secrets) { secrets.map { it.kind }.toSet() }
 
     LaunchedEffect(deleted) { if (deleted) onBack() }
 
@@ -514,11 +484,12 @@ fun SessionScreen(
                         // Trägt die Session einen Titel, rutscht das Repository
                         // hier hinein — sonst stünde es nirgends mehr.
                         session?.let { s ->
-                            // Adapter und Autonomie stehen bereits als Chips unten,
-                            // dort auch änderbar (Fund: Adapter/Modus doppelt
-                            // sichtbar) — die StatusLine trägt nur noch, was die
-                            // Chips nicht tragen: Repository und eine Abweichung
-                            // vom sicheren Netzwerk-Default.
+                            // Autonomie, Modell und Reasoning stehen als Chips
+                            // unten, dort auch änderbar (Fund: dieselbe
+                            // Einstellung doppelt sichtbar) — die StatusLine
+                            // trägt nur noch, was die Chips nicht tragen:
+                            // Repository und eine Abweichung vom sicheren
+                            // Netzwerk-Default.
                             StatusLine(
                                 session = s,
                                 details = listOfNotNull(
@@ -637,8 +608,7 @@ fun SessionScreen(
                                 )
                             }
                         }
-                        // Kompakte Chip-Reihe: Agent und Modus immer, Modell und
-                        // Reasoning nur, wenn der Adapter sie wirklich unterstützt.
+                        // Kompakte Chip-Reihe: Autonomie, Modell, Reasoning.
                         // Während der Agent hochfährt ist nichts davon einstellbar.
                         session?.let { s ->
                             val chipsEnabled = s.status != SessionStatus.CREATING
@@ -651,15 +621,6 @@ fun SessionScreen(
                                     .padding(start = ScreenGutter, end = ScreenGutter, top = 2.dp, bottom = 4.dp),
                             ) {
                                 SettingChip(
-                                    label = "Agent",
-                                    value = adapterLabel(adapters, s.adapter),
-                                    enabled = chipsEnabled,
-                                    onClick = {
-                                        sheet = SessionSheet.AGENT
-                                        vm.loadSecrets()
-                                    },
-                                )
-                                SettingChip(
                                     // Derselbe Begriff wie beim Anlegen einer
                                     // Session (Fund: "Autonomie" vs. "Modus"
                                     // heißen dieselbe Einstellung anders).
@@ -668,25 +629,21 @@ fun SessionScreen(
                                     enabled = chipsEnabled,
                                     onClick = { sheet = SessionSheet.MODE },
                                 )
-                                if (capabilities.modelSwitch) {
-                                    SettingChip(
-                                        label = "Modell",
-                                        value = s.model.ifBlank { "Standard" },
-                                        enabled = chipsEnabled,
-                                        onClick = {
-                                            sheet = SessionSheet.MODEL
-                                            vm.loadModels()
-                                        },
-                                    )
-                                }
-                                if (capabilities.reasoning) {
-                                    SettingChip(
-                                        label = "Reasoning",
-                                        value = reasoningLabel(ReasoningEffort.fromRaw(s.reasoningEffort)),
-                                        enabled = chipsEnabled,
-                                        onClick = { sheet = SessionSheet.REASONING },
-                                    )
-                                }
+                                SettingChip(
+                                    label = "Modell",
+                                    value = s.model.ifBlank { "Standard" },
+                                    enabled = chipsEnabled,
+                                    onClick = {
+                                        sheet = SessionSheet.MODEL
+                                        vm.loadModels()
+                                    },
+                                )
+                                SettingChip(
+                                    label = "Reasoning",
+                                    value = reasoningLabel(ReasoningEffort.fromRaw(s.reasoningEffort)),
+                                    enabled = chipsEnabled,
+                                    onClick = { sheet = SessionSheet.REASONING },
+                                )
                             }
                         }
                         // Eingabefeld und Senden-Knopf teilen sich ComposerHeight,
@@ -826,14 +783,6 @@ fun SessionScreen(
     }
 
     when (sheet) {
-        SessionSheet.AGENT -> AgentSheet(
-            adapters = adapters,
-            current = session?.adapter.orEmpty(),
-            secretKinds = secretKinds,
-            onDismiss = { sheet = null },
-            onSwitch = { adapterId -> sheet = null; vm.setAdapter(adapterId) },
-        )
-
         SessionSheet.MODE -> ModeSheet(
             current = session?.mode,
             onDismiss = { sheet = null },
@@ -934,9 +883,14 @@ private fun StartProgressCard(progress: StartProgress) {
                     )
                 }
             }
-            if (progress.phase == StartPhase.IMAGE_BUILD) {
+            // v1 hatte für den Image-Bau eine eigene Phase; v2 meldet ihn als
+            // 'container-start' (der Server baut das eine Runner-Image beim
+            // ersten Session-Start selbst, server/src/docker.ts). Der Hinweis
+            // hing an der alten Phase und war damit unerreichbar geworden —
+            // deshalb hier zusätzlich an der Meldung erkannt.
+            if (progress.phase == StartPhase.IMAGE_BUILD || progress.message.contains(IMAGE_BUILD_MARKER)) {
                 Text(
-                    text = "Der erste Start eines Agenten dauert einige Minuten – sein Image wird einmalig gebaut.",
+                    text = "Der erste Start dauert einige Minuten – das Image wird einmalig gebaut.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 8.dp),
@@ -976,14 +930,10 @@ private fun StartProgressCard(progress: StartProgress) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Agent / Modus / Modell / Reasoning — Chips + Bottom Sheets          */
+/* Modus / Modell / Reasoning — Chips + Bottom Sheets                  */
 /* ------------------------------------------------------------------ */
 
-enum class SessionSheet { AGENT, MODE, MODEL, REASONING }
-
-/** Anzeigename des Adapters; ohne Manifest bleibt die rohe Id stehen. */
-fun adapterLabel(adapters: List<AdapterDescriptor>, id: String): String =
-    adapters.firstOrNull { it.id == id }?.name ?: id
+enum class SessionSheet { MODE, MODEL, REASONING }
 
 /**
  * Deutsche Labels statt englischem Jargon ('Yolo', 'Ask', 'Accept Edits') in
@@ -1130,125 +1080,6 @@ fun SettingIconChip(
         }
     }
 }
-
-/**
- * Agent der laufenden Session wechseln. Die Liste ist dieselbe wie beim
- * Anlegen einer Session; der Hinweis darunter sagt, was der Wechsel kostet.
- */
-@Composable
-private fun AgentSheet(
-    adapters: List<AdapterDescriptor>,
-    current: String,
-    secretKinds: Set<String>,
-    onDismiss: () -> Unit,
-    onSwitch: (String) -> Unit,
-) {
-    var picked by remember(current) { mutableStateOf(current) }
-    SettingSheet(
-        title = "Agent",
-        onDismiss = onDismiss,
-        // Steht fest über der Unterkante, statt mit der Liste wegzuscrollen.
-        actions = {
-            Button(
-                onClick = { onSwitch(picked) },
-                enabled = picked.isNotBlank() && picked != current,
-                shape = PillShape,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = ScreenGutter, vertical = 10.dp)
-                    .heightIn(min = PrimaryButtonHeight),
-            ) {
-                Text("Agent wechseln")
-            }
-        },
-    ) {
-        AgentPickList(
-            adapters = adapters,
-            picked = picked,
-            secretKinds = secretKinds,
-            onPick = { picked = it },
-        )
-        SectionNote(
-            "Der neue Agent startet frisch auf dem aktuellen Code-Stand dieser Session. " +
-                "Der bisherige Gesprächskontext des Agenten geht verloren; der Verlauf hier " +
-                "bleibt sichtbar.",
-        )
-    }
-}
-
-/**
- * Die Agentenliste, wie sie beide Screens zeigen — beim Wechsel einer
- * laufenden Session und beim Anlegen einer neuen. Eine Liste, damit ein
- * Agent an beiden Stellen gleich heißt und gleich aussieht.
- *
- * [compact] entscheidet, wie viel vom Manifest mitkommt: im Wechsel-Sheet
- * genügt die erste Zeile der Beschreibung, weil der Agent dort schon gewählt
- * war. Beim Anlegen ist es eine echte Erstauswahl — dort steht die ganze
- * Beschreibung und dazu, was der Agent kann.
- */
-@Composable
-fun AgentPickList(
-    adapters: List<AdapterDescriptor>,
-    picked: String,
-    secretKinds: Set<String>,
-    onPick: (String) -> Unit,
-    compact: Boolean = true,
-) {
-    GroupCard {
-        Column(
-            // Eigene Höhengrenze, weil diese Liste in einer scrollbaren
-            // Fläche steckt: eine unbegrenzte scrollbare Fläche in einer
-            // scrollbaren Fläche hat keine sinnvolle Höhe. Die Grenze richtet
-            // sich nach dem Platz, der wirklich da ist (siehe
-            // pickListMaxHeight) — quer und mit offener Tastatur ist das
-            // weniger als hochkant.
-            modifier = Modifier
-                .heightIn(max = sheetPickListMaxHeight())
-                .verticalScroll(rememberScrollState()),
-        ) {
-            adapters.forEachIndexed { index, descriptor ->
-                if (index > 0) ListDivider(RadioRowDividerInset)
-                val caps = descriptor.capabilities
-                SelectableTile(
-                    title = descriptor.name,
-                    subtitle = if (compact) {
-                        shortDescription(descriptor.description)
-                    } else {
-                        descriptor.description?.takeIf { it.isNotBlank() }
-                    },
-                    selected = picked == descriptor.id,
-                    onClick = { onPick(descriptor.id) },
-                    trailing = if (!adapterKeyPresent(descriptor, secretKinds)) {
-                        { DotLabel(color = semantic().warning, label = "Kein Zugang") }
-                    } else {
-                        null
-                    },
-                    extra = if (!compact && (caps.approvals || caps.resume || caps.streaming)) {
-                        {
-                            FlowRow(
-                                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                verticalArrangement = Arrangement.spacedBy(4.dp),
-                            ) {
-                                if (caps.approvals) InfoChip("Rückfragen")
-                                if (caps.resume) InfoChip("Fortsetzen")
-                                if (caps.streaming) InfoChip("Streaming")
-                            }
-                        }
-                    } else {
-                        null
-                    },
-                )
-            }
-        }
-    }
-}
-
-/** Erste Zeile der Adapter-Beschreibung, auf Sheet-Länge gekürzt. */
-private fun shortDescription(raw: String?): String? =
-    raw?.takeIf { it.isNotBlank() }
-        ?.lineSequence()
-        ?.first()
-        ?.let { if (it.length > 64) it.take(63).trimEnd() + "…" else it }
 
 /**
  * Die Autonomieliste — dieselbe Einstellung, dieselbe Beschriftung an beiden

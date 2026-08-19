@@ -1,22 +1,21 @@
 {
   "name": "pocketagent",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "Provider-agnostic mobile agent platform: Android app + orchestrator + adapter shim plugins (kilo, claude, pi, junie, codex)",
+  "description": "PocketAgent v2 (pi-only): Android-Fernbedienung für den pi-Coding-Agenten — Orchestrator, Runner-Image und Link-Agent",
   "type": "module",
   "workspaces": [
     "packages/*",
     "server",
-    "link",
-    "cli",
-    "shims/*"
+    "link"
   ],
   "scripts": {
-    "typecheck": "tsc -p packages/protocol && tsc -p server && tsc -p link && tsc -p cli && tsc -p shims/kilo && tsc -p shims/claude && tsc -p shims/pi && tsc -p shims/junie && tsc -p shims/codex",
+    "typecheck": "tsc -p packages/protocol && tsc -p server && tsc -p link && tsc -p runner",
+    "test": "npm run test -w packages/protocol --if-present && npm run test -w link --if-present",
     "smoke:server": "npm run smoke -w server --if-present",
+    "smoke:runner": "cd runner && npm run smoke",
     "smoke:link": "npm run smoke -w link --if-present",
-    "smoke:shims": "npm run smoke -w shims/kilo --if-present && npm run smoke -w shims/claude --if-present && npm run smoke -w shims/pi --if-present && npm run smoke -w shims/junie --if-present && npm run smoke -w shims/codex --if-present",
-    "smoke:real": "npm run smoke:real -w shims/pi --if-present && npm run smoke:real -w shims/claude --if-present"
+    "smoke:real": "cd runner && npm run smoke:real"
   },
   "engines": {
     "node": ">=22"

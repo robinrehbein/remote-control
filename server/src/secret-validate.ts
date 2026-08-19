@@ -61,16 +61,16 @@ const openAiStyle = (url: string): Check => ({
 });
 
 /**
- * Known-good endpoints only. `zai` is deliberately absent: the public Z.AI
- * base is `https://api.z.ai/api/paas/v4/`, but no model-listing path there is
- * confirmed, and a 404 from a guessed path would read as "key broken".
+ * Nur belegte Endpunkte, und nur für die Arten aus `SECRET_KINDS` (pi-Provider
+ * + github). `zai` fehlt bewusst: die öffentliche Z.AI-Basis ist
+ * `https://api.z.ai/api/paas/v4/`, ein Modell-Listing-Pfad darunter ist aber
+ * nicht bestätigt - ein 404 von einem geratenen Pfad läse sich als „Key kaputt".
+ * Es fällt damit auf `unverified` zurück und wird trotzdem gespeichert.
  */
 const CHECKS: Record<string, Check> = {
   openai: openAiStyle('https://api.openai.com/v1/models'),
-  groq: openAiStyle('https://api.groq.com/openai/v1/models'),
   moonshot: openAiStyle('https://api.moonshot.ai/v1/models'),
   kimi: openAiStyle('https://api.moonshot.ai/v1/models'),
-  xai: openAiStyle('https://api.x.ai/v1/models'),
   anthropic: {
     url: () => 'https://api.anthropic.com/v1/models',
     headers: (value) => ({ 'x-api-key': value, 'anthropic-version': '2023-06-01' }),
@@ -83,17 +83,6 @@ const CHECKS: Record<string, Check> = {
     detail: (body) => {
       const models = (body as { models?: unknown } | null)?.models;
       return modelsDetail(Array.isArray(models) ? models.length : null);
-    },
-  },
-  openrouter: {
-    // /api/v1/models answers 200 without any key, so it cannot validate one;
-    // /api/v1/key is the key-scoped endpoint.
-    url: () => 'https://openrouter.ai/api/v1/key',
-    headers: bearer,
-    detail: (body) => {
-      const data = (body as { data?: { label?: unknown; limit?: unknown; usage?: unknown } } | null)?.data;
-      const label = typeof data?.label === 'string' && data.label.length > 0 ? data.label : null;
-      return label ? `Key „${label}" aktiv` : 'Key aktiv';
     },
   },
   github: {

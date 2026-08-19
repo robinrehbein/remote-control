@@ -1,11 +1,23 @@
 name: Build & Push Images
 
+# In v1 baute dieser Workflow das Orchestrator-Image und fünf Adapter-Shims.
+# In v2 gibt es nur noch zwei Images, und eines davon muss hier gar nicht
+# entstehen: `pocketagent/pi-runner` baut der Orchestrator beim ersten
+# Session-Start selbst über die Docker-API, aus dem Build-Kontext, den sein
+# eigenes Image unter /app/build-context mitbringt (server/src/docker.ts,
+# ensureRunnerImage). Ein Registry-Push des Runners ist also nirgends
+# Voraussetzung — er ist nur die Abkürzung für Betreiber, die das Artefakt
+# selbst besitzen und den Server per RUNNER_IMAGE darauf zeigen lassen wollen
+# (dann wird nur gepullt, nie gebaut).
+#
+# Beide Images werden aus dem Repo-ROOT gebaut; die Kontexte teilen sich
+# tsconfig.base.json und packages/protocol.
 on:
   push:
     branches: [main]
     paths:
       - "server/**"
-      - "shims/**"
+      - "runner/**"
       - "packages/protocol/**"
       - ".github/workflows/images.yml"
   workflow_dispatch:
@@ -26,11 +38,7 @@ jobs:
       matrix:
         include:
           - { name: orchestrator, dockerfile: server/Dockerfile, image: orchestrator }
-          - { name: kilo-shim, dockerfile: shims/kilo/Dockerfile, image: kilo-shim }
-          - { name: claude-shim, dockerfile: shims/claude/Dockerfile, image: claude-shim }
-          - { name: pi-shim, dockerfile: shims/pi/Dockerfile, image: pi-shim }
-          - { name: junie-shim, dockerfile: shims/junie/Dockerfile, image: junie-shim }
-          - { name: codex-shim, dockerfile: shims/codex/Dockerfile, image: codex-shim }
+          - { name: pi-runner, dockerfile: runner/Dockerfile, image: pi-runner }
     steps:
       - uses: actions/checkout@v4
 

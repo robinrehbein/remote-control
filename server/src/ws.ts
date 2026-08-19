@@ -2,16 +2,14 @@ import { randomUUID } from 'node:crypto';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import type { RawData, WebSocket } from 'ws';
 import type { ClientMessage, ServerMessage } from '@pocketagent/protocol';
-import { WS_CLOSE_REPLACED, WS_CLOSE_TOO_MANY_CONNECTIONS, WS_CLOSE_UNAUTHORIZED } from '@pocketagent/protocol';
+import { SECRET_KINDS, WS_CLOSE_REPLACED, WS_CLOSE_TOO_MANY_CONNECTIONS, WS_CLOSE_UNAUTHORIZED } from '@pocketagent/protocol';
 import { SERVER_VERSION } from './config.js';
 import { sha256 } from './db.js';
 import type { Store } from './db.js';
-import { listAdapters } from './adapters.js';
 import type { SessionManager } from './sessions.js';
-import type { CodexAuthManager } from './codex-auth.js';
 import { encrypt } from './vault.js';
 import { validateSecret } from './secret-validate.js';
-import { isValidSecretKind } from './secrets-api.js';
+import { isKnownSecretKind, isValidSecretKind } from './secrets-api.js';
 
 /** Security audit line (stdout-warn JSON; never log tokens). */
 function auditWarn(kind: string, fields: Record<string, unknown>): void {
@@ -240,8 +238,8 @@ export class Hub {
   }
 }
 
-type FcmRegisterMessage = { type: 'fcm.register'; token: string };
-type AppClientMessage = ClientMessage | FcmRegisterMessage;
+/** `fcm.register` ist seit dem pi-Contract Teil von `ClientMessage`. */
+type AppClientMessage = ClientMessage;
 /** Incoming frames on a link socket (link -> server uses ServerMessage variants). */
 type LinkInMessage = Extract<
   ServerMessage,
@@ -258,7 +256,6 @@ export function registerWs(
   manager: SessionManager,
   hub: Hub,
   heartbeat?: Heartbeat,
-  codexAuth?: CodexAuthManager,
   authTimeoutMs: number = WS_AUTH_TIMEOUT_MS,
 ): void {
   // maxPayload (1 MiB) is enforced at the websocket plugin registration in index.ts.
@@ -292,9 +289,6 @@ export function registerWs(
     let role: 'device' | 'link' = 'device';
     let deviceId: string | null = null;
     let linkId: string | null = null;
-    // In-flight codex auth flows this socket started (cancelled on disconnect so
-    // an orphaned flow's auth container is torn down when the app goes away).
-    const authRequests = new Set<string>();
 
     // Neither hello variant arrived in time: close before the heartbeat ever
     // gets a chance to keep this socket alive on protocol pongs alone.
@@ -418,15 +412,8 @@ export function registerWs(
       void handle(msg).catch((e) => send({ type: 'error', message: errText(e) }));
     });
 
-    const cleanupAuth = (): void => {
-      if (!codexAuth || authRequests.size === 0) return;
-      const ids = new Set(authRequests);
-      authRequests.clear();
-      codexAuth.cancelAll((requestId) => ids.has(requestId));
-    };
     socket.on('close', () => {
       hub.remove(socket);
-      cleanupAuth();
       if (role === 'link' && linkId) {
         // dropLink is identity-guarded; only report the link as gone when no
         // other socket has taken over in the meantime. The displaced socket's
@@ -439,7 +426,6 @@ export function registerWs(
     });
     socket.on('error', () => {
       hub.remove(socket);
-      cleanupAuth();
       if (role === 'link' && linkId) {
         hub.dropLink(linkId, socket);
         if (!hub.hasLink(linkId)) manager.linkDisconnected(linkId);
@@ -485,12 +471,10 @@ export function registerWs(
           return;
         case 'session.update': {
           try {
-            const { session, reprovision } = manager.updateSession(msg);
-            // session.status already went to every device; ack the requester
+            // updateSession hat die aktualisierte Session bereits an alle
+            // Geräte gesendet; hier wird nur der Anfragende quittiert.
+            const session = manager.updateSession(msg);
             send({ type: 'request.ok', requestId: msg.requestId, payload: { session } });
-            // A harness switch recreates the container (possibly building its
-            // image first, minutes): ack first, report progress/errors as events.
-            if (reprovision) void reprovision();
           } catch (e) {
             send({ type: 'error', requestId: msg.requestId, sessionId: msg.sessionId, message: errText(e) });
           }
@@ -589,9 +573,6 @@ export function registerWs(
           }
           return;
         }
-        case 'adapter.list':
-          send({ type: 'adapter.list', requestId: msg.requestId, adapters: listAdapters() });
-          return;
         case 'repo.list': {
           const repos = store.listRepos('default').map((r) => ({
             id: r.id,
@@ -619,14 +600,25 @@ export function registerWs(
           return;
         }
         case 'secret.set': {
-          // Same shape check as the REST path (secrets-api.ts KIND_RE): an
-          // unvalidated kind lands verbatim in the AAD string below, and a
-          // kind containing ':' makes that namespace ambiguous.
+          // Zwei Prüfungen: die Form (wie im REST-Pfad, secrets-api.ts KIND_RE -
+          // eine ungeprüfte Art landet unverändert im AAD-String unten, und ein
+          // ':' darin macht dessen Namensraum mehrdeutig) und die Zugehörigkeit
+          // zu `SECRET_KINDS` aus dem Protokoll. In v1 stand hier nur die Form:
+          // eine vertippte Art wurde stillschweigend gespeichert und tauchte in
+          // der App als Secret auf, das nie eine Session erreicht.
           if (!isValidSecretKind(msg.kind)) {
             send({
               type: 'error',
               requestId: msg.requestId,
               message: 'invalid kind (expected lowercase [a-z0-9_-]{1,64})',
+            });
+            return;
+          }
+          if (!isKnownSecretKind(msg.kind)) {
+            send({
+              type: 'error',
+              requestId: msg.requestId,
+              message: `unknown secret kind "${msg.kind}" (expected one of ${SECRET_KINDS.join(', ')})`,
             });
             return;
           }
@@ -669,29 +661,6 @@ export function registerWs(
         case 'secret.delete':
           store.deleteSecret(msg.id, 'default');
           send({ type: 'secret.deleted', requestId: msg.requestId, id: msg.id });
-          return;
-        case 'auth.start': {
-          if (!codexAuth) {
-            send({ type: 'auth.done', requestId: msg.requestId, ok: false, error: 'In-App-Login ist auf diesem Server nicht verfügbar' });
-            return;
-          }
-          authRequests.add(msg.requestId);
-          // auth.done (success or failure) is delivered via `send`; drop the id
-          // from the socket's set on either close event fired by the manager.
-          await codexAuth.start(msg.requestId, msg.adapter, msg.flow, (m) => {
-            if (m.type === 'auth.done') authRequests.delete(msg.requestId);
-            send(m);
-          });
-          return;
-        }
-        case 'auth.callback':
-          if (codexAuth) await codexAuth.callback(msg.requestId, msg.code, msg.state);
-          return;
-        case 'auth.cancel':
-          if (codexAuth) {
-            authRequests.delete(msg.requestId);
-            codexAuth.cancel(msg.requestId);
-          }
           return;
         case 'device.list': {
           // Single-tenant trust model: any authenticated device may list/revoke.

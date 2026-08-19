@@ -1,182 +1,260 @@
 /**
- * PocketAgent shared protocol.
+ * PocketAgent v2 — gemeinsames Protokoll (pi-only).
  *
- * Single source of truth for:
- *  - Shim REST API (orchestrator -> session container), see docs in /README.md
- *  - Normalized agent event stream (SSE from shim, forwarded over WS to the app)
- *  - App <-> Orchestrator WebSocket messages
- *  - Pairing REST types
+ * Einzige Quelle der Wahrheit für:
+ *  - den REST-Contract Orchestrator -> Runner (im Session-Container bzw.
+ *    in-process im Link-Agent): POST /prompt, /abort, /resume,
+ *    /permissions/:id, GET /status, /models, /diff, /events
+ *  - den normalisierten Event-Strom (SSE vom Runner, per WS an die App)
+ *  - die WebSocket-Nachrichten App <-> Orchestrator
+ *  - das Link-Protokoll (Heartbeat, Session-Announce, terminale Close-Codes)
+ *  - die Pairing-REST-Typen
+ *  - die pi-Tabellen (Provider -> Env-Var, Modi-Semantik), die Server, Runner
+ *    und App früher jeweils für sich hielten
  *
- * Pure TypeScript types, zero runtime dependencies, and at the end of this file
- * the one deliberate exception: pure helpers used verbatim by the kilo shim
- * (kilo is an OpenCode fork and speaks the same wire format).
+ * Das Wire-Format ist zu v1 kompatibel für alles, was übernommen wurde — die
+ * App verlässt sich darauf. Entfallen ist ausschließlich die Multi-Adapter-
+ * Schicht (siehe GREENFIELD-PI.md): AdapterDescriptor/-Manifest, AuthFlow und
+ * die Codex-OAuth-Nachrichten (`auth.*`), `adapter.list` sowie das Feld
+ * `adapter` in `session.create`/`session.update`/`SessionInfo`/`ShimStatus`/
+ * `agent.hello`. Empfänger ignorieren unbekannte JSON-Felder, ein alter Client
+ * der `adapter` noch mitsendet wird also nicht abgewiesen — der Server liest es
+ * schlicht nicht mehr.
  *
- * This package MUST stay a single file. Shim containers run compiled JS on
- * plain node and load this package as TypeScript source via node's type
- * stripping, which - unlike tsx and tsc - does not resolve a './x.js' import
- * onto './x.ts'. A second file would therefore load everywhere in development
- * and crash every session container at startup.
+ * Dieses Paket MUSS eine einzige Datei bleiben und ohne Laufzeit-Abhängigkeiten
+ * auskommen: der Runner-Container lädt es als TypeScript-Quelle über Nodes
+ * Type-Stripping, und das löst — anders als tsx und tsc — einen Import
+ * './x.js' nicht auf './x.ts' auf. Eine zweite Datei würde in der Entwicklung
+ * überall laden und jeden Session-Container beim Start zerlegen. Aus demselben
+ * Grund importiert hier nichts aus `node:*`: Senken und Umgebungen kommen als
+ * strukturelle Typen bzw. als Record herein.
  */
 
 /* ------------------------------------------------------------------ */
-/* Common enums                                                        */
+/* pi: Provider-Tabelle (Quelle: ehemals shims/pi/adapter.json)        */
 /* ------------------------------------------------------------------ */
 
 /**
- * Adapter ids are open-ended: built-in ids are 'kilo' | 'claude' | 'pi' |
- * 'junie', but the server loads adapters from manifests at boot, so any
- * harness plugin can register additional ids.
+ * Provider -> Env-Variable, unter der der Runner-Container den API-Key
+ * erwartet. Der Orchestrator baut daraus die Container-Umgebung (genau der
+ * Key des gewählten Providers wird injiziert, nie alle), der Runner liest die
+ * Variable, und die App benutzt dieselben Ids als `SecretKind`.
+ *
+ * `moonshot` und `kimi` teilen sich bewusst `KIMI_API_KEY`: pi spricht beide
+ * Kataloge über dieselbe Moonshot-Plattform an, die Ids bleiben trotzdem
+ * getrennt, weil die Modellkataloge unterschiedlich heißen.
  */
-export type AdapterId = (string & {});
+export const PI_PROVIDER_ENV = Object.freeze({
+  openai: 'OPENAI_API_KEY',
+  zai: 'ZAI_API_KEY',
+  moonshot: 'KIMI_API_KEY',
+  kimi: 'KIMI_API_KEY',
+  anthropic: 'ANTHROPIC_API_KEY',
+  google: 'GEMINI_API_KEY',
+} as const);
 
-export interface AdapterCapabilities {
-  /** Remote permission flow (permission.request events + /permissions/:id). */
-  approvals: boolean;
-  /** Runtime-native session resume across container restarts. */
-  resume: boolean;
-  /** Token-level message deltas vs turn-granularity only. */
-  streaming: boolean;
-  /** Shim performs auto-push + draft PR itself (yolo mode). */
-  autoPush: boolean;
-  /**
-   * Shim maps `PromptRequest.reasoningEffort` onto a runtime option.
-   * Optional for backwards compatibility; treated as false when absent.
-   */
-  reasoning?: boolean;
-  /**
-   * Shim honours `PromptRequest.model` per prompt (live model switching).
-   * Optional for backwards compatibility; treated as false when absent.
-   */
-  modelSwitch?: boolean;
-}
+/** Die von pi unterstützten Provider-Ids (Schlüssel von `PI_PROVIDER_ENV`). */
+export type PiProviderId = keyof typeof PI_PROVIDER_ENV;
 
 /**
- * Human-facing metadata for one credential an adapter can use. Purely
- * cosmetic: the app renders display names, "create key" links and setup
- * hints from it instead of hard-coding a provider table.
+ * Menschenlesbare Metadaten zu einem Provider-Key. Rein kosmetisch: die App
+ * rendert Anzeigename, „Key anlegen"-Link und Einrichtungshinweis daraus,
+ * statt eine eigene Tabelle zu pflegen.
  */
 export interface ProviderDescriptor {
-  /** Secret kind == provider key, i.e. a key of `providerEnv` or `credentials`. */
-  id: string;
-  /** Display name, e.g. "Google Gemini". */
+  /** Provider-Id == Schlüssel von `PI_PROVIDER_ENV` == `SecretKind`. */
+  id: PiProviderId;
+  /** Anzeigename, z. B. "Google Gemini". */
   name: string;
-  /** Page where the user creates/copies the key. */
+  /** Seite, auf der der Nutzer den Key anlegt/kopiert. */
   keyUrl?: string;
-  /** One-line setup hint shown in the secret dialog. */
+  /** Einzeiler für den Secret-Dialog. */
   hint?: string;
 }
 
 /**
- * Adapter plugin manifest. Each `shims/<id>/adapter.json` describes one
- * harness; the orchestrator registry loads them at boot and serves the list
- * to apps via `adapter.list`.
+ * Reihenfolge ist Anzeigereihenfolge in der App (häufigster Provider zuerst).
+ * Die Hinweise sind absichtlich deutsch — sie erscheinen unverändert in der UI.
  */
-export interface AdapterDescriptor {
-  id: AdapterId;
+export const PI_PROVIDERS: readonly ProviderDescriptor[] = Object.freeze([
+  { id: 'openai', name: 'OpenAI', keyUrl: 'https://platform.openai.com/api-keys', hint: 'API-Key von platform.openai.com (sk-…)' },
+  { id: 'zai', name: 'Z.AI', keyUrl: 'https://z.ai/manage-apikey/apikey-list', hint: 'API-Key aus dem Z.AI-Dashboard' },
+  { id: 'moonshot', name: 'Moonshot', keyUrl: 'https://platform.moonshot.ai/console/api-keys', hint: 'API-Key von platform.moonshot.ai' },
+  { id: 'kimi', name: 'Kimi', keyUrl: 'https://platform.moonshot.ai/console/api-keys', hint: 'API-Key von platform.moonshot.ai (gleicher Key wie Moonshot)' },
+  { id: 'anthropic', name: 'Anthropic', keyUrl: 'https://console.anthropic.com/settings/keys', hint: 'API-Key von console.anthropic.com (sk-ant-…)' },
+  { id: 'google', name: 'Google Gemini', keyUrl: 'https://aistudio.google.com/apikey', hint: 'API-Key aus Google AI Studio' },
+] as const satisfies readonly ProviderDescriptor[]);
+
+/** Provider-Ids in Anzeigereihenfolge — abgeleitet, damit nichts driften kann. */
+export const PI_PROVIDER_IDS: readonly PiProviderId[] = Object.freeze(PI_PROVIDERS.map((p) => p.id));
+
+/** Vorgabe für neue Sessions, wenn die App keinen Provider mitschickt. */
+export const PI_DEFAULT_PROVIDER: PiProviderId = 'openai';
+
+/** True für eine Id, die pi kennt (Eingangsprüfung für WS/REST-Payloads). */
+export function isPiProvider(id: string): id is PiProviderId {
+  return Object.prototype.hasOwnProperty.call(PI_PROVIDER_ENV, id);
+}
+
+/**
+ * Env-Variable für einen Provider oder `undefined` für eine unbekannte Id.
+ * Der Orchestrator injiziert dann keinen Key, statt einen falschen Namen zu
+ * setzen — der Runner meldet den fehlenden Key sauber als Turn-Fehler.
+ */
+export function piProviderEnvVar(provider: string): string | undefined {
+  return isPiProvider(provider) ? PI_PROVIDER_ENV[provider] : undefined;
+}
+
+/* ------------------------------------------------------------------ */
+/* pi: Modi-Semantik                                                   */
+/* ------------------------------------------------------------------ */
+
+/** Reihenfolge = Anzeigereihenfolge (von „freilaufend" nach „streng"). */
+export const AGENT_MODES = Object.freeze(['yolo', 'auto', 'acceptEdits', 'ask'] as const);
+
+export type AgentMode = (typeof AGENT_MODES)[number];
+
+/** Vorgabe, wenn weder Session noch Prompt einen Modus setzen. */
+export const DEFAULT_AGENT_MODE: AgentMode = 'ask';
+
+export function isAgentMode(value: string): value is AgentMode {
+  return (AGENT_MODES as readonly string[]).includes(value);
+}
+
+/** Gating-Stufe eines Tool-Typs: nie / nur riskante Aufrufe / immer nachfragen. */
+export type GateLevel = 'none' | 'risky' | 'all';
+
+/**
+ * Was ein Modus konkret bedeutet. Bisher stand diese Matrix nur als Kommentar
+ * an der Approval-Weiche im pi-Shim; App (Modus-Auswahl), Server (AUTO_PUSH)
+ * und Runner (Gating) sollen dieselbe Quelle lesen.
+ *
+ * Reine Lese-Tools (read/grep/glob/…) werden in *keinem* Modus gegated — das
+ * ist Eigenschaft des Tools, nicht des Modus, und taucht deshalb hier nicht auf.
+ */
+export interface PiModeSemantics {
+  id: AgentMode;
+  /** Kurzlabel für die App. */
   name: string;
-  description?: string;
-  /** Docker image; falls back to `<ADAPTER_IMAGE_PREFIX>/<id>-shim:latest` when omitted. */
-  image?: string;
-  /** In-container path of the standalone push script (tap-push); default `/app/shims/<id>/scripts/push.js`. */
-  pushScript?: string;
-  capabilities: AdapterCapabilities;
-  /**
-   * Fixed credential injection: secret kind -> env vars that are always set
-   * when a secret of that kind exists (e.g. claude_oauth -> CLAUDE_CODE_OAUTH_TOKEN).
-   */
-  credentials?: Record<string, string[]>;
-  /**
-   * Provider-key mapping: provider name (== secret kind) -> env var, injected
-   * based on the session's chosen provider (e.g. openai -> OPENAI_API_KEY).
-   */
-  providerEnv?: Record<string, string>;
-  /**
-   * Optional display metadata for the credentials above (ids are the same
-   * secret kinds). Absent on older manifests — the app falls back to its own
-   * table then.
-   */
-  providers?: ProviderDescriptor[];
-  /**
-   * How a user signs this adapter in, declared by the manifest so the app can
-   * render the right login affordance generically instead of hard-coding a
-   * per-adapter table (CODEX-OAUTH.md §5). Absent on older manifests — the app
-   * then offers only the plain secret-paste flow it always had.
-   */
-  authFlows?: AuthFlow[];
-  defaults: { provider: string; model?: string };
+  /** Auto-Commit + Push + Draft-PR nach jedem abgeschlossenen Turn. */
+  autoPush: boolean;
+  /** Gating für Shell-Aufrufe. `risky` = nur bei erkannt gefährlichem Kommando. */
+  bash: GateLevel;
+  /** Gating für Datei-Änderungen (edit/write). */
+  edits: Extract<GateLevel, 'none' | 'all'>;
+  /** Gating für alle übrigen, nicht lesenden Tools (webfetch, externe Aufrufe …). */
+  otherTools: Extract<GateLevel, 'none' | 'all'>;
+  /** Einzeiler für die Modus-Auswahl in der App. */
+  hint: string;
 }
 
 /**
- * One sign-in method an adapter supports (AdapterDescriptor.authFlows):
- *  - `oauth-loopback`: browser login whose provider redirects to a localhost
- *    callback (codex: 127.0.0.1:1455, fallback 1457). `ports` lists the ports
- *    the provider's redirect allowlist permits; the app opens the auth URL and
- *    runs a matching loopback listener (see the `auth.*` messages below).
- *  - `device-code`: the provider shows a verification URL + a short user code
- *    the user enters on any device; no loopback listener needed.
- *  - `token-paste`: the user pastes a long-lived token from a CLI (`hint`
- *    names it, e.g. "claude setup-token").
- *  - `api-key`: a plain provider API key (`keyUrl` links the create-key page).
- * The type stays open so a new flow needs no protocol change; an app that does
- * not know a type simply skips it.
+ * Die vier Modi. `yolo` ist der einzige Modus mit Auto-Push: er ist als
+ * „laufen lassen und Ergebnis als Draft-PR abholen" gedacht, alle anderen
+ * pushen erst auf Tap (`session.push`).
  */
-export type AuthFlowType = 'oauth-loopback' | 'device-code' | 'token-paste' | 'api-key' | (string & {});
-
-export interface AuthFlow {
-  type: AuthFlowType;
-  /** oauth-loopback: the localhost ports the provider's redirect allowlist permits. */
-  ports?: number[];
-  /** token-paste: names the CLI command that mints the token. */
-  hint?: string;
-  /** api-key: page where the user creates/copies the key. */
-  keyUrl?: string;
-}
-
-export type AgentMode = 'yolo' | 'auto' | 'acceptEdits' | 'ask';
+export const PI_MODE_SEMANTICS: Readonly<Record<AgentMode, PiModeSemantics>> = Object.freeze({
+  yolo: {
+    id: 'yolo',
+    name: 'Yolo',
+    autoPush: true,
+    bash: 'none',
+    edits: 'none',
+    otherTools: 'none',
+    hint: 'Keine Rückfragen; pusht nach jedem Turn und legt einen Draft-PR an.',
+  },
+  auto: {
+    id: 'auto',
+    name: 'Auto',
+    autoPush: false,
+    bash: 'risky',
+    edits: 'none',
+    otherTools: 'all',
+    hint: 'Änderungen laufen durch; nur riskante Shell-Kommandos werden nachgefragt.',
+  },
+  acceptEdits: {
+    id: 'acceptEdits',
+    name: 'Edits ok',
+    autoPush: false,
+    bash: 'all',
+    edits: 'none',
+    otherTools: 'all',
+    hint: 'Datei-Änderungen laufen durch, jedes Shell-Kommando wird nachgefragt.',
+  },
+  ask: {
+    id: 'ask',
+    name: 'Nachfragen',
+    autoPush: false,
+    bash: 'all',
+    edits: 'all',
+    otherTools: 'all',
+    hint: 'Fragt vor jeder Änderung und jedem Kommando nach.',
+  },
+} as const satisfies Record<AgentMode, PiModeSemantics>);
 
 /**
- * Normalized reasoning/thinking budget. Adapters that expose an effort knob map
- * these three levels onto their runtime option; all others ignore the field
- * (and report `capabilities.reasoning === false`).
+ * Auto-Push ist Eigenschaft des Modus *dieses Turns*, nicht des Modus, mit dem
+ * der Container gestartet ist: `session.update` schaltet yolo<->ask mitten in
+ * der Session um, während `AUTO_PUSH` seit dem Containerstart eingefroren ist.
+ * Ein Prompt ohne Modus (älterer Orchestrator) behält deshalb die Env-Vorgabe.
+ */
+export function autoPushForMode(mode: AgentMode | undefined, envDefault: boolean): boolean {
+  return mode === undefined ? envDefault : PI_MODE_SEMANTICS[mode].autoPush;
+}
+
+/* ------------------------------------------------------------------ */
+/* Gemeinsame Aufzählungen                                             */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Normalisiertes Denk-Budget. pi bildet die drei Stufen auf seine
+ * Reasoning-Option ab; Modelle ohne solche Option ignorieren das Feld.
  */
 export type ReasoningEffort = 'low' | 'medium' | 'high';
 
+export const REASONING_EFFORTS = Object.freeze(['low', 'medium', 'high'] as const);
+
+export function isReasoningEffort(value: string): value is ReasoningEffort {
+  return (REASONING_EFFORTS as readonly string[]).includes(value);
+}
+
 /**
- * Per-session network isolation:
- *  - 'allowlist' (default): internal docker network, egress only via the
- *    orchestrator's HTTP(S) proxy restricted to an allowlist of hosts.
- *  - 'isolated': internal docker network, no proxy => no internet at all.
- *  - 'open': regular docker network with direct internet access.
+ * Netzwerk-Isolation je Session:
+ *  - 'allowlist' (Vorgabe): internes Docker-Netz, Ausgang nur über den
+ *    HTTP(S)-Proxy des Orchestrators, beschränkt auf eine Host-Allowlist.
+ *  - 'isolated': internes Docker-Netz ohne Proxy => gar kein Internet.
+ *  - 'open': normales Docker-Netz mit direktem Internetzugang.
+ * Link-Sessions laufen auf fremder Hardware; dort ist die Policy nur
+ * dokumentarisch — der Link-Agent erzwingt sie nicht.
  */
 export type NetworkPolicy = 'allowlist' | 'isolated' | 'open';
 
 export type SessionStatus =
-  | 'creating'   // container being created / repo being cloned
-  | 'running'    // agent actively processing a prompt
-  | 'idle'       // container up, waiting for input
-  | 'stopped'    // container stopped, volume retained (resumable)
+  | 'creating'   // Container wird erzeugt / Repo geklont
+  | 'running'    // Agent arbeitet an einem Prompt
+  | 'idle'       // Container läuft, wartet auf Eingabe
+  | 'stopped'    // Container gestoppt, Volume erhalten (fortsetzbar)
   | 'error';
 
 /**
- * Per-turn lifecycle (KILO-CLOUD-ANALYSE.md P1, "Message-Status als eigene
- * Ressource"). Distinct from `SessionStatus`: a session is a long-lived
- * container, a turn is one prompt-to-answer round inside it. The states are a
- * linear machine — `queued` (admitted, persisted, not yet handed to the
- * shim/agent) → `running` (the agent is working) → one terminal state:
- *  - `completed`   : the agent finished the turn (`turn.completed`).
- *  - `failed`      : the turn ended in an error, see `TurnFailureReason`.
- *  - `interrupted` : cut short from outside (user abort, or a server restart
- *                    that dropped the in-flight turn).
- * After a reconnect the app reads the turns of a session instead of guessing a
- * turn's fate from the event stream.
+ * Lebenszyklus eines einzelnen Turns — abzugrenzen von `SessionStatus`: eine
+ * Session ist ein langlebiger Container, ein Turn eine Prompt-zu-Antwort-Runde
+ * darin. Lineare Maschine: `queued` (angenommen, persistiert, noch nicht an den
+ * Runner übergeben) → `running` → genau ein Endzustand:
+ *  - `completed`   : der Agent hat den Turn beendet (`turn.completed`).
+ *  - `failed`      : der Turn endete im Fehler, siehe `TurnFailureReason`.
+ *  - `interrupted` : von außen abgeschnitten (Abbruch durch den Nutzer oder ein
+ *                    Server-Neustart, der den laufenden Turn verloren hat).
+ * Nach einem Reconnect liest die App die Turns einer Session, statt deren
+ * Ausgang aus dem Event-Strom zu raten.
  */
 export type TurnState = 'queued' | 'running' | 'completed' | 'failed' | 'interrupted';
 
 /**
- * Structured reason a turn reached `failed`, modelled on Kilo's failure object.
- * `stage` names where it broke (e.g. 'transport', 'shim', 'provision'), `code`
- * is an optional machine-readable tag, `retryable` tells the app whether a
- * fresh attempt could succeed. Only `message` is guaranteed.
+ * Strukturierter Grund für `failed`. `stage` benennt, wo es brach (z. B.
+ * 'transport', 'runner', 'provision'), `code` ist ein optionaler
+ * maschinenlesbarer Tag, `retryable` sagt der App, ob ein neuer Versuch
+ * überhaupt Aussicht hat. Garantiert ist nur `message`.
  */
 export interface TurnFailureReason {
   message: string;
@@ -186,9 +264,9 @@ export interface TurnFailureReason {
 }
 
 /**
- * One turn as the orchestrator persists and reports it. `turnId` is the
- * orchestrator's own id; `messageId` is the app-generated id that admitted it
- * (absent for a prompt from an older client that sent none).
+ * Ein Turn, wie der Orchestrator ihn persistiert und meldet. `turnId` ist seine
+ * eigene Id, `messageId` die von der App erzeugte Id, die den Turn zugelassen
+ * hat (fehlt, wenn der Prompt ohne eine kam).
  */
 export interface TurnInfo {
   turnId: string;
@@ -197,7 +275,7 @@ export interface TurnInfo {
   state: TurnState;
   createdAt: string;
   updatedAt: string;
-  /** Present only in the `failed` state. */
+  /** Nur im Zustand `failed` gesetzt. */
   reason?: TurnFailureReason;
 }
 
@@ -206,71 +284,62 @@ export type PermissionDecision = 'once' | 'always' | 'reject';
 export type PermissionKind = 'bash' | 'edit' | 'webfetch' | 'external' | 'other';
 
 /**
- * Secret kinds understood by the orchestrator vault.
- * `claude_oauth` = long-lived token from `claude setup-token` (CLAUDE_CODE_OAUTH_TOKEN).
- * Custom kinds are allowed (open string) so new providers need no protocol change.
+ * Secret-Arten, die der Vault des Orchestrators kennt: die pi-Provider-Ids plus
+ * `github` (PAT für Clone/Push/Draft-PR). Der Typ bleibt offen (`string & {}`),
+ * damit ein neuer Provider keine Protokolländerung erzwingt; der Server
+ * validiert gegen `SECRET_KINDS`.
  */
-export type SecretKind =
-  | 'openai'
-  | 'zai'
-  | 'moonshot'
-  | 'anthropic'
-  | 'github'
-  | 'claude_oauth'
-  /**
-   * ChatGPT OAuth backup for codex (CODEX-OAUTH.md §4). The canonical copy of
-   * codex `auth.json` lives in the shared CODEX_HOME volume; this vault entry
-   * is an encrypted backup so a volume loss does not force a re-login. The
-   * refresh token rotates and is single-use, so a *stale* backup may already be
-   * dead — validate on restore and re-login if needed.
-   */
-  | 'codex_oauth'
-  | 'junie'
-  | (string & {});
+export const SECRET_KINDS: readonly string[] = Object.freeze([...PI_PROVIDER_IDS, 'github']);
+
+export type SecretKind = PiProviderId | 'github' | (string & {});
 
 /* ------------------------------------------------------------------ */
-/* Shim REST API (orchestrator -> shim, inside session container)      */
+/* Runner-REST (Orchestrator -> Runner im Session-Container)           */
+/*                                                                     */
+/* Identisch zum bewährten Shim-Protokoll aus v1, nur ohne die         */
+/* „welcher Adapter bin ich"-Felder. Der Link-Agent bedient dieselben  */
+/* Pfade in-process und tunnelt sie über `agent.command`/`agent.response`. */
 /* ------------------------------------------------------------------ */
 
 /** POST /prompt */
 export interface PromptRequest {
   text: string;
-  /** May override the mode the container was started with. */
+  /** Überschreibt den Modus, mit dem der Container gestartet wurde. */
   mode?: AgentMode;
   /**
-   * App-generated, per-turn message id (`msg_<random>`), echoed end to end
-   * (KILO-CLOUD-ANALYSE.md P1). Optional for backwards compatibility: a prompt
-   * without one behaves exactly as before. The orchestrator uses it to make a
-   * re-sent prompt idempotent (no duplicate agent turn after a radio-hole
-   * reconnect); shims may echo it but are not required to.
+   * Von der App erzeugte Turn-Id (`msg_<random>`), Ende zu Ende durchgereicht.
+   * Optional: ein Prompt ohne sie verhält sich wie früher. Der Orchestrator
+   * macht damit einen erneut gesendeten Prompt idempotent (kein doppelter Turn
+   * nach einem Funkloch-Reconnect); der Runner darf sie zurückspiegeln, muss
+   * aber nicht.
    */
   messageId?: string;
   provider?: string;
   /**
-   * May override the model for this and following turns. Adapters whose runtime
-   * addresses models as provider + model accept the `"<provider>/<model>"` form
-   * (the same ids their GET /models returns); an empty string means
-   * "adapter default".
+   * Überschreibt das Modell für diesen und alle folgenden Turns. pi adressiert
+   * Modelle als provider + id, akzeptiert also auch die Form
+   * `"<provider>/<model>"` (dieselben Ids, die GET /models liefert). Der
+   * leere String setzt auf die pi-Vorgabe zurück.
    */
   model?: string;
-  /** Ignored by adapters without `capabilities.reasoning`. */
+  /** Wird ignoriert, wenn das gewählte Modell keine Reasoning-Stufe kennt. */
   reasoningEffort?: ReasoningEffort;
 }
 
-/** One entry of the shim's model catalog (GET /models). */
+/** Ein Eintrag des Modellkatalogs (GET /models). */
 export interface ModelInfo {
-  /** Id accepted by `PromptRequest.model` for this adapter. */
+  /** Id, die `PromptRequest.model` akzeptiert. */
   id: string;
-  /** Human-readable label; falls back to `id` in the UI. */
+  /** Anzeigename; die UI fällt auf `id` zurück. */
   name?: string;
 }
 
-/** GET /models — an empty list is valid (adapter has no catalog). */
+/** GET /models — eine leere Liste ist gültig (Katalog noch nicht geladen). */
 export interface ModelsResponse {
   models: ModelInfo[];
 }
 
-/** POST /resume */
+/** POST /resume — hängt den Runner an eine bestehende pi-Session-Datei. */
 export interface ResumeRequest {
   sessionRef: string;
 }
@@ -282,8 +351,7 @@ export interface PermissionReplyBody {
 
 /** GET /status */
 export interface ShimStatus {
-  adapter: AdapterId;
-  /** Runtime-native session reference (kilo session id, claude session_id, pi session file). */
+  /** pi-eigene Session-Referenz (Session-Datei), für /resume. */
   sessionRef?: string;
   provider?: string;
   model?: string;
@@ -291,46 +359,56 @@ export interface ShimStatus {
   busy: boolean;
 }
 
-/** GET /diff */
+/** GET /diff — ein Eintrag je geänderter Datei. */
 export interface DiffEntry {
   path: string;
   patch: string;
   binary?: boolean;
 }
 
-/** Standard success envelope */
+/** Standard-Erfolgshülle */
 export interface OkResponse { ok: true }
 export interface ErrorResponse { ok: false; error: string }
 
 export type ShimApiResponse = OkResponse | ErrorResponse;
 
+/** GET /health des Runners — bewusst ohne Auth, für Docker-Healthchecks. */
+export interface HealthResponse { ok: true }
+
 /**
- * Env vars the orchestrator injects into every session container.
- * The shim reads these at startup.
+ * Env-Variablen, die der Orchestrator in jeden Session-Container injiziert und
+ * die der Runner beim Start liest. Der Link-Agent baut dieselbe Struktur lokal
+ * zusammen, auch wenn dort kein Container beteiligt ist.
  */
 export interface ShimEnv {
-  /** Random per-session token; orchestrator sends it as `authorization: Bearer <token>`. */
+  /** Zufälliges Token je Session; der Orchestrator sendet es als `authorization: Bearer <token>`. */
   SHIM_TOKEN: string;
-  WORK_DIR: string;              // e.g. /work (repo checkout)
+  WORK_DIR: string;              // z. B. /work (Repo-Checkout)
   AGENT_MODE: AgentMode;
-  ADAPTER: AdapterId;
-  SESSION_ID: string;            // orchestrator session id (uuid)
-  REPO_URL: string;              // https clone url (no token embedded)
-  REPO_BRANCH?: string;          // base branch to start from (default: repo default branch)
-  GITHUB_PAT?: string;           // injected when push is allowed
-  REPO_FULL_NAME: string;        // owner/name for PR API calls
+  SESSION_ID: string;            // Session-Id des Orchestrators (uuid)
+  REPO_URL: string;              // https-Clone-URL, ohne eingebettetes Token
+  REPO_BRANCH?: string;          // Basis-Branch (Vorgabe: Default-Branch des Repos)
+  GITHUB_PAT?: string;           // nur gesetzt, wenn Push erlaubt ist
+  REPO_FULL_NAME: string;        // owner/name für die PR-API
   /**
-   * Start value only (yolo => 1): auto push + draft PR after each completed
-   * turn. Since mode is switchable mid-session, shims derive the decision per
-   * turn from `PromptRequest.mode` and fall back to this env when it is absent.
+   * Nur Startwert (yolo => 1): Auto-Push + Draft-PR nach jedem beendeten Turn.
+   * Weil der Modus mitten in der Session umschaltbar ist, entscheidet der
+   * Runner pro Turn über `PromptRequest.mode` und fällt nur ohne diesen auf die
+   * Env-Vorgabe zurück (siehe `autoPushForMode`).
    */
   AUTO_PUSH: '1' | '0';
-  /** Only provider credential relevant for this session, e.g. OPENAI_API_KEY / ZAI_API_KEY / CLAUDE_CODE_OAUTH_TOKEN. */
+  /** Startwerte für Provider/Modell; danach führt `PromptRequest`. */
+  PI_PROVIDER?: string;
+  PI_MODEL?: string;
+  /**
+   * Der eine Provider-Key dieser Session, unter dem Namen aus
+   * `PI_PROVIDER_ENV` (z. B. OPENAI_API_KEY). Nie werden mehrere injiziert.
+   */
   [key: string]: string | undefined;
 }
 
 /* ------------------------------------------------------------------ */
-/* Normalized event stream                                             */
+/* Normalisierter Event-Strom                                          */
 /* ------------------------------------------------------------------ */
 
 export interface TokenUsage {
@@ -340,32 +418,45 @@ export interface TokenUsage {
 }
 
 /**
- * Step a session start is currently in, carried by progress notices:
- *  - 'image-build'     : the adapter image is being built on the daemon
- *  - 'container-start' : the session container is being started
- *  - 'shim-start'      : the container boots (repo clone, agent process)
- *  - 'ready'           : the shim answers, the session can take prompts
- * The order is the order of a start, but clients must not assume every phase
- * occurs (a cached image skips 'image-build').
+ * Schritt, in dem ein Session-Start gerade steckt; getragen von `notice`:
+ *  - 'container-start' : der Session-Container wird gestartet
+ *  - 'shim-start'      : der Container bootet (Repo-Clone, Agent-Prozess)
+ *  - 'ready'           : der Runner antwortet, die Session nimmt Prompts an
+ * Die Reihenfolge ist die eines Starts, aber Clients dürfen nicht annehmen,
+ * dass jede Phase vorkommt (eine Link-Session hat keinen Container-Start).
+ *
+ * Diese drei Schreibweisen sind vollständig: gesendet werden sie AUSSCHLIESSLICH
+ * vom Orchestrator (server/src/sessions.ts, server/src/docker.ts); der Runner
+ * selbst kennt `phase` gar nicht, seine Notices sind gewöhnliche Systemzeilen.
+ * v1 kannte zusätzlich 'image-build'. Das Runner-Image wird zwar weiterhin zur
+ * Laufzeit gebaut (`ensureRunnerImage`, beim ersten Start auf einem Host), aber
+ * bewusst unter 'container-start' gemeldet — es ist Teil des Container-Starts,
+ * keine eigene Phase mehr.
+ *
+ * `ready` ist das Ende: erst danach nimmt die Session Prompts an, und erst
+ * dadurch verschwindet die Fortschrittskarte der App. Ein Startpfad, der nicht
+ * in `ready` mündet, MUSS stattdessen in einem `error`-Event enden (die App
+ * räumt die Karte auch daran weg) — sonst dreht sie sich ewig.
  */
-export type NoticePhase = 'image-build' | 'container-start' | 'shim-start' | 'ready';
+export type NoticePhase = 'container-start' | 'shim-start' | 'ready';
 
 /**
- * Sequence metadata every normalized event carries once a shim's sequenced
- * broadcaster has stamped it (see SequencedSseBroadcaster):
- *  - `seq`: a per-session, per-stream monotone sequence number, mirrored in the
- *    SSE `id:` field. It is the basis for Last-Event-ID replay (the orchestrator
- *    reconnects with the last seq it saw, the shim replays from there) and for
- *    client-side dedup between the live stream and the stored history. Named
- *    `seq`, not `id`, because `tool.call`/`tool.result` already carry a string
- *    `id` (the tool-call id) that this must not collide with.
- *  - `ts`: emit time in epoch milliseconds.
+ * Sequenz-Metadaten, die der `SequencedSseBroadcaster` jedem normalisierten
+ * Event aufprägt:
+ *  - `seq`: monotone Sequenznummer je Session und je Runner-Prozess,
+ *    gespiegelt im SSE-Feld `id:`. Sie ist die Grundlage für den
+ *    Last-Event-ID-Replay (der Orchestrator verbindet sich mit der zuletzt
+ *    gesehenen seq neu, der Runner spielt ab dort nach) und für die Dedup im
+ *    Client zwischen Live-Strom und gespeicherter Historie. Sie heißt `seq` und
+ *    nicht `id`, weil `tool.call`/`tool.result` bereits ein string-`id` (die
+ *    Tool-Call-Id) tragen, mit dem sie nicht kollidieren darf.
+ *  - `ts`: Sendezeitpunkt in Millisekunden seit Epoch.
  *
- * Both are optional for backward compatibility: events from an older shim (or
- * decoded by an older client) simply lack them, so every decoder must treat
- * them as "may be absent". The seq resets to 0 whenever a shim process restarts
- * (a new container / adapter switch / resume), so it is unique only within one
- * shim stream, not across the whole life of a session.
+ * Beide sind optional: Events aus der gespeicherten Historie oder von einem
+ * älteren Sender haben sie nicht, jeder Decoder muss sie als „darf fehlen"
+ * behandeln. Die seq beginnt bei jedem Runner-Neustart wieder bei 0 (neuer
+ * Container, Resume), ist also nur innerhalb eines Runner-Streams eindeutig,
+ * nicht über die gesamte Lebensdauer einer Session.
  */
 export interface AgentEventMeta {
   seq?: number;
@@ -373,9 +464,9 @@ export interface AgentEventMeta {
 }
 
 export type AgentEventBody =
+  /** Zustands-Schnappschuss; der Runner sendet ihn beim Verbinden und nach jeder Änderung. */
   | {
       type: 'status';
-      adapter: AdapterId;
       sessionRef?: string;
       provider?: string;
       model?: string;
@@ -390,13 +481,13 @@ export type AgentEventBody =
       type: 'permission.request';
       permissionId: string;
       kind: PermissionKind;
-      /** Short human title, e.g. "bash: npm install". */
+      /** Kurzer Titel für die Karte, z. B. "bash: npm install". */
       title: string;
-      /** Longer detail (full command, file contents for edits...). */
+      /** Ausführliches Detail (vollständiges Kommando, Dateiinhalt …). */
       detail?: string;
-      /** Unified diff for edit permissions. */
+      /** Unified Diff bei Edit-Freigaben. */
       diff?: string;
-      /** Suggested patterns when decision === 'always'. */
+      /** Vorgeschlagene Muster für die Entscheidung 'always'. */
       patterns?: string[];
     }
   | { type: 'permission.resolved'; permissionId: string; decision: PermissionDecision }
@@ -405,61 +496,56 @@ export type AgentEventBody =
   | { type: 'pushed'; branch: string; prUrl?: string; auto: boolean }
   | { type: 'error'; message: string; fatal?: boolean }
   /**
-   * Informational, non-fatal line for the session log (e.g. "the agent image is
-   * being built"). Purely additive: clients that predate this variant ignore
-   * unknown event types.
-   *
-   * With `phase` it is live progress of a starting session: the client replaces
-   * its status display with it (same phase = update of the same line, new phase
-   * = next step). Without `phase` it stays an ordinary timeline entry
-   * (e.g. "Agent gewechselt: kilo → claude").
+   * Nicht-fataler Hinweis für die Timeline. Mit `phase` ist es Live-Fortschritt
+   * eines Starts: der Client ersetzt damit seine Statuszeile (gleiche Phase =
+   * Aktualisierung derselben Zeile, neue Phase = nächster Schritt). Ohne
+   * `phase` bleibt es ein gewöhnlicher Timeline-Eintrag.
    */
   | { type: 'notice'; message: string; phase?: NoticePhase; detail?: string }
+  /** Keepalive; hält SSE-Verbindung und Zwischenboxen warm, siehe Broadcaster. */
   | { type: 'ping'; ts: number };
 
 /**
- * A normalized event as it travels the wire: the event body plus the optional
- * sequence metadata a shim stamps on it. Consumers keep switching on `type`
- * exactly as before (the intersection preserves the discriminated union); `id`
- * and `ts` are simply available when present.
+ * Ein normalisiertes Event auf dem Draht: Rumpf plus optionale Sequenz-Meta.
+ * Konsumenten schalten weiterhin über `type` (der Schnitt erhält die
+ * diskriminierte Union), `seq`/`ts` stehen einfach zur Verfügung, wenn da.
  */
 export type AgentEvent = AgentEventBody & AgentEventMeta;
 
-/** SSE wire format: `event: agent` + `data: <AgentEvent JSON>` */
+/** SSE-Wire-Format: `event: agent` + `data: <AgentEvent JSON>` */
 export interface AgentSseEvent {
   event: 'agent';
   data: AgentEvent;
 }
 
 /* ------------------------------------------------------------------ */
-/* App <-> Orchestrator WebSocket                                      */
+/* App <-> Orchestrator (WebSocket)                                    */
 /* ------------------------------------------------------------------ */
 
 export interface SessionInfo {
   id: string;
   repoId: string;
   repoFullName?: string;
-  adapter: AdapterId;
   provider: string;
   model: string;
   mode: AgentMode;
   status: SessionStatus;
-  /** Branch the session works on: agent/<session-id> */
+  /** Branch, auf dem die Session arbeitet: agent/<session-id> */
   branch: string;
   createdAt: string;
   lastActiveAt: string;
   prUrl?: string;
   networkPolicy?: NetworkPolicy;
-  /** Persisted reasoning budget; absent when the session never set one. */
+  /** Persistierte Reasoning-Stufe; fehlt, wenn nie eine gesetzt wurde. */
   reasoningEffort?: string;
-  /** User-set name (`session.rename`); absent => the client derives one as before. */
+  /** Vom Nutzer gesetzter Name (`session.rename`); fehlt => Client leitet einen ab. */
   title?: string;
-  /** Absent => false. Archived sessions stay in `session.list`; the client filters. */
+  /** Fehlt => false. Archivierte Sessions bleiben in `session.list`, der Client filtert. */
   archived?: boolean;
   /**
-   * True for link-agent sessions: the agent runs on the user's own machine
-   * (outbound WS, no container). Absent => false; the status semantics of a
-   * linked session differ ('stopped' means "agent host currently offline").
+   * True für Link-Sessions: der Agent läuft auf dem Rechner des Nutzers
+   * (ausgehende WS, kein Container). Fehlt => false. Die Status-Semantik
+   * unterscheidet sich: 'stopped' heißt hier „Agent-Host gerade offline".
    */
   linked?: boolean;
 }
@@ -474,7 +560,7 @@ export interface DeviceInfo {
   id: string;
   name: string;
   enrolledAt: string;
-  /** True while the device has a live authenticated WS connection. */
+  /** True, solange das Gerät eine authentifizierte WS-Verbindung hält. */
   online: boolean;
 }
 
@@ -484,314 +570,12 @@ export interface LinkInfo {
   createdAt: string;
 }
 
+/** Metadaten eines Vault-Eintrags — enthält nie den Klartext. */
 export interface SecretInfo {
   id: string;
   kind: SecretKind;
   createdAt: string;
-  /** Never contains the plaintext value. */
 }
-
-/* ------------------------------------------------------------------ */
-/* Link-agent relay (Kilo "remote connections" pattern, see            */
-/* KILO-CLOUD-ANALYSE.md P2)                                           */
-/* ------------------------------------------------------------------ */
-
-/**
- * Wire protocol version a link agent speaks, carried on `agent.hello` and
- * `agent.heartbeat`. Bump only for a breaking change to the link<->server
- * wire format; additive features (new optional fields, new
- * `LinkCapabilities` flags) never need a bump. Absent on the wire means
- * version 1 - a pre-W2.4 link agent that predates heartbeats/capabilities
- * entirely; the server treats that exactly like version 1 explicitly.
- */
-export const LINK_PROTOCOL_VERSION = 2;
-
-/**
- * Feature flags a link agent advertises on `agent.hello`/`agent.heartbeat`.
- * Every flag is optional and MUST be treated as `false` when absent, so an
- * older link agent (which sends none of this) keeps working unchanged
- * against a newer server, and a newer link agent talking to an older server
- * (which just ignores fields it does not read) degrades to the old
- * behaviour instead of breaking. New flags are additive-only: never repurpose
- * or remove one, add another instead.
- */
-export interface LinkCapabilities {
-  /**
-   * Sends periodic `agent.heartbeat` frames carrying the link's complete
-   * session list (see `LinkSessionState`) instead of relying solely on
-   * `agent.event`/connect-disconnect for status. Purely informational today
-   * (the server reconciles from any `agent.heartbeat` it receives regardless
-   * of this flag - the message itself is the capability signal); kept as an
-   * explicit flag for parity with Kilo's advertisement pattern and so a
-   * future capability that truly changes server behaviour has a precedent to
-   * follow.
-   */
-  heartbeat?: boolean;
-}
-
-/**
- * Per-session status a link agent reports in its heartbeat, modelled on
- * Kilo's `idle|busy|question|permission`. PocketAgent's shim event stream
- * has no distinct "waiting for a free-text answer" signal today (only
- * `permission.request`), so no link agent currently emits `'question'` - it
- * exists for wire parity with Kilo and so a future adapter can use it
- * without a protocol change.
- */
-export type LinkSessionStatus = 'idle' | 'busy' | 'question' | 'permission';
-
-/** One session a link agent currently manages, as carried by `agent.heartbeat`. */
-export interface LinkSessionState {
-  /** Orchestrator-assigned id, i.e. the `sessionId` from `agent.ready`. */
-  sessionId: string;
-  status: LinkSessionStatus;
-}
-
-/**
- * WebSocket close codes the app<->orchestrator and link<->orchestrator
- * connections use (the 4000-4999 range is private-use per RFC 6455).
- * Centralized here so `server/` (which sends them) and `link/` (which reacts
- * to them) cannot drift apart; `android/` mirrors `WS_CLOSE_UNAUTHORIZED` as
- * a literal in `WsClient.kt` since Kotlin cannot import this package.
- */
-/** Another connection already registered with this link's token; this socket lost the race. */
-export const WS_CLOSE_REPLACED = 4000;
-/** Bad/missing/revoked token, or no `hello`/`agent.hello` within the auth timeout. */
-export const WS_CLOSE_UNAUTHORIZED = 4001;
-/** Per-source-address connection cap (coarse DoS guard), see ws.ts MAX_CONNS_PER_ADDRESS. */
-export const WS_CLOSE_TOO_MANY_CONNECTIONS = 4002;
-
-/**
- * Terminal in the sense Kilo's 4401/4403/4409 are: retrying with the same
- * registration can never succeed, so a link agent stops its reconnect loop
- * for good instead of retrying with backoff.
- *  - `WS_CLOSE_UNAUTHORIZED`: the token is wrong or revoked - it stays wrong
- *    until a human changes it.
- *  - `WS_CLOSE_REPLACED`: another process already holds this link's slot.
- *    Reconnecting would just re-trigger the same replace on the other side
- *    (or flap forever if both sides keep retrying), so this side backs off
- *    for good and leaves it to whatever supervises the process (systemd,
- *    Docker's restart policy, a human) to decide about a restart.
- * Every other code - including `WS_CLOSE_TOO_MANY_CONNECTIONS`, a transient
- * resource cap, and any ordinary network drop or server restart - keeps
- * reconnecting with the existing exponential backoff.
- */
-export function isTerminalLinkCloseCode(code: number): boolean {
-  return code === WS_CLOSE_UNAUTHORIZED || code === WS_CLOSE_REPLACED;
-}
-
-export type ClientMessage =
-  | { type: 'hello'; deviceId: string; token: string }
-  | {
-      /** Link-agent (devcontainer/VPS/bare metal) registration; outbound WS, no inbound ports needed. */
-      type: 'agent.hello';
-      token: string;
-      name?: string;
-      adapter: AdapterId;
-      mode?: AgentMode;
-      branch?: string;
-      workDir?: string;
-      sessionRef?: string;
-      /** Absent => version 1 (pre-W2.4 link agent), no known capabilities. */
-      protocolVersion?: number;
-      capabilities?: LinkCapabilities;
-    }
-  | {
-      type: 'session.create';
-      requestId: string;
-      repoId: string;
-      adapter: AdapterId;
-      provider: string;
-      model: string;
-      mode: AgentMode;
-      branch?: string;
-      networkPolicy?: NetworkPolicy;
-    }
-  /**
-   * With `requestId` the server acknowledges acceptance via `request.ok`
-   * (or `error` on failure) carrying the same id; without it the call stays
-   * fire-and-forget as before, for older clients.
-   */
-  /**
-   * `requestId` acks this one WS request (see above). `messageId` is the
-   * app-generated, per-turn id (`msg_<random>`) that is stable across a resend:
-   * the server admits a given messageId exactly once (idempotent), and echoes
-   * it in the `request.ok` payload so the app can match the ack to the turn it
-   * sent. Both are optional — a client that sends neither keeps the old
-   * fire-and-forget, no-dedup behaviour.
-   */
-  | { type: 'session.prompt'; sessionId: string; text: string; mode?: AgentMode; requestId?: string; messageId?: string }
-  /**
-   * Change mode / model / reasoning effort / harness of a live session. Every
-   * field is optional; the server persists what is set and answers with
-   * `session.status` (carrying the updated session) to all devices.
-   */
-  | {
-      type: 'session.update';
-      requestId: string;
-      sessionId: string;
-      mode?: AgentMode;
-      /** Empty string resets the session to the adapter default. */
-      model?: string;
-      reasoningEffort?: ReasoningEffort;
-      /**
-       * Switch the session to another harness. The volume (repo checkout +
-       * branch) is kept, everything harness-bound is dropped: the runtime
-       * session reference, the model and the reasoning effort reset, provider
-       * falls back to the new adapter's default. The container is recreated
-       * asynchronously - `request.ok` only acknowledges the switch.
-       */
-      adapter?: AdapterId;
-    }
-  /** Ask the session's shim for its model catalog (proxied GET /models). */
-  | { type: 'session.models.get'; requestId: string; sessionId: string }
-  | { type: 'session.permission'; sessionId: string; permissionId: string; decision: PermissionDecision }
-  | { type: 'session.abort'; sessionId: string }
-  | { type: 'session.stop'; sessionId: string }
-  | { type: 'session.resume'; sessionId: string }
-  /** Tap-triggered push + draft PR (non-yolo mode). */
-  | { type: 'session.push'; sessionId: string }
-  | { type: 'session.diff.get'; requestId: string; sessionId: string }
-  | { type: 'session.list'; requestId: string }
-  /**
-   * Stored timeline of a session, so a client that dropped its in-memory
-   * messages (screen left, app restarted) can show the conversation again.
-   * `limit` counts the most recent events (default 200, max 1000); the answer
-   * carries them in chronological order, oldest first.
-   */
-  | { type: 'session.events.get'; requestId: string; sessionId: string; limit?: number }
-  /**
-   * Per-turn lifecycle of a session (KILO-CLOUD-ANALYSE.md P1). Lets a client
-   * that reconnected reconstruct every turn's fate (`TurnState`) instead of
-   * inferring it from the event stream. `limit` counts the most recent turns
-   * (default 50, max 500); the answer carries them oldest first.
-   */
-  | { type: 'session.turns.get'; requestId: string; sessionId: string; limit?: number }
-  /** Rename a session; an empty title removes it (client derives a name again). */
-  | { type: 'session.rename'; requestId: string; sessionId: string; title: string }
-  | { type: 'session.archive'; requestId: string; sessionId: string; archived: boolean }
-  | { type: 'session.delete'; requestId: string; sessionId: string }
-  | { type: 'adapter.list'; requestId: string }
-  | { type: 'repo.list'; requestId: string }
-  | { type: 'repo.add'; requestId: string; fullName: string; defaultBranch: string }
-  | { type: 'secret.set'; requestId: string; kind: SecretKind; value: string }
-  /**
-   * Live-check a key against its provider before/without storing it. The value
-   * is used for the outbound provider request only — it is never persisted,
-   * logged or echoed back.
-   */
-  | { type: 'secret.validate'; requestId: string; kind: SecretKind; value: string }
-  | { type: 'secret.list'; requestId: string }
-  | { type: 'secret.delete'; requestId: string; id: string }
-  /**
-   * Start an in-app browser/device sign-in for an adapter (CODEX-OAUTH.md
-   * Variante A). The orchestrator starts a short-lived auth container, drives
-   * the runtime's login (codex `login_chatgpt`), and answers with `auth.url`.
-   * `flow` selects the manifest `AuthFlow.type` to use (default: the adapter's
-   * first oauth-loopback flow, falling back to device-code). `requestId`
-   * correlates the whole exchange (`auth.url`/`auth.callback`/`auth.done`).
-   */
-  | { type: 'auth.start'; requestId: string; adapter: AdapterId; flow?: AuthFlowType }
-  /**
-   * Forward a loopback OAuth callback the app captured (browser redirected to
-   * `http://localhost:<port>/auth/callback?code&state` on the phone) to the
-   * login server inside the auth container. The orchestrator never inspects
-   * `code`/`state` — the runtime's own login server validates the state. They
-   * are single-use and travel over the already device-authenticated WSS.
-   */
-  | { type: 'auth.callback'; requestId: string; code: string; state: string }
-  /** Abort an in-flight auth flow (app closed the sheet / user cancelled). */
-  | { type: 'auth.cancel'; requestId: string }
-  | { type: 'device.list'; requestId: string }
-  | { type: 'device.revoke'; requestId: string; deviceId: string }
-  | { type: 'link.list'; requestId: string }
-  | { type: 'link.revoke'; requestId: string; linkId: string }
-  | { type: 'server.stats'; requestId: string };
-
-export type ServerMessage =
-  | { type: 'welcome'; ok: true; serverVersion: string }
-  /** server -> link agent: registration accepted, session bound */
-  | { type: 'agent.ready'; sessionId: string }
-  /** server -> link agent: proxy a shim HTTP call over the outbound WS */
-  | { type: 'agent.command'; sessionId: string; callId: string; path: string; method: 'GET' | 'POST'; body?: unknown }
-  /** link agent -> server: response to an agent.command */
-  | { type: 'agent.response'; callId: string; status: number; body?: unknown }
-  /** link agent -> server: normalized shim event */
-  | { type: 'agent.event'; sessionId: string; event: AgentEvent }
-  /** link agent -> server / server -> link agent keepalive */
-  | { type: 'agent.ping'; ts: number }
-  | { type: 'agent.pong'; ts: number }
-  /**
-   * link agent -> server periodic full-state snapshot (~10s; Kilo P2
-   * pattern). Carries every session the link currently manages instead of a
-   * delta: the orchestrator needs no per-event bookkeeping to stay correct,
-   * and a session id that stops appearing here is gone from the link
-   * agent's point of view - the same conclusion as a socket close, just
-   * without needing one. `protocolVersion`/`capabilities` ride along so the
-   * server can gate future additive behaviour; both are optional and a
-   * server that predates this message type never receives it at all (an
-   * older link agent simply never sends `agent.heartbeat`).
-   */
-  | { type: 'agent.heartbeat'; sessions: LinkSessionState[]; protocolVersion?: number; capabilities?: LinkCapabilities }
-  /** server -> link agent: session stopped from the app; link agent should shut down */
-  | { type: 'agent.bye'; sessionId: string }
-  | { type: 'error'; requestId?: string; sessionId?: string; message: string }
-  | { type: 'request.ok'; requestId: string; payload?: unknown }
-  | { type: 'session.list'; requestId: string; sessions: SessionInfo[] }
-  | { type: 'session.event'; sessionId: string; event: AgentEvent }
-  /** Answer to `session.events.get`: chronological, oldest first. */
-  | { type: 'session.events'; requestId: string; sessionId: string; events: AgentEvent[] }
-  /** Answer to `session.turns.get`: chronological, oldest first. */
-  | { type: 'session.turns'; requestId: string; sessionId: string; turns: TurnInfo[] }
-  /**
-   * Live push on every turn-state transition (queued/running/terminal). Purely
-   * additive: a client that predates the turn resource ignores this type and
-   * keeps working off `session.status`/`session.event` as before.
-   */
-  | { type: 'turn.status'; sessionId: string; turn: TurnInfo }
-  | { type: 'session.diff'; requestId: string; sessionId: string; diff: DiffEntry[] }
-  | { type: 'session.status'; sessionId: string; status: SessionStatus; session?: SessionInfo }
-  | { type: 'session.models'; requestId: string; sessionId: string; models: ModelInfo[] }
-  | { type: 'session.deleted'; requestId: string; sessionId: string }
-  | { type: 'adapter.list'; requestId: string; adapters: AdapterDescriptor[] }
-  | { type: 'repo.list'; requestId: string; repos: RepoInfo[] }
-  | { type: 'repo.added'; requestId: string; repo: RepoInfo }
-  | { type: 'secret.list'; requestId: string; secrets: SecretInfo[] }
-  | { type: 'secret.saved'; requestId: string; secret: SecretInfo }
-  /**
-   * Result of a `secret.validate`. Never carries the value.
-   * `unverified: true` means no live check exists for this kind — `ok` is
-   * true so the app keeps the flow going, but the UI must present it
-   * neutrally rather than as a confirmed key.
-   */
-  | {
-      type: 'secret.validated';
-      requestId: string;
-      kind: SecretKind;
-      ok: boolean;
-      detail?: string;
-      unverified?: boolean;
-    }
-  | { type: 'secret.deleted'; requestId: string; id: string }
-  /**
-   * Answer to `auth.start`: the runtime's login URL to open in the browser and
-   * the loopback `port` its redirect will target — the app must run its
-   * loopback listener on exactly this port (codex binds 1455, fallback 1457,
-   * and the server reports whichever it actually got). For a `device-code`
-   * flow `userCode` carries the code to show and `port` is 0 (no listener).
-   */
-  | { type: 'auth.url'; requestId: string; url: string; port: number; flow?: AuthFlowType; userCode?: string }
-  /**
-   * Terminal result of an auth flow. `ok` with an optional `account` label
-   * (e.g. "ChatGPT Plus, user@example.com") on success; `error` describes the
-   * failure otherwise. After `ok` the orchestrator has written the vault backup
-   * (secret kind `codex_oauth`) from the shared CODEX_HOME volume.
-   */
-  | { type: 'auth.done'; requestId: string; ok: boolean; account?: string; error?: string }
-  | { type: 'device.list'; requestId: string; devices: DeviceInfo[] }
-  | { type: 'device.revoked'; requestId: string; deviceId: string }
-  | { type: 'link.list'; requestId: string; links: LinkInfo[] }
-  | { type: 'link.revoked'; requestId: string; linkId: string }
-  | { type: 'server.stats'; requestId: string; stats: ServerStats };
 
 export interface ServerStats {
   sessionsActive: number;
@@ -802,14 +586,284 @@ export interface ServerStats {
 }
 
 /* ------------------------------------------------------------------ */
-/* Pairing (REST before WS)                                            */
+/* Link-Agent-Relay (Kilo-Muster „remote connections", siehe             */
+/* KILO-CLOUD-ANALYSE.md P2 im Tag v0.13.0 — GREENFIELD-PI.md,           */
+/* „Entfallene Dokumente")                                               */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Wire-Version, die ein Link-Agent spricht; getragen von `agent.hello` und
+ * `agent.heartbeat`. Nur bei einer brechenden Änderung am Link<->Server-Format
+ * erhöhen; additive Erweiterungen (neue optionale Felder, neue
+ * `LinkCapabilities`) brauchen keinen Sprung. Fehlt das Feld, gilt Version 1 —
+ * ein Link-Agent, der Heartbeats/Capabilities noch gar nicht kennt.
+ */
+export const LINK_PROTOCOL_VERSION = 2;
+
+/**
+ * Feature-Flags, die ein Link-Agent auf `agent.hello`/`agent.heartbeat`
+ * ankündigt. Jedes Flag ist optional und MUSS als `false` gelten, wenn es
+ * fehlt — so arbeitet ein älterer Link-Agent gegen einen neueren Server
+ * unverändert weiter und ein neuerer gegen einen älteren Server degradiert,
+ * statt zu brechen. Neue Flags nur additiv: nie eines umdeuten oder entfernen.
+ */
+export interface LinkCapabilities {
+  /**
+   * Sendet periodische `agent.heartbeat`-Frames mit der vollständigen
+   * Session-Liste (`LinkSessionState`), statt sich allein auf
+   * `agent.event`/Verbindungsabbruch zu verlassen. Heute rein informativ (der
+   * Server rekonziliert aus jedem empfangenen `agent.heartbeat`, unabhängig
+   * vom Flag — die Nachricht selbst ist das Signal); als explizites Flag
+   * behalten, damit eine künftige, wirklich verhaltensändernde Capability ein
+   * Vorbild hat.
+   */
+  heartbeat?: boolean;
+}
+
+/**
+ * Status je Session, wie ihn ein Link-Agent im Heartbeat meldet, nach Kilos
+ * `idle|busy|question|permission`. Der Event-Strom kennt heute kein Signal für
+ * „wartet auf eine Freitext-Antwort" (nur `permission.request`), also sendet
+ * derzeit niemand `'question'` — es existiert für Wire-Parität mit Kilo.
+ */
+export type LinkSessionStatus = 'idle' | 'busy' | 'question' | 'permission';
+
+/** Eine Session, die ein Link-Agent gerade führt (Inhalt von `agent.heartbeat`). */
+export interface LinkSessionState {
+  /** Vom Orchestrator vergebene Id, also die `sessionId` aus `agent.ready`. */
+  sessionId: string;
+  status: LinkSessionStatus;
+}
+
+/**
+ * WebSocket-Close-Codes für App<->Orchestrator und Link<->Orchestrator (der
+ * Bereich 4000-4999 ist laut RFC 6455 privat). Hier zentral, damit `server/`
+ * (das sie sendet) und `link/` (das darauf reagiert) nicht auseinanderlaufen;
+ * `android/` spiegelt `WS_CLOSE_UNAUTHORIZED` als Literal in `WsClient.kt`,
+ * weil Kotlin dieses Paket nicht importieren kann.
+ */
+/** Eine andere Verbindung hat sich mit demselben Link-Token registriert; dieser Socket hat das Rennen verloren. */
+export const WS_CLOSE_REPLACED = 4000;
+/** Falsches/fehlendes/widerrufenes Token oder kein `hello`/`agent.hello` innerhalb des Auth-Timeouts. */
+export const WS_CLOSE_UNAUTHORIZED = 4001;
+/** Verbindungsobergrenze je Quell-Adresse (grober DoS-Schutz), siehe ws.ts. */
+export const WS_CLOSE_TOO_MANY_CONNECTIONS = 4002;
+
+/**
+ * Terminal in dem Sinn, in dem Kilos 4401/4403/4409 es sind: ein neuer Versuch
+ * mit derselben Registrierung kann nie gelingen, der Link-Agent beendet seine
+ * Reconnect-Schleife also endgültig statt mit Backoff weiterzuprobieren.
+ *  - `WS_CLOSE_UNAUTHORIZED`: das Token ist falsch oder widerrufen — daran
+ *    ändert sich ohne menschliches Zutun nichts.
+ *  - `WS_CLOSE_REPLACED`: ein anderer Prozess hält den Platz dieses Links.
+ *    Ein Reconnect würde drüben dasselbe Ersetzen auslösen (oder beide Seiten
+ *    flattern ewig); diese Seite gibt auf und überlässt die Entscheidung dem,
+ *    was den Prozess beaufsichtigt (systemd, Dockers Restart-Policy, Mensch).
+ * Jeder andere Code — auch `WS_CLOSE_TOO_MANY_CONNECTIONS`, eine
+ * vorübergehende Ressourcengrenze, sowie jeder normale Netzabbruch oder
+ * Server-Neustart — führt weiter zum Reconnect mit exponentiellem Backoff.
+ */
+export function isTerminalLinkCloseCode(code: number): boolean {
+  return code === WS_CLOSE_UNAUTHORIZED || code === WS_CLOSE_REPLACED;
+}
+
+/* ------------------------------------------------------------------ */
+/* WS: App/Link -> Server                                              */
+/* ------------------------------------------------------------------ */
+
+export type ClientMessage =
+  /** Erste Nachricht einer App-Verbindung; ohne sie schließt der Server mit 4001. */
+  | { type: 'hello'; deviceId: string; token: string }
+  | {
+      /** Registrierung eines Link-Agenten (Heim-PC/VPS): ausgehende WS, keine offenen Ports nötig. */
+      type: 'agent.hello';
+      token: string;
+      name?: string;
+      mode?: AgentMode;
+      branch?: string;
+      workDir?: string;
+      sessionRef?: string;
+      /** Fehlt => Version 1 (Link-Agent ohne Heartbeat/Capabilities). */
+      protocolVersion?: number;
+      capabilities?: LinkCapabilities;
+    }
+  | {
+      type: 'session.create';
+      requestId: string;
+      repoId: string;
+      provider: string;
+      /** Leerer String => pi-Vorgabemodell. */
+      model: string;
+      mode: AgentMode;
+      branch?: string;
+      networkPolicy?: NetworkPolicy;
+    }
+  /**
+   * `requestId` quittiert diese eine WS-Anfrage über `request.ok` (bzw. `error`
+   * mit derselben Id). `messageId` ist die von der App erzeugte Turn-Id
+   * (`msg_<random>`), die ein Resend unverändert wiederholt: der Server lässt
+   * eine messageId genau einmal zu (idempotent) und spiegelt sie in
+   * `request.ok`, damit die App die Quittung ihrem Turn zuordnen kann. Beide
+   * sind optional — ohne sie bleibt es beim alten „abschicken und hoffen".
+   */
+  | { type: 'session.prompt'; sessionId: string; text: string; mode?: AgentMode; requestId?: string; messageId?: string }
+  /**
+   * Modus / Modell / Reasoning-Stufe einer laufenden Session ändern. Alle
+   * Felder optional; der Server persistiert, was gesetzt ist, und antwortet
+   * allen Geräten mit `session.status`. (Der Adapterwechsel aus v1 entfällt —
+   * es gibt nur pi.)
+   */
+  | {
+      type: 'session.update';
+      requestId: string;
+      sessionId: string;
+      mode?: AgentMode;
+      /** Leerer String setzt die Session auf das pi-Vorgabemodell zurück. */
+      model?: string;
+      reasoningEffort?: ReasoningEffort;
+    }
+  /** Modellkatalog der Session erfragen (durchgereichtes GET /models). */
+  | { type: 'session.models.get'; requestId: string; sessionId: string }
+  | { type: 'session.permission'; sessionId: string; permissionId: string; decision: PermissionDecision }
+  | { type: 'session.abort'; sessionId: string }
+  | { type: 'session.stop'; sessionId: string }
+  | { type: 'session.resume'; sessionId: string }
+  /** Push + Draft-PR auf Tap (alle Modi außer yolo). */
+  | { type: 'session.push'; sessionId: string }
+  | { type: 'session.diff.get'; requestId: string; sessionId: string }
+  | { type: 'session.list'; requestId: string }
+  /**
+   * Gespeicherte Timeline einer Session, damit ein Client, der seine
+   * In-Memory-Nachrichten verloren hat (Screen verlassen, App neu gestartet),
+   * den Verlauf wieder zeigen kann. `limit` zählt die jüngsten Events
+   * (Vorgabe 200, max. 1000); die Antwort liefert sie chronologisch, älteste
+   * zuerst.
+   */
+  | { type: 'session.events.get'; requestId: string; sessionId: string; limit?: number }
+  /**
+   * Turn-Lebenszyklus einer Session. Lässt einen wiederverbundenen Client den
+   * Ausgang jedes Turns (`TurnState`) rekonstruieren, statt ihn aus dem
+   * Event-Strom zu erschließen. `limit` zählt die jüngsten Turns (Vorgabe 50,
+   * max. 500), Antwort älteste zuerst.
+   */
+  | { type: 'session.turns.get'; requestId: string; sessionId: string; limit?: number }
+  /** Session umbenennen; ein leerer Titel entfernt den Namen wieder. */
+  | { type: 'session.rename'; requestId: string; sessionId: string; title: string }
+  | { type: 'session.archive'; requestId: string; sessionId: string; archived: boolean }
+  | { type: 'session.delete'; requestId: string; sessionId: string }
+  | { type: 'repo.list'; requestId: string }
+  | { type: 'repo.add'; requestId: string; fullName: string; defaultBranch: string }
+  | { type: 'secret.set'; requestId: string; kind: SecretKind; value: string }
+  /**
+   * Einen Key live gegen seinen Provider prüfen, vor bzw. ohne Speichern. Der
+   * Wert wird ausschließlich für die eine ausgehende Anfrage benutzt — nie
+   * persistiert, geloggt oder zurückgespiegelt.
+   */
+  | { type: 'secret.validate'; requestId: string; kind: SecretKind; value: string }
+  | { type: 'secret.list'; requestId: string }
+  | { type: 'secret.delete'; requestId: string; id: string }
+  /**
+   * FCM-Token des Geräts hinterlegen (nach `hello`, und erneut bei jeder
+   * Token-Rotation durch Firebase). Bewusst ohne `requestId`: die App wartet
+   * auf keine Antwort, und ein verlorenes Register kostet nur die nächste
+   * Push-Zustellung, die beim nächsten Verbinden ohnehin nachgeholt wird.
+   */
+  | { type: 'fcm.register'; token: string }
+  | { type: 'device.list'; requestId: string }
+  | { type: 'device.revoke'; requestId: string; deviceId: string }
+  | { type: 'link.list'; requestId: string }
+  | { type: 'link.revoke'; requestId: string; linkId: string }
+  | { type: 'server.stats'; requestId: string };
+
+/* ------------------------------------------------------------------ */
+/* WS: Server -> App/Link (und die Link->Server-Gegenrichtung)         */
+/*                                                                     */
+/* Die `agent.*`-Varianten laufen in beide Richtungen: der Server      */
+/* sendet `agent.ready`/`agent.command`/`agent.bye`, der Link-Agent    */
+/* antwortet mit `agent.response`/`agent.event`/`agent.heartbeat`.     */
+/* Sie stehen zusammen in einem Typ, weil beide Seiten denselben       */
+/* Decoder benutzen.                                                   */
+/* ------------------------------------------------------------------ */
+
+export type ServerMessage =
+  | { type: 'welcome'; ok: true; serverVersion: string }
+  /** Server -> Link-Agent: Registrierung akzeptiert, Session gebunden. */
+  | { type: 'agent.ready'; sessionId: string }
+  /** Server -> Link-Agent: einen Runner-HTTP-Aufruf über die ausgehende WS durchreichen. */
+  | { type: 'agent.command'; sessionId: string; callId: string; path: string; method: 'GET' | 'POST'; body?: unknown }
+  /** Link-Agent -> Server: Antwort auf ein `agent.command`. */
+  | { type: 'agent.response'; callId: string; status: number; body?: unknown }
+  /** Link-Agent -> Server: normalisiertes Runner-Event. */
+  | { type: 'agent.event'; sessionId: string; event: AgentEvent }
+  /** Keepalive in beide Richtungen. */
+  | { type: 'agent.ping'; ts: number }
+  | { type: 'agent.pong'; ts: number }
+  /**
+   * Link-Agent -> Server: periodischer Voll-Schnappschuss (~10 s, Kilo-Muster
+   * P2). Trägt jede Session, die der Link gerade führt, statt eines Deltas:
+   * der Orchestrator braucht keine Event-Buchhaltung, um korrekt zu bleiben,
+   * und eine Session-Id, die hier nicht mehr auftaucht, ist aus Sicht des
+   * Link-Agenten weg — dieselbe Folgerung wie bei einem Socket-Close, nur ohne
+   * dass einer nötig wäre. `protocolVersion`/`capabilities` fahren mit, damit
+   * der Server künftiges additives Verhalten daran knüpfen kann.
+   */
+  | { type: 'agent.heartbeat'; sessions: LinkSessionState[]; protocolVersion?: number; capabilities?: LinkCapabilities }
+  /** Server -> Link-Agent: Session aus der App gestoppt; der Link-Agent fährt herunter. */
+  | { type: 'agent.bye'; sessionId: string }
+  | { type: 'error'; requestId?: string; sessionId?: string; message: string }
+  | { type: 'request.ok'; requestId: string; payload?: unknown }
+  | { type: 'session.list'; requestId: string; sessions: SessionInfo[] }
+  /** Live-Event einer Session an alle verbundenen Geräte. */
+  | { type: 'session.event'; sessionId: string; event: AgentEvent }
+  /** Antwort auf `session.events.get`: chronologisch, älteste zuerst. */
+  | { type: 'session.events'; requestId: string; sessionId: string; events: AgentEvent[] }
+  /** Antwort auf `session.turns.get`: chronologisch, älteste zuerst. */
+  | { type: 'session.turns'; requestId: string; sessionId: string; turns: TurnInfo[] }
+  /**
+   * Live-Push bei jedem Turn-Zustandswechsel (queued/running/terminal). Rein
+   * additiv: ein Client, der die Turn-Ressource nicht kennt, ignoriert diesen
+   * Typ und arbeitet wie bisher mit `session.status`/`session.event`.
+   */
+  | { type: 'turn.status'; sessionId: string; turn: TurnInfo }
+  | { type: 'session.diff'; requestId: string; sessionId: string; diff: DiffEntry[] }
+  /** `session` fehlt bei reinen Statuswechseln ohne weitere Änderung. */
+  | { type: 'session.status'; sessionId: string; status: SessionStatus; session?: SessionInfo }
+  | { type: 'session.models'; requestId: string; sessionId: string; models: ModelInfo[] }
+  | { type: 'session.deleted'; requestId: string; sessionId: string }
+  | { type: 'repo.list'; requestId: string; repos: RepoInfo[] }
+  | { type: 'repo.added'; requestId: string; repo: RepoInfo }
+  | { type: 'secret.list'; requestId: string; secrets: SecretInfo[] }
+  | { type: 'secret.saved'; requestId: string; secret: SecretInfo }
+  /**
+   * Ergebnis einer `secret.validate`; trägt nie den Wert. `unverified: true`
+   * heißt, dass es für diese Art keinen Live-Check gibt — `ok` ist dann true,
+   * damit der Ablauf weitergeht, die UI muss es aber neutral darstellen und
+   * nicht als bestätigten Key.
+   */
+  | {
+      type: 'secret.validated';
+      requestId: string;
+      kind: SecretKind;
+      ok: boolean;
+      detail?: string;
+      unverified?: boolean;
+    }
+  | { type: 'secret.deleted'; requestId: string; id: string }
+  | { type: 'device.list'; requestId: string; devices: DeviceInfo[] }
+  | { type: 'device.revoked'; requestId: string; deviceId: string }
+  | { type: 'link.list'; requestId: string; links: LinkInfo[] }
+  | { type: 'link.revoked'; requestId: string; linkId: string }
+  | { type: 'server.stats'; requestId: string; stats: ServerStats };
+
+/* ------------------------------------------------------------------ */
+/* Pairing (REST vor der WS)                                           */
 /* ------------------------------------------------------------------ */
 
 /**
  * POST /api/pairing/confirm
- * The app scans a QR code containing `<serverUrl>` + one-time 12-hex-char code
- * (code is generated by the operator via `npm run pair` on the server, TTL 10 min,
- * invalidated after 5 failed confirm attempts).
+ * Die App scannt einen QR-Code mit `<serverUrl>` und einem einmaligen Code aus
+ * 12 Hex-Zeichen (erzeugt vom Betreiber über `npm run pair`, TTL 10 min, nach
+ * 5 Fehlversuchen ungültig). Der Endpunkt ist ratenbegrenzt (IP + global).
  */
 export interface PairingConfirmBody {
   code: string;
@@ -819,12 +873,30 @@ export interface PairingConfirmBody {
 export interface PairingConfirmResponse {
   ok: true;
   deviceId: string;
-  /** Long-lived device token; stored in Android Keystore-backed storage. */
+  /** Langlebiges Gerätetoken; landet im Keystore-gestützten Speicher der App. */
   deviceToken: string;
 }
 
+/**
+ * POST /api/pairing/create (Admin-Token im Authorization-Header).
+ * Liefert den Code, den der Betreiber als QR anzeigt.
+ */
+export interface PairingCreateResponse {
+  ok: true;
+  code: string;
+  /** ISO-8601; nach diesem Zeitpunkt lehnt `confirm` den Code ab. */
+  expiresAt: string;
+}
+
+/** GET /api/health — ohne Auth, für Coolify/Docker-Healthchecks. */
+export interface ServerHealthResponse {
+  ok: true;
+  version: string;
+  docker: boolean;
+}
+
 /* ------------------------------------------------------------------ */
-/* FCM push payload                                                    */
+/* FCM-Push                                                            */
 /* ------------------------------------------------------------------ */
 
 export interface FcmPushPayload {
@@ -833,112 +905,34 @@ export interface FcmPushPayload {
   title: string;
   body: string;
   /**
-   * Only set for `permission.request`: lets the app answer directly from an
-   * actionable notification (Allow/Deny) without opening the session first —
-   * `session.permission` needs it to address the right approval.
+   * Nur bei `permission.request` gesetzt: erlaubt die Antwort direkt aus der
+   * Benachrichtigung (Erlauben/Ablehnen), ohne die Session vorher zu öffnen —
+   * `session.permission` braucht die Id, um die richtige Freigabe zu treffen.
    */
   permissionId?: string;
 }
 
 /* ------------------------------------------------------------------ */
-/* Shared opencode-wire helpers (used by the kilo shim)                */
+/* Event-Sequenzierung + Replay (Broadcaster des Runners)              */
 /*                                                                     */
-/* kilo is an OpenCode fork, so it speaks the same `/config/providers` */
-/* catalog format and the same `provider/model` id form OpenCode does. */
-/* The logic is pure, synchronous and dependency-free, so it stays as  */
-/* portable as the type declarations above.                            */
-/* ------------------------------------------------------------------ */
-/**
- * Flatten opencode's `GET /config/providers` catalog into `provider/model` ids
- * (the form POST /session/:id/prompt accepts as {providerID, modelID}).
- * Shape: { providers: [{ id, name, models: { <modelID>: { id?, name? } } }] };
- * anything unexpected yields an empty catalog instead of an error.
- */
-export function parseProviderCatalog(raw: unknown): ModelInfo[] {
-  const providers = Array.isArray(raw)
-    ? raw
-    : typeof raw === 'object' && raw !== null && Array.isArray((raw as { providers?: unknown }).providers)
-      ? ((raw as { providers: unknown[] }).providers)
-      : [];
-  const out: ModelInfo[] = [];
-  for (const entry of providers) {
-    if (typeof entry !== 'object' || entry === null) continue;
-    const p = entry as { id?: unknown; name?: unknown; models?: unknown };
-    const providerId = typeof p.id === 'string' ? p.id : undefined;
-    if (providerId === undefined) continue;
-    const providerName = typeof p.name === 'string' ? p.name : providerId;
-    const models = p.models;
-    const list: Array<[string, { name?: unknown } | null]> = Array.isArray(models)
-      ? models.map((m) => {
-          const rec = typeof m === 'object' && m !== null ? (m as { id?: unknown; name?: unknown }) : null;
-          return [typeof rec?.id === 'string' ? rec.id : '', rec] as [string, { name?: unknown } | null];
-        })
-      : typeof models === 'object' && models !== null
-        ? Object.entries(models as Record<string, unknown>).map(([key, value]) => {
-            const rec = typeof value === 'object' && value !== null ? (value as { id?: unknown; name?: unknown }) : null;
-            const id = typeof rec?.id === 'string' ? rec.id : key;
-            return [id, rec] as [string, { name?: unknown } | null];
-          })
-        : [];
-    for (const [modelId, rec] of list) {
-      if (modelId.length === 0) continue;
-      const modelName = typeof rec?.name === 'string' ? rec.name : modelId;
-      out.push({ id: `${providerId}/${modelId}`, name: `${providerName} · ${modelName}` });
-    }
-  }
-  return out;
-}
-
-/**
- * Model selection for one prompt. opencode addresses models as
- * {providerID, modelID}, so `model` may carry the `provider/model` form the
- * shim's GET /models returns; an empty string falls back to the runtime's own
- * default (the documented "adapter default" reset).
- */
-export function selectModel(
-  current: { provider?: string; model?: string },
-  body: { provider?: unknown; model?: unknown },
-): { provider?: string; model?: string } {
-  const next = { ...current };
-  if (typeof body.provider === 'string' && body.provider.length > 0) next.provider = body.provider;
-  if (typeof body.model !== 'string') return next;
-  const raw = body.model.trim();
-  if (raw.length === 0) {
-    // explicit reset: let the runtime pick its configured default again
-    next.model = undefined;
-    return next;
-  }
-  const slash = raw.indexOf('/');
-  if (slash > 0) {
-    next.provider = raw.slice(0, slash);
-    next.model = raw.slice(slash + 1);
-  } else {
-    next.model = raw;
-  }
-  return next;
-}
-
-/* ------------------------------------------------------------------ */
-/* Shared event sequencing + replay (used by every shim's broadcaster) */
-/*                                                                     */
-/* All shims speak the same normalized SSE stream, and all of them lost */
-/* events on a reconnect gap because the broadcaster buffered nothing   */
-/* and carried no ids. This one implementation gives every shim a       */
-/* monotone `id` per event, a ring buffer of the recent past, and       */
-/* Last-Event-ID replay - the orchestrator side reconnects with the id  */
-/* it last saw, and the shim resends whatever is still in the ring. It  */
-/* stays pure and dependency-free (loaded verbatim in shim containers   */
-/* via node's type stripping), so the sink is a structural type, never  */
-/* an import of node:http.                                              */
+/* Der Runner-SSE-Strom hat in v0 bei jeder Reconnect-Lücke Events     */
+/* verloren, weil nichts gepuffert war und keine Ids mitliefen. Diese  */
+/* Implementierung gibt jedem Event eine monotone `seq`, hält einen    */
+/* Ringpuffer der jüngsten Vergangenheit und beherrscht                */
+/* Last-Event-ID-Replay: der Orchestrator verbindet sich mit der       */
+/* zuletzt gesehenen Id neu, der Runner schickt nach, was noch im Ring */
+/* liegt. Bleibt pur und ohne node-Import (die Senke ist ein           */
+/* struktureller Typ), weil die Datei im Container als TS-Quelle lädt. */
 /* ------------------------------------------------------------------ */
 
-/** How many recent events a shim keeps for Last-Event-ID replay. */
+/** Wie viele Events der Runner für den Last-Event-ID-Replay vorhält. */
 export const EVENT_RING_CAPACITY = 1000;
 
 /**
- * Minimal SSE client the broadcaster writes to. `ServerResponse` satisfies it
- * structurally, so nothing here depends on node:http. `writableEnded` lets the
- * broadcaster drop a client whose socket already closed.
+ * Minimale SSE-Senke, in die der Broadcaster schreibt. Nodes `ServerResponse`
+ * erfüllt sie strukturell, deshalb hängt hier nichts an `node:http`.
+ * `writableEnded` lässt den Broadcaster einen Client wegwerfen, dessen Socket
+ * schon zu ist.
  */
 export interface SseSink {
   write(chunk: string): unknown;
@@ -946,10 +940,10 @@ export interface SseSink {
 }
 
 /**
- * Parse a `Last-Event-ID` header (SSE reconnect) into a sequence number. Node
- * lower-cases header names and may hand back an array for a repeated header;
- * anything that is not a non-negative integer means "no cursor" (a fresh
- * connection), which replays nothing.
+ * Einen `Last-Event-ID`-Header (SSE-Reconnect) in eine Sequenznummer wandeln.
+ * Node schreibt Headernamen klein und liefert bei doppeltem Header ein Array;
+ * alles, was keine nicht-negative Ganzzahl ist, bedeutet „kein Cursor" (frische
+ * Verbindung) und spielt nichts nach.
  */
 export function parseLastEventId(header: string | string[] | undefined): number | undefined {
   const raw = Array.isArray(header) ? header[0] : header;
@@ -959,19 +953,21 @@ export function parseLastEventId(header: string | string[] | undefined): number 
 }
 
 /**
- * Fan-out broadcaster for the normalized AgentEvent SSE stream with per-event
- * sequence ids and a replay ring.
+ * Fan-out-Broadcaster für den normalisierten AgentEvent-SSE-Strom, mit
+ * Sequenz-Ids je Event und Replay-Ring.
  *
- * `publish` stamps the next id (and a `ts`) into the event, formats the SSE
- * frame with an `id:` line, buffers it, and writes it to every live client.
- * `add` registers a client; on a reconnect the caller passes the client's
- * Last-Event-ID and every buffered frame after it is replayed first, so a gap
- * in the connection loses no event still held in the ring.
+ * `publish` prägt die nächste Id (und ein `ts`) ins Event, formatiert den
+ * SSE-Frame mit `id:`-Zeile, puffert ihn und schreibt ihn an jeden lebenden
+ * Client. `add` registriert einen Client; bei einem Reconnect reicht der
+ * Aufrufer dessen Last-Event-ID mit, und jeder gepufferte Frame danach wird
+ * zuerst nachgespielt — eine Verbindungslücke verliert also kein Event, das
+ * noch im Ring liegt.
  *
- * `ping` keepalives are deliberately unsequenced: they are fanned out to keep
- * the socket warm but never consume an id or a ring slot, so a long-idle
- * session's pings cannot evict the real events (a missed `turn.completed`) that
- * a reconnecting client still needs to replay.
+ * `ping`-Keepalives sind bewusst unsequenziert: sie gehen live raus, um den
+ * Socket warm zu halten, verbrauchen aber weder Id noch Ringplatz. Sonst
+ * könnten die Pings einer lange leerlaufenden Session genau die echten Events
+ * (ein verpasstes `turn.completed`) aus dem Ring drängen, die ein
+ * wiederverbindender Client noch braucht.
  */
 export class SequencedSseBroadcaster {
   private seq = 0;
@@ -984,8 +980,8 @@ export class SequencedSseBroadcaster {
   }
 
   /**
-   * Stamp, buffer and fan out an event. Returns the assigned id, or `undefined`
-   * for a `ping` (which is sent live but never sequenced).
+   * Event prägen, puffern und verteilen. Liefert die vergebene Id, oder
+   * `undefined` für ein `ping` (das gesendet, aber nie sequenziert wird).
    */
   publish(event: AgentEvent): number | undefined {
     if (event.type === 'ping') {
@@ -1002,9 +998,9 @@ export class SequencedSseBroadcaster {
   }
 
   /**
-   * Register an SSE client. `lastEventId` (from its Last-Event-ID header on a
-   * reconnect) replays every still-buffered frame after it before the client
-   * starts receiving live frames again.
+   * SSE-Client registrieren. `lastEventId` (aus dessen Last-Event-ID-Header bei
+   * einem Reconnect) spielt jeden noch gepufferten Frame danach nach, bevor der
+   * Client wieder Live-Frames bekommt.
    */
   add(sink: SseSink, lastEventId?: number): void {
     if (lastEventId !== undefined) {
@@ -1021,7 +1017,7 @@ export class SequencedSseBroadcaster {
     return this.clients.size;
   }
 
-  /** The id of the last sequenced event (0 before anything was published). */
+  /** Id des zuletzt sequenzierten Events (0, solange nichts veröffentlicht wurde). */
   get lastId(): number {
     return this.seq;
   }
@@ -1044,32 +1040,29 @@ export class SequencedSseBroadcaster {
 }
 
 /* ------------------------------------------------------------------ */
-/* Egress proxy wiring (used at process start by every shim)          */
-/* Under network policy 'allowlist' a session container hangs on an   */
-/* internal docker network with no route out: the only way to the     */
-/* internet is the orchestrator's egress proxy, handed in as          */
-/* HTTP_PROXY / HTTPS_PROXY / NO_PROXY (server/src/docker.ts,         */
-/* sessionNetworking). Node honours none of those on its own - not    */
-/* fetch (undici), not http.request - so whether a provider call went */
-/* through the proxy came down to which HTTP client the SDK happened  */
-/* to use. The clients that ignore the variables died with a bare     */
-/* "Connection error." and left no line in the proxy log at all,      */
-/* because nothing ever reached the proxy. Pinning undici's *global*  */
-/* dispatcher fixes that for the whole process at once, an SDK's own  */
-/* bundled undici copy included: the global dispatcher lives on a     */
-/* globalThis symbol that every copy reads.                           */
-/*                                                                    */
-/* Pure and node-free like the rest of this file (it is loaded        */
-/* verbatim in the containers via node's type stripping): the undici  */
-/* call comes in as a callback, and the caller does the logging.      */
+/* Egress-Proxy-Verdrahtung (beim Prozessstart des Runners)            */
+/*                                                                     */
+/* Unter der Policy 'allowlist' hängt ein Session-Container in einem   */
+/* internen Docker-Netz ohne Route nach draußen: der einzige Weg ins   */
+/* Internet ist der Egress-Proxy des Orchestrators, hereingereicht als */
+/* HTTP_PROXY / HTTPS_PROXY / NO_PROXY (server/src/docker.ts).         */
+/* Node beachtet keine dieser Variablen von sich aus — weder fetch     */
+/* (undici) noch http.request — es hing also am HTTP-Client des SDK,   */
+/* ob ein Provider-Aufruf überhaupt beim Proxy ankam. Clients, die die */
+/* Variablen ignorieren, starben mit einem nackten "Connection error." */
+/* und hinterließen keine Zeile im Proxy-Log, weil nie etwas ankam.    */
+/* Den *globalen* Dispatcher von undici zu setzen behebt das für den   */
+/* ganzen Prozess auf einen Schlag, mitgebrachte undici-Kopien eines   */
+/* SDK eingeschlossen: der globale Dispatcher liegt auf einem          */
+/* globalThis-Symbol, das jede Kopie liest. (PR #57)                   */
 /* ------------------------------------------------------------------ */
 
 /**
- * The proxy URL the environment asks outbound traffic to take, or `undefined`
- * when the session was started without one (policy 'open': direct internet).
- * https wins over http because every provider endpoint is https, and both
- * spellings are read - these variables are conventionally lowercase, but the
- * orchestrator injects the uppercase form.
+ * Die Proxy-URL, über die die Umgebung ausgehenden Verkehr haben will, oder
+ * `undefined`, wenn die Session ohne Proxy gestartet wurde (Policy 'open':
+ * direktes Internet). https schlägt http, weil jeder Provider-Endpunkt https
+ * ist; beide Schreibweisen werden gelesen — konventionell sind die Variablen
+ * klein geschrieben, der Orchestrator injiziert die große Form.
  */
 export function envProxyUrl(env: Record<string, string | undefined>): string | undefined {
   const raw = env.https_proxy ?? env.HTTPS_PROXY ?? env.http_proxy ?? env.HTTP_PROXY;
@@ -1078,30 +1071,30 @@ export function envProxyUrl(env: Record<string, string | undefined>): string | u
 }
 
 /**
- * Proxy URL without its userinfo. The injected URL carries the session's shim
- * token as Basic credentials for the egress proxy, so only this form may be
- * logged.
+ * Proxy-URL ohne ihren Userinfo-Teil. Die injizierte URL trägt das
+ * Shim-Token der Session als Basic-Credentials für den Egress-Proxy — nur
+ * diese Form darf geloggt werden.
  */
 export function redactProxyUrl(url: string): string {
   return url.replace(/\/\/[^/@]*@/, '//***@');
 }
 
 /**
- * Pin every outbound HTTP(S) request of this process to the egress proxy - but
- * only when one is configured. Without proxy variables the container has direct
- * internet access and must keep it: installing a dispatcher there would aim
- * every request at a proxy that does not exist.
+ * Jeden ausgehenden HTTP(S)-Aufruf dieses Prozesses auf den Egress-Proxy
+ * festnageln — aber nur, wenn einer konfiguriert ist. Ohne Proxy-Variablen hat
+ * der Container direkten Internetzugang und muss ihn behalten: ein Dispatcher
+ * würde dort jeden Aufruf auf einen Proxy richten, den es nicht gibt.
  *
- * `install` is expected to set undici's global dispatcher to an
- * `EnvHttpProxyAgent`, which reads HTTP_PROXY/HTTPS_PROXY/NO_PROXY itself - so
- * loopback traffic named in NO_PROXY (the shim's own HTTP surface, kilo's local
- * `kilo serve`) keeps going direct. It is a callback because this package is
- * loaded as TypeScript source from /app/packages/protocol in the shim images,
- * where a bare `import 'undici'` would resolve against the package's own
- * (nonexistent) node_modules instead of the shim's.
+ * `install` soll undicis globalen Dispatcher auf einen `EnvHttpProxyAgent`
+ * setzen, der HTTP_PROXY/HTTPS_PROXY/NO_PROXY selbst liest — damit geht
+ * Loopback-Verkehr, der in NO_PROXY steht (die eigene HTTP-Oberfläche des
+ * Runners), weiterhin direkt. Es ist ein Callback, weil dieses Paket im
+ * Runner-Image als TypeScript-Quelle aus /app/packages/protocol geladen wird,
+ * wo ein blankes `import 'undici'` gegen die (nicht vorhandenen) node_modules
+ * dieses Pakets aufgelöst würde statt gegen die des Runners.
  *
- * Returns the redacted proxy URL now in force, or `undefined` when nothing was
- * installed.
+ * Liefert die redigierte Proxy-URL, die jetzt gilt, oder `undefined`, wenn
+ * nichts installiert wurde.
  */
 export function installEnvProxyDispatcher(
   env: Record<string, string | undefined>,

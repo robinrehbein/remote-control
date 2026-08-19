@@ -22,7 +22,7 @@ export interface RepoRow {
 }
 export interface SessionRow {
   id: string; tenant_id: string; repo_id: string; repo_full_name: string;
-  adapter: string; provider: string; model: string; mode: string;
+  provider: string; model: string; mode: string;
   status: string; branch: string; session_ref: string | null; container_id: string | null;
   volume_name: string | null; shim_token: string | null; pr_url: string | null;
   shim_endpoint: string | null; link_id: string | null; network_policy: string | null;
@@ -72,9 +72,10 @@ CREATE TABLE IF NOT EXISTS repos (
 );
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, repo_id TEXT NOT NULL, repo_full_name TEXT NOT NULL,
-  adapter TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, mode TEXT NOT NULL,
+  provider TEXT NOT NULL, model TEXT NOT NULL, mode TEXT NOT NULL,
   status TEXT NOT NULL, branch TEXT NOT NULL, session_ref TEXT, container_id TEXT,
-  volume_name TEXT, shim_token TEXT, pr_url TEXT, shim_endpoint TEXT,
+  volume_name TEXT, shim_token TEXT, pr_url TEXT, shim_endpoint TEXT, link_id TEXT,
+  network_policy TEXT, reasoning_effort TEXT, title TEXT, archived INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL, last_active_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS session_events (
@@ -121,25 +122,11 @@ export class Store {
       'CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_message ON turns(session_id, message_id) WHERE message_id IS NOT NULL',
     );
     this.migrateSecretsUnique();
-    const sessionCols = this.db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>;
-    if (!sessionCols.some((c) => c.name === 'shim_endpoint')) {
-      this.db.exec('ALTER TABLE sessions ADD COLUMN shim_endpoint TEXT');
-    }
-    if (!sessionCols.some((c) => c.name === 'link_id')) {
-      this.db.exec('ALTER TABLE sessions ADD COLUMN link_id TEXT');
-    }
-    if (!sessionCols.some((c) => c.name === 'network_policy')) {
-      this.db.exec('ALTER TABLE sessions ADD COLUMN network_policy TEXT');
-    }
-    if (!sessionCols.some((c) => c.name === 'reasoning_effort')) {
-      this.db.exec('ALTER TABLE sessions ADD COLUMN reasoning_effort TEXT');
-    }
-    if (!sessionCols.some((c) => c.name === 'title')) {
-      this.db.exec('ALTER TABLE sessions ADD COLUMN title TEXT');
-    }
-    if (!sessionCols.some((c) => c.name === 'archived')) {
-      this.db.exec('ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0');
-    }
+    // Die Session-Spalten stehen vollständig in SCHEMA (v2 startet auf einer
+    // frischen Datei, siehe GREENFIELD-PI.md „Risiken"), deshalb bleibt hier nur
+    // die attempts-Migration: pairing_codes wird ohne sie angelegt, wenn eine
+    // Datenbank aus einer sehr frühen Version weiterbenutzt wird, und ohne die
+    // Spalte fällt der 5-Versuche-Lockout in consumePairingCode aus.
     const pairingCols = this.db.prepare('PRAGMA table_info(pairing_codes)').all() as Array<{ name: string }>;
     if (!pairingCols.some((c) => c.name === 'attempts')) {
       this.db.exec('ALTER TABLE pairing_codes ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0');
@@ -367,13 +354,13 @@ export class Store {
     this.bumpSessionAuth();
     this.db
       .prepare(
-        `INSERT INTO sessions (id, tenant_id, repo_id, repo_full_name, adapter, provider, model, mode,
+        `INSERT INTO sessions (id, tenant_id, repo_id, repo_full_name, provider, model, mode,
          status, branch, session_ref, container_id, volume_name, shim_token, pr_url, shim_endpoint, link_id,
          network_policy, reasoning_effort, title, archived, created_at, last_active_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
-        row.id, row.tenant_id, row.repo_id, row.repo_full_name, row.adapter, row.provider,
+        row.id, row.tenant_id, row.repo_id, row.repo_full_name, row.provider,
         row.model, row.mode, row.status, row.branch, row.session_ref, row.container_id,
         row.volume_name, row.shim_token, row.pr_url, row.shim_endpoint, row.link_id,
         row.network_policy, row.reasoning_effort, row.title, row.archived ? 1 : 0,
@@ -408,9 +395,9 @@ export class Store {
   }
 
   /**
-   * Partial update of the switchable session settings (session.update).
-   * `clearSessionRef` belongs to the harness switch: a runtime session
-   * reference is bound to the old adapter and must not survive it.
+   * Teilweise Aktualisierung der umschaltbaren Session-Einstellungen
+   * (`session.update`). Der Adapterwechsel aus v1 ist entfallen - es gibt nur
+   * pi -, deshalb bleiben Provider und `session_ref` hier unberührt.
    */
   updateSessionSettings(
     id: string,
@@ -418,9 +405,6 @@ export class Store {
       mode?: string;
       model?: string;
       reasoningEffort?: string;
-      adapter?: string;
-      provider?: string;
-      clearSessionRef?: boolean;
     },
   ): void {
     const sets: string[] = [];
@@ -437,17 +421,6 @@ export class Store {
       sets.push('reasoning_effort = ?');
       // empty string clears the stored effort
       values.push(patch.reasoningEffort === '' ? null : patch.reasoningEffort);
-    }
-    if (patch.adapter !== undefined) {
-      sets.push('adapter = ?');
-      values.push(patch.adapter);
-    }
-    if (patch.provider !== undefined) {
-      sets.push('provider = ?');
-      values.push(patch.provider);
-    }
-    if (patch.clearSessionRef === true) {
-      sets.push('session_ref = NULL');
     }
     if (sets.length === 0) return;
     this.db.prepare(`UPDATE sessions SET ${sets.join(', ')} WHERE id = ?`).run(...values, id);

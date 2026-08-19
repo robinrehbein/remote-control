@@ -1,16 +1,16 @@
 /**
- * Provisioning progress: everything behind the phased `notice` events that show
- * a starting session what is happening right now (image build, container start,
- * repo clone). Pure and docker-free on purpose - the derivation rules are the
- * part that has to stay covered by the smoke suite, the daemon plumbing lives
- * in docker.ts.
+ * Provisioning-Fortschritt: alles hinter den `notice`-Events mit `phase`, die
+ * einer startenden Session zeigen, was gerade passiert (Runner-Image-Bau,
+ * Container-Start, Repo-Clone). Bewusst pur und docker-frei - die
+ * Ableitungsregeln sind der Teil, der von der Smoke-Suite gedeckt bleiben muss,
+ * die Daemon-Klempnerei liegt in docker.ts.
  */
 
 /** Log lines read per poll while a session container boots (keep the poll cheap). */
 export const LOG_TAIL_LINES = 20;
-/** Minimum gap between two image-build notices (the daemon emits many lines/s). */
+/** Mindestabstand zweier Bau-Meldungen (der Daemon sendet viele Zeilen/s). */
 export const BUILD_NOTICE_INTERVAL_MS = 2_000;
-/** Poll interval of the container log tail while waiting for the shim. */
+/** Poll-Abstand des Container-Logs, während auf den Runner gewartet wird. */
 export const SHIM_LOG_POLL_MS = 3_000;
 
 const MAX_DETAIL_LINES = 6;
@@ -107,7 +107,7 @@ export function buildProgressMessage(lines: readonly string[]): string {
 
 export const SHIM_START_MESSAGE = 'Agent-Container startet';
 
-/** Marker lines the shims print while booting (their gitops/index modules). */
+/** Markerzeilen, die der Runner beim Booten druckt (gitops/index). */
 const SHIM_MARKERS: readonly { readonly re: RegExp; readonly message: string }[] = [
   { re: /\[git\]\s*cloning|cloning into|git clone/i, message: 'Repo wird geklont' },
   { re: /\[git\]\s*on branch|switched to (?:a new )?branch|git checkout/i, message: 'Branch wird vorbereitet' },
@@ -115,7 +115,7 @@ const SHIM_MARKERS: readonly { readonly re: RegExp; readonly message: string }[]
   { re: /listening on/i, message: 'Agent-Prozess läuft – Verbindung wird geprüft' },
 ];
 
-/** Shim-start message for the newest recognized marker; generic otherwise. */
+/** Meldung zum jüngsten erkannten Marker; sonst die allgemeine. */
 export function shimProgressMessage(lines: readonly string[]): string {
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i] ?? '';

@@ -34,21 +34,28 @@ RUN npm ci --omit=dev
 
 COPY --from=builder /app/dist /app/dist
 
-# Shim build contexts for the on-demand self build (server/src/image-build.ts):
-# without a registry the orchestrator builds a missing <prefix>/<id>-shim image
-# itself over the docker API, so the layout here MUST match what every
-# shims/<id>/Dockerfile COPYs from its (repo-root) context.
-# node_modules stay out via the root .dockerignore.
+# Build-Kontext des Runner-Images (server/src/runner.ts, docker.ensureRunnerImage).
+#
+# Coolify baut nur dieses Dockerfile, das Runner-Image muss also ohne manuellen
+# Schritt auf den Host kommen: der Server bündelt die Quellen und baut daraus
+# beim ersten Session-Start `pocketagent/pi-runner:<RUNNER_IMAGE_TAG>` über die
+# Docker-API, falls das Image dort noch nicht liegt.
+#
+# Das Layout hier MUSS genau dem entsprechen, was runner/Dockerfile aus seinem
+# (Repo-Root-)Kontext kopiert - tsconfig.base.json, packages/protocol, runner/.
+# node_modules bleiben über die .dockerignore draußen.
 COPY tsconfig.base.json /app/build-context/tsconfig.base.json
 COPY packages/protocol /app/build-context/packages/protocol
-COPY shims /app/build-context/shims
+COPY runner /app/build-context/runner
 
-# Adapter plugin manifests (shims/*/adapter.json -> /app/adapters/<id>.json)
-RUN mkdir -p /app/adapters \
-  && cd /app/build-context/shims \
-  && for d in */; do \
-       if [ -f "${d}adapter.json" ]; then cp "${d}adapter.json" "/app/adapters/${d%/}.json"; fi; \
-     done
+# Zur Buildzeit eingebrannter Vorgabe-Tag. Ein Deploy mit geändertem Runner
+# sollte ihn hochzählen (`--build-arg RUNNER_IMAGE_TAG=…` bzw. Coolify-Build-Arg),
+# damit ensureRunnerImage kein Image dieses Namens findet und neu baut - das
+# Content-Hash-System aus v1 gibt es bewusst nicht mehr.
+# Zur Laufzeit schlägt eine gesetzte Env-Variable diesen Wert; `RUNNER_IMAGE`
+# gibt ein fertiges Registry-Image komplett vor (dann wird nur gepullt).
+ARG RUNNER_IMAGE_TAG=latest
+ENV RUNNER_IMAGE_TAG=${RUNNER_IMAGE_TAG}
 
 EXPOSE 3000
 

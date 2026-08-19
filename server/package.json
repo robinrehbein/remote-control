@@ -1,10 +1,11 @@
 {
   "name": "@pocketagent/server",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "tsx src/index.ts",
+    "build": "tsc -p tsconfig.build.json",
     "start": "node dist/index.js",
     "pair": "node dist/pair.js",
     "admin": "node dist/admin.js",

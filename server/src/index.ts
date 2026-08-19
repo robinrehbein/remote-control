@@ -10,8 +10,6 @@ import { Heartbeat, Hub, registerWs } from './ws.js';
 import { confirmPairing, generatePairingCode, adminTokenOk, SlidingWindowRateLimiter } from './pairing.js';
 import { registerSecretsApi } from './secrets-api.js';
 import { startEgressProxy } from './egress-proxy.js';
-import { DockerCodexAuthTransport, setEgressSessionProvider } from './docker.js';
-import { CodexAuthManager, type CodexAuthTransport } from './codex-auth.js';
 
 export interface App {
   app: ReturnType<typeof Fastify>;
@@ -19,16 +17,6 @@ export interface App {
   manager: SessionManager;
   hub: Hub;
   heartbeat: Heartbeat;
-  codexAuth: CodexAuthManager;
-}
-
-export interface BuildAppOptions {
-  /**
-   * Override the codex auth transport (CODEX-OAUTH.md). Defaults to the
-   * docker-backed one; the smoke test injects a fake app-server transport so
-   * the whole auth.* WS flow runs without a daemon or the real codex binary.
-   */
-  codexAuthTransport?: CodexAuthTransport;
 }
 
 /** Security audit line (stdout-warn JSON; never log full pairing codes or tokens). */
@@ -36,7 +24,7 @@ export function auditWarn(kind: string, fields: Record<string, unknown>): void {
   console.warn(JSON.stringify({ ts: new Date().toISOString(), ev: 'auth.fail', kind, ...fields }));
 }
 
-export async function buildApp(options: BuildAppOptions = {}): Promise<App> {
+export async function buildApp(): Promise<App> {
   // trustProxy: only honour X-Forwarded-For when TRUST_PROXY=1 (behind
   // Coolify/Traefik) - it makes req.ip (WS conn cap, pairing rate limiter)
   // resolve the real client instead of the proxy's single shared address.
@@ -45,9 +33,6 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<App> {
   const hub = new Hub();
   const heartbeat = new Heartbeat();
   const manager = new SessionManager(store, (m) => hub.broadcast(m));
-  // Remote-gateway mode: the gateway's egress proxy gates on the same session
-  // table as the in-process one, pushed to it whenever it changes (docker.ts).
-  setEgressSessionProvider(() => manager.egressSessions());
   manager.setLinkTransport({
     call: (linkId, path, method, body) => hub.callLink(linkId, path, method, body),
     isConnected: (linkId) => hub.hasLink(linkId),
@@ -91,13 +76,9 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<App> {
 
   registerSecretsApi(app, store);
 
-  // In-app codex OAuth (CODEX-OAUTH.md): drives `codex app-server` login in a
-  // short-lived auth container and backs the resulting auth.json up to the vault.
-  const codexAuth = new CodexAuthManager(store, options.codexAuthTransport ?? new DockerCodexAuthTransport());
-
   // maxPayload: reject WS frames larger than 1 MiB at the protocol level.
   await app.register(websocket, { options: { maxPayload: 1048576 } });
-  registerWs(app, store, manager, hub, heartbeat, codexAuth);
+  registerWs(app, store, manager, hub, heartbeat);
 
   // A redeploy starts a fresh orchestrator container next to the still running
   // session containers: reconnect it to their networks and event streams.
@@ -106,7 +87,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<App> {
     console.error(`[orchestrator] session reconcile failed: ${e instanceof Error ? e.message : String(e)}`);
   });
 
-  return { app, store, manager, hub, heartbeat, codexAuth };
+  return { app, store, manager, hub, heartbeat };
 }
 
 export async function main(): Promise<void> {
@@ -116,10 +97,10 @@ export async function main(): Promise<void> {
   let egress: HttpServer | null = null;
   if (config.dockerEnabled) {
     try {
-      // Two gates: a live session's shim token, or the source IP of a live
-      // session container (clients that drop the proxy URL's userinfo). Both
-      // answer with the session behind the request, whose network policy then
-      // decides - an 'isolated' session never passes either way.
+      // Two gates: a live session's token, or the source IP of a live session
+      // container (clients that drop the proxy URL's userinfo). Both answer
+      // with the session behind the request, whose network policy then decides
+      // - an 'isolated' session never passes either way.
       egress = startEgressProxy({
         tokenValidator: (t) => manager.egressTokenAllowed(t),
         peerValidator: (ip) => manager.egressPeerAllowed(ip),

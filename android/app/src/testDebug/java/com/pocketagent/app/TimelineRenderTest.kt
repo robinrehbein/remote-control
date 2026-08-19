@@ -31,6 +31,13 @@ import org.robolectric.annotation.Config
  *
  * Ein unge-bundenes SessionViewModel() genügt: TimelineItemView fasst es nur
  * in Klick-Handlern an, die der Test nicht auslöst.
+ *
+ * Liegt bewusst in `testDebug`, nicht in `test`: createComposeRule() braucht
+ * die ComponentActivity aus ui-test-manifest, die nur ins Debug-Manifest
+ * gemergt wird — ins Release-APK darf sie nicht. `testReleaseUnitTest`
+ * (Release-Workflow) fand die Activity daher nicht und schlug fehl (Fund:
+ * Release-Run 48, v0.13.0). Das Gerenderte ist variantenunabhängig; einmal
+ * pro Build in der Debug-Variante reicht.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34])

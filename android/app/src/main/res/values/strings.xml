@@ -24,4 +24,10 @@
          die Antwort stillschweigend zu verlieren. -->
     <string name="notification_decision_failed">Nicht zugestellt – zum Öffnen tippen</string>
     <string name="notification_group_summary">Neue Ereignisse in dieser Session</string>
+    <!-- Stiller Dauer-Kanal des ConnectionService: hält die WebSocket im
+         Hintergrund offen, damit die App beim Öffnen nicht neu verbinden
+         muss (Einstellungen → Server → „Im Hintergrund verbunden bleiben“). -->
+    <string name="connection_channel_name">Verbindung im Hintergrund</string>
+    <string name="connection_notification_title">PocketAgent bleibt verbunden</string>
+    <string name="connection_notification_connecting">Verbindung wird aufgebaut …</string>
 </resources>

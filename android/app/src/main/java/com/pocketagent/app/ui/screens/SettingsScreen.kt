@@ -2,8 +2,12 @@
 
 package com.pocketagent.app.ui.screens
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
+import android.os.PowerManager
+import android.provider.Settings as AndroidSettings
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -31,6 +35,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.outlined.BatteryChargingFull
 import androidx.compose.material.icons.outlined.BugReport
 import androidx.compose.material.icons.outlined.CheckCircleOutline
 import androidx.compose.material.icons.outlined.Delete
@@ -41,6 +46,7 @@ import androidx.compose.material.icons.outlined.Fingerprint
 import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Key
+import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material.icons.outlined.Visibility
 import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material3.CircularProgressIndicator
@@ -59,6 +65,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberSwipeToDismissBoxState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -87,6 +94,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.pocketagent.app.PocketAgentApp
+import com.pocketagent.app.connection.ConnectionService
 import com.pocketagent.app.data.AppRepository
 import com.pocketagent.app.data.CrashLog
 import com.pocketagent.app.data.PI_DEFAULT_PROVIDER
@@ -103,6 +111,9 @@ import com.pocketagent.app.ui.theme.CardInset
 import com.pocketagent.app.ui.theme.SectionSpacing
 import com.pocketagent.app.ui.theme.TileMinHeight
 import com.pocketagent.app.ui.theme.semantic
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -168,6 +179,14 @@ class SettingsViewModel : ViewModel() {
 
     fun setBiometric(enabled: Boolean) {
         viewModelScope.launch { repository.tokenStore.setBiometricEnabled(enabled) }
+    }
+
+    /**
+     * Speichert die Einstellung; Start/Stopp des ConnectionService übernimmt
+     * der Aufrufer mit dem Activity-Kontext (VM hält bewusst keinen Context).
+     */
+    fun setBackgroundConnection(enabled: Boolean) {
+        viewModelScope.launch { repository.tokenStore.setBackgroundConnection(enabled) }
     }
 
     fun logout(onDone: () -> Unit) {
@@ -262,6 +281,9 @@ fun SettingsScreen(onBack: () -> Unit) {
     val secrets by repository.secrets.collectAsState()
     val repos by repository.repos.collectAsState()
     val biometric by repository.tokenStore.biometricEnabled.collectAsState(initial = false)
+    // initial = true wie der Default der Einstellung: vor der ersten DataStore-
+    // Emission darf der Schalter nicht kurz „aus“ zeigen (siehe BiometricGate).
+    val backgroundConnection by repository.tokenStore.backgroundConnection.collectAsState(initial = true)
     val connState by repository.connState.collectAsState()
     val error by vm.error.collectAsState()
     val connected = connState is WsClient.ConnState.Connected
@@ -339,6 +361,45 @@ fun SettingsScreen(onBack: () -> Unit) {
                             ListDivider(CardInset)
                             SettingsRow(label = "Laufzeit", value = s?.let { formatUptime(it.uptimeSec) } ?: "…")
                         }
+                    }
+                    ListDivider(CardInset)
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .toggleable(
+                                value = backgroundConnection,
+                                role = Role.Switch,
+                                onValueChange = { enabled ->
+                                    vm.setBackgroundConnection(enabled)
+                                    // Settings ist ein Vordergrund-Moment — der
+                                    // einzige erlaubte Kontext, einen
+                                    // Foreground-Service zu starten (Android 12+).
+                                    if (enabled) {
+                                        ConnectionService.startIfEligible(context)
+                                    } else {
+                                        ConnectionService.stop(context)
+                                    }
+                                },
+                            )
+                            .heightIn(min = TileMinHeight)
+                            .padding(horizontal = CardInset, vertical = 8.dp),
+                    ) {
+                        SettingsIcon(Icons.Outlined.Sync)
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Im Hintergrund verbunden bleiben", style = MaterialTheme.typography.bodyLarge)
+                            Text(
+                                text = "Hält die Verbindung über eine stille Dauer-Notification – beim Öffnen der App ist sie sofort da",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Switch(checked = backgroundConnection, onCheckedChange = null)
+                    }
+                    // Nur solange nötig: mit erteilter Ausnahme wäre die Zeile
+                    // eine Handlung ohne Wirkung.
+                    if (backgroundConnection) {
+                        BatteryExemptionRow()
                     }
                 }
             }
@@ -730,6 +791,66 @@ private fun AppUpdateSection() {
         }
     }
     SectionNote("Prüft nur auf Antippen die GitHub-Releases des Projekts — kein automatischer Check im Hintergrund.")
+}
+
+/**
+ * Doze (Bildschirm aus, Gerät liegt ruhig) kappt selbst einen laufenden
+ * Foreground-Service vom Netz — über Nacht stirbt die gehaltene Verbindung
+ * sonst doch, nur später. Die Ausnahme von den Akku-Optimierungen hält sie
+ * wirklich dauerhaft offen; die Zeile erscheint deshalb nur, solange die
+ * Ausnahme noch nicht erteilt ist (ein ON_RESUME-Tick prüft nach der
+ * Rückkehr aus dem Systemdialog neu).
+ */
+@SuppressLint("BatteryLife")
+@Composable
+private fun BatteryExemptionRow() {
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var resumeTick by remember { mutableStateOf(0) }
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) resumeTick += 1
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    val ignoringOptimizations = remember(resumeTick) {
+        val power = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
+        power?.isIgnoringBatteryOptimizations(context.packageName) ?: false
+    }
+    if (ignoringOptimizations) return
+    ListDivider(CardInset)
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable {
+                runCatching {
+                    context.startActivity(
+                        Intent(
+                            AndroidSettings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                            Uri.parse("package:${context.packageName}"),
+                        ),
+                    )
+                }
+            }
+            .heightIn(min = TileMinHeight)
+            .padding(horizontal = CardInset, vertical = 8.dp),
+    ) {
+        SettingsIcon(Icons.Outlined.BatteryChargingFull)
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                "Akku-Ausnahme erteilen",
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.primary,
+            )
+            Text(
+                text = "Ohne die Ausnahme trennt Android die Verbindung im Doze-Modus (über Nacht). Die Ausnahme hält sie dauerhaft offen.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
 }
 
 @Composable

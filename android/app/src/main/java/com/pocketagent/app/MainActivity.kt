@@ -18,6 +18,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import androidx.navigation.compose.rememberNavController
+import com.pocketagent.app.connection.ConnectionService
 import com.pocketagent.app.ui.PocketAgentNavHost
 import com.pocketagent.app.ui.screens.PairingScreen
 import com.pocketagent.app.ui.screens.RequestNotificationPermission
@@ -89,7 +90,16 @@ private fun AppRoot(deepLinkSessionId: String?, onConsumeDeepLink: () -> Unit) {
 
     when (paired) {
         null -> Unit
-        false -> PairingScreen(onPaired = { paired = true })
+        false -> PairingScreen(
+            onPaired = {
+                paired = true
+                // Frisch gekoppelt und im Vordergrund — der beste Moment, den
+                // Hintergrund-Dienst zu starten (startIfEligible prüft die
+                // Einstellung selbst; der Vordergrund-Übergang allein feuert
+                // erst beim nächsten Verlassen/Wiederkehren der App).
+                ConnectionService.startIfEligible(context)
+            },
+        )
         true -> {
             RequestNotificationPermission()
             // initial = null statt false: der Platzhalter vor der ersten

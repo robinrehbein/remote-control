@@ -3,6 +3,7 @@ package com.pocketagent.app
 import android.app.Application
 import com.google.firebase.FirebaseApp
 import com.google.firebase.FirebaseOptions
+import com.pocketagent.app.connection.ConnectionService
 import com.pocketagent.app.data.AppRepository
 import com.pocketagent.app.data.ConnectivityWatcher
 import com.pocketagent.app.data.CrashLog
@@ -34,6 +35,12 @@ class AppContainer(app: Application, scope: CoroutineScope) {
      * `onNetworkAvailable()` bleibt daneben nötig, damit der Backoff/State-
      * Übergang (raus aus `Waiting`/`Disconnected`) sofort greift, statt auf
      * den Debounce von `ensureAlive` zu warten.
+     *
+     * Der Vordergrund-Wechsel startet außerdem den ConnectionService, wenn
+     * „Verbindung im Hintergrund halten“ an ist — der Aufruf prüft das selbst
+     * und ist no-op, wenn er schon läuft. Genau hier ist der Prozess garantiert
+     * im Vordergrund: Android 12+ verbietet Hintergrund-Apps das Starten von
+     * Foreground-Services.
      */
     val connectivity = ConnectivityWatcher(
         app = app,
@@ -42,7 +49,10 @@ class AppContainer(app: Application, scope: CoroutineScope) {
             repository.ensureAlive()
         },
         onNetworkLost = { wsClient.onNetworkLost() },
-        onForeground = { repository.ensureAlive() },
+        onForeground = {
+            repository.ensureAlive()
+            ConnectionService.startIfEligible(app)
+        },
     )
 }
 

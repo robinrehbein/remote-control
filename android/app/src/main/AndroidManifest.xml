@@ -5,6 +5,16 @@
     <!-- Nur um zu erfahren, wann wieder ein Netz da ist (registerNetworkCallback). -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Verbindung im Hintergrund halten (ConnectionService): ein
+         Foreground-Service hält den Prozess und damit die WebSocket offen.
+         specialUse statt dataSync, weil dataSync ab Android 15 auf 6 h
+         gedeckelt ist — für eine über Nacht haltende Verbindung die falsche
+         Kategorie. Sideload-Verteilung, kein Play-Review. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- Systemdialog „Akku-Restriktionen umgehen“ aus den Einstellungen:
+         ohne die Ausnahme trennt Doze die Verbindung über Nacht. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <!-- In-App-Updater (Settings → App-Update): darf den System-Installer für
          ein heruntergeladenes Release-APK öffnen. Sideload-Verteilung ohne
          Store — der Nutzer muss "Unbekannte Apps installieren" einmalig für
@@ -48,6 +58,23 @@
             <intent-filter>
                 <action android:name="com.google.firebase.MESSAGING_EVENT" />
             </intent-filter>
+        </service>
+
+        <!--
+          Hält die WebSocket-Verbindung zum Orchestrator offen, während die
+          App im Hintergrund ist (stille Dauer-Notification mit
+          Verbindungsstatus). specialUse mit deklariertem Subtyp: die
+          dauerhafte Verbindung zu einem eigenen Server passt in keine der
+          engeren Kategorien, und dataSync wäre ab Android 15 nach 6 h
+          beendet.
+        -->
+        <service
+            android:name=".connection.ConnectionService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Hält die WebSocket-Verbindung zum eigenen PocketAgent-Orchestrator offen, damit die App beim Wiederöffnen nicht neu verbinden muss." />
         </service>
 
         <!--

@@ -36,6 +36,7 @@ class TokenStore(private val context: Context) {
         val DEVICE_NAME = stringPreferencesKey("device_name")
         val DEVICE_TOKEN_ENC = stringPreferencesKey("device_token_enc")
         val BIOMETRIC_ENABLED = booleanPreferencesKey("biometric_enabled")
+        val BACKGROUND_CONNECTION = booleanPreferencesKey("background_connection")
     }
 
     val biometricEnabled: Flow<Boolean> =
@@ -43,6 +44,19 @@ class TokenStore(private val context: Context) {
 
     suspend fun setBiometricEnabled(enabled: Boolean) {
         context.dataStore.edit { prefs -> prefs[Keys.BIOMETRIC_ENABLED] = enabled }
+    }
+
+    /**
+     * Verbindung im Hintergrund halten (ConnectionService). Bewusst an als
+     * Default: Die App ist eine Fernbedienung — ihr ganzer Zweck ist, ohne
+     * erneutes Verbinden sofort einsatzbereit zu sein. Wer den Akku schont,
+     * schaltet sie in den Einstellungen aus; Push (FCM) weckt auch ohne sie.
+     */
+    val backgroundConnection: Flow<Boolean> =
+        context.dataStore.data.map { prefs -> prefs[Keys.BACKGROUND_CONNECTION] ?: true }
+
+    suspend fun setBackgroundConnection(enabled: Boolean) {
+        context.dataStore.edit { prefs -> prefs[Keys.BACKGROUND_CONNECTION] = enabled }
     }
 
     val setup: Flow<DeviceSetup?> = context.dataStore.data.map { prefs ->

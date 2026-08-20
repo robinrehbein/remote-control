@@ -19,9 +19,11 @@ import android.os.Bundle
  *     ist die Verbindung oft still gestorben.
  *
  * Der Netz-Callback hängt am Vordergrund der App: er wird beim ersten
- * sichtbaren Activity registriert und beim letzten wieder abgemeldet. Im
- * Hintergrund lauscht die App also nicht mit — dort weckt Push, und beim
- * Zurückkommen greift ohnehin (2).
+ * sichtbaren Activity registriert und beim letzten wieder abgemeldet. Zwei
+ * Ausnahmen: läuft der ConnectionService (Verbindung im Hintergrund
+ * halten), bleibt er über [retain] auch im Hintergrund registriert — und
+ * im Hintergrund ohne Dienst weckt Push, während beim Zurückkommen
+ * ohnehin (2) greift.
  */
 class ConnectivityWatcher(
     private val app: Application,
@@ -35,6 +37,13 @@ class ConnectivityWatcher(
 
     /** Wie viele Activities gerade sichtbar sind — 0 heißt Hintergrund. */
     private var startedActivities = 0
+
+    /**
+     * Dauerhafte Anforderungen, die Netz-Callbacks auch im Hintergrund
+     * offenzuhalten (ConnectionService). Jede retain() einer release().
+     * 0 und keine sichtbare Activity = deregistrieren wie bisher.
+     */
+    private var retained = 0
 
     private var registered = false
 
@@ -61,6 +70,22 @@ class ConnectivityWatcher(
         val active = cm.activeNetwork ?: return false
         val caps = cm.getNetworkCapabilities(active) ?: return false
         return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    }
+
+    /**
+     * Netz-Callbacks über das Verlassen der App hinaus offenhalten — Aufrufer
+     * ist der ConnectionService. Damit bekommt ein Netzwechsel im Hintergrund
+     * sofort einen Reconnect statt erst beim nächsten Vordergrund-Wechsel.
+     */
+    fun retain() {
+        retained += 1
+        register()
+    }
+
+    /** Gibt eine retain()-Anforderung zurück (ConnectionService-Ende). */
+    fun release() {
+        retained = (retained - 1).coerceAtLeast(0)
+        if (retained == 0 && startedActivities == 0) unregister()
     }
 
     private fun register() {
@@ -93,7 +118,10 @@ class ConnectivityWatcher(
 
     override fun onActivityStopped(activity: Activity) {
         startedActivities = (startedActivities - 1).coerceAtLeast(0)
-        if (startedActivities == 0) unregister()
+        // Läuft der ConnectionService, bleiben die Callbacks registriert —
+        // sonst nützt der gehaltene Prozess nichts, weil ein Netzwechsel im
+        // Hintergrund niemanden mehr erreicht.
+        if (startedActivities == 0 && retained == 0) unregister()
     }
 
     override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) = Unit

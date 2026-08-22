@@ -11,6 +11,7 @@ import { installEnvProxyDispatcher } from '@pocketagent/protocol';
 import { EventBroadcaster } from '../src/events';
 import { askpassEnv, commitTurn, ensureRepo, pushBranch, readGithubPat, type GitContext } from '../src/gitops';
 import { buildApp, loadConfig } from '../src/index';
+import { buildEnvProxyDispatcher, proxyAuthHeader } from '../src/proxy';
 import { FakeRunner } from './fake';
 
 const exec = promisify(execFile);
@@ -211,6 +212,97 @@ async function checkEgressProxyDispatcher(): Promise<void> {
   origin.closeAllConnections();
   await new Promise<void>(resolve => proxy.close(() => resolve()));
   await new Promise<void>(resolve => origin.close(() => resolve()));
+}
+
+/**
+ * The proxy-auth contract of src/proxy.ts (F3): a proxy URL with userinfo
+ * (`pa:<shim_token>@`, injected for Docker sessions and Fly machines alike)
+ * must not depend on undici's env handling to forward those credentials -
+ * older ProxyAgents dropped URL userinfo, and a Fly machine has no peer-IP
+ * gate to catch the difference, so it would see 407 on every provider call.
+ *
+ * Asserted here: the pure userinfo->header helper (including percent-encoded
+ * and malformed input), the dispatcher choice per environment (none / plain
+ * EnvHttpProxyAgent / token dispatcher), and - against a real loopback
+ * listener - that a forwarded request carries the Proxy-Authorization header
+ * built from the URL userinfo while NO_PROXY targets still go direct.
+ */
+async function checkProxyAuthDispatcher(): Promise<void> {
+  /* ---- pure helper: userinfo -> Proxy-Authorization ---- */
+
+  const basic = (userpass: string): string => `Basic ${Buffer.from(userpass).toString('base64')}`;
+
+  expect(
+    proxyAuthHeader('http://pa:tok-1@orchestrator:3128')?.header === basic('pa:tok-1'),
+    'user:pass becomes Basic base64("user:pass")',
+  );
+  expect(proxyAuthHeader('http://orchestrator:3128') === null, 'no userinfo -> null');
+  expect(
+    proxyAuthHeader('http://pa@egress.example.com:3128')?.header === basic('pa:'),
+    'username without password becomes Basic base64("user:")',
+  );
+  const fancy = 'tök/en:x@secret=?';
+  expect(
+    proxyAuthHeader(`http://pa:${encodeURIComponent(fancy)}@egress.example.com:3128`)?.header
+      === basic(`pa:${fancy}`),
+    'percent-encoded userinfo decodes before base64 (fly.ts encodes the token)',
+  );
+  const malformed = proxyAuthHeader('http://pa:broken%@egress.example.com:3128');
+  expect(
+    malformed?.header === basic('pa:broken%') || malformed === null,
+    'malformed percent-escaping never throws',
+  );
+  expect(proxyAuthHeader('::not a url') === null, 'unparseable URL -> null');
+
+  /* ---- dispatcher choice per environment ---- */
+
+  expect(buildEnvProxyDispatcher({}) === null, 'no proxy variables -> no dispatcher (policy open)');
+  const plain = buildEnvProxyDispatcher({ HTTPS_PROXY: 'http://orchestrator:3128' });
+  expect(plain instanceof EnvHttpProxyAgent, 'proxy URL without userinfo keeps EnvHttpProxyAgent (Docker peer-gate path)');
+
+  /* ---- wire level: credentials reach the proxy, NO_PROXY stays direct ---- */
+
+  const seenAuth: (string | undefined)[] = [];
+  const proxy = http.createServer((req, res) => {
+    seenAuth.push(req.headers['proxy-authorization']);
+    res.writeHead(204).end();
+  });
+  const origin = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' }).end('local');
+  });
+  await new Promise<void>(resolve => proxy.listen(0, '127.0.0.1', resolve));
+  await new Promise<void>(resolve => origin.listen(0, '127.0.0.1', resolve));
+  const proxyPort = (proxy.address() as AddressInfo).port;
+  const originPort = (origin.address() as AddressInfo).port;
+  const token = 'smoke-fly-token';
+  const proxyUrl = `http://pa:${token}@127.0.0.1:${proxyPort}`;
+
+  const dispatcher = buildEnvProxyDispatcher({
+    HTTP_PROXY: proxyUrl,
+    HTTPS_PROXY: proxyUrl,
+    NO_PROXY: 'localhost,127.0.0.1',
+  });
+  expect(dispatcher !== null && !(dispatcher instanceof EnvHttpProxyAgent), 'userinfo -> token dispatcher');
+
+  const dispatcherBefore = getGlobalDispatcher();
+  try {
+    setGlobalDispatcher(dispatcher as NonNullable<typeof dispatcher>);
+    await fetch('http://api.provider.test/v1/models', { signal: AbortSignal.timeout(5_000) });
+    expect(
+      seenAuth.length === 1 && seenAuth[0] === basic(`pa:${token}`),
+      `a forwarded request carries Proxy-Authorization from the URL userinfo (saw ${JSON.stringify(seenAuth)})`,
+    );
+
+    const local = await fetch(`http://127.0.0.1:${originPort}/health`, { signal: AbortSignal.timeout(5_000) });
+    expect(local.status === 200 && seenAuth.length === 1, 'NO_PROXY keeps loopback traffic off the proxy');
+  } finally {
+    setGlobalDispatcher(dispatcherBefore);
+    await (dispatcher as NonNullable<typeof dispatcher>).close().catch(() => undefined);
+    proxy.closeAllConnections();
+    origin.closeAllConnections();
+    await new Promise<void>(resolve => proxy.close(() => resolve()));
+    await new Promise<void>(resolve => origin.close(() => resolve()));
+  }
 }
 
 async function main(): Promise<void> {
@@ -561,7 +653,8 @@ async function main(): Promise<void> {
   await rm(agentDir, { recursive: true, force: true });
   await rm(credsDir, { recursive: true, force: true });
 
-  // Last, because it swaps the process-wide dispatcher for the duration.
+  // Last, because both swap the process-wide dispatcher for their duration.
+  await checkProxyAuthDispatcher();
   await checkEgressProxyDispatcher();
 
   console.log('SMOKE OK');

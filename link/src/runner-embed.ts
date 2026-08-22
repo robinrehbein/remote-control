@@ -62,6 +62,16 @@ function freePort(): Promise<number> {
  * process.env dieses Link-Agent-Prozesses, in der sie der Betreiber beim
  * Start gesetzt hat, und laufen über `...process.env` unverändert durch -
  * der pi-SDK und `readGithubPat()` (runner/src/gitops.ts) lesen sie selbst.
+ *
+ * Proxy-Env (HTTPS_PROXY/HTTP_PROXY inkl. Userinfo, NO_PROXY) läuft ebenso
+ * unverändert mit: Der Import von runner/src/index.js hier unten zieht dessen
+ * ersten Import './proxy.js' hoch, der bei gesetzter Proxy-Env (siehe
+ * envProxyUrl im Protokoll) den globalen EnvHttpProxyDispatcher installiert -
+ * NO_PROXY (Orchestrator-Host, Loopback für die eigenen 127.0.0.1-Aufrufe in
+ * agent.ts) respektiert der Agent selbst. Die WSS-Verbindung des Link-Agenten
+ * bleibt davon unberührt: Die ws-Library nutzt weder Proxy-Env noch undici-
+ * Dispatcher (verifiziert - link/src setzt nirgends einen globalen Dispatcher
+ * und übergibt der WebSocket kein Agent-Objekt).
  */
 export async function embedPiRunner(opts: EmbedPiRunnerOptions): Promise<EmbeddedRunner> {
   const port = await freePort();

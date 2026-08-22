@@ -16,6 +16,7 @@ import type {
   ServerStats,
   SessionInfo,
   SessionStatus,
+  SessionTarget,
   TurnFailureReason,
   TurnInfo,
 } from '@pocketagent/protocol';
@@ -25,11 +26,15 @@ import {
   isAgentMode as isAgentModeContract,
   isPiProvider,
   isReasoningEffort as isReasoningEffortContract,
+  isSessionTarget as isSessionTargetContract,
+  piProviderEnvVar,
 } from '@pocketagent/protocol';
 import { SERVER_VERSION, config, isNetworkPolicy } from './config.js';
+import { sha256 } from './db.js';
 import type { LinkRow, RepoRow, SessionRow, Store, TurnRow } from './db.js';
 import * as docker from './docker.js';
 import type { NoticeFn } from './docker.js';
+import * as fly from './fly.js';
 import {
   LOG_TAIL_LINES,
   SHIM_LOG_POLL_MS,
@@ -38,7 +43,7 @@ import {
   shimProgressMessage,
   splitLogLines,
 } from './progress.js';
-import { buildRunnerEnv } from './runner.js';
+import { buildRunnerEnv, lookupProviderSecret } from './runner.js';
 import { matchTokenDigest, tokenDigest, type EgressSession, type TokenEntry } from './egress-proxy.js';
 import { ShimClient, normalizeModels } from './shim-client.js';
 import { sendPush } from './fcm.js';
@@ -61,6 +66,11 @@ export function isAgentMode(v: unknown): v is AgentMode {
 
 export function isReasoningEffort(v: unknown): v is ReasoningEffort {
   return typeof v === 'string' && isReasoningEffortContract(v);
+}
+
+/** Wire-Eingang: `unknown` -> Session-Ziel. Die Liste selbst kommt aus dem Protokoll (F1). */
+export function isSessionTarget(v: unknown): v is SessionTarget {
+  return typeof v === 'string' && isSessionTargetContract(v);
 }
 
 export function isNoticePhase(v: unknown): v is NoticePhase {
@@ -100,6 +110,15 @@ const EGRESS_LIVE_STATUSES: readonly SessionStatus[] = ['creating', 'running', '
  * caught, short enough to correct a hang well before the idle reaper would.
  */
 export const RESYNC_STALE_MS = 90_000;
+
+/**
+ * Wartezeit der Fly-Provisionierung auf den Machine-Start bzw. die ausgehende
+ * Verbindung des Agenten (Dial-Home). Eine frische Machine muss booten, das
+ * Repo klonen und die WSS aufbauen - zusammen deutlich mehr als ein Container-
+ * Start, aber Minuten wären ein hängender Start ohne Fehlermeldung.
+ */
+export const FLY_MACHINE_START_TIMEOUT_MS = 120_000;
+export const FLY_LINK_CONNECT_TIMEOUT_MS = 120_000;
 
 /** `session.events.get`: youngest events, chronological; the client may ask for fewer. */
 export const EVENTS_DEFAULT_LIMIT = 200;
@@ -186,13 +205,16 @@ export function buildPromptBody(row: SessionRow, text: string, mode?: AgentMode)
  * Link-Sessions bleiben grundsätzlich stehen. Sie sind bewusst langlebig (siehe
  * reapIdle) und überschreiten den Cutoff garantiert; ein deleteSession würde
  * ihnen zusätzlich `agent.bye` schicken und damit den Agenten auf dem Rechner
- * des Nutzers herunterfahren.
+ * des Nutzers herunterfahren. Fly-Sessions sind das Gegenstück, das eingesammelt
+ * werden DARF: deleteSession zerstört ihre Machine (verwaiste Machines kosten
+ * Geld) und bekommt `agent.bye` nie zu sehen - ihr Agent lebt in der Machine,
+ * nicht auf dem Rechner des Nutzers.
  *
  * Ein unlesbares last_active_at fällt auf created_at zurück, damit eine kaputte
  * Zeile nicht unsterblich wird.
  */
 export function isCollectableSession(row: SessionRow, cutoffMs: number): boolean {
-  if (row.link_id) return false;
+  if (row.target !== 'fly' && row.link_id) return false;
   if (row.status !== 'stopped' && row.status !== 'error') return false;
   const lastActive = Date.parse(row.last_active_at);
   const reference = Number.isFinite(lastActive) ? lastActive : Date.parse(row.created_at);
@@ -325,7 +347,15 @@ export class SessionManager {
     this.linkTransport = t;
   }
 
-  /** Link agent (re)connected: bind or create its session row and mark idle. */
+  /**
+   * Link agent (re)connected: bind or create its session row and mark idle.
+   *
+   * Fly-Machines melden sich über denselben Weg (Dial-Home mit ihrem je-
+   * Session-Link-Token). Für sie existiert die Zeile schon (createSession legt
+   * sie samt Link-Row an, BEVOR die Machine erzeugt wird) - dieser Zweig bindet
+   * nur und legt nie eine zweite an; die Neuanlage bleibt echten Link-Agenten
+   * auf dem Rechner des Nutzers vorbehalten.
+   */
   registerLinkSession(link: LinkRow, hello: LinkHello): string {
     const now = new Date().toISOString();
     const existing = this.store.getSessionByLink(link.id);
@@ -356,6 +386,8 @@ export class SessionManager {
       link_id: null,
       network_policy: null,
       reasoning_effort: null,
+      target: null,
+      fly_machine_id: null,
       title: null,
       archived: 0,
       created_at: now,
@@ -416,14 +448,22 @@ export class SessionManager {
   }
 
   /**
-   * Neue Docker-Session. Der Adapter ist entfallen; validiert werden Repo,
-   * Provider (gegen die pi-Tabelle im Protokoll), Modus und Netz-Policy - ein
-   * unbekannter Provider würde sonst als Session ohne jeden Key starten und
-   * erst im ersten Turn scheitern.
+   * Neue Session (Docker oder Fly). Der Adapter ist entfallen; validiert werden
+   * Ziel, Repo, Provider (gegen die pi-Tabelle im Protokoll), Modus und Netz-
+   * Policy - ein unbekannter Provider würde sonst als Session ohne jeden Key
+   * starten und erst im ersten Turn scheitern.
+   *
+   * Für 'fly' laufen die Checks SYNCHRON vor dem Row-Insert (assertFlyProvisionable):
+   * eine Verletzung ist ein Konfigurations-/Deckel-Problem des Servers, das
+   * Gerät bekommt sie als error-Reply auf `session.create` statt eine Session,
+   * die erst beim asyncen Provisioning fehlschlägt. Die Provisionierung selbst
+   * (App, Image, Machine, Dial-Home) ist asynchron - wie bei Docker.
    */
   createSession(msg: CreateMsg, tenant: string = TENANT): SessionRow {
     const repo = this.store.getRepo(msg.repoId);
     if (!repo) throw new Error('repo not found');
+    const target: SessionTarget = msg.target ?? 'docker';
+    if (!isSessionTarget(target)) throw new Error(`invalid target "${String(msg.target)}"`);
     const provider = msg.provider && msg.provider.length > 0 ? msg.provider : PI_DEFAULT_PROVIDER;
     if (!isPiProvider(provider)) throw new Error(`unknown provider "${String(msg.provider)}"`);
     if (!isAgentMode(msg.mode)) throw new Error(`invalid mode "${String(msg.mode)}"`);
@@ -431,6 +471,7 @@ export class SessionManager {
       throw new Error(`invalid networkPolicy "${String(msg.networkPolicy)}"`);
     }
     const networkPolicy: NetworkPolicy = msg.networkPolicy ?? config.networkPolicyDefault;
+    if (target === 'fly') this.assertFlyProvisionable(networkPolicy);
     const id = randomUUID();
     const now = new Date().toISOString();
     const row: SessionRow = {
@@ -452,11 +493,27 @@ export class SessionManager {
       link_id: null,
       network_policy: networkPolicy,
       reasoning_effort: null,
+      target,
+      fly_machine_id: null,
       title: null,
       archived: 0,
       created_at: now,
       last_active_at: now,
     };
+    let flyLinkToken: string | null = null;
+    if (target === 'fly') {
+      // Eigene Link-Row + frischer Token je Session (Muster link-token.ts): die
+      // Machine dialt damit herein, ein Widerrufen/Zerstören betrifft nur sie.
+      // shim_token authentisiert die Machine parallel dazu am öffentlichen
+      // Egress-Proxy (Policy 'allowlist'), dieselbe Doppelrolle wie beim
+      // Docker-Container - nur dass der Proxy hier über die öffentliche URL
+      // erreicht wird statt über das Docker-Netz.
+      flyLinkToken = randomBytes(24).toString('hex');
+      const linkId = randomUUID();
+      this.store.createLink(linkId, tenant, `fly-${id.slice(0, 8)}`, sha256(flyLinkToken));
+      row.link_id = linkId;
+      row.shim_token = randomBytes(24).toString('hex');
+    }
     this.store.insertSession(row);
     // Announce the session to every device the moment it exists - not only
     // when provisioning finishes. Clients insert unknown sessions from this
@@ -464,8 +521,44 @@ export class SessionManager {
     // (by the acked id) instead of diffing the session list, and a second
     // device sees it right away.
     this.broadcastStatus(row.id, 'creating');
-    void this.provision(row, repo, msg.branch ?? repo.default_branch);
+    if (target === 'fly') {
+      void this.provisionFly(row, repo, msg.branch ?? repo.default_branch, flyLinkToken as string);
+    } else {
+      void this.provision(row, repo, msg.branch ?? repo.default_branch);
+    }
     return row;
+  }
+
+  /**
+   * Synchrone Vorab-Prüfung für target 'fly' (vor dem Row-Insert, damit der
+   * Fehler als error-Reply ankommt statt als asynces Provisioning-Ende):
+   * Aktivierung, PUBLIC_URL (PA_SERVER der Machine), EGRESS_PUBLIC_URL für
+   * 'allowlist' (der Proxy ist von Fly aus nur über seine öffentliche URL
+   * erreichbar) und der Machine-Deckel - der verhindert, dass eine vergessene
+   * idle Session unbemerkt Fly-Kosten verursacht.
+   */
+  private assertFlyProvisionable(networkPolicy: NetworkPolicy): void {
+    if (!config.flyEnabled || !config.flyApiToken) {
+      throw new Error('Fly-Sessions sind auf diesem Server nicht aktiviert (FLY_API_TOKEN fehlt).');
+    }
+    if (!config.publicUrl) {
+      throw new Error('PUBLIC_URL fehlt: ohne die öffentliche Basis-URL des Orchestrators findet die Fly-Machine ihn nicht (PA_SERVER).');
+    }
+    if (networkPolicy === 'allowlist' && !config.egressPublicUrl) {
+      throw new Error("Für Fly-Sessions mit Policy 'allowlist' fehlt EGRESS_PUBLIC_URL (öffentliche URL des Egress-Proxys, ohne Userinfo).");
+    }
+    const active = this.store
+      .listSessions(TENANT)
+      .filter(
+        (r) =>
+          r.target === 'fly' && (r.status === 'creating' || r.status === 'running' || r.status === 'idle'),
+      ).length;
+    if (active >= config.flyMaxMachines) {
+      throw new Error(
+        `Die Limite von ${config.flyMaxMachines} laufenden Fly-Machines (FLY_MAX_MACHINES) ist erreicht - ` +
+          'stoppe oder lösche eine Fly-Session, bevor du eine neue anlegst.',
+      );
+    }
   }
 
   /**
@@ -535,6 +628,240 @@ export class SessionManager {
       return;
     }
     console.log(`[sessions] start of ${short} aborted - superseded by a newer lifecycle action`);
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Fly-Sessions (F2): Machine-Lifecycle mit derselben Generation-Mechanik */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * Abbruchprüfung eines Fly-Laufs (Gegenstück zu checkpoint): existiert die
+   * Session noch und ist die eigene Generation aktuell? Sonst räumt der Lauf
+   * seine Machine selbst ab und bricht ab - niemand sonst kennt eine Machine,
+   * deren Id noch nicht (mehr) in der Zeile steht.
+   */
+  private async checkpointFly(id: string, gen: number, machineId: string | null = null): Promise<void> {
+    const row = this.store.getSession(id);
+    if (row !== undefined && this.generations.get(id) === gen) return;
+    await this.discardFlyRun(id, machineId);
+    throw new LifecycleAborted(id);
+  }
+
+  /**
+   * Aufräumen eines überholten Fly-Laufs (Gegenstück zu discardRun): Zerstört
+   * wird die Machine dieses Laufs nur, wenn die Zeile sie nicht (mehr) kennt -
+   * sonst nähme man dem Nachfolger (Stop hat angehalten, Resume will starten)
+   * seine eigene Machine weg. Eine bekannte Machine bleibt bestehen; ihr Stop
+   * gehört der Aktion, die die Generation hochgezählt hat.
+   */
+  private async discardFlyRun(id: string, machineId: string | null): Promise<void> {
+    const short = id.slice(0, 8);
+    if (machineId) {
+      const row = this.store.getSession(id);
+      if (!row || row.fly_machine_id !== machineId) {
+        await fly.destroyMachine(machineId).catch(() => {});
+      }
+    }
+    if (this.store.getSession(id) === undefined) {
+      this.clients.get(id)?.stop();
+      this.clients.delete(id);
+      this.generations.delete(id);
+      this.lastPersistedSeq.delete(id);
+      console.log(`[sessions] fly start of ${short} aborted - session was deleted, its machine was cleaned up`);
+      return;
+    }
+    console.log(`[sessions] fly start of ${short} aborted - superseded by a newer lifecycle action`);
+  }
+
+  /**
+   * Provisionierung einer Fly-Session (asynchron nach dem Row-Insert, wie
+   * provision): App + Image sicherstellen, Machine erzeugen, auf ihr Hochfahren
+   * und die ausgehende Verbindung des Agenten warten. Die drei Notice-Phasen
+   * sind dieselben wie bei Docker - 'container-start' meint hier das Erzeugen
+   * der Machine (kein Docker-Container), 'shim-start' ihr Booten samt Clone und
+   * Dial-Home, 'ready' die annahmebereite Session.
+   *
+   * Fehlerpfad: Machine ZERSTÖREN (nicht nur stoppen - konsistent mit
+   * discardRun; der Repo-State lebt im Git, also ist nichts an ihr zu erhalten)
+   * und die Session auf 'error' setzen; ein Resume dieser Zeile scheitert dann
+   * bewusst an der fehlenden Machine, die Session wird neu angelegt.
+   */
+  private async provisionFly(
+    row: SessionRow,
+    repo: RepoRow,
+    baseBranch: string,
+    flyLinkToken: string,
+  ): Promise<void> {
+    const notice = this.noticeFor(row.id);
+    const gen = this.nextGeneration(row.id);
+    let machineId: string | null = null;
+    try {
+      await this.checkpointFly(row.id, gen);
+      notice('Machine wird erzeugt', { phase: 'container-start' });
+      await fly.ensureApp();
+      const image = await fly.ensureRunnerImage(notice);
+      await this.checkpointFly(row.id, gen);
+      const env = this.buildFlyMachineEnv(row, repo, baseBranch, flyLinkToken);
+      const machine = await fly.createMachine({ image, env, region: config.flyRegion });
+      machineId = machine.id;
+      // Persistieren wie beim Container: ein Delete von hier an findet die
+      // Machine über die Zeile, ein Abbruch nur die eigene Id.
+      this.store.setFlyMachine(row.id, machineId);
+      await this.checkpointFly(row.id, gen, machineId);
+      notice('Machine bootet – Agent verbindet sich', { phase: 'shim-start' });
+      await fly.waitUntilMachine(machineId, 'started', FLY_MACHINE_START_TIMEOUT_MS);
+      await this.checkpointFly(row.id, gen, machineId);
+      await this.waitForFlyLink(row.id, row.link_id as string, gen, machineId);
+      await this.checkpointFly(row.id, gen, machineId);
+      notice('Bereit', { phase: 'ready' });
+      this.setStatus(row.id, 'idle');
+    } catch (err) {
+      if (err instanceof LifecycleAborted) return; // discardFlyRun already logged and cleaned up
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[sessions] fly provisioning failed for ${row.id.slice(0, 8)}: ${message}`);
+      if (machineId) await fly.destroyMachine(machineId).catch(() => {});
+      this.store.updateSessionStatus(row.id, 'error');
+      this.emitEvent(row.id, { type: 'error', message, fatal: true });
+      this.broadcastStatus(row.id, 'error');
+    }
+  }
+
+  /**
+   * Auf die ausgehende Verbindung der Machine warten. Zwei Signale, eines
+   * genügt: der Transport meldet die Verbindung (isConnected), oder die Zeile
+   * wurde auf 'idle' gesetzt (registerLinkSession beim Dial-Home - das Pollen
+   * darf nicht allein vom Socket-Zustand abhängen, den dieser Prozess nur
+   * gespiegelt bekommt). Jede Runde läuft durch den Generation-Check: ein
+   * Stop/Delete während des Wartens würde sonst erst nach dem Timeout im
+   * Fehlerpfad landen und die (für ein Resume zu erhaltende) Machine zerstören.
+   */
+  private async waitForFlyLink(
+    sessionId: string,
+    linkId: string,
+    gen: number,
+    machineId: string | null,
+    timeoutMs: number = FLY_LINK_CONNECT_TIMEOUT_MS,
+  ): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      await this.checkpointFly(sessionId, gen, machineId);
+      const row = this.store.getSession(sessionId);
+      if (!row) throw new LifecycleAborted(sessionId); // checkpoint deckt das ab - defensive
+      if (row.status === 'idle') return;
+      if (this.linkTransport?.isConnected(linkId)) return;
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `Die Fly-Machine hat sich innerhalb von ${Math.round(timeoutMs / 1000)}s nicht mit dem Orchestrator verbunden ` +
+            '(PA_SERVER/PA_TOKEN der Machine oder ihre Ausgänge prüfen).',
+        );
+      }
+      await new Promise((r) => setTimeout(r, 1_000));
+    }
+  }
+
+  /**
+   * Machine-Umgebung einer Fly-Session - der Env-Contract von F4 (link/src/
+   * fly-bootstrap.ts + index.ts), Seite Orchestrator. Spiegelt die Auswahl-
+   * Logik von buildRunnerEnv (runner.ts): genau der EINER Provider-Key aus dem
+   * Vault unter seinem PI_PROVIDER_ENV-Namen (mit moonshot<->kimi-Fallback).
+   *
+   * Zwei bewusste Unterschiede zum Docker-Container: Der GitHub-PAT reist als
+   * Env (GITHUB_PAT), denn eine Machine lässt sich vor dem Start nichts mehr
+   * injizieren - fly-bootstrap gibt ihn nur per GIT_ASKPASS an git weiter. Und
+   * der Egress-Proxy wird über seine öffentliche URL gereicht (die Machine
+   * hängt in keinem Docker-Netz), mit dem shim_token der Session als Basic-
+   * Userinfo; 'isolated' setzt den toten Loopback-Proxy (kein Docker-Netz
+   * blockt von selbst) und lässt nur den Orchestrator-Host und Loopback (von
+   * fly-bootstrap ergänzt) direkt - genau so little wie beim Container.
+   */
+  private buildFlyMachineEnv(
+    row: SessionRow,
+    repo: RepoRow,
+    baseBranch: string,
+    flyLinkToken: string,
+  ): Record<string, string> {
+    const env: Record<string, string> = {
+      // publicUrl -> WS-Form (https->wss); den /ws-Pfad ergänzt der Link-Agent selbst.
+      PA_SERVER: fly.machineServerWsUrl(config.publicUrl as string),
+      PA_TOKEN: flyLinkToken,
+      // WICHTIG: Der Runner-Branch ist agent/<PA_NAME> - also die Session-Id,
+      // nicht der Link-Name (fly-<id-8>): nur so findet fly-bootstrap den
+      // Remote-Branch der vorigen Runde (PA_AGENT_BRANCH) wieder.
+      PA_NAME: row.id,
+      PA_WORKDIR: '/work',
+      PA_MODE: row.mode,
+      PA_REPO_URL: `https://github.com/${repo.full_name}`,
+      PA_REPO_BRANCH: baseBranch,
+      PA_AGENT_BRANCH: row.branch,
+      // owner/name für die Draft-PR-API des Runners (yolo-Auto-Push).
+      PA_REPO_FULL_NAME: repo.full_name,
+    };
+    if (row.model.length > 0) env.PI_MODEL = row.model;
+    env.PI_PROVIDER = row.provider;
+    const pat = this.githubPatFor(row);
+    if (pat) env.GITHUB_PAT = pat;
+    const providerVar = piProviderEnvVar(row.provider);
+    if (providerVar !== undefined) {
+      const key = lookupProviderSecret(row.provider, (kind) => this.store.getSecretValue(kind, row.tenant_id));
+      if (key !== null) env[providerVar] = key;
+    }
+    const policy: NetworkPolicy = isNetworkPolicy(row.network_policy)
+      ? row.network_policy
+      : config.networkPolicyDefault;
+    if (policy !== 'open') {
+      // Der Orchestrator-Host muss am Proxy vorbei erreichbar sein - sonst
+      // hinge die Dial-Home-Verbindung am Proxy, den 'isolated' gerade totlegt.
+      const serverHost = fly.urlHost(config.publicUrl as string);
+      env.NO_PROXY = serverHost;
+      if (policy === 'allowlist') {
+        const proxy = fly.proxyUrlWithAuth(config.egressPublicUrl as string, row.shim_token as string);
+        env.HTTP_PROXY = proxy;
+        env.HTTPS_PROXY = proxy;
+        // Zweite Hälfte des Gürtels wie beim Container (docker.ts): auch
+        // nodes eigene http-Clients und Kindprozesse auf den Proxy leiten.
+        env.NODE_USE_ENV_PROXY = '1';
+      } else {
+        env.HTTP_PROXY = 'http://127.0.0.1:9';
+        env.HTTPS_PROXY = 'http://127.0.0.1:9';
+      }
+    }
+    return env;
+  }
+
+  /**
+   * Fly-Resume: Machine starten und auf die erneute Verbindung des Agenten
+   * warten. Der Repo-State wird dabei neu geklont (fly-bootstrap rollt den
+   * Remote-Stand von agent/<session-id> aus); eine pi-SessionRef überlebt den
+   * Machine-Neustart bewusst nicht - dokumentiertes Delta der disk-losen
+   * Fly-Sessions, es gibt hier keinen /resume-Aufruf. Ein gescheiterter Resume
+   * stoppt die Machine best effort: weiterlaufend würde sie nur kosten, ein
+   * erneuter Versuch startet sie wieder.
+   */
+  private async resumeFly(row: SessionRow): Promise<void> {
+    if (!config.flyEnabled || !config.flyApiToken) {
+      throw new Error('Fly-Sessions sind auf diesem Server nicht aktiviert (FLY_API_TOKEN fehlt).');
+    }
+    if (!row.fly_machine_id || !row.link_id) {
+      throw new Error('Diese Fly-Session wurde nie vollständig provisioniert – lege eine neue an.');
+    }
+    const gen = this.nextGeneration(row.id);
+    const notice = this.noticeFor(row.id);
+    try {
+      notice('Machine startet', { phase: 'container-start' });
+      await fly.startMachine(row.fly_machine_id);
+      await this.checkpointFly(row.id, gen, row.fly_machine_id);
+      await fly.waitUntilMachine(row.fly_machine_id, 'started', FLY_MACHINE_START_TIMEOUT_MS);
+      await this.checkpointFly(row.id, gen, row.fly_machine_id);
+      notice('Machine bootet – Agent verbindet sich', { phase: 'shim-start' });
+      await this.waitForFlyLink(row.id, row.link_id, gen, row.fly_machine_id);
+      await this.checkpointFly(row.id, gen, row.fly_machine_id);
+      notice('Bereit', { phase: 'ready' });
+      this.setStatus(row.id, 'idle');
+    } catch (err) {
+      if (err instanceof LifecycleAborted) return; // stop/delete won, nothing to report
+      await fly.stopMachine(row.fly_machine_id).catch(() => {});
+      throw err;
+    }
   }
 
   private async provision(row: SessionRow, repo: RepoRow, baseBranch: string): Promise<void> {
@@ -1077,6 +1404,15 @@ export class SessionManager {
     // 'creating' was overwritten with 'idle' when provision() finished, and the
     // explicitly stopped container ran on.
     this.nextGeneration(id);
+    if (row.target === 'fly') {
+      // VOR dem Link-Zweig (fly rows tragen link_id) und KEIN agent.bye: der
+      // Link-Agent der Machine würde daraufhin sauber beenden, und die Restart-
+      // Policy 'always' startete ihn sofort neu - ein Stop-Loop. Die Machine
+      // selbst zu stoppen pausiert auch ihre Abrechnung.
+      if (row.fly_machine_id) await fly.stopMachine(row.fly_machine_id);
+      this.setStatus(id, 'stopped');
+      return;
+    }
     if (row.link_id) {
       this.linkTransport?.bye(row.link_id);
       this.setStatus(id, 'stopped');
@@ -1110,6 +1446,10 @@ export class SessionManager {
 
   private async runResume(id: string): Promise<void> {
     const row = this.requireSession(id);
+    if (row.target === 'fly') {
+      await this.resumeFly(row);
+      return;
+    }
     if (row.link_id) {
       if (!this.linkTransport?.isConnected(row.link_id)) {
         throw new Error('link agent not connected - restart it on the agent host');
@@ -1182,8 +1522,10 @@ export class SessionManager {
 
   async push(id: string): Promise<void> {
     const row = this.requireSession(id);
-    if (row.link_id) {
-      throw new Error('tap-push is not supported for linked sessions (yolo mode auto-pushes from the agent host)');
+    if (row.target === 'fly' || row.link_id) {
+      throw new Error(
+        'Tap-Push ist Docker vorbehalten; Link- und Fly-Sessions pushen über yolo automatisch (oder per Agent)',
+      );
     }
     // The push container talks to github through the same egress proxy, and its
     // proxy credentials are the session's shim_token: without one it would be
@@ -1233,7 +1575,9 @@ export class SessionManager {
    * exactly where it was - archiving is a view decision plus the resource
    * saving, never data loss. Link sessions are left running: their agent
    * process lives on the user's own machine and a 'bye' would shut it down,
-   * which a list gesture must not do.
+   * which a list gesture must not do. Fly sessions ARE stopped - ihre Machine
+   * gehört dem Betreiber des Orchestrators, ihr Stop pausiert nur die
+   * Abrechnung, und Resume startet sie frisch wieder.
    *
    * Nothing else changes: idle-stop and GC keep treating the row as before (an
    * archived session is already stopped, so reapIdle skips it anyway, and GC
@@ -1243,7 +1587,7 @@ export class SessionManager {
     const row = this.requireSession(id);
     if (typeof archived !== 'boolean') throw new Error('archived must be a boolean');
     this.store.setSessionArchived(id, archived);
-    if (archived && !row.link_id && row.status !== 'stopped') {
+    if (archived && (row.target === 'fly' || !row.link_id) && row.status !== 'stopped') {
       await this.stopSession(id).catch((e: unknown) => {
         console.warn(`[sessions] archive: stopping ${id.slice(0, 8)} failed: ${e instanceof Error ? e.message : String(e)}`);
       });
@@ -1266,6 +1610,22 @@ export class SessionManager {
     this.nextGeneration(id);
     this.clients.get(id)?.stop();
     this.clients.delete(id);
+    if (row?.target === 'fly') {
+      // VOR dem Link-Zweig (fly rows tragen link_id, der würde bye senden und
+      // die Machine per Restart-Policy neu hochfahren). Destroy mit force
+      // statt stop: Bei Delete gibt es an der Machine nichts zu erhalten - der
+      // Repo-State lebt im Git. Ein Destroy-Fehler (außer 404) unterbricht das
+      // Delete bewusst: eine verwaiste, weiterlaufende Machine wäre unsichtbar
+      // und kostet, die Zeile bleibt für einen erneuten Versuch stehen.
+      if (row.fly_machine_id) await fly.destroyMachine(row.fly_machine_id);
+      // Deren Link-Row gehört nur ihr: Token mit löschen, niemand dialt wieder.
+      if (row.link_id) this.store.deleteLink(row.link_id);
+      // deletes the stored events with the row (see Store.deleteSession)
+      this.store.deleteSession(id);
+      this.generations.delete(id);
+      this.lastPersistedSeq.delete(id);
+      return;
+    }
     if (row?.link_id) {
       this.linkTransport?.bye(row.link_id);
       this.store.deleteSession(id);
@@ -1300,6 +1660,14 @@ export class SessionManager {
   }
 
   toInfo(row: SessionRow): SessionInfo {
+    // Alte Zeilen ohne target: Link-Sessions erkennen wir an link_id, alles
+    // andere ist Docker (F1-Vertrag: fehlendes target === 'docker'). Neue
+    // Zeilen tragen ihr Ziel seit dem Insert.
+    const target: SessionTarget = isSessionTarget(row.target)
+      ? row.target
+      : row.link_id
+        ? 'link'
+        : 'docker';
     return {
       id: row.id,
       repoId: row.repo_id,
@@ -1318,6 +1686,7 @@ export class SessionManager {
       ...(row.title ? { title: row.title } : {}),
       ...(row.archived ? { archived: true } : {}),
       ...(row.link_id ? { linked: true } : {}),
+      target,
     };
   }
 
@@ -1348,6 +1717,7 @@ export class SessionManager {
     // runs, so their IPs have to be known before the first of those requests.
     await docker.refreshSessionPeers().catch(() => {});
     for (const row of this.store.listSessions(tenant)) {
+      if (row.target === 'fly') continue; // Fly-Machines redialen selbst (Restart-Policy)
       if (row.link_id) continue; // link agents redial by themselves
       if (!row.container_id) {
         this.recoverUnprovisioned(row);
@@ -1480,9 +1850,27 @@ export class SessionManager {
     );
   }
 
-  private async reapIdle(): Promise<void> {
+  /**
+   * Idle-Reaper: Docker- und Fly-Sessions werden nach idleStopSec gestoppt -
+   * eine gestoppte Fly-Machine kostet nichts mehr weiter, eine laufende sehr
+   * wohl (genau deshalb gehören sie hier NICHT zu den geschonten Link-Rows).
+   * Echte Link-Sessions auf dem Rechner des Nutzers bleiben unangetastet.
+   *
+   * Öffentlich, damit der Lauf testbar ist (Smoke) - regulär feuert ihn nur der
+   * Timer aus start().
+   */
+  async reapIdle(): Promise<void> {
     const cutoff = Date.now() - config.idleStopSec * 1000;
     for (const row of this.store.listSessions(TENANT)) {
+      if (row.target === 'fly') {
+        if (
+          (row.status === 'running' || row.status === 'idle') &&
+          Date.parse(row.last_active_at) < cutoff
+        ) {
+          await this.stopSession(row.id).catch(() => {});
+        }
+        continue;
+      }
       if (row.link_id) continue; // linked agents are long-lived, no container cost
       if (
         (row.status === 'running' || row.status === 'idle') &&

@@ -70,6 +70,7 @@ import com.pocketagent.app.data.PI_DEFAULT_PROVIDER
 import com.pocketagent.app.data.PI_PROVIDERS
 import com.pocketagent.app.data.ReasoningEffort
 import com.pocketagent.app.data.RepoInfo
+import com.pocketagent.app.data.SessionTarget
 import com.pocketagent.app.data.WsClient
 import com.pocketagent.app.data.piProviderName
 import com.pocketagent.app.ui.sheetPickListMaxHeight
@@ -107,6 +108,12 @@ class NewSessionViewModel : ViewModel() {
         val model: String = "",
         val reasoning: ReasoningEffort? = null,
         val mode: AgentMode = AgentMode.AUTO,
+        /**
+         * Wo die Session laufen soll. Fly ist der Default: die produktive,
+         * isolierte Cloud-Sandbox — Coolify bleibt für Tests, der Heim-PC
+         * für die eigene Maschine.
+         */
+        val target: SessionTarget = SessionTarget.FLY,
         val branch: String = "",
         val networkPolicy: String = "allowlist",
         /** Optionaler erster Auftrag; leer heißt: nur die Session anlegen. */
@@ -208,7 +215,10 @@ class NewSessionViewModel : ViewModel() {
                 model = s.model.trim(),
                 mode = s.mode,
                 branch = s.branch.trim().ifBlank { null },
-                networkPolicy = s.networkPolicy,
+                // Auf dem Heim-PC läuft der Agent im Netz des Rechners — eine
+                // Policy wäre dort nur noch Dokumentation und bleibt weg.
+                networkPolicy = if (s.target == SessionTarget.LINK) null else s.networkPolicy,
+                target = s.target,
             )
             val failure = result.exceptionOrNull()
             if (failure != null) {
@@ -329,13 +339,22 @@ fun modelChipValue(model: String, reasoning: ReasoningEffort?): String {
 enum class NewSessionSheet { MODEL, MODE, ADVANCED }
 
 /**
+ * Ob die Netzwerk-Policy für dieses Ziel wählbar ist. Container-Ziele
+ * (Coolify, Fly) bekommen dieselbe Auswahl mit gleicher Semantik; auf dem
+ * Heim-PC nutzt der Agent das Netz des eigenen Rechners — eine Policy wäre
+ * dort nur noch Dokumentation.
+ */
+fun networkPolicyAvailable(target: SessionTarget): Boolean = target != SessionTarget.LINK
+
+/**
  * Was auf dem "Erweitert"-Chip steht: "Standard", solange Netzwerk und
  * Basis-Branch beim jeweiligen Default liegen, sonst "Angepasst" — derselbe
  * Grundsatz wie bei der Session-Karte, die eine Netzwerk-Abweichung nur
  * zeigt, wenn es wirklich eine gibt (Fund: Netzwerk als Dauerpräsenz).
+ * Für den Heim-PC zählt die Policy nicht (siehe [networkPolicyAvailable]).
  */
-fun advancedSummary(networkPolicy: String, branch: String): String =
-    if (networkPolicy == "allowlist" && branch.isBlank()) "Standard" else "Angepasst"
+fun advancedSummary(target: SessionTarget, networkPolicy: String, branch: String): String =
+    if ((networkPolicyAvailable(target) && networkPolicy != "allowlist") || branch.isNotBlank()) "Angepasst" else "Standard"
 
 /**
  * Sichert das offene Sheet als seinen Namen statt als Enum-Wert — ein
@@ -514,9 +533,47 @@ fun NewSessionScreen(
                 // Weicht die Wahl vom Default ab, sagt der Wert das.
                 SettingChip(
                     label = "Erweitert",
-                    value = advancedSummary(state.networkPolicy, state.branch),
+                    value = advancedSummary(state.target, state.networkPolicy, state.branch),
                     onClick = { sheet = NewSessionSheet.ADVANCED },
                 )
+            }
+
+            /* -------- Ziel -------- */
+            // Wo der Agent arbeitet — die erste Frage vor dem Repository, denn
+            // alles andere (Modell, Netzwerk, Basis-Branch) gilt für jedes
+            // Ziel. Fly steht zuerst und ist vorgewählt: die produktive
+            // Sandbox. Gibt der Server Fly nicht her, antwortet er mit einer
+            // klaren Fehlermeldung, die hier als Fehlerzeile auftaucht.
+            SectionHeader("Ziel")
+            GroupCard {
+                Column {
+                    val entries = listOf(
+                        Triple(
+                            SessionTarget.FLY,
+                            "Fly (Produktion)",
+                            "Isolierte Cloud-Sandbox – jede Session bekommt ihre eigene Machine",
+                        ),
+                        Triple(
+                            SessionTarget.DOCKER,
+                            "Coolify (Test)",
+                            "Session-Container auf dem eigenen Server",
+                        ),
+                        Triple(
+                            SessionTarget.LINK,
+                            "Heim-PC",
+                            "Läuft im Link-Agent auf deinem Rechner – dieser muss dort laufen",
+                        ),
+                    )
+                    entries.forEachIndexed { index, (target, title, hint) ->
+                        if (index > 0) ListDivider(RadioRowDividerInset)
+                        SelectableTile(
+                            title = title,
+                            subtitle = hint,
+                            selected = state.target == target,
+                            onClick = { vm.update { it.copy(target = target) } },
+                        )
+                    }
+                }
             }
 
             /* -------- Repository -------- */
@@ -566,6 +623,7 @@ fun NewSessionScreen(
         )
 
         NewSessionSheet.ADVANCED -> AdvancedSheet(
+            target = state.target,
             branch = state.branch,
             defaultBranch = repos.firstOrNull { it.id == state.repoId }?.defaultBranch.orEmpty(),
             onBranchChange = { v -> vm.update { it.copy(branch = v) } },
@@ -806,9 +864,14 @@ private fun ModelAccessSheet(
  * Dauerpräsenz"). Beide wirken sofort, keine Bestätigung nötig — der
  * Erweitert-Chip selbst sagt schon, ob von einem Default abgewichen wurde
  * (siehe [advancedSummary]).
+ *
+ * Die Netzwerk-Auswahl gilt für Container-Ziele (Coolify wie Fly, gleiche
+ * open/allowlist/isolated-Semantik); für den Heim-PC fehlt sie — der Agent
+ * läuft dort im Netz des eigenen Rechners.
  */
 @Composable
 private fun AdvancedSheet(
+    target: SessionTarget,
     branch: String,
     defaultBranch: String,
     onBranchChange: (String) -> Unit,
@@ -818,23 +881,29 @@ private fun AdvancedSheet(
 ) {
     SettingSheet(title = "Erweitert", onDismiss = onDismiss) {
         SectionHeader("Netzwerk")
-        GroupCard {
-            Column {
-                val entries = listOf(
-                    Triple("allowlist", "Allowlist", "Nur GitHub, KI-Anbieter und Paket-Registries (empfohlen)"),
-                    Triple("isolated", "Isoliert", "Kein Internetzugriff – nur für lokale Aufgaben"),
-                    Triple("open", "Offen", "Vollständiger Netzwerkzugriff wie lokal"),
-                )
-                entries.forEachIndexed { index, (policy, title, subtitle) ->
-                    if (index > 0) ListDivider(RadioRowDividerInset)
-                    SelectableTile(
-                        title = title,
-                        subtitle = subtitle,
-                        selected = networkPolicy == policy,
-                        onClick = { onNetworkChange(policy) },
+        if (networkPolicyAvailable(target)) {
+            GroupCard {
+                Column {
+                    val entries = listOf(
+                        Triple("allowlist", "Allowlist", "Nur GitHub, KI-Anbieter und Paket-Registries (empfohlen)"),
+                        Triple("isolated", "Isoliert", "Kein Internetzugriff – nur für lokale Aufgaben"),
+                        Triple("open", "Offen", "Vollständiger Netzwerkzugriff wie lokal"),
                     )
+                    entries.forEachIndexed { index, (policy, title, subtitle) ->
+                        if (index > 0) ListDivider(RadioRowDividerInset)
+                        SelectableTile(
+                            title = title,
+                            subtitle = subtitle,
+                            selected = networkPolicy == policy,
+                            onClick = { onNetworkChange(policy) },
+                        )
+                    }
                 }
             }
+        } else {
+            // Keine Auswahl verstecken, ohne zu sagen warum — sonst sucht der
+            // Nutzer eine Einstellung, die es auf diesem Ziel nicht gibt.
+            SectionNote("Auf dem Heim-PC nutzt der Agent das Netz deines Rechners – eine Policy gibt es dort nicht.")
         }
         Spacer(modifier = Modifier.height(SectionSpacing))
         SectionHeader("Basis-Branch")

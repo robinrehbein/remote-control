@@ -179,6 +179,8 @@ function sessionRow(id: string, repoId: string, patch: Partial<SessionRow> = {})
     link_id: null,
     network_policy: 'allowlist',
     reasoning_effort: null,
+    target: null,
+    fly_machine_id: null,
     title: null,
     archived: 0,
     created_at: now,
@@ -1267,6 +1269,375 @@ async function linkSmoke(store: Store, wsBase: string, c2: Client): Promise<void
 }
 
 /* ------------------------------------------------------------------ */
+/* 5b. Fly-Sessions gegen eine gefaelschte Machines-API                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Der Fly-Weg (F2): createSession(target 'fly') erzeugt Link-Row + Machine mit
+ * der richtigen Env (PA_SERVER/PA_TOKEN/PA_NAME=Session-Id, GITHUB_PAT, genau
+ * EIN Provider-Key, Proxy-Env je Policy), der Deckel und die fehlende
+ * Konfiguration werden synchron abgewiesen, eine gescheiterte Provisionierung
+ * endet im Fehler-Status, und der Lifecycle (idle->stop, resume->start,
+ * delete->destroy + Link-Row weg) schlägt auf der Machines-API auf. Docker-
+ * Sessions mit und ohne target-Attribut verhalten sich exakt wie vorher.
+ */
+async function flySmoke(store: Store, manager: SessionManager, c2: Client, repoId: string): Promise<void> {
+  section('fly sessions (fake machines api)');
+  const http = await import('node:http');
+  const { randomBytes } = await import('node:crypto');
+  const flyMod = await import('./fly.js');
+  const { PI_PROVIDER_ENV } = await import('@pocketagent/protocol');
+  const { isCollectableSession } = await import('./sessions.js');
+  type LinkRow = import('./db.js').LinkRow;
+
+  /** Machine, wie der Fake sie haelt: Konfiguration (Env/Image/Restart) bleibt fuer Asserts stehen. */
+  interface FakeMachine {
+    id: string;
+    state: string;
+    region?: string;
+    config: { image?: string; env?: Record<string, string>; restart?: { policy?: string } };
+  }
+
+  const calls: string[] = [];
+  const machines = new Map<string, FakeMachine>();
+  let appExists = false;
+  let appCreated = 0;
+  let machineSeq = 0;
+
+  const fakeApi = http.createServer((req, res) => {
+    const method = req.method ?? 'GET';
+    const path = (req.url ?? '').split('?')[0] ?? '';
+    calls.push(`${method} ${path}`);
+    let raw = '';
+    req.on('data', (c) => (raw += String(c)));
+    req.on('end', () => {
+      const body = (): Record<string, unknown> => {
+        try {
+          return JSON.parse(raw || '{}') as Record<string, unknown>;
+        } catch {
+          return {};
+        }
+      };
+      const send = (code: number, payload: unknown): void => {
+        res.writeHead(code, { 'content-type': 'application/json' }).end(JSON.stringify(payload));
+      };
+      // Ein fremder Token kommt nie durch - genau wie bei Fly.
+      if ((req.headers.authorization ?? '') !== 'Bearer smoke-fly-token') return send(401, { error: 'unauthorized' });
+
+      if (method === 'POST' && path === '/v3/apps') {
+        appCreated++;
+        appExists = true;
+        return send(201, { id: 'app-smoke', name: (body().app_name as string) ?? '' });
+      }
+      let m = /^\/v6\/apps\/([^/]+)\/machines$/.exec(path);
+      if (m && !appExists) return send(404, { error: 'app not found' });
+      if (m && method === 'GET' && decodeURIComponent(m[1]!) === 'smoke-fly-app') {
+        return send(200, [...machines.values()]);
+      }
+      if (m && method === 'POST' && decodeURIComponent(m[1]!) === 'smoke-fly-app') {
+        const cfg = body().config as FakeMachine['config'] | undefined;
+        const id = `mec-${String(++machineSeq).padStart(3, '0')}`;
+        machines.set(id, { id, state: 'starting', region: body().region as string | undefined, config: cfg ?? {} });
+        return send(200, machines.get(id));
+      }
+      m = /^\/v6\/apps\/([^/]+)\/machines\/([^/]+)\/(start|stop)$/.exec(path);
+      if (m && method === 'POST') {
+        const mach = machines.get(decodeURIComponent(m[2]!));
+        if (!mach) return send(404, { error: 'machine not found' });
+        mach.state = m[3] === 'start' ? 'started' : 'stopped';
+        return send(200, {});
+      }
+      m = /^\/v6\/apps\/([^/]+)\/machines\/([^/]+)$/.exec(path);
+      if (m) {
+        const mach = machines.get(decodeURIComponent(m[2]!));
+        if (!mach) return send(404, { error: 'machine not found' });
+        if (method === 'GET') {
+          if (mach.state === 'starting') mach.state = 'started'; // erster Poll: der Boot wird sichtbar
+          return send(200, mach);
+        }
+        if (method === 'DELETE') {
+          machines.delete(mach.id);
+          return send(200, {});
+        }
+      }
+      send(404, { error: 'no such route' });
+    });
+  });
+  const flyPort = await listen(fakeApi);
+
+  const cfg = config as unknown as {
+    flyEnabled: boolean;
+    flyApiToken: string | undefined;
+    flyApiBase: string;
+    flyOrgSlug: string | undefined;
+    flyAppName: string;
+    flyRegion: string | undefined;
+    flyImage: string | undefined;
+    flyMaxMachines: number;
+    publicUrl: string | undefined;
+    egressPublicUrl: string | undefined;
+  };
+  const saved = {
+    flyEnabled: cfg.flyEnabled,
+    flyApiToken: cfg.flyApiToken,
+    flyApiBase: cfg.flyApiBase,
+    flyOrgSlug: cfg.flyOrgSlug,
+    flyAppName: cfg.flyAppName,
+    flyRegion: cfg.flyRegion,
+    flyImage: cfg.flyImage,
+    flyMaxMachines: cfg.flyMaxMachines,
+    publicUrl: cfg.publicUrl,
+    egressPublicUrl: cfg.egressPublicUrl,
+  };
+  cfg.flyApiToken = 'smoke-fly-token';
+  cfg.flyEnabled = true;
+  cfg.flyApiBase = `http://127.0.0.1:${flyPort}`;
+  cfg.flyAppName = 'smoke-fly-app';
+  cfg.flyOrgSlug = 'smoke-org';
+  cfg.flyImage = 'ghcr.io/smoke/fly-link:test'; // fester Ref: Build/Push wird nie angerufen
+  cfg.flyRegion = 'fra';
+  cfg.publicUrl = 'https://pa.example.com';
+  cfg.egressPublicUrl = 'http://egress.example.com:3128';
+  cfg.flyMaxMachines = 5;
+  flyMod.resetFlyImageMemo();
+
+  const createFly = async (
+    requestId: string,
+    patch: Record<string, unknown> = {},
+  ): Promise<ServerMessage> =>
+    request(c2, { type: 'session.create', requestId, repoId, provider: 'openai', model: '', mode: 'yolo', ...patch });
+
+  try {
+    /* ---- (0) unbekanntes Ziel + reine Env-Ableitungen ---- */
+
+    const badTarget = await createFly('fly-bad-target', { target: 'kube' });
+    assert(badTarget.type === 'error', 'ein unbekanntes target wird abgewiesen');
+    assert(flyMod.machineServerWsUrl('https://pa.example.com') === 'wss://pa.example.com', 'https wird zu wss');
+    assert(flyMod.machineServerWsUrl('http://pa.example.com') === 'ws://pa.example.com', 'http wird zu ws');
+    assert(
+      flyMod.proxyUrlWithAuth('http://egress.example.com:3128', 'abc123') === 'http://pa:abc123@egress.example.com:3128',
+      'die Egress-URL traegt die Basic-Userinfo pa:<shim_token>',
+    );
+
+    /* ---- (1) fehlende Konfiguration wird synchron abgewiesen ---- */
+
+    cfg.publicUrl = undefined;
+    const noUrl = await createFly('fly-no-url', { target: 'fly' });
+    assert(noUrl.type === 'error' && noUrl.message.includes('PUBLIC_URL'), 'ohne PUBLIC_URL kein Fly-Start');
+    cfg.publicUrl = 'https://pa.example.com';
+
+    cfg.egressPublicUrl = undefined;
+    const noEgress = await createFly('fly-no-egress', { target: 'fly', networkPolicy: 'allowlist' });
+    assert(
+      noEgress.type === 'error' && noEgress.message.includes('EGRESS_PUBLIC_URL'),
+      "allowlist ohne EGRESS_PUBLIC_URL wird abgewiesen",
+    );
+    cfg.egressPublicUrl = 'http://egress.example.com:3128';
+
+    cfg.flyEnabled = false;
+    const disabled = await createFly('fly-disabled', { target: 'fly' });
+    assert(disabled.type === 'error' && disabled.message.includes('nicht aktiviert'), 'ohne FLY_API_TOKEN kein Fly-Start');
+    cfg.flyEnabled = true;
+
+    /* ---- (2) Deckel: laufende Fly-Sessions zaehlen, gestoppte nicht ---- */
+
+    cfg.flyMaxMachines = 1;
+    const cappedId = randomUUID();
+    store.insertSession(sessionRow(cappedId, repoId, { status: 'creating', target: 'fly', container_id: null, volume_name: null }));
+    const capped = await createFly('fly-capped', { target: 'fly' });
+    assert(capped.type === 'error' && capped.message.includes('FLY_MAX_MACHINES'), 'der Machine-Deckel wird synchron durchgesetzt');
+    store.deleteSession(cappedId);
+    cfg.flyMaxMachines = 5;
+
+    /* ---- (3) App-Anlage ohne Org: asynchroner Fehlerpfad ---- */
+
+    cfg.flyOrgSlug = undefined;
+    const noOrgCreated = await createFly('fly-no-org', { target: 'fly' });
+    assert(noOrgCreated.type === 'request.ok', 'ohne FLY_ORG_SLUG wird die Session zunaechst angelegt');
+    const noOrgId = (noOrgCreated.payload as { sessionId: string }).sessionId;
+    const noOrgError = await c2.wait(
+      (m) => m.type === 'session.event' && m.sessionId === noOrgId && m.event.type === 'error',
+      15_000,
+    );
+    assert(
+      noOrgError.type === 'session.event' && noOrgError.event.type === 'error' && noOrgError.event.message.includes('FLY_ORG_SLUG'),
+      'die Provisionierung scheitert mit der Aufforderung, FLY_ORG_SLUG zu setzen',
+    );
+    await waitUntil(() => store.getSession(noOrgId)?.status === 'error', 'den Fehler-Status der Session ohne Org');
+    assert(
+      !calls.some((c) => c.startsWith('POST /v6/apps/smoke-fly-app/machines')),
+      'ohne App-Anlage wird keine Machine erzeugt',
+    );
+    const noOrgLink = store.getSession(noOrgId)?.link_id ?? '';
+    assert(noOrgLink !== '', 'die Fly-Session hat ihre eigene Link-Row');
+    await manager.deleteSession(noOrgId);
+    assert(!store.listLinks('default').some((l) => l.id === noOrgLink), 'deleteSession entfernt die Link-Row mit');
+    cfg.flyOrgSlug = 'smoke-org';
+
+    /* ---- (4) echte Provisionierung: Machine-Env und Dial-Home ---- */
+
+    const expectPat = store.getSecretValue('github', 'default');
+    const expectKey = store.getSecretValue('openai', 'default');
+    assert(expectPat !== null && expectKey !== null, 'die Vault-Fixtures stehen (github + openai)');
+
+    const created = await createFly('fly-open', { target: 'fly', networkPolicy: 'open' });
+    assert(created.type === 'request.ok', 'session.create mit target fly klappt gegen den Fake');
+    const flyId = (created.payload as { sessionId: string }).sessionId;
+    const flyRow = store.getSession(flyId);
+    assert(flyRow?.target === 'fly' && flyRow.status === 'creating', 'die Zeile ist target fly und creating');
+    assert(!!flyRow?.link_id && flyRow.shim_token !== null, 'Link-Bindung und Egress-Token stehen ab dem Insert');
+    const linkRow = store.listLinks('default').find((l) => l.id === flyRow?.link_id);
+    assert(linkRow?.name === `fly-${flyId.slice(0, 8)}`, 'die Link-Row heisst fly-<session-id-8>');
+
+    await waitUntil(() => Boolean(store.getSession(flyId)?.fly_machine_id), 'die persistierte Machine-Id');
+    assert(appCreated === 1, 'ensureApp legt die App genau einmal an (POST /v3/apps)');
+    const mach = machines.get(store.getSession(flyId)?.fly_machine_id ?? '');
+    assert(!!mach, 'der Fake haelt die erzeugte Machine');
+    const env = mach?.config.env ?? {};
+    assert(mach?.config.image === 'ghcr.io/smoke/fly-link:test', 'die Machine startet vom FLY_IMAGE-Ref');
+    assert(mach?.config.restart?.policy === 'always', "die Restart-Policy ist 'always' (Dial-Home nach Crash/Reboot)");
+    assert(mach?.region === 'fra', 'FLY_REGION reist in der Machine-Konfiguration mit');
+    assert(env.PA_SERVER === 'wss://pa.example.com', 'PA_SERVER ist die ws-Form der PUBLIC_URL');
+    assert(
+      store.getLinkByTokenHash(sha256(env.PA_TOKEN ?? ''))?.id === flyRow?.link_id,
+      'PA_TOKEN ist der frische Link-Token dieser Session (Hash trifft die Link-Row)',
+    );
+    assert(env.PA_NAME === flyId, 'PA_NAME ist die Session-Id (der Runner-Branch ist agent/<PA_NAME>)');
+    assert(env.PA_WORKDIR === '/work' && env.PA_MODE === 'yolo', 'PA_WORKDIR und PA_MODE nach row');
+    assert(env.PA_REPO_URL === 'https://github.com/acme/demo' && env.PA_REPO_BRANCH === 'main', 'Repo-URL und Basis-Branch');
+    assert(env.PA_AGENT_BRANCH === `agent/${flyId}` && env.PA_REPO_FULL_NAME === 'acme/demo', 'Agent-Branch und PR-Namensraum');
+    assert(env.GITHUB_PAT === expectPat, 'der GitHub-PAT kommt aus dem Vault (hier als Env - keine Datei-Injektion auf einer Machine)');
+    assert(env.OPENAI_API_KEY === expectKey, 'der Provider-Key des gewaehlten Providers ist gesetzt');
+    assert(
+      Object.keys(env).filter((k) => (Object.values(PI_PROVIDER_ENV) as string[]).includes(k)).length === 1,
+      'genau EIN Provider-Key erreicht die Machine',
+    );
+    assert(env.HTTPS_PROXY === undefined && env.HTTP_PROXY === undefined && env.NO_PROXY === undefined, "Policy 'open' setzt keine Proxy-Env");
+
+    // Dial-Home simulieren: registerLinkSession (der ws-Pfad fuer agent.hello)
+    // findet die Fly-Row per link_id und legt KEINE zweite an.
+    const bound = manager.registerLinkSession(linkRow as LinkRow, {
+      type: 'agent.hello',
+      token: 'x',
+      name: linkRow?.name ?? '',
+      mode: 'yolo',
+    });
+    assert(bound === flyId, 'registerLinkSession bindet die Fly-Session statt sie neu anzulegen');
+    const ready = await c2.wait(
+      (m) => m.type === 'session.event' && m.sessionId === flyId && m.event.type === 'notice' && m.event.phase === 'ready',
+      15_000,
+    );
+    assert(ready.type === 'session.event', 'die Provisionierung endet in der ready-Notice');
+    await waitUntil(() => store.getSession(flyId)?.status === 'idle', 'idle nach dem Dial-Home');
+    assert(manager.toInfo(store.getSession(flyId)!).target === 'fly', 'SessionInfo traegt target fly');
+
+    /* ---- (5) Policy-Env: allowlist / isolated ---- */
+
+    const allowCreated = await createFly('fly-allow', { target: 'fly', networkPolicy: 'allowlist' });
+    assert(allowCreated.type === 'request.ok', 'allowlist-Fly-Session wird angelegt');
+    const allowId = (allowCreated.payload as { sessionId: string }).sessionId;
+    await waitUntil(() => Boolean(store.getSession(allowId)?.fly_machine_id), 'die allowlist-Machine');
+    const allowEnv = machines.get(store.getSession(allowId)?.fly_machine_id ?? '')?.config.env ?? {};
+    const allowShim = store.getSession(allowId)?.shim_token ?? '';
+    assert(
+      allowEnv.HTTPS_PROXY === `http://pa:${allowShim}@egress.example.com:3128` && allowEnv.HTTP_PROXY === allowEnv.HTTPS_PROXY,
+      'allowlist: Proxy-Env mit pa:<shim_token>-Userinfo (http und https)',
+    );
+    assert(allowEnv.NO_PROXY === 'pa.example.com', 'allowlist: der Orchestrator-Host geht am Proxy vorbei');
+    assert(allowEnv.NODE_USE_ENV_PROXY === '1', 'allowlist: NODE_USE_ENV_PROXY wie beim Docker-Container');
+
+    const isoCreated = await createFly('fly-iso', { target: 'fly', networkPolicy: 'isolated' });
+    assert(isoCreated.type === 'request.ok', 'isolated-Fly-Session wird angelegt');
+    const isoId = (isoCreated.payload as { sessionId: string }).sessionId;
+    await waitUntil(() => Boolean(store.getSession(isoId)?.fly_machine_id), 'die isolated-Machine');
+    const isoEnv = machines.get(store.getSession(isoId)?.fly_machine_id ?? '')?.config.env ?? {};
+    assert(isoEnv.HTTPS_PROXY === 'http://127.0.0.1:9' && isoEnv.HTTP_PROXY === 'http://127.0.0.1:9', 'isolated: toter Loopback-Proxy');
+    assert(isoEnv.NO_PROXY === 'pa.example.com', 'isolated: Orchestrator-Host bleibt direkt erreichbar (Dial-Home)');
+
+    // Beide wieder entfernen: delete mid-provisioning zerstoert ihre Machines.
+    await manager.deleteSession(allowId);
+    await manager.deleteSession(isoId);
+    assert(
+      calls.filter((c) => c.startsWith('DELETE /v6/apps/smoke-fly-app/machines/')).length >= 2,
+      'delete zerstoert die Machines der beiden Policy-Sessions',
+    );
+    assert(
+      !store.getSession(allowId) && !store.getSession(isoId),
+      'die Zeilen der Policy-Sessions sind weg',
+    );
+
+    /* ---- (6) Tap-Push bleibt Docker vorbehalten ---- */
+
+    let pushErr = '';
+    await manager.push(flyId).catch((e: unknown) => {
+      pushErr = e instanceof Error ? e.message : String(e);
+    });
+    assert(pushErr.includes('Docker vorbehalten'), 'Tap-Push auf einer Fly-Session wird abgewiesen');
+
+    /* ---- (7) Lifecycle: reapIdle stoppt, resume startet ---- */
+
+    const flyMachineId = store.getSession(flyId)?.fly_machine_id ?? '';
+    assert(
+      isCollectableSession(
+        sessionRow(flyId, repoId, { status: 'stopped', target: 'fly', link_id: 'l', fly_machine_id: flyMachineId, container_id: null, volume_name: null, last_active_at: new Date(Date.now() - 40 * 86_400_000).toISOString() }),
+        Date.now() - 14 * 86_400_000,
+      ),
+      'eine alte gestoppte Fly-Session ist einsammelbar (GC zerstoert die Machine)',
+    );
+    assert(
+      !isCollectableSession(
+        sessionRow(randomUUID(), repoId, { status: 'stopped', link_id: 'l2', container_id: null, volume_name: null, last_active_at: new Date(Date.now() - 40 * 86_400_000).toISOString() }),
+        Date.now() - 14 * 86_400_000,
+      ),
+      'echte Link-Sessions bleiben von der GC geschont',
+    );
+
+    store.db
+      .prepare('UPDATE sessions SET last_active_at = ? WHERE id = ?')
+      .run(new Date(Date.now() - (config.idleStopSec + 60) * 1000).toISOString(), flyId);
+    await manager.reapIdle();
+    assert(store.getSession(flyId)?.status === 'stopped', 'reapIdle stoppt die idle Fly-Session');
+    assert(calls.includes(`POST /v6/apps/smoke-fly-app/machines/${flyMachineId}/stop`), 'der Stop schlaegt als Machine-Stop auf der API auf');
+
+    const resumeRun = manager.resumeSession(flyId);
+    manager.registerLinkSession(linkRow as LinkRow, { type: 'agent.hello', token: 'x', name: linkRow?.name ?? '', mode: 'yolo' });
+    await resumeRun;
+    assert(store.getSession(flyId)?.status === 'idle', 'resume bringt die Machine zurueck und wartet auf ihren Agenten');
+    assert(calls.includes(`POST /v6/apps/smoke-fly-app/machines/${flyMachineId}/start`), 'resume startet die Machine (kein bye, kein Destroy)');
+
+    /* ---- (8) delete: destroy + Link-Row weg ---- */
+
+    await manager.deleteSession(flyId);
+    assert(calls.includes(`DELETE /v6/apps/smoke-fly-app/machines/${flyMachineId}`), 'delete zerstoert die Machine (force)');
+    assert(!store.listLinks('default').some((l) => l.id === (linkRow?.id ?? '')), 'die Link-Row der Session ist geloescht');
+    assert(store.getSession(flyId) === undefined, 'die Session-Zeile ist weg');
+    assert(appCreated === 1, 'die App wurde ueber alle Sessions hinweg nur einmal angelegt');
+
+    /* ---- (9) Docker-Regression: mit und ohne target wie vorher ---- */
+
+    const explicit = await createFly('fly-docker-explicit', { target: 'docker', mode: 'ask' });
+    assert(explicit.type === 'request.ok', 'target docker ist weiterhin erlaubt');
+    const explicitId = (explicit.payload as { sessionId: string }).sessionId;
+    assert(store.getSession(explicitId)?.target === 'docker', 'die Zeile traegt target docker');
+    assert(!store.getSession(explicitId)?.link_id, 'eine Docker-Session bekommt keine Link-Row');
+    await manager.deleteSession(explicitId).catch(() => undefined);
+
+    const implicit = await createFly('fly-docker-implicit', { mode: 'ask' });
+    assert(implicit.type === 'request.ok', 'ohne target bleibt Docker die Vorgabe');
+    const implicitId = (implicit.payload as { sessionId: string }).sessionId;
+    const implicitRow = store.getSession(implicitId);
+    assert(implicitRow?.target === 'docker' && !implicitRow.link_id && !implicitRow.fly_machine_id, 'ohne target entsteht eine reine Docker-Zeile');
+    assert(manager.toInfo(implicitRow!).target === 'docker', 'SessionInfo leitet docker ab');
+    await manager.deleteSession(implicitId).catch(() => undefined);
+    assert(machines.size === 0, 'alle Machines des Fakes sind am Ende zerstoert');
+  } finally {
+    Object.assign(cfg, saved);
+    flyMod.resetFlyImageMemo();
+    fakeApi.close();
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* 6. WS-Heartbeat (halbtote Sockets)                                  */
 /* ------------------------------------------------------------------ */
 
@@ -1656,6 +2027,7 @@ async function main(): Promise<void> {
   await egressSmoke(store, manager, repoId);
   await lifecycleSmoke(store, manager, c2, repoId);
   await linkSmoke(store, wsBase, c2);
+  await flySmoke(store, manager, c2, repoId);
   await heartbeatSmoke();
   await shimClientSmoke();
 

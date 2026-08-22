@@ -76,7 +76,9 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.DialogProperties
 import com.pocketagent.app.data.SessionStatus
+import com.pocketagent.app.data.SessionTarget
 import com.pocketagent.app.data.WsClient
+import com.pocketagent.app.data.effectiveTarget
 import com.pocketagent.app.ui.KeepWindowStillForIme
 import com.pocketagent.app.ui.bottomSurfacePadding
 import com.pocketagent.app.ui.surfaceSafeInsets
@@ -138,13 +140,18 @@ fun statusLabel(status: SessionStatus): String = when (status) {
 }
 
 /**
- * Status-Text mit Blick für Link-Sessions: „gestoppt“ hieße dort, jemand
- * hätte die Session angehalten — in Wahrheit ist nur der Agenten-Host
- * gerade nicht verbunden. Ein eigener Begriff sagt das, ohne einen neuen
- * Session-Status zu erfinden.
+ * Status-Text mit Blick für verbundene Sessions (`linked` — Link UND Fly):
+ * „gestoppt“ hieße dort, jemand hätte die Session angehalten. In Wahrheit
+ * ist bei einer Fly-Session die Machine gestoppt — pausiert und mit einem
+ * Tap fortsetzbar (dieselbe Sprache wie „Session pausieren“ im Menü); bei
+ * einer Link-Session ist nur der Agenten-Host gerade nicht verbunden. Ein
+ * eigener Begriff sagt das, ohne einen neuen Session-Status zu erfinden.
  */
-fun sessionStatusLabel(session: com.pocketagent.app.data.SessionInfo): String =
-    if (session.linked && session.status == SessionStatus.STOPPED) "Host offline" else statusLabel(session.status)
+fun sessionStatusLabel(session: com.pocketagent.app.data.SessionInfo): String = when {
+    session.status == SessionStatus.STOPPED && session.effectiveTarget() == SessionTarget.FLY -> "Pausiert"
+    session.linked && session.status == SessionStatus.STOPPED -> "Host offline"
+    else -> statusLabel(session.status)
+}
 
 /** Farbe zum sessionbewussten Status-Text (siehe [sessionStatusLabel]). */
 @Composable

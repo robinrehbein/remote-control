@@ -26,6 +26,19 @@ services:
       # Loopback-only by default; remove the 127.0.0.1 prefix only for
       # direct LAN exposure or when a reverse proxy terminates TLS for you.
       - "127.0.0.1:3000:3000"
+      # ---- Egress-Proxy für Fly-Machines (optional, KEIN Default) --------
+      # Fly-Machines mit Policy 'allowlist' erreichen den Egress-Proxy über
+      # seine öffentliche URL (EGRESS_PUBLIC_URL in .env, siehe
+      # sessions.buildFlyMachineEnv); dafür muss EGRESS_PROXY_PORT (3128)
+      # von außen erreichbar sein. Auth läuft dort ausschließlich über das
+      # Token-Gate (Proxy-Authorization mit dem Shim-Token der Session) —
+      # das Peer-IP-Gate kennt keine Fly-Adressen. Betriebsempfehlung: TLS
+      # per TCP-Passthrough, z. B. Traefik TCP-Router auf diesen Port
+      # (services.tcp.routers.… rule: HostSNI(`egress.example.com`) mit
+      # tls=true und den Service auf server:3128 zeigen lassen). Kein
+      # HTTP-terminierender Proxy davor — der bricht das Peer-IP-Gate der
+      # Docker-Sessions; Details im Kopfkommentar von server/src/egress-proxy.ts.
+      # - "3128:3128"
     environment:
       # Generate once: openssl rand -hex 32
       MASTER_KEY: ${MASTER_KEY:?set MASTER_KEY in .env}
@@ -112,6 +125,18 @@ services:
     profiles: ["runner"]
     build: { context: ., dockerfile: runner/Dockerfile }
     image: ${RUNNER_IMAGE_PREFIX:-pocketagent}/pi-runner:${RUNNER_IMAGE_TAG:-latest}
+    entrypoint: ["true"]
+
+  # ---- Fly-Link-Image vorbauen (optional, build-only, läuft nie) ---------
+  # Image für disk-lose Fly-Machines (Fly-Sessions): Link-Agent + eingebetteter
+  # pi-Runner, klont beim Start frisch (link/src/fly-bootstrap.ts) und meldet
+  # sich per outbound WSS beim Orchestrator. Kein Docker-Socket, kein Volume —
+  # der Orchestrator pusht dieses Image in eine Registry (fly deploy).
+  #   docker compose --profile fly-runner build fly-runner
+  fly-runner:
+    profiles: ["fly-runner"]
+    build: { context: ., dockerfile: runner/Dockerfile.fly }
+    image: ${RUNNER_IMAGE_PREFIX:-pocketagent}/fly-link:${RUNNER_IMAGE_TAG:-latest}
     entrypoint: ["true"]
 
 volumes:

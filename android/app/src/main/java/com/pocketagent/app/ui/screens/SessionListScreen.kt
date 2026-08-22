@@ -87,6 +87,7 @@ import com.pocketagent.app.PocketAgentApp
 import com.pocketagent.app.data.SessionInfo
 import com.pocketagent.app.data.SessionStatus
 import com.pocketagent.app.data.WsClient
+import com.pocketagent.app.data.effectiveTarget
 import com.pocketagent.app.ui.theme.CardInset
 import com.pocketagent.app.ui.theme.EmptyStateInset
 import com.pocketagent.app.ui.theme.OneUiAccent
@@ -590,14 +591,22 @@ private fun SessionCard(
             }
             // Ausnahmebasiert: nur eine Abweichung vom sicheren Netzwerk-
             // Default verdient hier noch einen Chip — der Modus steht im
-            // Session-Screen.
-            session.networkPolicy
+            // Session-Screen. Das Ziel steht daneben, wenn es vom langjährigen
+            // Standard abweicht: „Fly" für die Cloud-Sandbox, „PC" für den
+            // Heim-PC; Docker bleibt stumm.
+            val targetLabel = sessionTargetLabel(session.effectiveTarget())
+            val policyLabel = session.networkPolicy
                 ?.takeIf { it != "allowlist" }
-                ?.let { policy ->
-                    Row(modifier = Modifier.padding(top = 10.dp)) {
-                        InfoChip(networkPolicyLabel(policy))
-                    }
+                ?.let(::networkPolicyLabel)
+            if (targetLabel != null || policyLabel != null) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.padding(top = 10.dp),
+                ) {
+                    targetLabel?.let { InfoChip(it) }
+                    policyLabel?.let { InfoChip(it) }
                 }
+            }
             if (prUrl != null) {
                 // Antippbar statt reiner Text (Fund: "PR-Erfolg ist eine
                 // Sackgasse" — dieselbe Karte, die den Erfolg meldet, führt

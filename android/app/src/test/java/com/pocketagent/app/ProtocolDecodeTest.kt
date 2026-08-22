@@ -2,7 +2,9 @@ package com.pocketagent.app
 
 import com.pocketagent.app.data.AgentEvent
 import com.pocketagent.app.data.ServerMessage
+import com.pocketagent.app.data.SessionTarget
 import com.pocketagent.app.data.StartPhase
+import com.pocketagent.app.data.encodeSessionCreate
 import com.pocketagent.app.data.parseServerMessage
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -519,6 +521,89 @@ class ProtocolDecodeTest {
         assertTrue(sessions[0].linked)
         // Alter Server ohne das Feld: keine Link-Session
         assertFalse(sessions[1].linked)
+    }
+
+    /* -------------------- Session-Ziel (Fly) -------------------- */
+
+    @Test
+    fun `decodes the session target and leaves it null for old rows`() {
+        val msg = parseServerMessage(
+            """
+            {
+              "type": "session.list",
+              "requestId": "req-tgt",
+              "sessions": [
+                {
+                  "id": "s1", "repoId": "r1", "adapter": "pi", "provider": "anthropic",
+                  "model": "", "mode": "auto", "status": "running", "branch": "agent/s1",
+                  "createdAt": "2026-01-01T10:00:00Z", "lastActiveAt": "2026-01-01T11:00:00Z",
+                  "target": "fly", "linked": true
+                },
+                {
+                  "id": "s2", "repoId": "r1", "adapter": "pi", "provider": "anthropic",
+                  "model": "", "mode": "auto", "status": "idle", "branch": "agent/s2",
+                  "createdAt": "2026-01-01T10:00:00Z", "lastActiveAt": "2026-01-01T11:00:00Z"
+                },
+                {
+                  "id": "s3", "repoId": "r1", "adapter": "pi", "provider": "anthropic",
+                  "model": "", "mode": "auto", "status": "idle", "branch": "agent/s3",
+                  "createdAt": "2026-01-01T10:00:00Z", "lastActiveAt": "2026-01-01T11:00:00Z",
+                  "target": "gcp"
+                }
+              ]
+            }
+            """.trimIndent(),
+        )
+        val sessions = (msg as ServerMessage.SessionListMsg).sessions
+        // Eine Fly-Session traegt das Ziel explizit (und ist intern linked)
+        assertEquals(SessionTarget.FLY, sessions[0].target)
+        assertTrue(sessions[0].linked)
+        // Alter Server ohne das Feld: null, nicht 'docker' — die Aufloesung
+        // uebernimmt effectiveTarget (linked => Heim-PC, sonst Docker).
+        assertNull(sessions[1].target)
+        // Ein Ziel eines neueren Servers faellt auf null zurueck, statt die
+        // ganze Session zu verwerfen.
+        assertNull(sessions[2].target)
+    }
+
+    @Test
+    fun `unknown raw targets fall back to docker`() {
+        assertEquals(SessionTarget.LINK, SessionTarget.fromRaw("link"))
+        assertEquals(SessionTarget.FLY, SessionTarget.fromRaw("fly"))
+        assertEquals(SessionTarget.DOCKER, SessionTarget.fromRaw("docker"))
+        // Vertrag: fehlt das Feld (null) oder ist es leer/unbekannt, gilt
+        // 'docker' — die Session bleibt damit nutzbar.
+        assertEquals(SessionTarget.DOCKER, SessionTarget.fromRaw(null))
+        assertEquals(SessionTarget.DOCKER, SessionTarget.fromRaw(""))
+        assertEquals(SessionTarget.DOCKER, SessionTarget.fromRaw("  "))
+        assertEquals(SessionTarget.DOCKER, SessionTarget.fromRaw("gcp"))
+    }
+
+    @Test
+    fun `encodes session create with a target only when one is set`() {
+        val fly = encodeSessionCreate(
+            requestId = "req-t1",
+            repoId = "r1",
+            provider = "zai",
+            model = "",
+            mode = com.pocketagent.app.data.AgentMode.AUTO,
+            branch = null,
+            networkPolicy = "allowlist",
+            target = SessionTarget.FLY,
+        )
+        assertTrue(fly.contains(""""target":"fly""""))
+
+        // Ohne Ziel bleibt das Feld weg — ein alter Server soll es nicht
+        // unbekannt annehmen muessen; fehlend gilt serverseitig 'docker'.
+        val none = encodeSessionCreate(
+            requestId = "req-t2",
+            repoId = "r1",
+            provider = "zai",
+            model = "",
+            mode = com.pocketagent.app.data.AgentMode.AUTO,
+            branch = null,
+        )
+        assertFalse(none.contains("\"target\""))
     }
 
     /* -------------------- Neue Client-Nachrichten -------------------- */

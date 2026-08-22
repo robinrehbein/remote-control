@@ -27,6 +27,15 @@ export interface SessionRow {
   volume_name: string | null; shim_token: string | null; pr_url: string | null;
   shim_endpoint: string | null; link_id: string | null; network_policy: string | null;
   reasoning_effort: string | null;
+  /**
+   * Wo der Agent dieser Session läuft ('docker'|'link'|'fly'). Null = Zeile aus
+   * vor-fly-Zeiten; die Aufrufer leiten das Ziel aus link_id ab. Fly-Rows tragen
+   * zusätzlich link_id (die Machine ist intern eine Link-Session) - target
+   * entscheidet, welcher Lifecycle-Zweig greift.
+   */
+  target: string | null;
+  /** Machine-Id der Fly-API (nur target 'fly', nach dem Anlegen der Machine gesetzt). */
+  fly_machine_id: string | null;
   /** User-set title; null = the client derives the name from repo/branch. */
   title: string | null;
   /** 0/1 (sqlite has no boolean). */
@@ -76,6 +85,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   status TEXT NOT NULL, branch TEXT NOT NULL, session_ref TEXT, container_id TEXT,
   volume_name TEXT, shim_token TEXT, pr_url TEXT, shim_endpoint TEXT, link_id TEXT,
   network_policy TEXT, reasoning_effort TEXT, title TEXT, archived INTEGER NOT NULL DEFAULT 0,
+  target TEXT, fly_machine_id TEXT,
   created_at TEXT NOT NULL, last_active_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS session_events (
@@ -130,6 +140,17 @@ export class Store {
     const pairingCols = this.db.prepare('PRAGMA table_info(pairing_codes)').all() as Array<{ name: string }>;
     if (!pairingCols.some((c) => c.name === 'attempts')) {
       this.db.exec('ALTER TABLE pairing_codes ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0');
+    }
+    // Fly-Sessions (F2) haben die Spalten von Anfang an im SCHEMA; eine Datenbank
+    // aus vor-fly-Zeiten bekommt sie hier einmalig nachgelegt (SQLite kann kein
+    // IF NOT EXISTS bei ADD COLUMN, deshalb der PRAGMA-Umweg wie oben). NULL =
+    // Docker-/Link-Session, siehe SessionRow.
+    const sessionCols = this.db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>;
+    if (!sessionCols.some((c) => c.name === 'target')) {
+      this.db.exec('ALTER TABLE sessions ADD COLUMN target TEXT');
+    }
+    if (!sessionCols.some((c) => c.name === 'fly_machine_id')) {
+      this.db.exec('ALTER TABLE sessions ADD COLUMN fly_machine_id TEXT');
     }
   }
 
@@ -356,14 +377,15 @@ export class Store {
       .prepare(
         `INSERT INTO sessions (id, tenant_id, repo_id, repo_full_name, provider, model, mode,
          status, branch, session_ref, container_id, volume_name, shim_token, pr_url, shim_endpoint, link_id,
-         network_policy, reasoning_effort, title, archived, created_at, last_active_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         network_policy, reasoning_effort, title, archived, target, fly_machine_id, created_at, last_active_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         row.id, row.tenant_id, row.repo_id, row.repo_full_name, row.provider,
         row.model, row.mode, row.status, row.branch, row.session_ref, row.container_id,
         row.volume_name, row.shim_token, row.pr_url, row.shim_endpoint, row.link_id,
         row.network_policy, row.reasoning_effort, row.title, row.archived ? 1 : 0,
+        row.target ?? null, row.fly_machine_id ?? null,
         row.created_at, row.last_active_at,
       );
   }
@@ -445,6 +467,20 @@ export class Store {
   setLinkId(id: string, linkId: string | null): void {
     this.bumpSessionAuth();
     this.db.prepare('UPDATE sessions SET link_id = ? WHERE id = ?').run(linkId, id);
+  }
+
+  /** Läuftstempel der Session-Zeile ('docker'|'link'|'fly'), siehe SessionRow.target. */
+  setSessionTarget(id: string, target: string): void {
+    this.db.prepare('UPDATE sessions SET target = ? WHERE id = ?').run(target, id);
+  }
+
+  /**
+   * Machine-Id einer Fly-Session. Bewusst ohne bumpSessionAuth: die Id ändert
+   * nichts an Egress-Auth (Token/Status/Container entscheiden), aber jedes
+   * Provisioning würde sonst die Proxy-Tabelle der ganzen Sessions neu bauen.
+   */
+  setFlyMachine(id: string, machineId: string): void {
+    this.db.prepare('UPDATE sessions SET fly_machine_id = ? WHERE id = ?').run(machineId, id);
   }
 
   setSessionRef(id: string, ref: string): void {

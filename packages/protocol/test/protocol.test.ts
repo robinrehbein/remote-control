@@ -23,6 +23,7 @@ import {
   PI_PROVIDER_ENV,
   PI_PROVIDER_IDS,
   SECRET_KINDS,
+  SESSION_TARGETS,
   SequencedSseBroadcaster,
   WS_CLOSE_REPLACED,
   WS_CLOSE_TOO_MANY_CONNECTIONS,
@@ -33,6 +34,7 @@ import {
   isAgentMode,
   isPiProvider,
   isReasoningEffort,
+  isSessionTarget,
   isTerminalLinkCloseCode,
   parseLastEventId,
   piProviderEnvVar,
@@ -332,6 +334,26 @@ test('Modus- und Reasoning-Prüfer nehmen nur bekannte Werte an', () => {
   assert.equal(isAgentMode(''), false);
   assert.ok(isReasoningEffort('high'));
   assert.equal(isReasoningEffort('extreme'), false);
+});
+
+/* ------------------------------------------------------------------ */
+/* Session-Ziele                                                       */
+/* ------------------------------------------------------------------ */
+
+test('isSessionTarget akzeptiert genau die drei Ziele', () => {
+  assert.ok(isSessionTarget('docker'));
+  assert.ok(isSessionTarget('link'));
+  assert.ok(isSessionTarget('fly'));
+  assert.equal(isSessionTarget('local'), false);
+  assert.equal(isSessionTarget(''), false);
+  assert.equal(isSessionTarget('Fly'), false, 'case-sensitiv');
+  assert.equal(isSessionTarget('docker, link'), false);
+});
+
+test('SESSION_TARGETS führt alle Ziele ohne Duplikate', () => {
+  assert.deepEqual([...SESSION_TARGETS], ['docker', 'link', 'fly']);
+  assert.equal(new Set(SESSION_TARGETS).size, SESSION_TARGETS.length);
+  for (const target of SESSION_TARGETS) assert.ok(isSessionTarget(target));
 });
 
 /* ------------------------------------------------------------------ */

@@ -3,6 +3,8 @@ package com.pocketagent.app.ui.screens
 import com.pocketagent.app.data.AgentMode
 import com.pocketagent.app.data.SessionInfo
 import com.pocketagent.app.data.SessionStatus
+import com.pocketagent.app.data.SessionTarget
+import com.pocketagent.app.data.effectiveTarget
 
 /* ------------------------------------------------------------------ */
 /* Anzeigename                                                         */
@@ -26,6 +28,22 @@ fun sessionDisplayName(session: SessionInfo): String =
 fun sessionSubtitle(session: SessionInfo): String? =
     session.repoFullName?.trim()
         ?.takeIf { it.isNotEmpty() && it != sessionDisplayName(session) }
+
+/* ------------------------------------------------------------------ */
+/* Ziel                                                                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Kürzel des Ziels für die Session-Karte. Nur Fly- und Heim-PC-Sessions
+ * bekommen eines — Docker ist der langjährige Standard, der braucht keine
+ * Kennzeichnung (denselben Grundsatz wie beim Netzwerk-Chip: nur die
+ * Abweichung zeigt sich).
+ */
+fun sessionTargetLabel(target: SessionTarget): String? = when (target) {
+    SessionTarget.FLY -> "Fly"
+    SessionTarget.LINK -> "PC"
+    SessionTarget.DOCKER -> null
+}
 
 /* ------------------------------------------------------------------ */
 /* Aktiv / Archiv                                                      */
@@ -139,26 +157,42 @@ fun sessionActionLabel(action: SessionAction): String = when (action) {
 
 /**
  * Der Text unter dem Menüeintrag, wo eine Erklärung nötig ist. Alles
- * andere erklärt sich selbst und bleibt einzeilig. Für Link-Sessions sagen
- * die Erklärungen, was auf dem Agenten-Host passiert — „Container“ gäbe es
- * dort nicht.
+ * andere erklärt sich selbst und bleibt einzeilig. Für verbundene Sessions
+ * (`linked`) sagen die Erklärungen, was auf dem Agenten-Host passiert —
+ * „Container“ gäbe es dort nicht. Fly-Sessions sind intern ebenfalls
+ * verbunden, laufen aber in einer gesteuerten Machine des Orchestrators;
+ * ihre Texte nennen die Machine.
  */
 fun sessionActionNote(action: SessionAction, session: SessionInfo): String? = when (action) {
     SessionAction.ARCHIVE ->
-        if (session.linked) "Der Agent auf dem Host läuft weiter"
-        else "Container wird gestoppt, der Arbeitsstand bleibt erhalten"
+        when (session.effectiveTarget()) {
+            SessionTarget.LINK -> "Der Agent auf dem Host läuft weiter"
+            SessionTarget.FLY -> "Die Machine wird gestoppt, der Arbeitsstand bleibt erhalten"
+            SessionTarget.DOCKER -> "Container wird gestoppt, der Arbeitsstand bleibt erhalten"
+        }
 
     SessionAction.UNARCHIVE ->
-        if (session.linked) "Zurück in die Liste"
-        else "Zurück in die Liste; Fortsetzen startet den Container neu"
+        when (session.effectiveTarget()) {
+            SessionTarget.LINK -> "Zurück in die Liste"
+            SessionTarget.FLY -> "Zurück in die Liste; Fortsetzen startet die Machine neu"
+            SessionTarget.DOCKER -> "Zurück in die Liste; Fortsetzen startet den Container neu"
+        }
 
     SessionAction.STOP ->
-        if (session.linked) "Beendet den Agenten-Prozess auf dem Host – dort neu starten"
-        else "Der Container wird beendet; Fortsetzen startet ihn neu"
+        when (session.effectiveTarget()) {
+            SessionTarget.LINK -> "Beendet den Agenten-Prozess auf dem Host – dort neu starten"
+            SessionTarget.FLY -> "Stoppt die Machine in der Cloud; Fortsetzen startet sie neu"
+            SessionTarget.DOCKER -> "Der Container wird beendet; Fortsetzen startet ihn neu"
+        }
 
+    // Nur der Heim-PC hängt davon ab, dass jemand den Agenten dort startet —
+    // eine gestoppte Fly-Machine startet der Server auf Fortsetzen selbst.
     SessionAction.RESUME ->
-        if (session.linked) "Klappt erst, wenn der Agenten-Host wieder verbunden ist"
-        else null
+        if (session.effectiveTarget() == SessionTarget.LINK) {
+            "Klappt erst, wenn der Agenten-Host wieder verbunden ist"
+        } else {
+            null
+        }
 
     SessionAction.DELETE -> "Endgültig – mit Verlauf und Arbeitsstand"
     else -> null

@@ -1,0 +1,63 @@
+# Image fuer disk-lose Fly-Machines (Fly-Sessions, F4): Link-Agent mit
+# eingebettetem pi-Runner, der sich per outbound WSS beim Orchestrator meldet
+# (Dial-Home) und beim Start das GitHub-Repo frisch klont (link/src/
+# fly-bootstrap.ts). Kein Docker-Socket, kein DOCKER_HOST, kein Volume -
+# reiner Node-Prozess + git; Repo-State lebt im Git (agent/<session-id>).
+#
+# Kontext ist IMMER das Repo-Root, genau wie runner/Dockerfile:
+#   docker build -f runner/Dockerfile.fly -t pocketagent/fly-link:latest .
+# (oder vorbauen: docker compose --profile fly-runner build fly-runner)
+#
+# Bewusst EIN-STUFIG ohne tsc-Build: link/ hat kein Build-Artefakt, sondern
+# laeuft in der Entwicklung (und damit auch hier) auf tsx - dasselbe
+# Laufzeit-Setup wie `npm run start -w link`. Der eingebettete Runner laedt
+# dabei als TS-Quelle (runner-embed.ts importiert ../../runner/src/index.js,
+# tsx loest .js auf .ts auf) und findet seine Laufzeit-Abhaengigkeiten in
+# runner/node_modules (eigenes npm ci, siehe runner-embed.ts).
+FROM node:22-bookworm-slim
+
+# Dieselbe Basis wie runner/Dockerfile, git + CA-Zertifikate fuer den Clone.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends git ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# ---- Root-Workspace: protocol + link (wie `npm install` in der Entwicklung,
+# README "Quickstart: Link-Agent"). server/ fehlt im Build-Kontext bewusst -
+# npm ci toleriert die fehlende Workspace-Dir und installiert nur die Deps
+# der vorhandenen Workspaces (protocol hat gar keine, link nur ws) - inkl.
+# Dev-Dependencies, weil tsx hier der Runtime-Einstieg ist.
+COPY package.json package-lock.json tsconfig.base.json ./
+COPY packages/protocol ./packages/protocol
+COPY link ./link
+RUN npm ci --no-audit --no-fund
+
+# ---- runner/ ist eigenstaendig (kein Root-Workspace, eigenes package-lock,
+# siehe runner/Dockerfile): file:../packages/protocol zeigt von /app/runner
+# auf /app/packages/protocol. Nur Produktions-Deps - der Runner laeuft als
+# TS-Quelle, kein Build noetig.
+WORKDIR /app/runner
+COPY runner/package.json runner/package-lock.json ./
+RUN npm ci --omit=dev --no-audit --no-fund
+COPY runner/src ./src
+
+WORKDIR /app
+
+# Session containers run as uid 1000 (node): HOME/XDG_CONFIG_HOME point at
+# writable /tmp locations (pi SDK, git askpass helper), /work receives the
+# fresh clone. Disk-less: nichts davon ueberlebt einen Machine-Stop.
+ENV NODE_ENV=production
+ENV HOME=/tmp
+ENV XDG_CONFIG_HOME=/tmp/xdg
+ENV PA_WORKDIR=/work
+
+RUN mkdir -p /work /tmp/xdg \
+  && chown -R node:node /work /tmp/xdg
+
+USER node
+
+# Kein EXPOSE, kein HEALTHCHECK: die Machine haelt ausschliesslich eine
+# ausgehende WSS-Verbindung (kein HTTP-Interface nach aussen). Signale
+# (SIGTERM beim Machine-Stop) behandelt index.ts selbst.
+CMD ["node", "--import", "tsx", "/app/link/src/fly-bootstrap.ts"]

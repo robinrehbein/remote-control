@@ -50,6 +50,16 @@ function b64Env(name: string): string | undefined {
 }
 
 /**
+ * Getrimmter Env-Wert oder undefined - Leerstring gilt als "nicht gesetzt".
+ * Die gemeinsame Form all der optionalen Fly-/Registry-Variablen, damit jede
+ * einzelne nur ihren Warum-Kommentar tragen muss.
+ */
+function optionalEnv(name: string): string | undefined {
+  const raw = process.env[name]?.trim();
+  return raw && raw.length > 0 ? raw : undefined;
+}
+
+/**
  * Hosts, die eine Session unter der Policy 'allowlist' erreichen darf. Gegenüber
  * v1 sind die Adapter-spezifischen Einträge (models.dev für kilo) raus; geblieben
  * sind GitHub (Clone/Push/PR), die pi-Provider-Endpunkte und die Paket-Registries,
@@ -136,6 +146,28 @@ function loadRunnerImageOverride(): string | null {
   return raw && raw.length > 0 ? raw : null;
 }
 
+/* ------------------------------------------------------------------ */
+/* Fly-Sessions (Machines-API, F2)                                     */
+/* ------------------------------------------------------------------ */
+
+const flyApiToken = optionalEnv('FLY_API_TOKEN');
+
+/**
+ * Deckel für gleichzeitig laufende Fly-Machines. Ungültige Werte fallen auf 3
+ * zurück - ein Deckel, der wegen eines Tippfehlers auf 0 fiele, nähme Fly-
+ * Sessions komplett aus, einer auf NaN wäre gar keiner.
+ */
+function loadFlyMaxMachines(): number {
+  const raw = process.env.FLY_MAX_MACHINES?.trim();
+  if (!raw) return 3;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 1) {
+    console.warn(`[config] invalid FLY_MAX_MACHINES "${raw}" - falling back to 3`);
+    return 3;
+  }
+  return Math.floor(n);
+}
+
 export const config = {
   port: Number(process.env.PORT ?? 3000),
   dataDir: resolve(process.env.DATA_DIR ?? './data'),
@@ -165,6 +197,28 @@ export const config = {
   sessionCpuQuota: loadSessionCpuQuota(),
   /** Trust X-Forwarded-For from a reverse proxy in front of the server (see TRUST_PROXY). */
   trustProxy: loadTrustProxy(),
+  /** Fly-Sessions: aktiviert allein durch das Vorhandensein eines API-Tokens. */
+  flyEnabled: flyApiToken !== undefined,
+  flyApiToken,
+  /** Machines-API (v6); api.machines.dev ist ein Alias der Plattform-API. */
+  flyApiBase: optionalEnv('FLY_API_BASE') ?? 'https://api.machines.dev',
+  /** Nur nötig, solange die App noch nicht existiert (einmalige Anlage, siehe fly.ensureApp). */
+  flyOrgSlug: optionalEnv('FLY_ORG_SLUG'),
+  flyAppName: optionalEnv('FLY_APP_NAME') ?? 'pocketagent-sessions',
+  flyRegion: optionalEnv('FLY_REGION'),
+  /** Fertiger Image-Ref der Machine; gesetzt => es wird nie gebaut oder gepusht. */
+  flyImage: optionalEnv('FLY_IMAGE'),
+  /** Deckel gleichzeitig laufender Fly-Machines (creating/running/idle), siehe loadFlyMaxMachines. */
+  flyMaxMachines: loadFlyMaxMachines(),
+  /** Ziel-Ref des Image-Pushs (z. B. ghcr.io/acme/fly-link:tag). Ohne ihn muss FLY_IMAGE gesetzt sein. */
+  ghcrImage: optionalEnv('GHCR_IMAGE'),
+  /** Registry-Credentials für den Push - Infra-Token des Orchestrators, nicht Vault (siehe fly.ts). */
+  ghcrPushToken: optionalEnv('GHCR_PUSH_TOKEN'),
+  ghcrUsername: optionalEnv('GHCR_USERNAME'),
+  /** Öffentliche Basis-URL; PA_SERVER der Machine wird daraus abgeleitet (https->wss, http->ws). */
+  publicUrl: optionalEnv('PUBLIC_URL'),
+  /** Öffentliche URL des Egress-Proxys ohne Userinfo; Pflicht für Fly-Sessions mit Policy 'allowlist'. */
+  egressPublicUrl: optionalEnv('EGRESS_PUBLIC_URL'),
 } as const;
 
 /**

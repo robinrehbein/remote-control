@@ -1,8 +1,8 @@
 # RUNBOOK-PI — Betrieb von PocketAgent v2
 
 Alles, was zwischen „Repo ausgecheckt" und „Checkliste grün" liegt: Deploy auf
-Coolify, Pairing, Secrets, Link-Agent auf dem Heim-PC, Troubleshooting und das
-Abnahme-Protokoll.
+Coolify, Pairing, Secrets, Link-Agent auf dem Heim-PC, Fly-Sessions in
+Produktion, Troubleshooting und das Abnahme-Protokoll.
 
 Zielbild und Nicht-Ziele stehen in [`GREENFIELD-PI.md`](GREENFIELD-PI.md), der
 Überblick in [`README.md`](README.md). Alle Befehle vom Monorepo-Root, wenn
@@ -58,6 +58,16 @@ Infrastruktur-Umbau nötig ist:
 | `IDLE_STOP_SEC` / `GC_DAYS` | nein (900 / 14) | Idle-Reaper und Aufräumfrist |
 | `NETWORK_POLICY` | nein (`allowlist`) | Vorgabe je Session; `isolated` und `open` sind die Alternativen |
 | `NETWORK_ALLOWLIST` | nein | überschreibt die Vorgabeliste (GitHub, pi-Provider, Paket-Registries) |
+| `FLY_API_TOKEN` | für Fly: **ja** | Fly-Sessions sind aktiviert, sobald das Token steht (fly.io → Settings → API) |
+| `FLY_APP_NAME` | nein (`pocketagent-sessions`) | Fly-App, unter der der Server die Session-Machines verwaltet |
+| `FLY_ORG_SLUG` | nur einmalige App-Anlage | erlaubt dem Server, die App beim ersten Start anzulegen; danach entbehrlich |
+| `FLY_REGION` | nein | Region der Machines (z. B. `fra`); leer = Fly wählt |
+| `FLY_IMAGE` | nein | fertiger Image-Ref der Machine (z. B. öffentliches ghcr-Image). Gesetzt = nie bauen, nie pushen |
+| `FLY_MAX_MACHINES` | nein (3) | Deckel gleichzeitig laufender Fly-Machines (`creating`/`running`/`idle`) |
+| `GHCR_IMAGE` | für Fly-Selbstbau: **ja** | Push-Ziel des Fly-Link-Images, z. B. `ghcr.io/<owner>/fly-link:2026-08` (sonst `FLY_IMAGE` setzen) |
+| `GHCR_PUSH_TOKEN` / `GHCR_USERNAME` | mit `GHCR_IMAGE`: **ja** | GitHub-PAT mit `write:packages` und Username für den Image-Push |
+| `PUBLIC_URL` | für Fly: **ja** | öffentliche Basis-URL des Orchestrators; daraus wird `PA_SERVER` der Machine (`https`→`wss`) |
+| `EGRESS_PUBLIC_URL` | für Fly + `allowlist`: **ja** | öffentliche Proxy-URL **ohne** Userinfo, TLS empfohlen (siehe Abschnitt 5) |
 
 Entfallen gegenüber v1 (ersatzlos, nicht umbenannt): `ADAPTER_IMAGE_PREFIX`,
 `ADAPTER_IMAGE_TAG`, `ADAPTERS_DIR`, `GATEWAY_TOKEN`/`GATEWAY_PORT`/
@@ -245,7 +255,110 @@ pi-Runner.
 
 ---
 
-## 5. Troubleshooting
+## 5. Fly-Sessions (Produktion)
+
+Drittes Session-Ziel neben Docker und Link: **eine Fly.io-Machine je Session**,
+disk-less (kein Volume), vom Orchestrator über die Machines-API provisioniert.
+Die Machine startet vom Fly-Link-Image (Link-Agent mit eingebettetem pi-Runner,
+`runner/Dockerfile.fly`), klont beim Start das Repo frisch, arbeitet auf
+`agent/<session-id>` und meldet sich per **outbound WSS** beim Orchestrator —
+derselbe Dial-Home wie der Link-Agent, aber mit einem frischen Link-Token, der
+exklusiv zu dieser Session gehört (Delete nimmt ihn mit). Aktiviert wird Fly
+allein durch das Setzen von `FLY_API_TOKEN`.
+
+Netzwerk-Policy pro Session wie bei Docker, auf der Machine über Proxy-Env
+umgesetzt:
+
+| Policy | Machine-Env | Wirkung |
+|---|---|---|
+| `allowlist` (Vorgabe) | `HTTPS_PROXY=http://pa:<shim_token>@<EGRESS_PUBLIC_URL>`, `NO_PROXY=<Orchestrator-Host>` | Egress nur durch den Egress-Proxy des Orchestrators (Token-Gate + Allowlist) |
+| `isolated` | `HTTPS_PROXY=http://127.0.0.1:9` (toter Proxy) | kein Egress — Clone/Fetch laufen bewusst ins Leere |
+| `open` | nichts | direkter Internetzugriff |
+
+### Voraussetzungen
+
+1. **Fly-Account + API-Token**: Token unter fly.io → Settings → API erzeugen
+   und als `FLY_API_TOKEN` setzen.
+2. **Fly-App einmalig anlegen** — einer von beiden Wegen:
+   - automatisch: `FLY_ORG_SLUG` setzen; der Server legt die App beim ersten
+     Session-Start an (danach kann die Variable wieder weg),
+   - manuell: `fly apps create --name <FLY_APP_NAME> --org <org>`.
+3. **Machine-Image** — einer von beiden Wegen:
+   - `FLY_IMAGE` mit fertigen Ref setzen (z. B. das öffentliche ghcr-Image):
+     kein Bau, kein Push.
+   - `GHCR_IMAGE` (Push-Ziel, z. B. `ghcr.io/<owner>/fly-link:2026-08`) +
+     `GHCR_PUSH_TOKEN` (GitHub-PAT mit `write:packages`) + `GHCR_USERNAME`:
+     der Server baut und pusht selbst (siehe unten).
+
+   Ein **privates** ghcr-Image kann Fly nur mit Registry-Auth an der App ziehen
+   (über die Fly-Plattform zu hinterlegen) — das ist bewusst **nicht**
+   automatisiert. Empfehlung: Image öffentlich machen; es enthält keine
+   Secrets (alle Token stehen je Session in der Machine-Env, nie im Image).
+4. **`PUBLIC_URL`**: öffentliche Basis-URL des Orchestrators, z. B.
+   `https://pa.example.com`; daraus leitet der Server `PA_SERVER` der Machine
+   ab (`https`→`wss`).
+5. **`EGRESS_PUBLIC_URL`** (nur für Policy `allowlist`): öffentliche URL des
+   Egress-Proxys **ohne** Userinfo, z. B. `https://egress.example.com` oder
+   `http://egress.example.com:3128` — siehe unten.
+
+### Erster Start
+
+- Beim ersten Fly-Session-Start stellt der Server die App sicher und sorgt für
+  das Image: ohne `FLY_IMAGE` baut er `<RUNNER_IMAGE_PREFIX>/fly-link:
+  <RUNNER_IMAGE_TAG>` über die Docker-API (dieselbe Baumechanik wie beim
+  pi-Runner-Image) und pusht es nach `GHCR_IMAGE`.
+- **Das dauert Minuten** — die App zeigt Bau und Push als Fortschrittskarte
+  mit ausklappbarem Log.
+- Danach startet jede weitere Session in **Sekunden**: Machine aus dem
+  vorhandenen Registry-Image, Bootstrap klont das Repo, Agent dialt heim.
+- Vorbauen (spart die Wartezeit beim ersten Start):
+  `docker compose --profile fly-runner build fly-runner`.
+- Invalidierung: `RUNNER_IMAGE_TAG` hochzählen — das gilt für beide
+  Runner-Images; neuer Tag heißt neuer Build und neuer Push (den Tag in
+  `GHCR_IMAGE` sinnvollerweise mitziehen).
+
+### Egress-Proxy öffentlich machen (Policy `allowlist`)
+
+Fly-Machines hängen in keinem Docker-Netz — für sie ist der Egress-Proxy nur
+über seine öffentliche URL erreichbar:
+
+1. Port exponieren (der Orchestrator lauscht auf 3128, umstellbar über
+   `EGRESS_PROXY_PORT`): in Coolify als TCP-Port oder per Traefik-**TCP**-
+   Router. Keinen HTTP-terminierenden Proxy davor — der würde dem Proxy die
+   Adresse des eigentlichen Clients vorspiegeln (Details im Kopfkommentar von
+   `server/src/egress-proxy.ts` und im Kommentar zu Port 3128 in der
+   `docker-compose.yml`).
+2. `EGRESS_PUBLIC_URL` setzen — ohne Userinfo.
+3. **TLS empfehlen**: Eine HTTP-Terminierung bricht das Peer-IP-Gate der
+   Docker-Sessions zwar nicht, aber ohne TLS trägt jede Fly-Session ihr
+   Proxy-Token (Basic `pa:<shim_token>`) im Klartext über das Netz.
+
+### Lifecycle & Kosten
+
+| Ereignis | Verhalten |
+|---|---|
+| Idle (`IDLE_STOP_SEC`, Default 900 s) | Machine wird **gestoppt** — die Abrechnung pausiert. Die App zeigt „Pausiert". |
+| Resume | Machine startet neu; der Bootstrap klont bzw. zieht den `agent/<session-id>`-Branch auf Remote-Stand (ein paar Sekunden). Ungepushte Commits der vorigen Runde sind mit dem Machine-Stop **weg** (disk-less): der Runner committet nach jedem Turn, pusht aber nur im Yolo-Modus automatisch (Tap-Push ist Docker vorbehalten). Eine laufende pi-SessionRef überlebt den Neustart bewusst nicht. |
+| Delete / GC (`GC_DAYS`) | Machine wird **zerstört** (force) samt Link-Token, die Zeile verschwindet. GC sammelt gestoppte/fehlgeschlagene Fly-Sessions nach der Inaktivitätsfrist ein. |
+| Deckel | `FLY_MAX_MACHINES` (Default 3) zählt Fly-Sessions in `creating`/`running`/`idle`; darüber wird `session.create` mit klarer Meldung abgelehnt. |
+| Orchestrator-Neustart | nichts zu tun — laufende Machines redialen selbst (Restart-Policy `always`); gestoppte bleiben gestoppt und warten auf Resume. |
+
+### Troubleshooting (Fly)
+
+| Symptom | Ursache | Fix |
+|---|---|---|
+| `Fly-Sessions sind auf diesem Server nicht aktiviert (FLY_API_TOKEN fehlt).` | Server lief ohne `FLY_API_TOKEN` | Token setzen (fly.io → Settings → API) und den Server neu starten |
+| `PUBLIC_URL fehlt: …` | öffentliche Basis-URL nicht gesetzt | `PUBLIC_URL` auf die von außen erreichbare Orchestrator-URL setzen |
+| `Die Fly-App "…" existiert noch nicht. FLY_ORG_SLUG setzen …` | App noch nicht angelegt | `FLY_ORG_SLUG` setzen (der Server legt an) oder manuell `fly apps create --name <FLY_APP_NAME> --org <org>` |
+| `Für Fly-Sessions mit Policy 'allowlist' fehlt EGRESS_PUBLIC_URL …` | Proxy-URL fehlt | `EGRESS_PUBLIC_URL` setzen und den Port freigeben (siehe oben) |
+| Provider-Call aus einer Fly-Session scheitert; Orchestrator-Log zeigt `[egress] denied … (no proxy credentials` bzw. `token not accepted)`, der Client sieht 407 | `EGRESS_PUBLIC_URL` falsch, Port 3128 nicht exponiert oder Token tot | URL und Port prüfen; das Token ist der `shim_token` der Session und lebt nur, solange sie läuft (eine gestoppte Session wird abgewiesen — nach dem Resume ist es wieder gültig) |
+| Machine-Erzeugung dauert ewig, oder `Image-Push nach … scheiterte` | erster Build + Push laufen noch, oder der ghcr-Push ist gescheitert | Fortschrittskarte abwarten (Minuten); sonst `GHCR_PUSH_TOKEN` (`write:packages`), `GHCR_USERNAME` und `GHCR_IMAGE` prüfen |
+| `Die Fly-Machine hat sich innerhalb von 120s nicht mit dem Orchestrator verbunden …` („Agent hat sich nicht gemeldet") | Machine erreicht den Orchestrator nicht — `PA_SERVER` stimmt nicht | `PUBLIC_URL` prüfen: von außen erreichbar, `https` wird zu `wss`; Orchestrator-Log ansehen |
+| Fly-Session nach App-/Server-Neustart „Pausiert" | erwartet | Machine redialt von selbst; sonst Resume antippen |
+
+---
+
+## 6. Troubleshooting
 
 ### „Failed to connect …" / keine Verbindung beim Koppeln
 
@@ -302,7 +415,7 @@ ist in der Vorgabeliste, eine eigene `NETWORK_ALLOWLIST` muss ihn enthalten.
 
 ---
 
-## 6. Verifikation vor dem Ausrollen
+## 7. Verifikation vor dem Ausrollen
 
 ```bash
 npm install && (cd runner && npm install)
@@ -325,7 +438,7 @@ Key, FCM-Push, Netzwechsel im laufenden Turn.
 
 ---
 
-## 7. Abnahme-Protokoll (Definition of Done)
+## 8. Abnahme-Protokoll (Definition of Done)
 
 Aus [`GREENFIELD-PI.md`](GREENFIELD-PI.md). Jede Zeile **dreimal hintereinander
 fehlerfrei**, einmal über WLAN, einmal über Mobilfunk; das Ganze **zweimal in
@@ -340,6 +453,16 @@ Folge**. Kein neues Feature vorher.
 | 5 | App killen, wieder öffnen | Verlauf vollständig, Reconnect ohne Doppel-Events |
 | 6 | Netzwechsel mitten im Turn | App fängt sich selbst |
 | 7 | Handy weglegen | Push-Notification bei Approval/Turn-Ende kommt an |
+
+### Fly-Checkliste (einmal je Setup)
+
+| # | Schritt | Grün, wenn |
+|---|---|---|
+| 1 | Fly-Session erstellen → erster Prompt | Fortschrittskarte (beim allerersten Start inkl. Image-Bau), dann kommt die Antwort an |
+| 2 | Yolo-Turn laufen lassen | pusht automatisch, Draft-PR entsteht auf GitHub |
+| 3 | Idle abwarten (`IDLE_STOP_SEC`) | App zeigt „Pausiert" → Resume → weiterarbeiten ohne Datenverlust (Agent-Branch wird neu ausgecheckt) |
+| 4 | `allowlist`-Session: Turn laufen lassen | Provider-Call geht durch den Proxy — Server-Log zeigt `[egress]` |
+| 5 | eine Fly-Session mehr als `FLY_MAX_MACHINES` anlegen | wird abgewiesen: „Die Limite von 3 laufenden Fly-Machines (FLY_MAX_MACHINES) ist erreicht …" |
 
 Notiere je Durchlauf Datum, Netz (WLAN/Mobilfunk), App-Version und den Punkt,
 an dem es hakte. Funde gehen als eigene Fix-Pakete zurück in die Umsetzung —

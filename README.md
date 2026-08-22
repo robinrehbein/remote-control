@@ -1,9 +1,10 @@
 # PocketAgent v2
 
 Fernbedienung für **pi** vom Handy. Eine Android-App steuert Coding-Sessions,
-die entweder in Docker-Containern auf deinem Server laufen (Coolify-VPS) oder
-per Link-Agent direkt auf deinem Heim-PC/Devcontainer — auf deinen echten
-GitHub-Repos, mit Approval-Karten, Diff, Push und Draft-PR.
+die in Docker-Containern auf deinem Server laufen (Coolify-VPS), per Link-Agent
+direkt auf deinem Heim-PC/Devcontainer oder als disk-lose Fly.io-Machine in
+Produktion — auf deinen echten GitHub-Repos, mit Approval-Karten, Diff, Push
+und Draft-PR.
 
 v2 ist ein bewusster Schnitt: **ein** Agent (pi), **ein** Runner-Image, keine
 Adapter-Schicht. Der komplette Multi-Adapter-Stand (Kilo, Claude, Junie, Codex,
@@ -24,14 +25,17 @@ Android (Kotlin/Compose, One UI 9) ─ WSS (JSON, Device-Token) ─┐
                     eigenes Netz + Egress-Proxy                        Port, kein Tunnel
 ```
 
+Fly-Session: Machine je Session auf Fly.io — disk-less, klont das Repo beim
+Start (Branch `agent/<session-id>`), dialt per outbound WSS wie der Link-Agent.
+
 ## Monorepo
 
 | Pfad | Inhalt |
 |---|---|
 | `packages/protocol/` | Geteilter Contract: Runner-REST-API, normierter Event-Stream, WS-Nachrichten, Pairing, Link-Protokoll, Provider-/Modus-Tabellen (pure TS) |
 | `server/` | Orchestrator: SQLite, Vault (AES-256-GCM), Docker-Lifecycle, Runner-Image-Bau, Egress-Proxy, SSE→WS-Weiterleitung, Pairing, FCM, Idle-Reaper, GC |
-| `runner/` | Das eine Session-Image: pi-SDK hinter dem REST/SSE-Contract, Auto-Commit auf `agent/<session>`, Push + Draft-PR. **Kein Root-Workspace** (eigenes `package-lock.json`) |
-| `link/` | Link-Agent für Heim-PC/Devcontainer: bettet denselben Runner in-process ein und meldet sich per outbound WebSocket beim Orchestrator |
+| `runner/` | Das eine Session-Image: pi-SDK hinter dem REST/SSE-Contract, Auto-Commit auf `agent/<session>`, Push + Draft-PR. **Kein Root-Workspace** (eigenes `package-lock.json`); `Dockerfile.fly` baut die disk-lose Fly-Variante `<prefix>/fly-link:<tag>` |
+| `link/` | Link-Agent für Heim-PC/Devcontainer: bettet denselben Runner in-process ein und meldet sich per outbound WebSocket beim Orchestrator; `fly-bootstrap.ts` bringt eine Fly-Machine vor dem Dial-Home in einen definierten Repo-Zustand (frischer Clone / Agent-Branch) |
 | `android/` | Native App (Kotlin, Jetpack Compose, Material3 in One-UI-9-Anmutung); CI baut das APK |
 
 Der Runner spricht dasselbe Protokoll wie die Shims in v1: `POST /prompt`,
@@ -48,6 +52,9 @@ App.
 | Auto | Änderungen laufen durch; nur riskante Shell-Kommandos werden nachgefragt |
 | Edits ok | Datei-Änderungen laufen durch, jedes Shell-Kommando wird nachgefragt |
 | Nachfragen | Fragt vor jeder Änderung und jedem Kommando nach |
+
+Netzwerk-Policy je Session — `allowlist` (Vorgabe), `isolated`, `open` — gilt
+für Docker- und Fly-Sessions; Link-Sessions auf dem Heim-PC kennen sie nicht.
 
 Provider (pi): `openai`, `anthropic`, `google`, `zai`, `moonshot`, `kimi`.
 `moonshot` und `kimi` sind derselbe Account bei platform.moonshot.ai und
@@ -71,6 +78,16 @@ Minuten — die App zeigt den Fortschritt. Vorbauen geht optional mit
 `docker compose --profile runner build pi-runner`.
 
 Details, Envs, frisches Volume, Secrets, Troubleshooting: **[`RUNBOOK-PI.md`](RUNBOOK-PI.md)**.
+
+### Fly-Sessions (Produktion)
+
+`.env` um `FLY_API_TOKEN`, `PUBLIC_URL` und entweder `FLY_IMAGE` (fertiges
+Image) oder `GHCR_IMAGE`/`GHCR_PUSH_TOKEN`/`GHCR_USERNAME` (Selbstbau-Push)
+ergänzen; für Policy `allowlist` zusätzlich `EGRESS_PUBLIC_URL` setzen und den
+Proxy-Port 3128 exponieren. Der erste Fly-Start baut und pusht das
+Machine-Image — das dauert Minuten (Fortschrittskarte in der App), danach
+startet jede Session in Sekunden. Details: Abschnitt „Fly-Sessions" im
+**[`RUNBOOK-PI.md`](RUNBOOK-PI.md)**.
 
 ## Quickstart: Link-Agent (Heim-PC / Devcontainer)
 
@@ -112,4 +129,5 @@ Root-Rechte in eigenen internen Docker-Netzen, ausgehender Verkehr geht
 zwangsweise über den Egress-Proxy des Orchestrators (Policy `allowlist` per
 Vorgabe), Secrets liegen AES-256-GCM-verschlüsselt unter `MASTER_KEY`, und der
 GitHub-PAT erreicht den Container als Datei unter `/run/secrets/pa/`, nie über
-die Umgebung.
+die Umgebung. Fly-Sessions weichen ab (Machine-Env statt Secrets-Datei,
+Proxy-Env statt Docker-Netz) — das Delta steht in [`SECURITY.md`](SECURITY.md).

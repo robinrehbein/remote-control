@@ -107,6 +107,7 @@ import com.pocketagent.app.data.SessionInfo
 import com.pocketagent.app.data.SessionStatus
 import com.pocketagent.app.data.StartPhase
 import com.pocketagent.app.data.WsClient
+import com.pocketagent.app.data.effectiveTarget
 import com.pocketagent.app.ui.components.MarkdownText
 import com.pocketagent.app.ui.sheetPickListMaxHeight
 import com.pocketagent.app.ui.theme.CardInset
@@ -488,12 +489,14 @@ fun SessionScreen(
                             // unten, dort auch änderbar (Fund: dieselbe
                             // Einstellung doppelt sichtbar) — die StatusLine
                             // trägt nur noch, was die Chips nicht tragen:
-                            // Repository und eine Abweichung vom sicheren
+                            // Repository, das Ziel (falls vom Standard
+                            // abweichend) und eine Abweichung vom sicheren
                             // Netzwerk-Default.
                             StatusLine(
                                 session = s,
                                 details = listOfNotNull(
                                     sessionSubtitle(s),
+                                    sessionTargetLabel(s.effectiveTarget()),
                                     s.networkPolicy?.takeIf { it != "allowlist" }?.let(::networkPolicyLabel),
                                 ),
                                 modifier = Modifier.padding(top = 2.dp),

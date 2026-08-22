@@ -54,6 +54,43 @@ enum class ReasoningEffort { @SerialName("low") LOW, @SerialName("medium") MEDIU
 
 fun ReasoningEffort.wireName(): String = name.lowercase()
 
+/**
+ * Wo eine Session läuft — Spiegel von `SESSION_TARGETS` aus packages/protocol.
+ * Kotlin kann das TS-Paket nicht importieren; derselbe Grundsatz wie bei den
+ * WS-Close-Codes: die Literalwerte stehen hier und werden bei einer
+ * Vertragsänderung nachgeführt.
+ *
+ * - `docker`: Session-Container auf dem eigenen Server (Coolify)
+ * - `link`: Agent läuft im Link-Agent auf dem Heim-PC (outbound WS)
+ * - `fly`: Fly.io-Machine je Session — intern eine Link-Session, `linked`
+ *   ist darum für beide true
+ */
+@Serializable
+enum class SessionTarget {
+    @SerialName("docker") DOCKER,
+    @SerialName("link") LINK,
+    @SerialName("fly") FLY;
+
+    companion object {
+        /**
+         * Vertrag: fehlt das Feld, gilt 'docker'. Dasselbe gilt für leere und
+         * unbekannte Werte (ein Ziel eines neueren Servers) — die Session
+         * bleibt nutzbar, nur ihre Ziel-Kennzeichnung fällt zurück.
+         */
+        fun fromRaw(raw: String?): SessionTarget = when (raw?.trim()?.lowercase()) {
+            "link" -> LINK
+            "fly" -> FLY
+            else -> DOCKER
+        }
+    }
+}
+
+fun SessionTarget.wireName(): String = when (this) {
+    SessionTarget.DOCKER -> "docker"
+    SessionTarget.LINK -> "link"
+    SessionTarget.FLY -> "fly"
+}
+
 /** One entry of the runner's model catalog (session.models). */
 @Serializable
 data class ModelInfo(
@@ -182,7 +219,22 @@ data class SessionInfo(
      * Fehlt das Feld (alter Server), ist es keine Link-Session.
      */
     val linked: Boolean = false,
+    /**
+     * Wo der Agent dieser Session läuft. Fehlt das Feld (alter Server), ist
+     * es unbekannt — null, nicht 'docker': die Auflösung macht
+     * [effectiveTarget], denn eine alte Zeile mit `linked` ist eine Link-
+     * Session. Ein Ziel, das diese App-Version nicht kennt, fällt ebenfalls
+     * auf null zurück (coerceInputValues), statt die Session zu verwerfen.
+     */
+    val target: SessionTarget? = null,
 )
+
+/**
+ * Wirksames Ziel einer Session: Fehlt `target` (alter Server), gilt 'docker'
+ * — außer die Session ist als `linked` angemeldet, dann ist sie eine Link-
+ * Session auf dem Heim-PC. 'fly' schickt ein neuerer Server stets explizit.
+ */
+fun SessionInfo.effectiveTarget(): SessionTarget = target ?: if (linked) SessionTarget.LINK else SessionTarget.DOCKER
 
 @Serializable
 data class RepoInfo(
@@ -731,6 +783,7 @@ fun encodeSessionCreate(
     mode: AgentMode,
     branch: String?,
     networkPolicy: String? = null,
+    target: SessionTarget? = null,
 ): String = buildJsonObject {
     put("type", "session.create")
     put("requestId", requestId)
@@ -741,6 +794,10 @@ fun encodeSessionCreate(
     put("mode", mode.wireName())
     branch?.let { put("branch", it) }
     networkPolicy?.let { put("networkPolicy", it) }
+    // Nur senden, wenn gesetzt — ein alter Server ignoriert das Feld sonst
+    // (oder sollte es unbekannterweise annehmen müssen). Fehlt es, gilt
+    // serverseitig 'docker' (Vertrag).
+    target?.let { put("target", it.wireName()) }
 }.toString()
 
 /**

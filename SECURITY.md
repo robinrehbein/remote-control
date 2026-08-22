@@ -54,6 +54,14 @@ Anyone with read access to the repository can sign a malicious APK that Android 
 - **Link sessions run with the privileges of the user who started the link agent** on that machine — outside any container, directly on `PA_WORKDIR`. Provider keys and the GitHub PAT are read from that process's environment and never leave it.
 - **Pairing codes are short-lived, single-use secrets.** Treat the server URL and the channel used to transmit a pairing code as sensitive.
 
+### Fly sessions
+
+- **The GitHub PAT travels as machine env (`GITHUB_PAT`), not as a `/run/secrets` file.** A machine cannot have files injected before it starts; `link/src/fly-bootstrap.ts` hands it to git via `GIT_ASKPASS` only (never URL, `.git/config`, or argv). The PAT remains readable by the agent process (same uid) — the same exposure as a Docker session, just a different injection medium.
+- **Machines are disk-less.** There is no persistent volume; session state lives in the git branch `agent/<session-id>`. Anything not pushed is lost when the machine stops (idle-stop, crash): the runner commits after every turn, but only yolo mode pushes automatically (tap-push is Docker-only).
+- **Network policy on Fly is best-effort via proxy environment variables.** `allowlist` routes agent egress through the orchestrator's proxy — it relies on the trustworthiness *and* the availability of the Coolify VPS. `isolated` points `HTTP(S)_PROXY` at a dead loopback address, which breaks git/fetch egress for cooperating clients but cannot network-block a process that simply ignores proxy env — unlike Docker sessions, which sit in an internal docker network with no route out. Documented delta.
+- **The public egress port is authenticated by the session's `shim_token` only** (Fly source addresses are unknown to the peer-IP gate). Without TLS the Basic token travels in clear text — serve the port over TLS (TCP passthrough or a TCP-terminating router). The token dies with its session: a stopped or errored session's token is refused at the gate.
+- **The orchestrator stays single-tenant, and the Fly API token sits in the orchestrator's environment** (like `GHCR_PUSH_TOKEN`), not in the vault — a deliberate deviation from the original plan: infrastructure tokens authenticate the operator against Fly/ghcr, while the vault holds the sessions' secrets that travel to the machine (see `server/src/fly.ts`).
+
 ## Reporting
 
 TODO(maintainer): insert contact / issue-tracker guidance (e.g. a security contact address or "use GitHub private vulnerability reporting for this repo"). Until then, do not post exploit details in public issues; contact the repository maintainer directly.

@@ -3,6 +3,8 @@ package com.pocketagent.app
 import com.pocketagent.app.data.AgentMode
 import com.pocketagent.app.data.SessionInfo
 import com.pocketagent.app.data.SessionStatus
+import com.pocketagent.app.data.SessionTarget
+import com.pocketagent.app.data.effectiveTarget
 import com.pocketagent.app.ui.screens.ComposerButton
 import com.pocketagent.app.ui.screens.SessionAction
 import com.pocketagent.app.ui.screens.activeSessions
@@ -14,9 +16,12 @@ import com.pocketagent.app.ui.screens.composerButton
 import com.pocketagent.app.ui.screens.deleteConfirmText
 import com.pocketagent.app.ui.screens.diffPushAvailable
 import com.pocketagent.app.ui.screens.sessionActionLabel
+import com.pocketagent.app.ui.screens.sessionActionNote
 import com.pocketagent.app.ui.screens.sessionActions
 import com.pocketagent.app.ui.screens.sessionDisplayName
+import com.pocketagent.app.ui.screens.sessionStatusLabel
 import com.pocketagent.app.ui.screens.sessionSubtitle
+import com.pocketagent.app.ui.screens.sessionTargetLabel
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -33,6 +38,8 @@ class SessionActionsTest {
         mode: AgentMode = AgentMode.ASK,
         archived: Boolean = false,
         prUrl: String? = null,
+        linked: Boolean = false,
+        target: SessionTarget? = null,
     ) = SessionInfo(
         id = id,
         repoId = "r1",
@@ -48,6 +55,8 @@ class SessionActionsTest {
         prUrl = prUrl,
         title = title,
         archived = archived,
+        linked = linked,
+        target = target,
     )
 
     /* ---------------- Anzeigename ---------------- */
@@ -210,6 +219,61 @@ class SessionActionsTest {
         for (action in SessionAction.entries) {
             assertTrue(action.name, sessionActionLabel(action).isNotBlank())
         }
+    }
+
+    /* ---------------- Ziel (Fly / Coolify / Heim-PC) ---------------- */
+
+    @Test
+    fun `target badge labels fly and the home pc, docker stays quiet`() {
+        assertEquals("Fly", sessionTargetLabel(SessionTarget.FLY))
+        assertEquals("PC", sessionTargetLabel(SessionTarget.LINK))
+        // Docker ist der langjaehrige Standard — kein Badge (derselbe
+        // Grundsatz wie beim Netzwerk-Chip: nur die Abweichung zeigt sich).
+        assertNull(sessionTargetLabel(SessionTarget.DOCKER))
+    }
+
+    @Test
+    fun `an old linked row without target resolves to the home pc`() {
+        // Alter Server: linked ohne target => Heim-PC, alles andere => Docker.
+        assertEquals(SessionTarget.LINK, session(linked = true).effectiveTarget())
+        assertEquals(SessionTarget.DOCKER, session().effectiveTarget())
+        // Neuer Server: das Ziel steht explizit da.
+        assertEquals(SessionTarget.FLY, session(target = SessionTarget.FLY).effectiveTarget())
+        assertEquals(SessionTarget.LINK, session(target = SessionTarget.LINK).effectiveTarget())
+        assertEquals(SessionTarget.DOCKER, session(target = SessionTarget.DOCKER).effectiveTarget())
+    }
+
+    @Test
+    fun `a stopped fly session is paused, a stopped link session says host offline`() {
+        // Fly: 'stopped' heisst die Machine ist gestoppt — pausiert und per
+        // Fortsetzen wieder anzuschubsen (gleiche Copy wie im Menue).
+        assertEquals("Pausiert", sessionStatusLabel(session(target = SessionTarget.FLY, status = SessionStatus.STOPPED, linked = true)))
+        // Heim-PC: der Agenten-Host ist nur gerade nicht verbunden.
+        assertEquals("Host offline", sessionStatusLabel(session(linked = true, status = SessionStatus.STOPPED)))
+        assertEquals("Host offline", sessionStatusLabel(session(target = SessionTarget.LINK, status = SessionStatus.STOPPED, linked = true)))
+        // Docker behaelt den gewohnten Text.
+        assertEquals("Gestoppt", sessionStatusLabel(session(status = SessionStatus.STOPPED)))
+    }
+
+    @Test
+    fun `action notes name the machine for fly and stay honest for the home pc`() {
+        val fly = session(target = SessionTarget.FLY)
+        assertEquals(
+            "Stoppt die Machine in der Cloud; Fortsetzen startet sie neu",
+            sessionActionNote(SessionAction.STOP, fly),
+        )
+        // Fortsetzen einer gestoppten Fly-Machine startet der Server selbst —
+        // der Vorbehalt gilt nur dem Heim-PC.
+        assertNull(sessionActionNote(SessionAction.RESUME, fly))
+        assertEquals(
+            "Klappt erst, wenn der Agenten-Host wieder verbunden ist",
+            sessionActionNote(SessionAction.RESUME, session(linked = true)),
+        )
+        // Docker bleibt beim Container-Wortlaut.
+        assertEquals(
+            "Der Container wird beendet; Fortsetzen startet ihn neu",
+            sessionActionNote(SessionAction.STOP, session()),
+        )
     }
 
     /* ---------------- Diff-Aktionsleiste (Fund: Diff-Screen ohne Handlung) ---------------- */

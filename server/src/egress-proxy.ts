@@ -13,6 +13,27 @@
  *  2. policy   - an 'isolated' session never egresses, whatever it presents
  *  3. target   - allowlisted host, allowed port, and an address outside every
  *                private/loopback/link-local range (SSRF, DNS rebinding)
+ *
+ * Public operation (Fly sessions): the listener binds 0.0.0.0 and is also
+ * the PUBLIC egress path for Fly machines, addressed via EGRESS_PUBLIC_URL
+ * (sessions.buildFlyMachineEnv hands each machine
+ * HTTPS_PROXY=http://pa:<shim_token>@<egressPublicUrl>). Fly source
+ * addresses are unknown to the peer-IP gate (the docker daemon never sees
+ * them), so out there the token gate is the ONLY gate: without a valid
+ * Proxy-Authorization (Bearer <t> or Basic "pa:<t>", see parseProxyAuth)
+ * every request answers 407 - the runner therefore derives the header from
+ * the URL userinfo itself (runner/src/proxy.ts, F3) instead of trusting
+ * undici's env handling to forward it.
+ *
+ * Operating recommendations for that public port:
+ *  - Serve it over TLS (e.g. a Traefik TCP router terminating TLS in front
+ *    of 3128, or a TLS port of its own). Plain HTTP carries the Basic token
+ *    - the session's shim token - in clear text on the wire.
+ *  - Terminate TLS only as a TCP passthrough (or expose the port directly).
+ *    An HTTP-terminating proxy in front would break the peer-IP gate: the
+ *    proxy's address, not the session container's, would arrive as the peer,
+ *    so Docker sessions would lose their unforgeable identity claim and
+ *    depend on token forwarding alone.
  */
 import * as dns from 'node:dns';
 import * as http from 'node:http';

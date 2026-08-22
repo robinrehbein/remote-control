@@ -63,6 +63,15 @@ function docker(): Docker | null {
 }
 
 /**
+ * Zugang zum Daemon für andere Module (fly.ts: Image taggen + pushen). Gibt
+ * null zurück, wenn Docker deaktiviert ist - Aufrufer entscheiden selbst, ob
+ * das ein Fehler ist (für Fly ist es einer, außer FLY_IMAGE ist gesetzt).
+ */
+export function dockerDaemon(): Docker | null {
+  return docker();
+}
+
+/**
  * Peer-IP authorization for the egress proxy (see egress-proxy.ts): the source
  * addresses of all live session containers mapped onto the session they belong
  * to, as the daemon reports them. The session id is what makes the gate
@@ -204,20 +213,28 @@ async function provideRunnerImage(onNotice?: NoticeFn): Promise<string> {
 }
 
 /** Cause plus the last build-log lines, trimmed for an error message (never full logs). */
-function withTail(cause: string, lines: string[], n = 8): string {
+export function withTail(cause: string, lines: string[], n = 8): string {
   const last = lines.slice(-n).join(' | ');
   return last.length > 0 ? `${cause} (${last})` : cause;
 }
 
 /**
  * Das Runner-Image über die Docker-API bauen. Der Kontext wird in ein
- * Wegwerf-Verzeichnis gestaged (dieselbe relative Struktur, die
- * `runner/Dockerfile` erwartet) und als tar an den Daemon gestreamt.
+ * Wegwerf-Verzeichnis gestaged (dieselbe relative Struktur, die das Dockerfile
+ * erwartet) und als tar an den Daemon gestreamt.
+ *
+ * `dockerfile` wählt die Datei im Kontext (Vorgabe der Runner); fly.ts baut
+ * dieselbe Staging-Maschinerie für das Fly-Link-Image (runner/Dockerfile.fly).
  *
  * Exportiert, damit der Smoke den Bau gegen einen gefälschten Daemon prüfen
  * kann - regulär ruft ihn nur `provideRunnerImage`.
  */
-export async function buildRunnerImage(d: Docker, image: string, onNotice?: NoticeFn): Promise<void> {
+export async function buildRunnerImage(
+  d: Docker,
+  image: string,
+  onNotice?: NoticeFn,
+  dockerfile: string = 'runner/Dockerfile',
+): Promise<void> {
   const root = runnerContextRoot();
   const files = runnerContextFiles();
   if (root === null || files === null) throw new Error('kein Build-Kontext im Server-Image');
@@ -235,9 +252,9 @@ export async function buildRunnerImage(d: Docker, image: string, onNotice?: Noti
     for (const rel of files) cpSync(join(root, rel), join(ctx, rel), { dereference: true, recursive: false });
     pack = tar.pack(ctx);
     pack.on('error', () => {});
-    // Kontext-Layout == Repo-Root, `dockerfile` ist also der Pfad, den
-    // runner/Dockerfile selbst dokumentiert (`docker build -f runner/Dockerfile .`).
-    const stream = await d.buildImage(pack, { t: image, dockerfile: 'runner/Dockerfile' });
+    // Kontext-Layout == Repo-Root, `dockerfile` ist also der Pfad, den das
+    // gewählte Dockerfile selbst dokumentiert (`docker build -f runner/Dockerfile .`).
+    const stream = await d.buildImage(pack, { t: image, dockerfile });
     // Ein gescheiterter Bau beendet den Stream normal und meldet sich nur in
     // einem `error`-Frame - der Callback von followProgress deckt allein
     // Transportfehler ab, also müssen beide geprüft werden.
@@ -291,7 +308,7 @@ export async function pullImage(image: string): Promise<void> {
   });
 }
 
-async function imageExists(d: Docker, image: string): Promise<boolean> {
+export async function imageExists(d: Docker, image: string): Promise<boolean> {
   try {
     await d.getImage(image).inspect();
     return true;

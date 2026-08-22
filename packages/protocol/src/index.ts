@@ -229,6 +229,32 @@ export function isReasoningEffort(value: string): value is ReasoningEffort {
  */
 export type NetworkPolicy = 'allowlist' | 'isolated' | 'open';
 
+/**
+ * Die drei Ziele, auf denen eine Session laufen kann:
+ *  - 'docker': Session-Container auf dem Orchestrator-Host (unter Coolify
+ *    deploytes Docker-Setup, auch für Tests). Der Orchestrator startet und
+ *    überwacht den Container selbst.
+ *  - 'link': Link-Agent auf dem Rechner des Nutzers (Heim-PC), manuell
+ *    gestartet und über eine ausgehende WS angebunden. Der Agent läuft auf
+ *    fremder Hardware, die der Orchestrator nur vermittelt, nicht verwaltet.
+ *  - 'fly': Fly.io-Machine je Session, vom Orchestrator über die Machines-API
+ *    provisioniert. Intern ist eine Fly-Session eine Link-Session: die Machine
+ *    baut selbst eine ausgehende WSS-Verbindung auf, authentisiert sich mit
+ *    einem frischen, je Session erzeugten Link-Token und bleibt damit ohne
+ *    offene Ports erreichbar.
+ *
+ * Reihenfolge ist historisch gewachsen ('docker' und 'link' gab es zuerst,
+ * 'fly' kommt hinzu); sie hat keine Bedeutung.
+ */
+export const SESSION_TARGETS = Object.freeze(['docker', 'link', 'fly'] as const);
+
+export type SessionTarget = (typeof SESSION_TARGETS)[number];
+
+/** True für ein bekanntes Session-Ziel (Eingangsprüfung für WS-Payloads). */
+export function isSessionTarget(value: string): value is SessionTarget {
+  return (SESSION_TARGETS as readonly string[]).includes(value);
+}
+
 export type SessionStatus =
   | 'creating'   // Container wird erzeugt / Repo geklont
   | 'running'    // Agent arbeitet an einem Prompt
@@ -437,6 +463,10 @@ export interface TokenUsage {
  * dadurch verschwindet die Fortschrittskarte der App. Ein Startpfad, der nicht
  * in `ready` mündet, MUSS stattdessen in einem `error`-Event enden (die App
  * räumt die Karte auch daran weg) — sonst dreht sie sich ewig.
+ *
+ * Eine Fly-Session durchläuft dieselben drei Phasen für Machine-Erzeugung,
+ * -Boot und -Verbindung ('container-start' = Machine wird erzeugt, nicht ein
+ * Docker-Container).
  */
 export type NoticePhase = 'container-start' | 'shim-start' | 'ready';
 
@@ -543,9 +573,19 @@ export interface SessionInfo {
   /** Fehlt => false. Archivierte Sessions bleiben in `session.list`, der Client filtert. */
   archived?: boolean;
   /**
-   * True für Link-Sessions: der Agent läuft auf dem Rechner des Nutzers
-   * (ausgehende WS, kein Container). Fehlt => false. Die Status-Semantik
-   * unterscheidet sich: 'stopped' heißt hier „Agent-Host gerade offline".
+   * Wo der Agent dieser Session läuft. Fehlt => 'docker' (alte Zeilen aus
+   * vor-fly-Zeiten tragen kein target); der Server füllt 'link' für Link-
+   * Sessions und 'fly' für Fly-Sessions. Ein Client, der `target` nicht kennt,
+   * behandelt alles wie 'docker' und verliert damit nur die Fly-Kennzeichnung,
+   * nicht die Session.
+   */
+  target?: SessionTarget;
+  /**
+   * True für Link- UND Fly-Sessions: beide verbinden sich per ausgehender WS
+   * mit dem Orchestrator, statt dass er sie erreicht. Fehlt => false. Die
+   * Status-Semantik unterscheidet sich: 'stopped' heißt hier „Agent-Host
+   * gerade offline bzw. Machine gestoppt". Ob es eine Link-Session auf dem
+   * Heim-PC oder eine Fly-Session ist, unterscheidet ein Client über `target`.
    */
   linked?: boolean;
 }
@@ -697,6 +737,13 @@ export type ClientMessage =
       mode: AgentMode;
       branch?: string;
       networkPolicy?: NetworkPolicy;
+      /**
+       * Wo die Session laufen soll. Fehlt => 'docker' (Abwärtskompatibilität:
+       * ältere Apps senden das Feld nicht). Eine per `agent.hello` angemeldete
+       * Link-Session entsteht ohne `session.create` — der Server leitet 'link'
+       * dort selbst ab und liest dieses Feld nicht.
+       */
+      target?: SessionTarget;
     }
   /**
    * `requestId` quittiert diese eine WS-Anfrage über `request.ok` (bzw. `error`

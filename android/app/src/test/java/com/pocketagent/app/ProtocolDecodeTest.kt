@@ -3,6 +3,7 @@ package com.pocketagent.app
 import com.pocketagent.app.data.AgentEvent
 import com.pocketagent.app.data.ServerMessage
 import com.pocketagent.app.data.StartPhase
+import com.pocketagent.app.data.parseAgentEvent
 import com.pocketagent.app.data.parseServerMessage
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -140,9 +141,56 @@ class ProtocolDecodeTest {
         assertEquals(1, list.size)
         val session = list.first()
         assertEquals("acme/api", session.repoFullName)
-        assertEquals("pi", session.adapter)
         assertEquals(com.pocketagent.app.data.AgentMode.ACCEPT_EDITS, session.mode)
         assertEquals(com.pocketagent.app.data.SessionStatus.RUNNING, session.status)
+    }
+
+    /**
+     * Regressionstest mit einem Payload genau in der Form, die der reale
+     * Server sendet (server/src/sessions.ts `toInfo()` kennt kein `adapter`-
+     * Feld) — nicht der Fixture oben, die (unrealistisch) noch eines trug.
+     * `SessionInfo.adapter` war früher ein Pflichtfeld ohne Default: jede
+     * echte Serverantwort ließ dadurch JEDE Session beim Dekodieren
+     * verwerfen (`runCatching{}.getOrNull()` schluckte den Fehler still),
+     * `session.list` kam als leere Liste an — die App zeigte für jede
+     * Session „noch keine Session" und in einer offenen Session fehlten
+     * Autonomie-/Modell-/Reasoning-Chips, weil sie nie in der Liste stand.
+     */
+    @Test
+    fun `decodes a real server session list payload without an adapter field`() {
+        val raw = """
+            {
+              "type": "session.list",
+              "requestId": "req-real",
+              "sessions": [
+                {
+                  "id": "s1", "repoId": "r1", "provider": "zai", "model": "glm-4.6",
+                  "mode": "acceptEdits", "status": "running", "branch": "agent/s1",
+                  "createdAt": "2026-01-01T10:00:00Z", "lastActiveAt": "2026-01-01T11:00:00Z"
+                }
+              ]
+            }
+        """.trimIndent()
+
+        val list = (parseServerMessage(raw) as ServerMessage.SessionListMsg).sessions
+        assertEquals(1, list.size)
+        assertEquals("s1", list.first().id)
+    }
+
+    /**
+     * Dasselbe für den `status`-AgentEvent (Vertrag: `AgentEventBody['status']`,
+     * kein `adapter`) — auch hier war das Feld ein Pflichtparameter ohne
+     * Default und ließ jedes einzelne Status-Event der App verschwinden.
+     */
+    @Test
+    fun `decodes a real runner status event without an adapter field`() {
+        val event = parseAgentEvent(
+            kotlinx.serialization.json.Json.parseToJsonElement(
+                """{"type":"status","mode":"auto","busy":true}""",
+            ) as kotlinx.serialization.json.JsonObject,
+        )
+        assertTrue(event is AgentEvent.Status)
+        assertTrue((event as AgentEvent.Status).busy)
     }
 
     /**
@@ -351,7 +399,6 @@ class ProtocolDecodeTest {
         val status = msg as ServerMessage.SessionStatusMsg
         assertEquals(com.pocketagent.app.data.SessionStatus.CREATING, status.status)
         assertEquals(com.pocketagent.app.data.SessionStatus.CREATING, status.session?.status)
-        assertEquals("pi", status.session?.adapter)
     }
 
     /**
@@ -382,11 +429,17 @@ class ProtocolDecodeTest {
     }
 
     /**
-     * `session.create` trägt weiterhin den Agenten im Wire-Format (Vertrag
-     * unverändert zu v1) — er ist nur keine Wahl mehr, sondern immer pi.
+     * `session.create` kennt kein `adapter`-Feld (Vertrag: packages/protocol
+     * `ClientMessage['session.create']`) — es gibt nur noch pi, und der
+     * Server hat den Multi-Adapter-Ballast nie ins v2-Wire-Format übernommen.
+     * Regressionstest für den Fund: ein mitgesendetes `adapter` war zwar für
+     * `session.create` harmlos (der Server ignoriert unbekannte Felder), aber
+     * dieselbe Annahme in `SessionInfo`/`AgentEvent.Status` als PFLICHTFELD
+     * beim Dekodieren ließ jede Session und jedes Status-Event der App still
+     * verschwinden, weil der Server sie nie sendet.
      */
     @Test
-    fun `encodes session create with the one agent`() {
+    fun `encodes session create without an adapter field`() {
         val json = com.pocketagent.app.data.encodeSessionCreate(
             requestId = "req-3",
             repoId = "r1",
@@ -397,7 +450,7 @@ class ProtocolDecodeTest {
             networkPolicy = "allowlist",
         )
         assertTrue(json.contains(""""type":"session.create""""))
-        assertTrue(json.contains(""""adapter":"pi""""))
+        assertFalse(json.contains("\"adapter\""))
         assertTrue(json.contains(""""provider":"zai""""))
         assertFalse(json.contains("\"branch\""))
     }

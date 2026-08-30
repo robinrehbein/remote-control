@@ -48,7 +48,7 @@ class TimelineMergeTest {
     fun `events without their own line leave the timeline untouched`() {
         val items = buildTimeline(
             listOf(
-                AgentEvent.Status("claude", null, null, null, AgentMode.AUTO, busy = true),
+                AgentEvent.Status(null, null, null, AgentMode.AUTO, busy = true),
                 AgentEvent.MessageDelta("assistant", "Teil"),
                 AgentEvent.Ping(1L),
                 AgentEvent.Notice("Image wird gebaut", phase = "image-build", detail = "Step 3/7"),
@@ -132,7 +132,7 @@ class TimelineMergeTest {
         // und ein Merkmal, das mehrfach vorkommt, dürfte nichts verschlucken.
         assertNull(eventIdentity(AgentEvent.Ping(1L)))
         assertNull(eventIdentity(AgentEvent.MessageDelta("assistant", "x")))
-        assertNull(eventIdentity(AgentEvent.Status("claude", null, null, null, AgentMode.AUTO, busy = false)))
+        assertNull(eventIdentity(AgentEvent.Status(null, null, null, AgentMode.AUTO, busy = false)))
 
         val ping = AgentEvent.Ping(1L)
         val merged = mergeEvents(listOf(ping), listOf(ping))
@@ -180,7 +180,7 @@ class TimelineMergeTest {
         // Broadcaster sequenziert alles außer ping) - das Merkmal bleibt
         // trotzdem null, weil diese Typen nie eine eigene Zeile stellen.
         assertNull(
-            eventIdentity(AgentEvent.Status("claude", null, null, null, AgentMode.AUTO, busy = false, seq = 3L)),
+            eventIdentity(AgentEvent.Status(null, null, null, AgentMode.AUTO, busy = false, seq = 3L)),
         )
         assertNull(eventIdentity(AgentEvent.MessageDelta("assistant", "x", seq = 4L)))
     }

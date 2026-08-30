@@ -149,11 +149,6 @@ data class SessionInfo(
     val id: String,
     val repoId: String,
     val repoFullName: String? = null,
-    /**
-     * Bleibt Teil des Wire-Formats (der Server nennt weiterhin den Agenten,
-     * heute immer [PI_AGENT_ID]); die Oberfläche verzweigt nicht mehr darauf.
-     */
-    val adapter: String,
     val provider: String,
     val model: String,
     // Default statt Pflichtfeld: nur so kann coerceInputValues (ProtocolJson)
@@ -311,7 +306,6 @@ sealed interface AgentEvent {
     val seq: Long?
 
     data class Status(
-        val adapter: String,
         val sessionRef: String? = null,
         val provider: String? = null,
         val model: String? = null,
@@ -562,7 +556,6 @@ fun parseAgentEvent(obj: JsonObject): AgentEvent? {
     return try {
         when (type) {
             "status" -> AgentEvent.Status(
-                adapter = obj.optString("adapter") ?: return null,
                 sessionRef = obj.optString("sessionRef"),
                 provider = obj.optString("provider"),
                 model = obj.optString("model"),
@@ -858,10 +851,7 @@ fun encodeHello(deviceId: String, token: String): String = buildJsonObject {
     put("token", token)
 }.toString()
 
-/**
- * Session anlegen. `adapter` bleibt im Wire-Format (unverändert zu v1), ist
- * aber keine Wahl mehr: es gibt genau einen Agenten ([PI_AGENT_ID]).
- */
+/** Session anlegen. */
 fun encodeSessionCreate(
     requestId: String,
     repoId: String,
@@ -874,7 +864,6 @@ fun encodeSessionCreate(
     put("type", "session.create")
     put("requestId", requestId)
     put("repoId", repoId)
-    put("adapter", PI_AGENT_ID)
     put("provider", provider)
     put("model", model)
     put("mode", mode.wireName())

@@ -1502,22 +1502,18 @@ internal fun TimelineItemView(item: TimelineItem, vm: SessionViewModel) {
         is TimelineItem.TurnEnd -> if (item.interrupted) {
             // Abgebrochener Turn (Stop/Neustart): eigener Wortlaut und Icon,
             // damit „unterbrochen" nicht wie ein regulärer Abschluss aussieht.
-            SystemLine(
-                text = listOfNotNull(
-                    "Unterbrochen",
-                    item.summary?.takeIf { it.isNotBlank() },
-                ).joinToString(" · "),
-                icon = Icons.Outlined.Close,
-            )
+            // Kein item.summary hier: der Runner liefert darin den KOMPLETTEN
+            // Antworttext (collectText des ganzen Assistant-Contents, nicht
+            // wirklich eine Kurzfassung) - der steht bei nicht-leerem Teiltext
+            // schon als eigene Chat-Karte über dieser Zeile (message.completed
+            // feuert für jeden Stop-Reason). Ihn hier zusätzlich auszuschreiben
+            // dupliziert die Karte, bei langen Antworten sehr sichtbar.
+            SystemLine(text = "Unterbrochen", icon = Icons.Outlined.Close)
         } else {
+            // Kein item.summary hier aus demselben Grund: er ist der volle
+            // Antworttext, den die App bereits als Chat-Karte zeigt.
             SystemLine(
-                // summary wird jetzt mit angezeigt statt still verworfen (Tier 6):
-                // „Fertig · <sha> · <summary>".
-                text = listOfNotNull(
-                    "Fertig",
-                    item.commitSha?.take(7),
-                    item.summary?.takeIf { it.isNotBlank() },
-                ).joinToString(" · "),
+                text = listOfNotNull("Fertig", item.commitSha?.take(7)).joinToString(" · "),
                 icon = Icons.Outlined.Check,
             )
         }

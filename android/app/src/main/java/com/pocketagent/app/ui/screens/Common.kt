@@ -224,6 +224,7 @@ fun DotLabel(
             style = MaterialTheme.typography.labelSmall,
             fontWeight = FontWeight.SemiBold,
             maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
         )
     }
 }
@@ -581,6 +582,8 @@ fun OneUiDialog(
                     Text(
                         text = title,
                         style = MaterialTheme.typography.titleMedium,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.padding(bottom = if (text != null) 8.dp else 12.dp),
                     )
                     text?.let {
@@ -653,6 +656,8 @@ fun SettingSheet(
             Text(
                 text = title,
                 style = MaterialTheme.typography.titleMedium,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.padding(start = ContentInset, end = ContentInset, bottom = 12.dp),
             )
             Column(
@@ -714,6 +719,8 @@ fun SelectableTile(
                     text = subtitle,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
                 )
             }
             extra?.let {

@@ -89,10 +89,12 @@ import com.pocketagent.app.data.SessionStatus
 import com.pocketagent.app.data.WsClient
 import com.pocketagent.app.ui.theme.CardInset
 import com.pocketagent.app.ui.theme.EmptyStateInset
+import com.pocketagent.app.ui.theme.ListItemTitle
 import com.pocketagent.app.ui.theme.OneUiAccent
 import com.pocketagent.app.ui.theme.PillShape
 import com.pocketagent.app.ui.theme.PrimaryButtonHeight
 import com.pocketagent.app.ui.theme.PrimaryButtonTextSize
+import com.pocketagent.app.ui.theme.RowVerticalPadding
 import com.pocketagent.app.ui.theme.ScreenGutter
 import com.pocketagent.app.ui.theme.TileMinHeight
 import kotlinx.coroutines.launch
@@ -568,7 +570,7 @@ private fun SessionCard(
                 onLongClickLabel = "Aktionen für diese Session",
             ),
     ) {
-        Column(Modifier.padding(horizontal = CardInset, vertical = 16.dp)) {
+        Column(Modifier.padding(horizontal = CardInset, vertical = RowVerticalPadding)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
@@ -660,7 +662,7 @@ private fun ArchiveRow(count: Int, expanded: Boolean, onToggle: () -> Unit) {
             Spacer(modifier = Modifier.width(14.dp))
             Text(
                 text = "Archiv ($count)",
-                style = MaterialTheme.typography.bodyLarge,
+                style = ListItemTitle,
                 modifier = Modifier.weight(1f),
             )
             Icon(
@@ -738,7 +740,7 @@ private fun SessionActionRow(action: SessionAction, session: SessionInfo, onClic
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 text = sessionActionLabel(action),
-                style = MaterialTheme.typography.bodyLarge,
+                style = ListItemTitle,
                 color = tint,
             )
             if (note != null) {

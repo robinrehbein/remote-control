@@ -650,7 +650,7 @@ private fun ModelAccessSheet(
                     .padding(horizontal = ScreenGutter, vertical = 10.dp)
                     .heightIn(min = PrimaryButtonHeight),
             ) {
-                Text("Übernehmen")
+                Text("Übernehmen", fontSize = PrimaryButtonTextSize)
             }
         },
     ) {
@@ -787,6 +787,7 @@ private fun ModelAccessSheet(
             }
         }
 
+        Spacer(modifier = Modifier.height(SectionSpacing))
         SectionHeader("Reasoning")
         ReasoningPickList(
             current = effort,
@@ -899,7 +900,7 @@ private fun RepoSelector(
                 .fillMaxWidth()
                 .clickable { sheetOpen = true }
                 .heightIn(min = TileMinHeight)
-                .padding(start = CardInset, end = 10.dp),
+                .padding(start = CardInset, end = CardInset),
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(
@@ -961,7 +962,11 @@ private fun RepoSelector(
                         )
                     }
                     // Repository hinzufügen als AddRow im Sheet, statt als
-                    // letzter Menüpunkt eines Dropdowns.
+                    // letzter Menüpunkt eines Dropdowns. Steht die "Noch
+                    // keine Repositories"-Zeile schon da, hat sie ihren
+                    // eigenen Divider schon gesetzt — ein zweiter direkt
+                    // danach wäre eine doppelte Linie ohne Inhalt dazwischen.
+                    if (repos.isNotEmpty()) ListDivider()
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         modifier = Modifier

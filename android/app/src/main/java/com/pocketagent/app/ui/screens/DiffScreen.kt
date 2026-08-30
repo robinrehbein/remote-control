@@ -56,6 +56,7 @@ import com.pocketagent.app.ui.theme.EmptyStateInset
 import com.pocketagent.app.ui.theme.MonoMedium
 import com.pocketagent.app.ui.theme.PillShape
 import com.pocketagent.app.ui.theme.PrimaryButtonHeight
+import com.pocketagent.app.ui.theme.PrimaryButtonTextSize
 import com.pocketagent.app.ui.theme.ScreenGutter
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -199,7 +200,7 @@ fun DiffScreen(
                         .padding(top = 20.dp)
                         .heightIn(min = PrimaryButtonHeight),
                 ) {
-                    Text("Erneut versuchen")
+                    Text("Erneut versuchen", fontSize = PrimaryButtonTextSize)
                 }
             }
 
@@ -308,7 +309,7 @@ private fun DiffActionBar(
                         modifier = Modifier.size(18.dp),
                     )
                     Spacer(modifier = Modifier.width(8.dp))
-                    Text("Pull Request öffnen")
+                    Text("Pull Request öffnen", fontSize = PrimaryButtonTextSize)
                 }
                 if (canPush) {
                     // Der Agent könnte seit dem PR weitergearbeitet haben — ein
@@ -320,7 +321,7 @@ private fun DiffActionBar(
                             .fillMaxWidth()
                             .heightIn(min = PrimaryButtonHeight),
                     ) {
-                        Text("Erneut pushen")
+                        Text("Erneut pushen", fontSize = PrimaryButtonTextSize)
                     }
                 }
             } else if (canPush) {
@@ -337,7 +338,7 @@ private fun DiffActionBar(
                         modifier = Modifier.size(18.dp),
                     )
                     Spacer(modifier = Modifier.width(8.dp))
-                    Text("Pushen & Draft-PR")
+                    Text("Pushen & Draft-PR", fontSize = PrimaryButtonTextSize)
                 }
             }
         }

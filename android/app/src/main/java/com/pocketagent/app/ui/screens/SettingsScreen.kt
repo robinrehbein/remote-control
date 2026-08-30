@@ -112,6 +112,7 @@ import com.pocketagent.app.data.UpdateInstaller
 import com.pocketagent.app.data.WsClient
 import com.pocketagent.app.data.truncateForShare
 import com.pocketagent.app.ui.theme.CardInset
+import com.pocketagent.app.ui.theme.ListItemTitle
 import com.pocketagent.app.ui.theme.SectionSpacing
 import com.pocketagent.app.ui.theme.TileMinHeight
 import com.pocketagent.app.ui.theme.semantic
@@ -449,6 +450,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                 }
             }
 
+            Spacer(modifier = Modifier.height(SectionSpacing))
             /* ---------- Sicherheit ---------- */
             SectionHeader("Sicherheit")
             GroupCard {
@@ -477,6 +479,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                 }
             }
 
+            Spacer(modifier = Modifier.height(SectionSpacing))
             /* ---------- Repositories ---------- */
             SectionHeader("Repositories")
             GroupCard {
@@ -499,6 +502,7 @@ fun SettingsScreen(onBack: () -> Unit) {
 
             /* ---------- Empfohlen ---------- */
             if (recommended.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(SectionSpacing))
                 SectionHeader("Empfohlen")
                 GroupCard {
                     Column(Modifier.padding(vertical = 4.dp)) {
@@ -528,6 +532,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                 }
             }
 
+            Spacer(modifier = Modifier.height(SectionSpacing))
             /* ---------- Zugänge ---------- */
             SectionHeader("Zugänge")
             GroupCard {
@@ -570,6 +575,7 @@ fun SettingsScreen(onBack: () -> Unit) {
             // Ohne Report keine Section — ein leerer Platzhalter würde nur
             // eine Frage aufwerfen, die die App nicht beantworten kann.
             lastCrash?.let { crash ->
+                Spacer(modifier = Modifier.height(SectionSpacing))
                 SectionHeader("Diagnose")
                 GroupCard {
                     Column(Modifier.padding(vertical = 4.dp)) {
@@ -605,6 +611,7 @@ fun SettingsScreen(onBack: () -> Unit) {
             /* ---------- App-Update ---------- */
             AppUpdateSection()
 
+            Spacer(modifier = Modifier.height(SectionSpacing))
             /* ---------- Gekoppelte Geräte ---------- */
             SectionHeader("Gekoppelte Geräte")
             GroupCard {
@@ -656,6 +663,7 @@ fun SettingsScreen(onBack: () -> Unit) {
             }
             SectionNote("Entzogene Geräte müssen neu gekoppelt werden. Das eigene Gerät meldest du unten ab.")
 
+            Spacer(modifier = Modifier.height(SectionSpacing))
             /* ---------- Gerät ---------- */
             SectionHeader("Gerät")
             GroupCard {
@@ -860,6 +868,7 @@ private fun AppUpdateSection() {
         }
     }
 
+    Spacer(modifier = Modifier.height(SectionSpacing))
     SectionHeader("App-Update")
     GroupCard {
         Column(Modifier.padding(vertical = 4.dp)) {
@@ -1019,7 +1028,7 @@ private fun SettingsIcon(icon: ImageVector) {
             modifier = Modifier.size(19.dp),
         )
     }
-    Spacer(modifier = Modifier.width(16.dp))
+    Spacer(modifier = Modifier.width(CardInset))
 }
 
 /** Icon + title + subtitle row. Every content row on this screen is one. */
@@ -1044,7 +1053,7 @@ private fun SettingsTile(
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 text = title,
-                style = MaterialTheme.typography.bodyLarge,
+                style = ListItemTitle,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
@@ -1074,10 +1083,10 @@ private fun SettingsRow(label: String, value: String) {
             .heightIn(min = TileMinHeight)
             .padding(horizontal = CardInset),
     ) {
-        Text(label, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+        Text(label, style = ListItemTitle, modifier = Modifier.weight(1f))
         Text(
             value,
-            style = MaterialTheme.typography.bodyMedium,
+            style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
@@ -1110,7 +1119,7 @@ private fun AddRow(label: String, onClick: () -> Unit, icon: ImageVector = Icons
             modifier = Modifier.size(20.dp),
         )
         Spacer(modifier = Modifier.width(12.dp))
-        Text(label, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.primary)
+        Text(label, style = ListItemTitle, color = MaterialTheme.colorScheme.primary)
     }
 }
 
@@ -1128,11 +1137,11 @@ private fun DialogActionRow(
             .clip(MaterialTheme.shapes.small)
             .clickable(onClick = onClick)
             .heightIn(min = TileMinHeight)
-            .padding(horizontal = 8.dp),
+            .padding(horizontal = CardInset, vertical = 10.dp),
     ) {
         Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(20.dp))
         Spacer(modifier = Modifier.width(14.dp))
-        Text(label, style = MaterialTheme.typography.bodyLarge, color = tint)
+        Text(label, style = ListItemTitle, color = tint)
     }
 }
 

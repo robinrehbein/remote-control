@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
@@ -125,6 +126,7 @@ import com.pocketagent.app.ui.theme.OneUiEasing
 import com.pocketagent.app.ui.theme.PillShape
 import com.pocketagent.app.ui.theme.RadioRowDividerInset
 import com.pocketagent.app.ui.theme.ScreenGutter
+import com.pocketagent.app.ui.theme.SectionSpacing
 import com.pocketagent.app.ui.theme.semantic
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -702,17 +704,9 @@ fun SessionScreen(
                         // Der Text ist nicht bestätigt und steht noch im Feld.
                         // Bewusst kein automatisches Nachsenden (siehe sendPrompt).
                         if (sendFailed) {
-                            Text(
-                                text = "Nicht gesendet – keine Verbindung oder keine Bestätigung. " +
+                            SectionError(
+                                "Nicht gesendet – keine Verbindung oder keine Bestätigung. " +
                                     "Dein Text bleibt stehen, tippe erneut auf Senden.",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.error,
-                                modifier = Modifier.padding(
-                                    start = ContentInset,
-                                    end = ContentInset,
-                                    top = 2.dp,
-                                    bottom = 2.dp,
-                                ),
                             )
                         }
                         // Der Start braucht Minuten — er steht ruhig über dem
@@ -886,6 +880,7 @@ fun SessionScreen(
                         Text(
                             text = "Woran soll gearbeitet werden?",
                             style = MaterialTheme.typography.titleMedium,
+                            textAlign = TextAlign.Center,
                         )
                         Text(
                             text = "Beschreibe die Aufgabe unten – zum Beispiel „Fixe den Login-Timeout und " +
@@ -1449,6 +1444,7 @@ private fun ModelSheet(
         }
         // Eigener Zweck, eigene Sektion: hier wird ein Modell gesetzt, das
         // die Liste gar nicht kennt — nicht in ihr gesucht.
+        Spacer(modifier = Modifier.height(SectionSpacing))
         SectionHeader("Eigenes Modell")
         Row(
             verticalAlignment = Alignment.CenterVertically,
@@ -1550,12 +1546,12 @@ private fun ChatBubble(item: TimelineItem.Chat) {
                 Text(
                     text = item.text,
                     style = MaterialTheme.typography.bodyLarge,
-                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                    modifier = Modifier.padding(horizontal = CardInset, vertical = 10.dp),
                 )
             } else {
                 MarkdownText(
                     text = item.text,
-                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                    modifier = Modifier.padding(horizontal = CardInset, vertical = 10.dp),
                 )
             }
         }
@@ -1580,7 +1576,7 @@ private fun StreamingBubble(message: SessionViewModel.StreamingMessage) {
             color = MaterialTheme.colorScheme.surfaceContainer,
             modifier = Modifier.weight(1f),
         ) {
-            Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+            Column(modifier = Modifier.padding(horizontal = CardInset, vertical = 10.dp)) {
                 MarkdownText(text = message.text)
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
@@ -1651,6 +1647,7 @@ private fun ToolCard(item: TimelineItem.Tool) {
                         text = item.title ?: item.tool,
                         style = MaterialTheme.typography.titleSmall,
                         maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
                     )
                     Text(
                         // Ohne eigenen Titel steht der Toolname schon in der
@@ -1678,7 +1675,7 @@ private fun ToolCard(item: TimelineItem.Tool) {
             ) {
                 Column(
                     Modifier
-                        .padding(horizontal = 14.dp, vertical = 4.dp)
+                        .padding(horizontal = CardInset, vertical = 4.dp)
                         .padding(bottom = 10.dp)
                 ) {
                     item.input?.let { input ->
@@ -1724,7 +1721,7 @@ private fun ApprovalCard(item: TimelineItem.Approval, vm: SessionViewModel) {
         color = MaterialTheme.colorScheme.surfaceContainer,
         modifier = Modifier.fillMaxWidth(),
     ) {
-        Column(Modifier.padding(16.dp)) {
+        Column(Modifier.padding(CardInset)) {
             Text(
                 text = "Bestätigung erforderlich",
                 style = MaterialTheme.typography.labelSmall,
@@ -1893,7 +1890,7 @@ private fun PushCard(item: TimelineItem.Pushed) {
     ) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.padding(14.dp),
+            modifier = Modifier.padding(CardInset),
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1953,7 +1950,7 @@ private fun ErrorCard(item: TimelineItem.Error) {
             text = item.message,
             color = MaterialTheme.colorScheme.onErrorContainer,
             style = MaterialTheme.typography.bodyMedium,
-            modifier = Modifier.padding(14.dp),
+            modifier = Modifier.padding(CardInset),
         )
     }
 }

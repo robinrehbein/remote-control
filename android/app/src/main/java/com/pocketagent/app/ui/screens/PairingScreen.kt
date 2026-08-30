@@ -50,6 +50,7 @@ import com.pocketagent.app.data.PairingApi
 import com.pocketagent.app.ui.theme.ContentInset
 import com.pocketagent.app.ui.theme.PillShape
 import com.pocketagent.app.ui.theme.PrimaryButtonHeight
+import com.pocketagent.app.ui.theme.PrimaryButtonTextSize
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
@@ -241,7 +242,7 @@ fun PairingScreen(onPaired: () -> Unit) {
                 )
                 Spacer(modifier = Modifier.width(8.dp))
             }
-            Text(stringResource(R.string.pairing_button))
+            Text(stringResource(R.string.pairing_button), fontSize = PrimaryButtonTextSize)
         }
 
         Text(

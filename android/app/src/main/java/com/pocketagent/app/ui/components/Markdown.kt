@@ -11,7 +11,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material3.Icon
@@ -71,7 +70,7 @@ fun MarkdownText(text: String, modifier: Modifier = Modifier) {
                     modifier = Modifier
                         .padding(vertical = 4.dp)
                         .fillMaxWidth()
-                        .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(8.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant, MaterialTheme.shapes.extraSmall)
                         .padding(10.dp),
                 ) {
                     Text(
@@ -242,7 +241,7 @@ private fun CodeBlock(block: Block.Code) {
             .fillMaxWidth()
             // Highest, not High: in light mode High is white — the same
             // color as the bubble the code block sits in.
-            .background(MaterialTheme.colorScheme.surfaceContainerHighest, RoundedCornerShape(12.dp)),
+            .background(MaterialTheme.colorScheme.surfaceContainerHighest, MaterialTheme.shapes.extraSmall),
     ) {
         Row(
             verticalAlignment = Alignment.CenterVertically,

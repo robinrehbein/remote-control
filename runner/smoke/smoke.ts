@@ -435,11 +435,13 @@ async function main(): Promise<void> {
   await waitFor(() => sse.events, event => event.type === 'status' && event.busy === true, 5_000, 'busy status');
   const abort = await fetch(`${base}/abort`, { method: 'POST', headers: auth });
   expect(abort.status === 200, `POST /abort accepted (got ${abort.status}: ${await abort.text()})`);
+  // Ein abgebrochener Turn endet als eigener Zustand 'turn.interrupted' (nicht
+  // 'completed'), damit die App-Timeline „unterbrochen" von „fertig" trennt.
   await waitFor(
     () => sse.events,
-    event => (event.type === 'turn.completed' || event.type === 'turn.failed') && event !== completed1 && event !== completed2,
+    event => event.type === 'turn.interrupted',
     5_000,
-    'turn end after abort',
+    'turn.interrupted after abort',
   );
   const statusAbort = (await (await fetch(`${base}/status`, { headers: auth })).json()) as { busy: boolean };
   expect(statusAbort.busy === false, 'idle again after abort');

@@ -799,13 +799,14 @@ export class SessionManager {
     if (ev.type === 'status' && ev.sessionRef) this.store.setSessionRef(sessionId, ev.sessionRef);
     else if (ev.type === 'permission.request')
       void this.notifyPermission(sessionId, ev.permissionId, ev.title);
-    else if (ev.type === 'turn.completed' || ev.type === 'turn.failed') {
+    else if (ev.type === 'turn.completed' || ev.type === 'turn.failed' || ev.type === 'turn.interrupted') {
       // Close the per-turn resource from the runner's own terminal signal: the
-      // in-flight turn reaches 'completed' or 'failed' (carrying the runner's
-      // error as the reason) so a reconnecting app reads its fate instead of
-      // guessing it from the stream.
+      // in-flight turn reaches 'completed', 'failed' (carrying the runner's
+      // error as the reason) or 'interrupted' (user abort / lost turn) so a
+      // reconnecting app reads its fate instead of guessing it from the stream.
       if (ev.type === 'turn.completed') this.finishTurn(sessionId, 'completed');
-      else this.finishTurn(sessionId, 'failed', { message: ev.error, stage: 'agent' });
+      else if (ev.type === 'turn.failed') this.finishTurn(sessionId, 'failed', { message: ev.error, stage: 'agent' });
+      else this.finishTurn(sessionId, 'interrupted', ev.reason ? { message: ev.reason } : undefined);
       if (this.store.getSession(sessionId)?.status === 'running') this.setStatus(sessionId, 'idle');
     } else if (ev.type === 'pushed' && ev.prUrl) this.store.setPrUrl(sessionId, ev.prUrl);
   }

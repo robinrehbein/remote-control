@@ -419,6 +419,7 @@ class ProtocolDecodeTest {
                 { "type": "tool.result", "id": "c1", "tool": "bash", "output": "ok" },
                 { "type": "message.completed", "role": "assistant", "text": "Fertig." },
                 { "type": "turn.completed", "commitSha": "abcdef1234" },
+                { "type": "turn.interrupted", "reason": "vom Nutzer gestoppt" },
                 { "type": "brandneu.aus.der.zukunft", "was": "auch immer" }
               ]
             }
@@ -429,12 +430,13 @@ class ProtocolDecodeTest {
         assertEquals("s1", msg.sessionId)
         assertEquals("req-hist", msg.requestId)
         // Unbekannte Event-Typen fallen still heraus, der Rest bleibt nutzbar
-        assertEquals(5, events.size)
+        assertEquals(6, events.size)
         assertEquals("Bau den Login um", (events[0] as AgentEvent.MessageCompleted).text)
         assertEquals("user", (events[0] as AgentEvent.MessageCompleted).role)
         assertEquals("c1", (events[1] as AgentEvent.ToolCall).id)
         assertEquals("ok", (events[2] as AgentEvent.ToolResult).output)
         assertEquals("abcdef1234", (events[4] as AgentEvent.TurnCompleted).commitSha)
+        assertEquals("vom Nutzer gestoppt", (events[5] as AgentEvent.TurnInterrupted).reason)
     }
 
     @Test
@@ -627,7 +629,7 @@ class ProtocolDecodeTest {
               "type": "device.list",
               "requestId": "r1",
               "devices": [
-                {"id":"d1","name":"Pixel","enrolledAt":"2026-01-01T10:00:00Z","online":true},
+                {"id":"d1","name":"Pixel","enrolledAt":"2026-01-01T10:00:00Z","online":true,"lastSeenAt":"2026-01-03T09:00:00Z"},
                 {"id":"d2","name":"Tablet","enrolledAt":"2026-01-02T10:00:00Z"}
               ]
             }
@@ -637,8 +639,11 @@ class ProtocolDecodeTest {
         val list = (devices as ServerMessage.DeviceListMsg).devices
         assertEquals(2, list.size)
         assertTrue(list[0].online)
+        assertEquals("2026-01-03T09:00:00Z", list[0].lastSeenAt)
         // Fehlt online (älterer Server), gilt das Gerät als offline.
         assertFalse(list[1].online)
+        // Fehlt lastSeenAt (älterer Server), bleibt es null; die UI fällt auf enrolledAt zurück.
+        assertNull(list[1].lastSeenAt)
 
         val links = parseServerMessage(
             """{"type":"link.list","requestId":"r3","links":[{"id":"l1","name":"devbox","createdAt":"2026-01-01T10:00:00Z"}]}""",

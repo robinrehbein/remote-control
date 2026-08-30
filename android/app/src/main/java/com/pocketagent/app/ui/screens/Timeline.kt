@@ -33,6 +33,8 @@ sealed interface TimelineItem {
     data class TurnEnd(
         val summary: String?,
         val commitSha: String?,
+        /** True, wenn der Turn abgebrochen wurde (Stop/Neustart) statt regulär zu enden. */
+        val interrupted: Boolean = false,
     ) : TimelineItem
 
     data class Pushed(
@@ -93,6 +95,11 @@ fun reduceTimeline(items: List<TimelineItem>, event: AgentEvent): List<TimelineI
     }
 
     is AgentEvent.TurnCompleted -> items + TimelineItem.TurnEnd(event.summary, event.commitSha)
+    is AgentEvent.TurnInterrupted -> items + TimelineItem.TurnEnd(
+        summary = event.reason?.takeIf { it.isNotBlank() },
+        commitSha = null,
+        interrupted = true,
+    )
     is AgentEvent.Pushed -> items + TimelineItem.Pushed(event.branch, event.prUrl, event.auto)
 
     is AgentEvent.TurnFailed -> {
@@ -153,6 +160,7 @@ fun eventIdentity(event: AgentEvent): String? {
         is AgentEvent.TurnCompleted -> "turn.completed:${event.commitSha}\u0000${event.summary}"
         is AgentEvent.Pushed -> "pushed:${event.branch}\u0000${event.prUrl}\u0000${event.auto}"
         is AgentEvent.TurnFailed -> "turn.failed:${event.error}"
+        is AgentEvent.TurnInterrupted -> "turn.interrupted:${event.reason}"
         is AgentEvent.ErrorEvent -> "error:${event.message}"
         is AgentEvent.Notice -> "notice:${event.phase}\u0000${event.message}\u0000${event.detail}"
         is AgentEvent.Status, is AgentEvent.MessageDelta, is AgentEvent.Ping -> null

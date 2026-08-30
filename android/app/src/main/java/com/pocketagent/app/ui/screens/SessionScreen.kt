@@ -388,9 +388,10 @@ class SessionViewModel : ViewModel() {
         when (event) {
             is AgentEvent.Status -> _busy.value = event.busy
 
-            // Ein Fehler beendet den Start: er wird als Karte gezeigt, die
-            // Fortschrittsanzeige hat dann nichts mehr zu melden.
-            is AgentEvent.TurnFailed, is AgentEvent.ErrorEvent -> _progress.value = null
+            // Ein Fehler oder Abbruch beendet den Start: er wird als Zeile
+            // gezeigt, die Fortschrittsanzeige hat dann nichts mehr zu melden.
+            is AgentEvent.TurnFailed, is AgentEvent.ErrorEvent, is AgentEvent.TurnInterrupted ->
+                _progress.value = null
 
             // Mit Phase ist die Notice Fortschritt und ersetzt den vorherigen
             // Stand; ohne Phase bleibt sie eine Systemzeile in der Timeline.
@@ -1498,16 +1499,28 @@ internal fun TimelineItemView(item: TimelineItem, vm: SessionViewModel) {
         is TimelineItem.Chat -> ChatBubble(item)
         is TimelineItem.Tool -> ToolCard(item)
         is TimelineItem.Approval -> ApprovalCard(item, vm)
-        is TimelineItem.TurnEnd -> SystemLine(
-            // summary wird jetzt mit angezeigt statt still verworfen (Tier 6):
-            // „Fertig · <sha> · <summary>".
-            text = listOfNotNull(
-                "Fertig",
-                item.commitSha?.take(7),
-                item.summary?.takeIf { it.isNotBlank() },
-            ).joinToString(" · "),
-            icon = Icons.Outlined.Check,
-        )
+        is TimelineItem.TurnEnd -> if (item.interrupted) {
+            // Abgebrochener Turn (Stop/Neustart): eigener Wortlaut und Icon,
+            // damit „unterbrochen" nicht wie ein regulärer Abschluss aussieht.
+            SystemLine(
+                text = listOfNotNull(
+                    "Unterbrochen",
+                    item.summary?.takeIf { it.isNotBlank() },
+                ).joinToString(" · "),
+                icon = Icons.Outlined.Close,
+            )
+        } else {
+            SystemLine(
+                // summary wird jetzt mit angezeigt statt still verworfen (Tier 6):
+                // „Fertig · <sha> · <summary>".
+                text = listOfNotNull(
+                    "Fertig",
+                    item.commitSha?.take(7),
+                    item.summary?.takeIf { it.isNotBlank() },
+                ).joinToString(" · "),
+                icon = Icons.Outlined.Check,
+            )
+        }
 
         is TimelineItem.Notice -> SystemLine(text = item.text)
         is TimelineItem.Pushed -> PushCard(item)

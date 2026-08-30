@@ -355,6 +355,7 @@ export function registerWs(
         clearTimeout(authTimer);
         deviceId = dev.id;
         hub.add(socket, dev.id);
+        store.touchDevice(dev.id); // „zuletzt aktiv" = letzte authentifizierte Verbindung
         send({ type: 'welcome', ok: true, serverVersion: SERVER_VERSION });
         return;
       }
@@ -675,6 +676,7 @@ export function registerWs(
             name: d.name,
             enrolledAt: d.enrolled_at,
             online: hub.isDeviceOnline(d.id),
+            lastSeenAt: d.last_seen_at ?? d.enrolled_at,
           }));
           send({ type: 'device.list', requestId: msg.requestId, devices });
           return;

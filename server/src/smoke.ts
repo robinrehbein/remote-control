@@ -933,6 +933,20 @@ async function turnSmoke(store: Store, manager: SessionManager, c2: Client, repo
     assert(turnsC[0]!.reason?.stage === 'transport', 'der Grund benennt die Stufe, an der es brach');
     assert(store.getSession(idC)?.status === 'error', 'ein gescheiterter Prompt laesst die Session im Fehler');
 
+    /* ---- (c2) ein abgebrochener Turn endet als 'interrupted' (Nutzer-Stop) ---- */
+    promptMode = 'ok';
+    const idI = insertIdle();
+    await manager.prompt(idI, 'lauf und werde gestoppt', undefined, 'msg_i');
+    assert(store.getSession(idI)?.status === 'running', 'der zu unterbrechende Turn laeuft');
+    manager.handleLinkEvent(idI, { type: 'turn.interrupted', reason: 'vom Nutzer gestoppt', seq: 1 });
+    const turnsI = manager.turns(idI);
+    assert(turnsI.length === 1 && turnsI[0]!.state === 'interrupted', "ein 'turn.interrupted' setzt den Turn auf interrupted");
+    assert(store.getSession(idI)?.status === 'idle', 'ein unterbrochener Turn bringt die Session auf idle zurueck');
+    assert(
+      manager.sessionEvents(idI).some((e) => e.type === 'turn.interrupted'),
+      "das 'turn.interrupted' steht als eigene Zeile in der Timeline",
+    );
+
     /* ---- (d) session.update und Stop ueber die WS-Oberflaeche ---- */
     promptMode = 'ok';
     const updated = await request(c2, {
@@ -1822,6 +1836,15 @@ async function main(): Promise<void> {
   const devices = devList.type === 'device.list' ? devList.devices : [];
   assert(devices.length >= 2, 'device.list liefert die gekoppelten Geraete');
   assert(devices.find((d) => d.id === paired.deviceId)?.online === true, 'device.list markiert einen lebenden Socket als online');
+  assert(
+    devices.every((d) => typeof d.lastSeenAt === 'string' && !Number.isNaN(Date.parse(d.lastSeenAt))),
+    'device.list traegt fuer jedes Geraet ein lastSeenAt',
+  );
+  const dev2Info = devices.find((d) => d.id === paired2.deviceId);
+  assert(
+    dev2Info != null && Date.parse(dev2Info.lastSeenAt) >= Date.parse(dev2Info.enrolledAt),
+    'lastSeenAt wird beim hello gestempelt (>= enrolledAt)',
+  );
 
   const c3Closed = c3.closeCode();
   const rev = await request(c2, { type: 'device.revoke', requestId: 'dev2', deviceId: paired2.deviceId as string });

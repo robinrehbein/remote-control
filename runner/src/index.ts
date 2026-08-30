@@ -330,13 +330,16 @@ export function buildApp(deps: AppDeps): FastifyInstance {
     }
     if (outcome.errorMessage) {
       bus.publish({ type: 'turn.failed', error: outcome.errorMessage });
+    } else if (outcome.aborted) {
+      // Nutzer-/Timeout-Abbruch (stopReason 'aborted'): eigener Endzustand, damit
+      // die Timeline „unterbrochen" von „fertig" trennt statt einen leeren Turn
+      // als 'abgebrochen'-Zusammenfassung zu zeigen. Kein Auto-Push — ein
+      // abgeschnittener Turn soll keinen Draft-PR auslösen.
+      bus.publish({ type: 'turn.interrupted', reason: outcome.summary });
     } else {
       bus.publish({
         type: 'turn.completed',
-        // Bei einem abgebrochenen Turn (Nutzer-/Timeout-Abbruch, stopReason
-        // 'aborted') trägt der Assistent oft keinen Text; dann statt einer leeren
-        // Zusammenfassung ein klares 'abgebrochen', damit die App den Ausgang sieht.
-        summary: outcome.aborted ? (outcome.summary ?? 'abgebrochen') : outcome.summary,
+        summary: outcome.summary,
         usage: outcome.usage,
         commitSha,
       });

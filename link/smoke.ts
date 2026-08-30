@@ -14,7 +14,7 @@
  * G1.4 verification calls for.
  *
  * Covers:
- *   - agent.hello (protocolVersion 2, capabilities.heartbeat) on connect
+ *   - agent.hello on connect
  *   - agent.heartbeat full-state snapshot on its own cadence
  *   - agent.command -> POST /prompt on the embedded runner -> agent.response
  *     + the resulting AgentEvents flowing back as agent.event
@@ -34,7 +34,7 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { WebSocket, WebSocketServer } from 'ws';
 import type { AgentEvent } from '@pocketagent/protocol';
-import { LINK_PROTOCOL_VERSION, WS_CLOSE_UNAUTHORIZED } from '@pocketagent/protocol';
+import { WS_CLOSE_UNAUTHORIZED } from '@pocketagent/protocol';
 import { buildApp, type ShimConfig } from '../runner/src/index.js';
 import { EventBroadcaster } from '../runner/src/events.js';
 import { FakeRunner } from '../runner/smoke/fake.js';
@@ -101,6 +101,7 @@ async function main(): Promise<void> {
   const runnerToken = randomBytes(16).toString('hex');
   const config: ShimConfig = {
     port: 0, // unused by buildApp itself - only main()'s app.listen() reads it
+    host: '127.0.0.1',
     token: runnerToken,
     workDir,
     sessionId: FAKE_SESSION_ID,
@@ -207,11 +208,6 @@ async function main(): Promise<void> {
       'agent.hello',
     );
     expect(hello.token === LINK_TOKEN, 'agent.hello carries PA_TOKEN');
-    expect(hello.protocolVersion === LINK_PROTOCOL_VERSION, `agent.hello protocolVersion is ${LINK_PROTOCOL_VERSION}`);
-    expect(
-      (hello.capabilities as { heartbeat?: boolean } | undefined)?.heartbeat === true,
-      'agent.hello announces heartbeat capability',
-    );
     expect(hello.name === 'smoke-link', 'agent.hello carries PA_NAME');
     expect(hello.workDir === workDir, 'agent.hello carries PA_WORKDIR');
 
@@ -221,7 +217,6 @@ async function main(): Promise<void> {
       'agent.heartbeat',
       5_000,
     );
-    expect(heartbeat.protocolVersion === LINK_PROTOCOL_VERSION, 'agent.heartbeat carries protocolVersion');
     const sessions = heartbeat.sessions as { sessionId: string; status: string }[];
     expect(sessions.length === 1 && sessions[0]?.sessionId === FAKE_SESSION_ID, 'heartbeat reports the bound session');
 
@@ -231,7 +226,6 @@ async function main(): Promise<void> {
     conn1?.ws.send(
       JSON.stringify({
         type: 'agent.command',
-        sessionId: FAKE_SESSION_ID,
         callId: 'call-1',
         path: '/prompt',
         method: 'POST',

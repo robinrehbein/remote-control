@@ -15,7 +15,7 @@ import {
   redactTokens,
   stripLogFraming,
 } from './progress.js';
-import { RUNNER_PORT, RUNNER_PUSH_SCRIPT, RUNNER_WORK_DIR, runnerContextFiles, runnerContextRoot, runnerImageName } from './runner.js';
+import { RUNNER_PORT, RUNNER_PUSH_SCRIPT, RUNNER_WORK_DIR, proxyTokenFor, runnerContextFiles, runnerContextRoot, runnerImageName } from './runner.js';
 import type { SessionRow } from './db.js';
 
 /** Optional payload of a progress notice (phases are the protocol contract). */
@@ -50,9 +50,6 @@ function docker(): Docker | null {
           protocol: url.protocol === 'https:' ? 'https' : 'http',
           host: url.hostname,
           port: url.port ? Number(url.port) : 2375,
-          ...(config.dockerTls.ca && config.dockerTls.cert && config.dockerTls.key
-            ? { ca: config.dockerTls.ca, cert: config.dockerTls.cert, key: config.dockerTls.key }
-            : {}),
         });
       }
     } else {
@@ -76,6 +73,8 @@ function docker(): Docker | null {
  * throw and never a stale allow.
  */
 const PEER_CACHE_TTL_MS = 10_000;
+/** Harte Obergrenze für den Tap-Push-Container, damit ein hängender Push das Egress-Fenster nicht offen lässt. */
+const ONE_SHOT_PUSH_TIMEOUT_MS = 10 * 60_000;
 let peerIps = new Map<string, string>();
 let peerIpsAt = 0; // 0 = never loaded
 let peerRefresh: Promise<Map<string, string>> | null = null;
@@ -180,9 +179,13 @@ async function provideRunnerImage(onNotice?: NoticeFn): Promise<string> {
   const d = docker();
   if (!d) return image; // Docker aus: der Aufrufer scheitert ohnehin mit klarer Meldung
   if (await imageExists(d, image)) return image;
-  await pullImage(image);
-  if (await imageExists(d, image)) return image;
+  // Aus der Registry ziehen NUR, wenn RUNNER_IMAGE fest vorgegeben ist ("nur pullen"-Modus).
+  // Im Selbstbau-Modus (config.runnerImage === null) niemals pullen — sonst würde ein
+  // beliebiges Docker-Hub-Image unter dem Default-Namen die lokal gebaute Version verdrängen
+  // (Supply-Chain-Risiko).
   if (config.runnerImage !== null) {
+    await pullImage(image);
+    if (await imageExists(d, image)) return image;
     throw new Error(
       `Runner-Image ${image} ist über RUNNER_IMAGE fest vorgegeben, liegt aber weder lokal vor noch konnte es ` +
         `aus der Registry geladen werden. Image bereitstellen oder RUNNER_IMAGE entfernen, damit der Server es selbst baut.`,
@@ -455,7 +458,11 @@ async function sessionNetworking(
     // ihn, resumeSession/push weisen eine unprovisionierte Session ab) - eine
     // URL ohne Credentials ließe die Session allein vom Peer-IP-Gate abhängen,
     // daher das auth= in der Logzeile unten.
-    const userinfo = session.shim_token ? `pa:${session.shim_token}@` : '';
+    // Nicht der shim_token selbst: das vom API-Token abgeleitete Egress-Credential
+    // (proxyTokenFor). So kann ein Kindprozess, der die Proxy-URL aus der Env liest,
+    // damit nicht das Permission-Gate der Runner-API ansprechen. egressTokens()
+    // (sessions.ts) leitet denselben Wert für die Validierung ab.
+    const userinfo = session.shim_token ? `pa:${proxyTokenFor(session.shim_token)}@` : '';
     const proxyHost = `${ORCHESTRATOR_ALIAS}:${config.egressProxyPort}`;
     env.HTTP_PROXY = `http://${userinfo}${proxyHost}`;
     env.HTTPS_PROXY = `http://${userinfo}${proxyHost}`;
@@ -596,16 +603,6 @@ export async function startContainer(id: string): Promise<boolean> {
   // egress proxy authorize the runner's very first request by peer IP.
   if (started) await refreshSessionPeers();
   return started;
-}
-
-/**
- * Base URL des Runners. Lokal ist das immer der Docker-Netz-Alias, deshalb
- * `null` - der Aufrufer setzt `http://<sessionId>:8080` ein. Die Funktion (und
- * die Spalte `shim_endpoint`) bleiben, weil Link-Sessions und Tests einen
- * expliziten Endpunkt setzen.
- */
-export function runnerEndpoint(): string | null {
-  return null;
 }
 
 /** Default-Basis-URL eines Session-Runners im lokalen Docker-Netz. */
@@ -787,8 +784,23 @@ export async function oneShotPush(
     if (creds && Object.keys(creds).length > 0) await injectCredsFile(c.id, creds);
     await c.start();
     await refreshSessionPeers(); // der Push-Container pusht durch denselben Egress-Proxy
-    const res = await c.wait();
-    return res.StatusCode === 0;
+    // c.wait() ohne Timeout kann bei einem hängenden Push (z. B. blockierte Egress-Verbindung)
+    // ewig laufen und das Egress-Fenster offen halten. Deshalb hart nach ONE_SHOT_PUSH_TIMEOUT_MS
+    // abbrechen; der Container wird im finally per remove({force:true}) gestoppt, und der Aufrufer
+    // (sessions.ts) schließt im finally das Egress-Fenster.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`push timed out after ${ONE_SHOT_PUSH_TIMEOUT_MS}ms`)),
+        ONE_SHOT_PUSH_TIMEOUT_MS,
+      );
+    });
+    try {
+      const res = await Promise.race([c.wait(), timeout]);
+      return res.StatusCode === 0;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     console.error(`[docker] push failed for session ${session.id.slice(0, 8)}: ${msg}`);

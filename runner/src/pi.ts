@@ -206,7 +206,11 @@ function classifyToolCall(toolName: string, input: Record<string, unknown>): Cla
             ...edit.newText.split('\n').map(line => `+${line}`),
           ].join('\n'),
         )
-        .join('\n');
+        .join('\n')
+        // Wie beim write-Diff unten: der Permission-Request ist eine
+        // Vorschau, kein vollständiger Patch - bei riesigen Multi-Edit-Aufrufen
+        // auf 8192 Zeichen kappen.
+        .slice(0, 8192);
     }
     if (toolName === 'write' && typeof input.content === 'string') {
       classification.diff = [`--- /dev/null`, `+++ b/${path}`, ...input.content.split('\n').map(line => `+${line}`)]
@@ -215,8 +219,14 @@ function classifyToolCall(toolName: string, input: Record<string, unknown>): Cla
     }
     return classification;
   }
-  const key = `other:${toolName}`;
-  return { kind: 'other', key, title: toolName, patterns: [key] };
+  // Unerreichbar für die feste Toolliste (['read','bash','edit','write','grep',
+  // 'find','ls']): read/grep/find/ls sind Lese-Tools (in decide() vor dem
+  // Klassifizieren freigegeben), bash/edit/write sind oben abgehandelt.
+  // Sollte doch je ein unbekanntes, nicht-lesendes Tool hier landen, wird es
+  // fail-closed als edit-Klasse behandelt (in ask gegated), nie stillschweigend
+  // durchgewinkt.
+  const key = `edit:${toolName}`;
+  return { kind: 'edit', key, title: toolName, patterns: [key] };
 }
 
 export interface GateVerdict {
@@ -259,8 +269,10 @@ export class PermissionGate {
   }
 
   async decide(toolName: string, input: Record<string, unknown>): Promise<GateVerdict> {
-    const classification = classifyToolCall(toolName, input);
+    // Lese-Tools vor dem Klassifizieren freigeben - so klassifiziert der Gate nur
+    // die tatsächlich genehmigungspflichtigen Tools (bash/edit/write).
     if (READ_ONLY_TOOLS.has(toolName)) return ALLOW;
+    const classification = classifyToolCall(toolName, input);
     if (!this.gateRequired(classification)) return ALLOW;
     if (this.alwaysAllowed.has(classification.key)) return ALLOW;
 
@@ -308,12 +320,10 @@ export class PermissionGate {
   private gateRequired(classification: Classification): boolean {
     const semantics = PI_MODE_SEMANTICS[this.getMode()];
     if (classification.kind === 'edit') return semantics.edits === 'all';
-    if (classification.kind === 'bash') {
-      if (semantics.bash === 'none') return false;
-      if (semantics.bash === 'all') return true;
-      return isRiskyBash(classification.command ?? '');
-    }
-    return semantics.otherTools === 'all';
+    // classification.kind === 'bash'
+    if (semantics.bash === 'none') return false;
+    if (semantics.bash === 'all') return true;
+    return isRiskyBash(classification.command ?? '');
   }
 }
 

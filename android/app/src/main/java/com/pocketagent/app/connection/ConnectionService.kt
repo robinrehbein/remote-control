@@ -111,11 +111,25 @@ class ConnectionService : Service() {
         container.connectivity.retain()
 
         // Die Notification ist die ehrliche Statuszeile der Verbindung: sie
-        // folgt jedem Zustandswechsel (Countdown inklusive).
+        // folgt jedem Zustandswechsel. Der Waiting-Countdown tickt sekündlich,
+        // aber ein manager.notify() pro Sekunde ist verschwenderisch (Fund) —
+        // deshalb während des Countdowns nur in ~5-s-Schritten aktualisieren,
+        // ansonsten bei jedem echten Zustandswechsel. Dedup über einen Schlüssel,
+        // der die Sekunden auf 5er-Blöcke bündelt.
         scope.launch {
+            var lastKey: String? = null
             container.repository.connState.collect { state ->
                 when (val action = connectionServiceAction(state)) {
-                    is ConnectionServiceAction.Announce -> notify(action.text)
+                    is ConnectionServiceAction.Announce -> {
+                        val key = when (state) {
+                            is WsClient.ConnState.Waiting -> "waiting:${state.retryInSec / 5}"
+                            else -> action.text
+                        }
+                        if (key != lastKey) {
+                            lastKey = key
+                            notify(action.text)
+                        }
+                    }
                     ConnectionServiceAction.Stop -> stopSelf()
                 }
             }

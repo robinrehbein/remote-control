@@ -38,7 +38,7 @@ import {
   shimProgressMessage,
   splitLogLines,
 } from './progress.js';
-import { buildRunnerEnv } from './runner.js';
+import { buildRunnerEnv, proxyTokenFor } from './runner.js';
 import { matchTokenDigest, tokenDigest, type EgressSession, type TokenEntry } from './egress-proxy.js';
 import { ShimClient, normalizeModels } from './shim-client.js';
 import { sendPush } from './fcm.js';
@@ -52,7 +52,7 @@ const TENANT = 'default';
  * Protokoll nicht länger.
  */
 const NOTICE_PHASES: readonly NoticePhase[] = ['container-start', 'shim-start', 'ready'];
-const LINK_SESSION_STATUSES: readonly LinkSessionStatus[] = ['idle', 'busy', 'question', 'permission'];
+const LINK_SESSION_STATUSES: readonly LinkSessionStatus[] = ['idle', 'busy', 'permission'];
 
 /** Wire-Eingang: `unknown` -> Modus. Die Liste selbst kommt aus dem Protokoll. */
 export function isAgentMode(v: unknown): v is AgentMode {
@@ -73,10 +73,10 @@ export function isLinkSessionStatus(v: unknown): v is LinkSessionStatus {
 
 /**
  * Maps a link agent's heartbeat status onto ours. `SessionStatus` has no
- * counterpart for "mid-turn, waiting on the user" (question/permission) - the
- * runner's own `busy` flag already collapses those into one boolean, and
+ * counterpart for "mid-turn, waiting on the user" (permission) - the runner's
+ * own `busy` flag already collapses that into one boolean, and
  * `permission.request`/`.resolved` events carry the finer detail separately -
- * so both fold into 'running', same as everything else that is not 'idle'.
+ * so it folds into 'running', same as everything else that is not 'idle'.
  */
 export function statusFromLinkHeartbeat(status: LinkSessionStatus): SessionStatus {
   return status === 'idle' ? 'idle' : 'running';
@@ -168,9 +168,10 @@ export function buildPromptBody(row: SessionRow, text: string, mode?: AgentMode)
   return {
     text,
     ...(effectiveMode !== undefined ? { mode: effectiveMode } : {}),
-    ...(typeof row.model === 'string'
-      ? { model: row.model, ...(row.provider ? { provider: row.provider } : {}) }
-      : {}),
+    // row.model ist immer ein String (die Spalte ist NOT NULL); der leere String
+    // ist der dokumentierte "pi-Default"-Reset, wird also bewusst mitgesendet.
+    model: row.model,
+    ...(row.provider ? { provider: row.provider } : {}),
     ...(isReasoningEffort(row.reasoning_effort) ? { reasoningEffort: row.reasoning_effort } : {}),
   };
 }
@@ -314,7 +315,10 @@ export class SessionManager {
     if (this.egressTokenCache === null || this.egressTokenCache.revision !== revision) {
       const entries: TokenEntry<string>[] = [];
       for (const row of this.store.listSessions(TENANT)) {
-        if (row.shim_token) entries.push({ digest: tokenDigest(row.shim_token), value: row.id });
+        // Die Proxy-URL trägt das abgeleitete Egress-Credential (proxyTokenFor),
+        // nicht den shim_token selbst - siehe Fix in docker.ts. Also hier denselben
+        // abgeleiteten Wert hashen, sonst wird jede Allowlist-Egress-Anfrage abgewiesen.
+        if (row.shim_token) entries.push({ digest: tokenDigest(proxyTokenFor(row.shim_token)), value: row.id });
       }
       this.egressTokenCache = { revision, entries };
     }
@@ -331,8 +335,14 @@ export class SessionManager {
     const existing = this.store.getSessionByLink(link.id);
     if (existing) {
       if (hello.mode) this.store.updateSessionMode(existing.id, hello.mode);
-      if (hello.sessionRef) this.store.setSessionRef(existing.id, hello.sessionRef);
       this.store.touchSession(existing.id);
+      // Der Link-Agent startet seine seq bei jedem (Neu-)Verbinden wieder bei 1
+      // (kein durchlaufender Prozess wie ein Container-Runner mit SSE-Cursor).
+      // Ohne diesen Reset bliebe die alte lastPersistedSeq-Marke stehen und
+      // persistEvent verwürfe jedes neue Link-Event als vermeintlichen Replay -
+      // die Session verlöre nach einem Neustart ihre gesamte Timeline. Die
+      // server-vergebene rowid-seq (onEvent) bleibt davon unberührt monoton.
+      this.lastPersistedSeq.delete(existing.id);
       this.setStatus(existing.id, 'idle');
       return existing.id;
     }
@@ -347,13 +357,19 @@ export class SessionManager {
       mode: hello.mode ?? DEFAULT_AGENT_MODE,
       status: 'idle',
       branch: hello.branch ?? 'local',
-      session_ref: hello.sessionRef ?? null,
+      // Link-Sessions bekommen ihren session_ref über das 'status'-Event des
+      // eingebetteten Runners (onEvent -> setSessionRef), nicht über agent.hello.
+      session_ref: null,
       container_id: null,
       volume_name: null,
       shim_token: null,
       pr_url: null,
       shim_endpoint: null,
-      link_id: null,
+      // link_id direkt im Insert setzen statt Insert + setLinkId: das spart den
+      // zweiten sessionAuth-Bump (insertSession bumpt bereits), und für eine
+      // Link-Session ist er ohnehin bedeutungslos (kein shim_token -> nicht in
+      // der Egress-Token-Tabelle).
+      link_id: link.id,
       network_policy: null,
       reasoning_effort: null,
       title: null,
@@ -362,7 +378,6 @@ export class SessionManager {
       last_active_at: now,
     };
     this.store.insertSession(row);
-    this.store.setLinkId(id, link.id);
     this.broadcastStatus(id, 'idle');
     return id;
   }
@@ -601,8 +616,9 @@ export class SessionManager {
 
   /**
    * Basis-URL des Runners. Regulär der Docker-Netz-Alias; die Spalte
-   * `shim_endpoint` überschreibt sie (Link-Sessions, Tests gegen einen
-   * gefälschten Runner).
+   * `shim_endpoint` überschreibt sie - genutzt von Tests, die gegen einen
+   * gefälschten Runner laufen (Link-Sessions setzen sie NICHT: ihr Runner ist
+   * in-process, sie sprechen ihn gar nicht über eine Basis-URL an).
    */
   private shimBase(id: string, endpoint?: string | null): string {
     return endpoint ?? this.store.getSession(id)?.shim_endpoint ?? docker.defaultRunnerBase(id);
@@ -623,8 +639,8 @@ export class SessionManager {
   /**
    * Container-Umgebung einer Session. Die Ableitung selbst ist pur und liegt in
    * runner.ts; hier kommt nur der Vault-Zugang dazu. `getSecretValue` (kein
-   * roher decrypt): Secrets sind seit der Vault-Migration AAD-gebunden, und nur
-   * dieser Pfad kennt AAD und Legacy-Fallback.
+   * roher decryptStrict): Secrets sind AAD-gebunden, und nur dieser Pfad bildet
+   * die AAD `secret:<tenant>:<kind>` und entschluesselt strikt.
    */
   private buildEnv(
     row: SessionRow,
@@ -721,24 +737,65 @@ export class SessionManager {
 
   /**
    * Single write path into the stored timeline (noise never reaches the table).
-   * Deduplicated by the event's `seq`: a replayed event (same seq the runner
-   * already sent before a reconnect) is dropped instead of appended a second
-   * time. Events without a seq (link agent) are always written.
+   *
+   * Deduplicated by the event's runner/link `seq`: a replayed event (same seq
+   * the runner already sent before a reconnect) is dropped instead of appended a
+   * second time. That `seq` is the TRANSPORT cursor - it drives this dedup and
+   * the SSE Last-Event-ID replay, restarts at 1 on every runner process and
+   * repeats across resume generations, so it is deliberately NOT what devices
+   * see.
+   *
+   * The return value carries the SERVER-canonical sequence for the device path:
+   *  - 'stored' + `seq`: the session_events rowid (session-wide, strictly
+   *    monotone, never resets) - the caller stamps it onto the broadcast so the
+   *    app's `seq:$id` dedup between live stream and history is well-defined.
+   *  - 'transient': a live-only event (a start notice, a ping) that never enters
+   *    the timeline - broadcast without a canonical seq.
+   *  - 'duplicate': a replay already stored - must not be broadcast again.
+   *
+   * Events without a runner seq (link agent, server-emitted) skip the dedup and
+   * are always stored.
    */
-  private persistEvent(sessionId: string, ev: AgentEvent): void {
-    if (!isHistoryEvent(ev)) return;
+  private persistEvent(
+    sessionId: string,
+    ev: AgentEvent,
+  ): { kind: 'stored'; seq: number } | { kind: 'transient' } | { kind: 'duplicate' } {
+    if (!isHistoryEvent(ev)) return { kind: 'transient' };
     if (typeof ev.seq === 'number') {
       const last = this.lastPersistedSeq.get(sessionId);
-      if (last !== undefined && ev.seq <= last) return;
+      if (last !== undefined && ev.seq <= last) return { kind: 'duplicate' };
       this.lastPersistedSeq.set(sessionId, last === undefined ? ev.seq : Math.max(last, ev.seq));
     }
-    this.store.appendEvent(sessionId, ev.type, JSON.stringify(ev));
+    const seq = this.store.appendEvent(sessionId, ev.type, JSON.stringify(ev));
+    return { kind: 'stored', seq };
+  }
+
+  /**
+   * Build the device-facing copy of an event and broadcast it, stamping the
+   * server-canonical seq (see persistEvent). A duplicate is suppressed; a
+   * transient event goes out without a canonical seq (its runner seq is stripped
+   * so it never collides with a stored event's rowid in the app's dedup).
+   */
+  private broadcastEvent(
+    sessionId: string,
+    ev: AgentEvent,
+    persisted: { kind: 'stored'; seq: number } | { kind: 'transient' } | { kind: 'duplicate' },
+  ): void {
+    if (persisted.kind === 'duplicate') return;
+    let event: AgentEvent;
+    if (persisted.kind === 'stored') {
+      event = { ...ev, seq: persisted.seq };
+    } else {
+      const { seq: _drop, ...rest } = ev;
+      event = rest as AgentEvent;
+    }
+    this.broadcast({ type: 'session.event', sessionId, event });
   }
 
   private onEvent(sessionId: string, ev: AgentEvent): void {
-    this.persistEvent(sessionId, ev);
+    const persisted = this.persistEvent(sessionId, ev);
     this.store.touchSession(sessionId);
-    this.broadcast({ type: 'session.event', sessionId, event: ev });
+    this.broadcastEvent(sessionId, ev, persisted);
     if (ev.type === 'status' && ev.sessionRef) this.store.setSessionRef(sessionId, ev.sessionRef);
     else if (ev.type === 'permission.request')
       void this.notifyPermission(sessionId, ev.permissionId, ev.title);
@@ -766,8 +823,8 @@ export class SessionManager {
   }
 
   private emitEvent(sessionId: string, ev: AgentEvent): void {
-    this.persistEvent(sessionId, ev);
-    this.broadcast({ type: 'session.event', sessionId, event: ev });
+    const persisted = this.persistEvent(sessionId, ev);
+    this.broadcastEvent(sessionId, ev, persisted);
   }
 
   /* ------------------------------------------------------------------ */
@@ -1141,7 +1198,9 @@ export class SessionManager {
       let cid = row.container_id;
       notice('Container startet', { phase: 'container-start' });
       let started = cid ? await docker.startContainer(cid) : false;
-      await this.checkpoint(id, gen);
+      // cid mitgeben: gewinnt ein Stop hier das Rennen, muss discardRun den eben
+      // wieder gestarteten (bestehenden) Container stoppen - sonst läuft er weiter.
+      await this.checkpoint(id, gen, cid);
       if (!started) {
         const repo = this.store.getRepo(row.repo_id);
         if (!repo) throw new Error('repo missing');

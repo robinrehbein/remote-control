@@ -16,7 +16,6 @@
  * einmal in `runner/` (eigenes package-lock.json, siehe RUNBOOK-PI).
  */
 import { randomBytes } from 'node:crypto';
-import net from 'node:net';
 import type { AgentMode } from '@pocketagent/protocol';
 import { main } from '../../runner/src/index.js';
 import type { EmbeddedRunner } from './agent.js';
@@ -33,27 +32,6 @@ export interface EmbedPiRunnerOptions {
 }
 
 /**
- * Freien Loopback-Port belegen. Der Runner selbst kennt kein "PORT=0" fürs
- * automatische Vergeben - `intEnv` in runner/src/index.ts verwirft 0 als
- * ungültig und fällt auf 8080 zurück -, also muss der Aufrufer den Port
- * vorher selbst wählen, genau wie v1 es für den Shim-Kindprozess tat.
- */
-function freePort(): Promise<number> {
-  return new Promise((resolvePort, reject) => {
-    const srv = net.createServer();
-    srv.listen(0, '127.0.0.1', () => {
-      const addr = srv.address();
-      if (addr === null || typeof addr === 'string') {
-        reject(new Error('no free port'));
-        return;
-      }
-      const { port } = addr;
-      srv.close(() => resolvePort(port));
-    });
-  });
-}
-
-/**
  * Startet eine frische pi-Runner-Instanz auf einem neuen ephemeren Port mit
  * einem neu erzeugten SHIM_TOKEN (Server-Vault ist hier nicht im Spiel - das
  * Token schützt nur die lokale HTTP-Schnittstelle im selben Prozess). Provider-
@@ -64,12 +42,17 @@ function freePort(): Promise<number> {
  * der pi-SDK und `readGithubPat()` (runner/src/gitops.ts) lesen sie selbst.
  */
 export async function embedPiRunner(opts: EmbedPiRunnerOptions): Promise<EmbeddedRunner> {
-  const port = await freePort();
   const token = randomBytes(24).toString('hex');
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     SHIM_TOKEN: token,
-    PORT: String(port),
+    // PORT=0: das OS vergibt einen freien Loopback-Port, den main() nach dem
+    // listen aus app.server.address() zurückgibt. Kein eigenes freePort()-Rennen
+    // mehr (zwischen Wahl und listen könnte ein anderer Prozess den Port belegen).
+    PORT: '0',
+    // Nur lokal erreichbar: der eingebettete Runner ist eine reine In-Process-
+    // Schnittstelle des Link-Agenten, nichts von aussen darf ihn ansprechen.
+    HOST: '127.0.0.1',
     WORK_DIR: opts.workDir,
     AGENT_MODE: opts.mode,
     SESSION_ID: opts.sessionId,
@@ -78,10 +61,15 @@ export async function embedPiRunner(opts: EmbedPiRunnerOptions): Promise<Embedde
     // gitops.ts) erkennt das leere REPO_URL und legt nur die
     // agent/<sessionId>-Branch auf dem bestehenden Checkout an.
     REPO_URL: '',
-    REPO_FULL_NAME: opts.repoFullName ?? opts.sessionId,
+    // Kein Fallback auf sessionId: ohne echtes owner/name legt der Runner keine
+    // Draft-PR an. Ein Fallback wie <sessionId> ergäbe repos/<sessionId>/pulls ->
+    // 404 nach jedem Yolo-Turn. undefined => REPO_FULL_NAME bleibt ungesetzt.
+    ...(opts.repoFullName !== undefined ? { REPO_FULL_NAME: opts.repoFullName } : {}),
     AUTO_PUSH: opts.autoPush ? '1' : '0',
   };
   const app = await main(env);
+  const addr = app.server.address();
+  const port = addr !== null && typeof addr === 'object' ? addr.port : 0;
   return {
     port,
     token,

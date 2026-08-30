@@ -208,10 +208,84 @@ data class DiffEntry(
 @Serializable
 data class ServerStats(
     val sessionsActive: Int = 0,
-    val sessionsTotal: Int = 0,
     val containersRunning: Int = 0,
     val uptimeSec: Long = 0,
-    val versions: Map<String, String> = emptyMap(),
+)
+
+/**
+ * Lebenszyklus eines einzelnen Turns (Prompt-zu-Antwort-Runde), gespiegelt aus
+ * dem Vertrag (`packages/protocol`: `TurnState`). Abzugrenzen von
+ * [SessionStatus] (langlebiger Container). Lineare Maschine:
+ * `queued` -> `running` -> genau ein Endzustand (`completed`/`failed`/
+ * `interrupted`). [UNKNOWN] fängt einen Zustand eines neueren Servers ab.
+ */
+@Serializable
+enum class TurnState {
+    @SerialName("queued") QUEUED,
+    @SerialName("running") RUNNING,
+    @SerialName("completed") COMPLETED,
+    @SerialName("failed") FAILED,
+    @SerialName("interrupted") INTERRUPTED,
+    @SerialName("unknown") UNKNOWN;
+
+    /** Ein Turn arbeitet noch (angenommen oder laufend), ist also nicht terminal. */
+    val active: Boolean get() = this == QUEUED || this == RUNNING
+
+    companion object {
+        fun fromRaw(raw: String?): TurnState = when (raw) {
+            "queued" -> QUEUED
+            "running" -> RUNNING
+            "completed" -> COMPLETED
+            "failed" -> FAILED
+            "interrupted" -> INTERRUPTED
+            else -> UNKNOWN
+        }
+    }
+}
+
+/** Strukturierter Grund für einen `failed`-Turn (Vertrag: `TurnFailureReason`). */
+@Serializable
+data class TurnFailureReason(
+    val message: String,
+    val stage: String? = null,
+    val code: String? = null,
+    val retryable: Boolean? = null,
+)
+
+/**
+ * Ein Turn, wie der Orchestrator ihn persistiert und meldet (Vertrag:
+ * `TurnInfo`). [messageId] echot die von der App erzeugte Id, die den Turn
+ * zugelassen hat — die Brücke zwischen optimistisch gesendetem Prompt und
+ * bestätigtem Turn (Idempotenz-Abgleich). Fehlt, wenn der Prompt ohne eine kam.
+ */
+@Serializable
+data class TurnInfo(
+    val turnId: String,
+    val sessionId: String,
+    val messageId: String? = null,
+    val state: TurnState = TurnState.UNKNOWN,
+    val createdAt: String? = null,
+    val updatedAt: String? = null,
+    /** Nur im Zustand `failed` gesetzt. */
+    val reason: TurnFailureReason? = null,
+)
+
+/** Ein gekoppeltes App-Gerät (Vertrag: `DeviceInfo`). */
+@Serializable
+data class DeviceInfo(
+    val id: String,
+    val name: String,
+    val enrolledAt: String,
+    /** True, solange das Gerät eine authentifizierte WS-Verbindung hält. */
+    val online: Boolean = false,
+)
+
+/** Ein verbundener Link-Agent (Vertrag: `LinkInfo`). */
+@Serializable
+data class LinkInfo(
+    val id: String,
+    val name: String,
+    val createdAt: String,
 )
 
 /* ------------------------------------------------------------------ */
@@ -411,24 +485,39 @@ sealed interface ServerMessage {
     data class ServerStatsMsg(val requestId: String, val stats: ServerStats) : ServerMessage {
         override val type: String get() = "server.stats"
     }
-}
 
-fun requestIdOf(msg: ServerMessage): String? = when (msg) {
-    is ServerMessage.ErrorMsg -> msg.requestId
-    is ServerMessage.RequestOk -> msg.requestId
-    is ServerMessage.SessionListMsg -> msg.requestId
-    is ServerMessage.SessionDiffMsg -> msg.requestId
-    is ServerMessage.SessionEventsMsg -> msg.requestId
-    is ServerMessage.SessionDeletedMsg -> msg.requestId
-    is ServerMessage.SessionModelsMsg -> msg.requestId
-    is ServerMessage.RepoListMsg -> msg.requestId
-    is ServerMessage.RepoAddedMsg -> msg.requestId
-    is ServerMessage.SecretListMsg -> msg.requestId
-    is ServerMessage.SecretSavedMsg -> msg.requestId
-    is ServerMessage.SecretDeletedMsg -> msg.requestId
-    is ServerMessage.SecretValidatedMsg -> msg.requestId
-    is ServerMessage.ServerStatsMsg -> msg.requestId
-    else -> null
+    /**
+     * Live-Push bei jedem Turn-Zustandswechsel (queued/running/terminal). Rein
+     * additiv — trägt das [TurnInfo.messageId]-Echo für den Idempotenz-Abgleich.
+     */
+    data class TurnStatusMsg(val sessionId: String, val turn: TurnInfo) : ServerMessage {
+        override val type: String get() = "turn.status"
+    }
+
+    /** Antwort auf `session.turns.get`: chronologisch, älteste zuerst. */
+    data class SessionTurnsMsg(
+        val requestId: String,
+        val sessionId: String,
+        val turns: List<TurnInfo>,
+    ) : ServerMessage {
+        override val type: String get() = "session.turns"
+    }
+
+    data class DeviceListMsg(val requestId: String, val devices: List<DeviceInfo>) : ServerMessage {
+        override val type: String get() = "device.list"
+    }
+
+    data class DeviceRevokedMsg(val requestId: String, val deviceId: String) : ServerMessage {
+        override val type: String get() = "device.revoked"
+    }
+
+    data class LinkListMsg(val requestId: String, val links: List<LinkInfo>) : ServerMessage {
+        override val type: String get() = "link.list"
+    }
+
+    data class LinkRevokedMsg(val requestId: String, val linkId: String) : ServerMessage {
+        override val type: String get() = "link.revoked"
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -680,14 +769,49 @@ fun parseServerMessage(raw: String): ServerMessage? {
                 stats = (root["stats"] as? JsonObject)?.let { s ->
                     ServerStats(
                         sessionsActive = s["sessionsActive"]?.jsonPrimitive?.intOrNull ?: 0,
-                        sessionsTotal = s["sessionsTotal"]?.jsonPrimitive?.intOrNull ?: 0,
                         containersRunning = s["containersRunning"]?.jsonPrimitive?.intOrNull ?: 0,
                         uptimeSec = s["uptimeSec"]?.jsonPrimitive?.longOrNull ?: 0L,
-                        versions = s["versions"]?.jsonObject?.mapNotNull { (k, v) ->
-                            (v as? kotlinx.serialization.json.JsonPrimitive)?.let { k to it.content }
-                        }?.toMap() ?: emptyMap(),
                     )
                 } ?: return null,
+            )
+
+            "turn.status" -> ServerMessage.TurnStatusMsg(
+                sessionId = root.optString("sessionId") ?: return null,
+                turn = runCatching {
+                    ProtocolJson.decodeFromJsonElement(TurnInfo.serializer(), root["turn"] ?: return null)
+                }.getOrNull() ?: return null,
+            )
+
+            "session.turns" -> ServerMessage.SessionTurnsMsg(
+                requestId = root.optString("requestId") ?: return null,
+                sessionId = root.optString("sessionId") ?: return null,
+                turns = root["turns"]?.jsonArray?.mapNotNull { el ->
+                    runCatching { ProtocolJson.decodeFromJsonElement(TurnInfo.serializer(), el) }.getOrNull()
+                } ?: emptyList(),
+            )
+
+            "device.list" -> ServerMessage.DeviceListMsg(
+                requestId = root.optString("requestId") ?: return null,
+                devices = root["devices"]?.jsonArray?.mapNotNull { el ->
+                    runCatching { ProtocolJson.decodeFromJsonElement(DeviceInfo.serializer(), el) }.getOrNull()
+                } ?: emptyList(),
+            )
+
+            "device.revoked" -> ServerMessage.DeviceRevokedMsg(
+                requestId = root.optString("requestId") ?: return null,
+                deviceId = root.optString("deviceId") ?: return null,
+            )
+
+            "link.list" -> ServerMessage.LinkListMsg(
+                requestId = root.optString("requestId") ?: return null,
+                links = root["links"]?.jsonArray?.mapNotNull { el ->
+                    runCatching { ProtocolJson.decodeFromJsonElement(LinkInfo.serializer(), el) }.getOrNull()
+                } ?: emptyList(),
+            )
+
+            "link.revoked" -> ServerMessage.LinkRevokedMsg(
+                requestId = root.optString("requestId") ?: return null,
+                linkId = root.optString("linkId") ?: return null,
             )
 
             else -> null
@@ -853,6 +977,39 @@ fun encodeSessionList(requestId: String): String = requestCommand("session.list"
 fun encodeRepoList(requestId: String): String = requestCommand("repo.list", requestId)
 fun encodeSecretList(requestId: String): String = requestCommand("secret.list", requestId)
 fun encodeServerStats(requestId: String): String = requestCommand("server.stats", requestId)
+fun encodeDeviceList(requestId: String): String = requestCommand("device.list", requestId)
+fun encodeLinkList(requestId: String): String = requestCommand("link.list", requestId)
+
+fun encodeDeviceRevoke(requestId: String, deviceId: String): String = buildJsonObject {
+    put("type", "device.revoke")
+    put("requestId", requestId)
+    put("deviceId", deviceId)
+}.toString()
+
+fun encodeLinkRevoke(requestId: String, linkId: String): String = buildJsonObject {
+    put("type", "link.revoke")
+    put("requestId", requestId)
+    put("linkId", linkId)
+}.toString()
+
+/**
+ * Turn-Lebenszyklus einer Session holen. Ohne [limit] entscheidet der Server
+ * (Vertrag: 50, max. 500); Antwort älteste zuerst.
+ */
+fun encodeSessionTurnsGet(requestId: String, sessionId: String, limit: Int? = null): String = buildJsonObject {
+    put("type", "session.turns.get")
+    put("requestId", requestId)
+    put("sessionId", sessionId)
+    limit?.let { put("limit", it) }
+}.toString()
+
+/**
+ * Über den Turn stabile Nachrichten-Id für die Idempotenz-/Ack-Zuordnung
+ * (`msg_<zufall>`; KILO-CLOUD-ANALYSE.md P1). Bei einem erneuten Senden
+ * desselben Textes wiederverwenden: der Server nimmt dieselbe Id genau einmal
+ * an und startet keinen zweiten Agent-Turn.
+ */
+fun newMessageId(): String = "msg_" + java.util.UUID.randomUUID().toString().replace("-", "")
 
 fun encodeSessionDelete(requestId: String, sessionId: String): String = buildJsonObject {
     put("type", "session.delete")

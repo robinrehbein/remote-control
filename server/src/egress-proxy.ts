@@ -577,9 +577,22 @@ export function createEgressProxyServer(opts: EgressGateOptions): http.Server {
      */
     socket.on('error', () => socket.destroy());
     const url = String(req.url ?? '');
-    const idx = url.lastIndexOf(':');
-    const host = idx === -1 ? url : url.slice(0, idx);
-    const portNum = idx === -1 ? 443 : Number(url.slice(idx + 1));
+    // Ein IPv6-Literal steht in CONNECT in Klammern (`[::1]:443`); ein blindes
+    // lastIndexOf(':') ließe die Klammern am Host stehen und träfe bei fehlendem
+    // Port einen Doppelpunkt IN der Adresse. Klammern getrennt behandeln, sonst
+    // wie bisher am letzten ':' in host/port schneiden.
+    let host: string;
+    let portNum: number;
+    if (url.startsWith('[')) {
+      const end = url.indexOf(']');
+      host = end === -1 ? url : url.slice(1, end);
+      const rest = end === -1 ? '' : url.slice(end + 1);
+      portNum = rest.startsWith(':') ? Number(rest.slice(1)) : 443;
+    } else {
+      const idx = url.lastIndexOf(':');
+      host = idx === -1 ? url : url.slice(0, idx);
+      portNum = idx === -1 ? 443 : Number(url.slice(idx + 1));
+    }
     const auth = proxyAuthorized(req, socket.remoteAddress, tokenValidator, peerValidator);
     const reason = denyReason(auth, host, portNum, allowlist, ports);
     if (reason !== null) {

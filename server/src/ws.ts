@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import type { RawData, WebSocket } from 'ws';
 import type { ClientMessage, ServerMessage } from '@pocketagent/protocol';
@@ -210,7 +210,7 @@ export class Hub {
       }, 20_000);
       this.pendingLinkCalls.set(callId, { linkId, resolve, timer });
       try {
-        socket.send(JSON.stringify({ type: 'agent.command', sessionId: linkId, callId, path, method, body }));
+        socket.send(JSON.stringify({ type: 'agent.command', callId, path, method, body }));
       } catch {
         clearTimeout(timer);
         this.pendingLinkCalls.delete(callId);
@@ -231,21 +231,19 @@ export class Hub {
     const socket = this.linkSockets.get(linkId);
     if (!socket) return;
     try {
-      socket.send(JSON.stringify({ type: 'agent.bye', sessionId: linkId }));
+      socket.send(JSON.stringify({ type: 'agent.bye' }));
     } catch {
       /* closed */
     }
   }
 }
 
-/** `fcm.register` ist seit dem pi-Contract Teil von `ClientMessage`. */
-type AppClientMessage = ClientMessage;
 /** Incoming frames on a link socket (link -> server uses ServerMessage variants). */
 type LinkInMessage = Extract<
   ServerMessage,
   { type: 'agent.response' | 'agent.event' | 'agent.ping' | 'agent.pong' | 'agent.heartbeat' }
 >;
-type SocketInMessage = AppClientMessage | LinkInMessage;
+type SocketInMessage = ClientMessage | LinkInMessage;
 
 const REPO_FULL_NAME_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
 const REPO_BRANCH_RE = /^[A-Za-z0-9._/-]+$/;
@@ -344,7 +342,11 @@ export function registerWs(
           socket.close(WS_CLOSE_UNAUTHORIZED, 'unauthorized');
           return;
         }
-        if (dev.token_hash !== sha256(msg.token)) {
+        // Konstantzeit-Vergleich der (gleich langen Hex-)Hashes, konsistent zu
+        // pairing.ts adminTokenOk - kein `!==` als Timing-Seitenkanal.
+        const provided = Buffer.from(sha256(msg.token), 'utf8');
+        const expected = Buffer.from(dev.token_hash, 'utf8');
+        if (provided.length !== expected.length || !timingSafeEqual(provided, expected)) {
           auditWarn('ws.unauthorized', { ip: addr, deviceId: msg.deviceId });
           socket.close(WS_CLOSE_UNAUTHORIZED, 'unauthorized');
           return;
@@ -391,9 +393,6 @@ export function registerWs(
           // resolves the target from the link's own binding, so a session id
           // in msg.sessions that is not this link's bound session is simply
           // never matched - it cannot affect a foreign session.
-          // protocolVersion/capabilities are accepted but not required (see
-          // LinkCapabilities): a heartbeat missing them is handled exactly
-          // like one that carries them.
           if (linkId) manager.handleLinkHeartbeat(linkId, msg.sessions);
           return;
         }
@@ -432,11 +431,18 @@ export function registerWs(
       }
     });
 
-    async function handle(msg: AppClientMessage): Promise<void> {
+    async function handle(msg: ClientMessage): Promise<void> {
       switch (msg.type) {
         case 'hello':
           return;
         case 'session.create': {
+          // msg.branch wird als Basis-Branch an `git clone --branch` gereicht
+          // (sessions.ts provision) - dieselbe Prüfung wie in repo.add, damit
+          // kein Wildwuchs/Sonderzeichen bis ans git-Kommando durchschlägt.
+          if (msg.branch !== undefined && !REPO_BRANCH_RE.test(msg.branch)) {
+            send({ type: 'error', requestId: msg.requestId, message: 'invalid branch name' });
+            return;
+          }
           try {
             const row = manager.createSession(msg);
             send({ type: 'request.ok', requestId: msg.requestId, payload: { sessionId: row.id } });

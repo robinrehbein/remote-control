@@ -42,13 +42,6 @@ function dockerHost(): string | null {
   return raw && raw.length > 0 ? raw : null;
 }
 
-function b64Env(name: string): string | undefined {
-  const raw = process.env[name]?.trim();
-  if (!raw) return undefined;
-  const buf = Buffer.from(raw, 'base64');
-  return buf.length > 0 ? buf.toString() : undefined;
-}
-
 /**
  * Hosts, die eine Session unter der Policy 'allowlist' erreichen darf. Gegenüber
  * v1 sind die Adapter-spezifischen Einträge (models.dev für kilo) raus; geblieben
@@ -143,11 +136,6 @@ export const config = {
   dockerEnabled: loadDockerEnabled(),
   /** null => /var/run/docker.sock; sonst derselbe Daemon über einen Socket-Proxy. */
   dockerHost: dockerHost(),
-  dockerTls: {
-    ca: b64Env('DOCKER_CLIENT_CA_B64'),
-    cert: b64Env('DOCKER_CLIENT_CERT_B64'),
-    key: b64Env('DOCKER_CLIENT_KEY_B64'),
-  },
   networkName: process.env.NETWORK_NAME ?? 'pocketagent',
   sessionMemLimit: process.env.SESSION_MEM_LIMIT ?? '2g',
   idleStopSec: Number(process.env.IDLE_STOP_SEC ?? 900),

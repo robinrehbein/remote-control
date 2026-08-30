@@ -16,7 +16,6 @@ import {
   AGENT_MODES,
   DEFAULT_AGENT_MODE,
   EVENT_RING_CAPACITY,
-  LINK_PROTOCOL_VERSION,
   PI_DEFAULT_PROVIDER,
   PI_MODE_SEMANTICS,
   PI_PROVIDERS,
@@ -344,5 +343,4 @@ test('nur unauthorized und replaced beenden die Reconnect-Schleife', () => {
   assert.equal(isTerminalLinkCloseCode(WS_CLOSE_TOO_MANY_CONNECTIONS), false);
   assert.equal(isTerminalLinkCloseCode(1006), false, 'normaler Netzabbruch');
   assert.equal(isTerminalLinkCloseCode(1001), false, 'Server-Neustart');
-  assert.equal(LINK_PROTOCOL_VERSION, 2);
 });

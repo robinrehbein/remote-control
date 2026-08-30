@@ -98,7 +98,7 @@ class TimelineRenderTest {
 
         // Systemzeilen: Turn-Ende mit gekürztem SHA, Notice ohne Phase drin,
         // Start-Fortschritt (Notice mit Phase) draußen.
-        compose.onNodeWithText("Fertig · a1b2c3d").assertExists()
+        compose.onNodeWithText("Fertig · a1b2c3d · Renderer gefixt").assertExists()
         compose.onNodeWithText("Arbeitsverzeichnis vorbereitet").assertExists()
         compose.onAllNodesWithText("Image wird gebaut…").assertCountEquals(0)
 

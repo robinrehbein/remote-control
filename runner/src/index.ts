@@ -2,7 +2,6 @@
 // before any SDK module below can issue a request (see ./proxy).
 import './proxy.js';
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { mkdir, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -45,6 +44,8 @@ export function splitModelRef(
 
 export interface ShimConfig {
   port: number;
+  /** Bind-Adresse; Default '0.0.0.0' (Container). Der Link-Embed setzt '127.0.0.1'. */
+  host: string;
   token: string;
   workDir: string;
   sessionId: string;
@@ -56,7 +57,6 @@ export interface ShimConfig {
   autoPush: boolean;
   agentDir: string;
   sessionDir: string;
-  authJson?: string;
   heartbeatMs: number;
   permissionTimeoutMs: number;
   autoContinue: boolean;
@@ -67,6 +67,18 @@ export interface ShimConfig {
 function intEnv(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/**
+ * Wie intEnv, aber 0 ist ein gültiger Wert: PORT=0 heißt "vom OS einen freien
+ * Port vergeben lassen" (der Link-Embed nutzt das statt eines eigenen
+ * freePort()-Rennens; den tatsächlichen Port liest main() nach dem listen aus
+ * app.server.address()). Nur ein negativer/ungültiger Wert fällt auf fallback.
+ */
+function portEnv(value: string | undefined, fallback: number): number {
+  if (value === undefined) return fallback;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv): ShimConfig {
@@ -80,7 +92,8 @@ export function loadConfig(env: NodeJS.ProcessEnv): ShimConfig {
   }
   const workDir = env.WORK_DIR ?? '/work';
   return {
-    port: intEnv(env.PORT, 8080),
+    port: portEnv(env.PORT, 8080),
+    host: env.HOST ?? '0.0.0.0',
     token,
     workDir,
     sessionId,
@@ -93,20 +106,12 @@ export function loadConfig(env: NodeJS.ProcessEnv): ShimConfig {
     autoPush: env.AUTO_PUSH === '1',
     agentDir: env.PI_AGENT_DIR ?? join(homedir(), '.pi', 'agent'),
     sessionDir: env.PI_SESSION_DIR ?? join(workDir, '.pi-sessions'),
-    authJson: env.PI_AUTH_JSON,
     heartbeatMs: intEnv(env.PI_HEARTBEAT_MS, 15_000),
     permissionTimeoutMs: intEnv(env.PI_PERMISSION_TIMEOUT_MS, 600_000),
     autoContinue: env.PI_AUTO_CONTINUE !== '0',
     provider: env.PI_PROVIDER,
     model: env.PI_MODEL,
   };
-}
-
-/** Orchestrator-injected pi auth.json (credential store), written 0600. */
-async function writeAuthFile(config: ShimConfig): Promise<void> {
-  if (!config.authJson) return;
-  await mkdir(config.agentDir, { recursive: true });
-  await writeFile(join(config.agentDir, 'auth.json'), config.authJson, { mode: 0o600 });
 }
 
 function bearerMatches(header: string | undefined, token: string): boolean {
@@ -222,8 +227,14 @@ export function buildApp(deps: AppDeps): FastifyInstance {
     return { ok: true as const };
   });
 
-  app.post('/abort', async () => {
-    await runner.abort();
+  app.post('/abort', async (_request, reply) => {
+    try {
+      await runner.abort();
+    } catch (error) {
+      // Abbruch ohne initialisierten Runner/aktive Session ist ein Client-Fehler
+      // (nichts zum Abbrechen da), kein Server-Absturz - 400 statt 500.
+      return reply.code(400).send({ ok: false, error: errorMessage(error) });
+    }
     return { ok: true as const };
   });
 
@@ -322,7 +333,10 @@ export function buildApp(deps: AppDeps): FastifyInstance {
     } else {
       bus.publish({
         type: 'turn.completed',
-        summary: outcome.summary,
+        // Bei einem abgebrochenen Turn (Nutzer-/Timeout-Abbruch, stopReason
+        // 'aborted') trägt der Assistent oft keinen Text; dann statt einer leeren
+        // Zusammenfassung ein klares 'abgebrochen', damit die App den Ausgang sieht.
+        summary: outcome.aborted ? (outcome.summary ?? 'abgebrochen') : outcome.summary,
         usage: outcome.usage,
         commitSha,
       });
@@ -339,7 +353,17 @@ export function buildApp(deps: AppDeps): FastifyInstance {
 
 export async function main(env: NodeJS.ProcessEnv = process.env): Promise<FastifyInstance> {
   const config = loadConfig(env);
-  await writeAuthFile(config);
+  // Sicherheit: SHIM_TOKEN ist das API-Token, mit dem der Orchestrator u. a. das
+  // Permission-Gate (/permissions/<id>) authentifiziert. loadConfig hat es bereits
+  // in config.token eingelesen; danach aus der Prozess-Umgebung löschen, damit
+  // Bash-Kinder des Agenten es nicht erben und ihr eigenes Approval-Gate per curl
+  // auf 127.0.0.1:8080 umgehen können. Die Proxy-Vars (HTTP(S)_PROXY) bleiben - sie
+  // tragen ein separates, abgeleitetes Egress-Credential (proxyTokenFor), das dank
+  // Host-Allowlist harmlos ist und sich nicht in das API-Token zurückrechnen lässt.
+  // Wirkt auf process.env (die Kinder erben genau diese): im Container ist env ===
+  // process.env; im Link-Embed erhält main() ein eigenes env-Objekt und process.env
+  // trägt hier gar kein SHIM_TOKEN, das delete ist dort ein No-op.
+  delete process.env.SHIM_TOKEN;
   const gitCtx: GitContext = {
     workDir: config.workDir,
     sessionId: config.sessionId,
@@ -365,9 +389,13 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<Fastif
   });
   await runner.init();
   const app = buildApp({ config, runner, bus, gitCtx, branch });
-  await app.listen({ port: config.port, host: '0.0.0.0' });
+  await app.listen({ port: config.port, host: config.host });
+  // Tatsächlichen Port aus dem Server lesen: bei PORT=0 hat das OS ihn erst hier
+  // vergeben (der Link-Embed liest ihn danach ebenfalls aus app.server.address()).
+  const addr = app.server.address();
+  const boundPort = addr !== null && typeof addr === 'object' ? addr.port : config.port;
   console.log(
-    `pi-runner listening on :${config.port} workDir=${config.workDir} branch=${branch} mode=${config.mode} autoPush=${config.autoPush}`,
+    `pi-runner listening on ${config.host}:${boundPort} workDir=${config.workDir} branch=${branch} mode=${config.mode} autoPush=${config.autoPush}`,
   );
   return app;
 }

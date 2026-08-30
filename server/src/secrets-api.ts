@@ -2,7 +2,9 @@
  * REST counterpart to the WS `secret.set` handler in ws.ts (not modified here).
  *
  * Lets a laptop/CI push a provider secret straight into the vault without a
- * paired device in the loop - e.g. `pocketagent-secret` (see cli/). Reuses
+ * paired device in the loop - e.g. via a small helper like the v1
+ * `pocketagent-secret` CLI (that CLI lives on in tag v0.13.0; this greenfield
+ * tree ships only the REST/WS endpoint, not the client). Reuses
  * the exact same underlying primitives the WS handler uses (vault.encrypt +
  * store.saveSecret/getSecret) *and* the same AAD binding (`secret:<tenant>:
  * <kind>`, ws.ts:518), so both paths produce byte-for-byte the same shape of

@@ -19,6 +19,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -97,6 +98,14 @@ private sealed interface Block {
     data class Code(val language: String?, val content: String) : Block
 }
 
+// Top-Level statt in der Zeilenschleife: die vier Block-Regex wurden vorher
+// PRO ZEILE jeder Antwort neu kompiliert (Fund). Einmal kompiliert, überall
+// wiederverwendet.
+private val HeadingRe = Regex("^(#{1,4})\\s+(.*)")
+private val BulletRe = Regex("^\\s*[-*•]\\s+(.*)")
+private val NumberedRe = Regex("^\\s*(\\d+)[.)]\\s+(.*)")
+private val QuoteRe = Regex("^\\s*>\\s?(.*)")
+
 private fun splitBlocks(text: String): List<Block> {
     val blocks = mutableListOf<Block>()
     val lines = text.lines()
@@ -125,22 +134,22 @@ private fun splitBlocks(text: String): List<Block> {
                 blocks += Block.Code(lang, code.toString().trimEnd())
             }
 
-            Regex("^(#{1,4})\\s+(.*)").find(line)?.let { m ->
+            HeadingRe.find(line)?.let { m ->
                 flushParagraph()
                 blocks += Block.Heading(m.groupValues[1].length, m.groupValues[2])
             } != null -> Unit
 
-            Regex("^\\s*[-*•]\\s+(.*)").find(line)?.let { m ->
+            BulletRe.find(line)?.let { m ->
                 flushParagraph()
                 blocks += Block.ListItem("•", m.groupValues[1])
             } != null -> Unit
 
-            Regex("^\\s*(\\d+)[.)]\\s+(.*)").find(line)?.let { m ->
+            NumberedRe.find(line)?.let { m ->
                 flushParagraph()
                 blocks += Block.ListItem("${m.groupValues[1]}.", m.groupValues[2])
             } != null -> Unit
 
-            Regex("^\\s*>\\s?(.*)").find(line)?.let { m ->
+            QuoteRe.find(line)?.let { m ->
                 flushParagraph()
                 blocks += Block.Quote(m.groupValues[1])
             } != null -> Unit
@@ -164,22 +173,31 @@ private val Italic = Regex("""(?<!\*)(\*|_)([^*\n]+?)\1(?!\*)""")
 private val InlineCode = Regex("""`([^`\n]+)`""")
 
 @Composable
-private fun inlineStyled(raw: String): AnnotatedString = buildAnnotatedString {
-    var cursor = 0
-    InlineCode.findAll(raw).forEach { m ->
-        if (m.range.first > cursor) appendMarkup(raw.substring(cursor, m.range.first))
-        pushStyle(
-            SpanStyle(
-                fontFamily = FontFamily.Monospace,
-                fontSize = MaterialTheme.typography.bodyMedium.fontSize * 0.92f,
-                background = MaterialTheme.colorScheme.surfaceVariant,
-            )
-        )
-        append(m.groupValues[1])
-        pop()
-        cursor = m.range.last + 1
+private fun inlineStyled(raw: String): AnnotatedString {
+    // Farbe/Größe aus dem Theme vor dem remember lesen, damit ein Themenwechsel
+    // (Hell/Dunkel) den Cache verwirft — aber dieselbe Zeile bei bloßer
+    // Recomposition nicht jedes Mal neu geparst und aufgebaut wird (Fund).
+    val codeBackground = MaterialTheme.colorScheme.surfaceVariant
+    val codeFontSize = MaterialTheme.typography.bodyMedium.fontSize * 0.92f
+    return remember(raw, codeBackground, codeFontSize) {
+        buildAnnotatedString {
+            var cursor = 0
+            InlineCode.findAll(raw).forEach { m ->
+                if (m.range.first > cursor) appendMarkup(raw.substring(cursor, m.range.first))
+                pushStyle(
+                    SpanStyle(
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = codeFontSize,
+                        background = codeBackground,
+                    )
+                )
+                append(m.groupValues[1])
+                pop()
+                cursor = m.range.last + 1
+            }
+            if (cursor < raw.length) appendMarkup(raw.substring(cursor))
+        }
     }
-    if (cursor < raw.length) appendMarkup(raw.substring(cursor))
 }
 
 /**

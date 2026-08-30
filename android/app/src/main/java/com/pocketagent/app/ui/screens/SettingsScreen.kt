@@ -618,13 +618,13 @@ fun SettingsScreen(onBack: () -> Unit) {
                         SettingsTile(
                             icon = Icons.Outlined.Smartphone,
                             title = if (self) "${device.name} (dieses Gerät)" else device.name,
-                            // DeviceInfo trägt keine eigene „letzte Aktivität" —
-                            // online-Status plus Kopplungszeitpunkt sind, was der
-                            // Vertrag hergibt.
+                            // online = lebender Socket; sonst „zuletzt aktiv" aus
+                            // dem lastSeenAt-Stempel (Fallback: Kopplungszeitpunkt
+                            // für einen älteren Server ohne das Feld).
                             subtitle = if (device.online) {
                                 "online"
                             } else {
-                                "gekoppelt ${relativeTime(device.enrolledAt)}"
+                                "zuletzt aktiv ${relativeTime(device.lastSeenAt ?: device.enrolledAt)}"
                             },
                             // Das eigene Gerät entkoppelt man über „Abmelden" —
                             // nicht über diese Liste (kein Selbst-Rauswurf).

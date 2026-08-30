@@ -501,6 +501,14 @@ export type AgentEventBody =
   | { type: 'permission.resolved'; permissionId: string; decision: PermissionDecision }
   | { type: 'turn.completed'; summary?: string; usage?: TokenUsage; commitSha?: string }
   | { type: 'turn.failed'; error: string }
+  /**
+   * Der Turn wurde von außen abgeschnitten, nicht regulär beendet: ein Abbruch
+   * durch den Nutzer (Stop) oder ein Server-Neustart, der den laufenden Turn
+   * verloren hat. Eigene Zeile, damit die Timeline „unterbrochen" von „fertig"
+   * unterscheidet, statt einen abgebrochenen Turn als `turn.completed` zu zeigen.
+   * `reason` ist ein optionaler Klartext (nie sicherheitsrelevant).
+   */
+  | { type: 'turn.interrupted'; reason?: string }
   | { type: 'pushed'; branch: string; prUrl?: string; auto: boolean }
   | { type: 'error'; message: string; fatal?: boolean }
   /**
@@ -564,6 +572,13 @@ export interface DeviceInfo {
   enrolledAt: string;
   /** True, solange das Gerät eine authentifizierte WS-Verbindung hält. */
   online: boolean;
+  /**
+   * Zeitpunkt der letzten authentifizierten Verbindung (ISO-8601). Der Server
+   * stempelt ihn bei jedem erfolgreichen `hello`. Für ein frisch gekoppeltes,
+   * nie wieder verbundenes Gerät gleich `enrolledAt`. Erlaubt der App „zuletzt
+   * aktiv vor …" statt nur „online / gekoppelt".
+   */
+  lastSeenAt: string;
 }
 
 export interface LinkInfo {

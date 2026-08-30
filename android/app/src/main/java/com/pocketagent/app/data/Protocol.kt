@@ -278,6 +278,12 @@ data class DeviceInfo(
     val enrolledAt: String,
     /** True, solange das Gerät eine authentifizierte WS-Verbindung hält. */
     val online: Boolean = false,
+    /**
+     * Letzte authentifizierte Verbindung (ISO-8601). Fällt für einen älteren
+     * Server ohne das Feld auf `enrolledAt` zurück, damit „zuletzt aktiv"
+     * immer einen Wert hat.
+     */
+    val lastSeenAt: String? = null,
 )
 
 /** Ein verbundener Link-Agent (Vertrag: `LinkInfo`). */
@@ -356,6 +362,13 @@ sealed interface AgentEvent {
     ) : AgentEvent
 
     data class TurnFailed(val error: String, override val seq: Long? = null) : AgentEvent
+
+    /**
+     * Der Turn wurde von außen abgeschnitten (Nutzer-Stop oder ein
+     * Server-Neustart), nicht regulär beendet. Eigene Zeile, damit die Timeline
+     * „unterbrochen" von „fertig" trennt (Vertrag: `turn.interrupted`).
+     */
+    data class TurnInterrupted(val reason: String? = null, override val seq: Long? = null) : AgentEvent
     data class Pushed(
         val branch: String,
         val prUrl: String? = null,
@@ -616,6 +629,8 @@ fun parseAgentEvent(obj: JsonObject): AgentEvent? {
             )
 
             "turn.failed" -> AgentEvent.TurnFailed(error = obj.optString("error") ?: "unknown error", seq = seq)
+
+            "turn.interrupted" -> AgentEvent.TurnInterrupted(reason = obj.optString("reason"), seq = seq)
 
             "pushed" -> AgentEvent.Pushed(
                 branch = obj.optString("branch") ?: "",

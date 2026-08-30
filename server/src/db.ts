@@ -12,7 +12,7 @@ export function sha256(s: string): string {
 
 export interface DeviceRow {
   id: string; tenant_id: string; name: string; token_hash: string;
-  fcm_token: string | null; enrolled_at: string;
+  fcm_token: string | null; enrolled_at: string; last_seen_at: string | null;
 }
 export interface SecretRow {
   id: string; tenant_id: string; kind: string; ciphertext: string; nonce: string; created_at: string;
@@ -56,7 +56,8 @@ export interface TurnRow {
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS devices (
   id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, name TEXT NOT NULL,
-  token_hash TEXT NOT NULL UNIQUE, fcm_token TEXT, enrolled_at TEXT NOT NULL
+  token_hash TEXT NOT NULL UNIQUE, fcm_token TEXT, enrolled_at TEXT NOT NULL,
+  last_seen_at TEXT
 );
 CREATE TABLE IF NOT EXISTS pairing_codes (
   code TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, expires_at TEXT NOT NULL,
@@ -123,12 +124,20 @@ export class Store {
     this.db.exec(
       'CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_message ON turns(session_id, message_id) WHERE message_id IS NOT NULL',
     );
-    // v2 startet auf einer frischen Datei (siehe GREENFIELD-PI.md „Risiken"):
-    // sämtliche Spalten und die UNIQUE-Constraints (secrets(tenant_id,kind),
-    // pairing_codes.attempts) stehen vollständig in SCHEMA, deshalb sind hier
-    // keine ALTER-/Dedupe-Migrationen aus v1 mehr nötig - nur die Indizes oben,
-    // die reine Performance sind und auf einer frischen wie einer bestehenden
-    // Datei idempotent laufen.
+    // v2 startet grundsätzlich auf einer frischen Datei (siehe GREENFIELD-PI.md
+    // „Risiken"): sämtliche Spalten und die UNIQUE-Constraints (secrets(tenant_id,
+    // kind), pairing_codes.attempts) stehen vollständig in SCHEMA. Die einzige
+    // additive Ausnahme ist devices.last_seen_at: sie kam nach dem ersten v2-
+    // Release dazu, deshalb bekommt eine bereits laufende Instanz die Spalte hier
+    // per idempotentem ADD COLUMN, ohne dass gekoppelte Geräte verloren gehen.
+    this.addColumnIfMissing('devices', 'last_seen_at', 'TEXT');
+  }
+
+  /** Fügt eine Spalte hinzu, falls sie noch fehlt (idempotent, ohne v1-Ballast). */
+  private addColumnIfMissing(table: string, column: string, type: string): void {
+    const cols = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    if (cols.some((c) => c.name === column)) return;
+    this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
   }
 
   close(): void {
@@ -136,13 +145,21 @@ export class Store {
   }
 
   createDevice(id: string, tenant: string, name: string, tokenHash: string): void {
+    const now = new Date().toISOString();
     this.db
-      .prepare('INSERT INTO devices (id, tenant_id, name, token_hash, enrolled_at) VALUES (?, ?, ?, ?, ?)')
-      .run(id, tenant, name, tokenHash, new Date().toISOString());
+      .prepare(
+        'INSERT INTO devices (id, tenant_id, name, token_hash, enrolled_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?)',
+      )
+      .run(id, tenant, name, tokenHash, now, now);
   }
 
   getDevice(id: string): DeviceRow | undefined {
     return this.db.prepare('SELECT * FROM devices WHERE id = ?').get(id) as DeviceRow | undefined;
+  }
+
+  /** Stempelt die letzte authentifizierte Verbindung eines Geräts (bei jedem `hello`). */
+  touchDevice(id: string): void {
+    this.db.prepare('UPDATE devices SET last_seen_at = ? WHERE id = ?').run(new Date().toISOString(), id);
   }
 
   setFcmToken(id: string, token: string): void {

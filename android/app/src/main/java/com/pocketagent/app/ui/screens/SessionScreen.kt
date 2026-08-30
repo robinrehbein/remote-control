@@ -201,29 +201,104 @@ class SessionViewModel : ViewModel() {
     private val _models = MutableStateFlow<ModelsState>(ModelsState.Idle)
     val models: StateFlow<ModelsState> = _models
 
+    /** Der laufende, live wachsende Assistententext (message.delta), noch nicht bestätigt. */
+    data class StreamingMessage(val role: String, val text: String)
+
+    private val _streaming = MutableStateFlow<StreamingMessage?>(null)
+    val streaming: StateFlow<StreamingMessage?> = _streaming
+
+    /**
+     * Über den Turn stabile Nachrichten-Id des zuletzt gesendeten Prompts plus
+     * der Text, zu dem sie gehört. Ein erneutes Senden desselben Textes benutzt
+     * dieselbe Id (Idempotenz — kein zweiter Agent-Turn). Erst die Bestätigung
+     * (request.ok) oder ein bestätigender turn.status verwirft sie.
+     */
+    private var pendingMessageId: String? = null
+    private var pendingText: String? = null
+
+    /**
+     * Kollektoren dieser Bindung. Ein einziges SessionViewModel wird über den
+     * Auswahlwechsel im Zwei-Spalten-Layout hinweg wiederverwendet (Fund:
+     * ViewModel-Leak — pro je geöffneter Session ein VM samt Kollektoren am nie
+     * gepoppten MAIN-Entry). Beim Rebind werden sie abgebrochen und neu gestartet.
+     */
+    private val bindJobs = mutableListOf<kotlinx.coroutines.Job>()
+    private var bound = false
+
     fun bind(id: String, repo: AppRepository) {
-        if (sessionId == id) return
+        if (bound && sessionId == id) return
+        // Alte Bindung sauber lösen, bevor die neue startet — sonst sammeln
+        // sich Kollektoren an.
+        bindJobs.forEach { it.cancel() }
+        bindJobs.clear()
+        historyJob?.cancel()
+        liveWhileLoading.clear()
+        // Zustand der vorigen Session zurücksetzen, damit ihr Verlauf/Busy nicht
+        // in die neue durchschlägt.
+        _items.value = emptyList()
+        _streaming.value = null
+        _busy.value = false
+        _progress.value = null
+        _session.value = null
+        _sendFailed.value = false
+        _sending.value = false
+        _historyLoading.value = false
+        _input.value = ""
+        _deleted.value = false
+        _models.value = ModelsState.Idle
+        pendingMessageId = null
+        pendingText = null
+
         sessionId = id
         repository = repo
-        viewModelScope.launch {
+        bound = true
+        bindJobs += viewModelScope.launch {
             repository.sessions.collect { list ->
                 val current = list.firstOrNull { it.id == id }
                 _session.value = current
-                // Sobald die Session nicht mehr startet, ist der Fortschritt
-                // erledigt — ein späterer Start beginnt wieder bei null.
-                if (current != null && current.status != SessionStatus.CREATING) _progress.value = null
+                if (current != null) {
+                    // Sobald die Session nicht mehr startet, ist der Fortschritt
+                    // erledigt — ein späterer Start beginnt wieder bei null.
+                    if (current.status != SessionStatus.CREATING) _progress.value = null
+                    // Busy aus dem (auch persistierten) Status ableiten (DoD 5):
+                    // nach einem Prozess-Tod/Reconnect mitten im Turn hat diese
+                    // App-Instanz das auslösende Live-`status`-Event nie gesehen —
+                    // RUNNING heißt aber, ein Turn läuft, also Stop-Knopf +
+                    // „Agent arbeitet …" zeigen. Bewusst nur EINSCHALTEN: das
+                    // Ausschalten überlassen wir den maßgeblichen Live-Signalen
+                    // (Status busy=false, turn.status terminal), sonst würde eine
+                    // noch-IDLE-Statusmeldung kurz nach dem optimistischen Senden
+                    // den „arbeitet"-Zustand fälschlich sofort wieder löschen.
+                    if (current.status == SessionStatus.RUNNING) _busy.value = true
+                }
             }
         }
-        viewModelScope.launch {
+        bindJobs += viewModelScope.launch {
             repository.sessionEvents.collect { envelope ->
                 if (envelope.sessionId == id) applyEvent(envelope.event)
+            }
+        }
+        // turn.status konsumieren: den Busy-Zustand tragen und den optimistisch
+        // gesendeten Prompt mit dem bestätigten Turn abgleichen (messageId-Echo).
+        bindJobs += viewModelScope.launch {
+            repository.turnStatus.collect { envelope ->
+                if (envelope.sessionId != id) return@collect
+                val turn = envelope.turn
+                _busy.value = turn.state.active
+                if (turn.messageId != null && turn.messageId == pendingMessageId) {
+                    // Der Server hat den Prompt als Turn angenommen — der
+                    // Idempotenz-Zustand ist damit erledigt.
+                    pendingMessageId = null
+                    pendingText = null
+                    _sendFailed.value = false
+                }
             }
         }
         // Beim Öffnen und nach jedem erfolgreichen (Wieder-)Verbinden den
         // gespeicherten Verlauf holen. connState ist ein StateFlow, der
         // aktuelle Wert kommt also sofort — steht die Verbindung schon,
         // lädt das hier direkt; sonst, sobald sie steht.
-        viewModelScope.launch {
+        bindJobs += viewModelScope.launch {
             repository.connState.collect { state ->
                 if (state is WsClient.ConnState.Connected) {
                     _sendFailed.value = false
@@ -231,7 +306,7 @@ class SessionViewModel : ViewModel() {
                 }
             }
         }
-        viewModelScope.launch { repository.refreshSessions() }
+        bindJobs += viewModelScope.launch { repository.refreshSessions() }
     }
 
     /* ---------------- Verlauf ---------------- */
@@ -255,6 +330,11 @@ class SessionViewModel : ViewModel() {
         historyJob = viewModelScope.launch {
             _historyLoading.value = true
             liveWhileLoading.clear()
+            // Beim Neuaufbau aus dem Verlauf einen ggf. stehengebliebenen
+            // Streaming-Puffer verwerfen — der fertige Text steckt bereits als
+            // message.completed im geladenen Verlauf. So entsteht nach einem
+            // Reconnect kein Doppeltext (halber Live-Text + vollständige Historie).
+            _streaming.value = null
             val result = repository.loadEvents(sessionId)
             val history = result.getOrNull()
             if (history != null) {
@@ -271,6 +351,27 @@ class SessionViewModel : ViewModel() {
 
     private fun applyEvent(event: AgentEvent) {
         applySideEffects(event)
+        // Live-Streaming: Deltas des laufenden Turns akkumulieren und als ein
+        // wachsendes Chat-Item unter der Timeline zeigen. Sie landen NIE in der
+        // Timeline-Liste selbst (reduceTimeline lässt sie fallen) — der fertige
+        // Text kommt gleich als message.completed und wird dort zur Chat-Karte,
+        // während der Streaming-Puffer geleert wird.
+        when (event) {
+            is AgentEvent.MessageDelta -> {
+                // Während der Verlauf lädt, keinen Live-Teiltext zeigen: der
+                // Merge baut die Timeline gleich sauber neu auf.
+                if (!_historyLoading.value) {
+                    val current = _streaming.value
+                    val base = if (current?.role == event.role) current.text else ""
+                    _streaming.value = StreamingMessage(event.role, base + event.delta)
+                }
+                return
+            }
+
+            is AgentEvent.MessageCompleted -> _streaming.value = null
+
+            else -> Unit
+        }
         if (_historyLoading.value) {
             liveWhileLoading += event
             return
@@ -336,15 +437,30 @@ class SessionViewModel : ViewModel() {
         val text = _input.value.trim()
         if (text.isEmpty() || _sending.value) return
         _sending.value = true
+        // Über den Turn stabile Id (Idempotenz, Tier 1): ein Retry DESSELBEN
+        // Textes benutzt dieselbe [messageId] — der Server nimmt sie genau
+        // einmal an und startet keinen zweiten Agent-Turn (kein doppeltes
+        // Committen/Pushen). Ein geänderter Text ist ein neuer Turn mit neuer Id.
+        val messageId = pendingMessageId?.takeIf { pendingText == text }
+            ?: com.pocketagent.app.data.newMessageId().also {
+                pendingMessageId = it
+                pendingText = text
+            }
         viewModelScope.launch {
-            repository.sendPrompt(sessionId, text, null)
+            repository.sendPrompt(sessionId, text, null, messageId)
                 .onSuccess {
+                    // Bestätigt: Idempotenz-Zustand verwerfen.
+                    pendingMessageId = null
+                    pendingText = null
                     _sendFailed.value = false
                     _input.value = ""
                     _busy.value = true
                     append(TimelineItem.Chat("user", text))
                 }
                 .onFailure {
+                    // Id + Text bleiben stehen (unklare Annahme): der nächste
+                    // Tap wiederholt denselben Turn idempotent, statt einen
+                    // zweiten anzustoßen.
                     _sendFailed.value = true
                 }
             _sending.value = false
@@ -423,10 +539,18 @@ fun SessionScreen(
 ) {
     val app = LocalContext.current.applicationContext as PocketAgentApp
     val repository = app.container.repository
-    val vm: SessionViewModel = viewModel(key = "session-$sessionId") {
-        SessionViewModel().also { it.bind(sessionId, repository) }
-    }
+    // KEIN key mehr: ein einziges Session-VM je NavBackStackEntry. Im
+    // Zwei-Spalten-Layout (SessionScreen liegt im nie gepoppten MAIN-Entry)
+    // hielt der frühere key="session-$id" pro je geöffneter Session ein eigenes
+    // VM samt drei Kollektoren + Timeline am Leben — jeder Reconnect feuerte
+    // N× session.events.get (Fund: ViewModel-Leak). Jetzt bindet dasselbe VM
+    // beim Auswahlwechsel um (bind bricht die alten Kollektoren ab). Im
+    // Compact-Fall bekommt jede SESSION-Route ohnehin ihren eigenen
+    // ViewModelStore, das VM stirbt also weiter mit ihrem Entry.
+    val vm: SessionViewModel = viewModel { SessionViewModel().also { it.bind(sessionId, repository) } }
+    LaunchedEffect(sessionId) { vm.bind(sessionId, repository) }
     val items by vm.items.collectAsState()
+    val streaming by vm.streaming.collectAsState()
     val historyLoading by vm.historyLoading.collectAsState()
     val sendFailed by vm.sendFailed.collectAsState()
     val sending by vm.sending.collectAsState()
@@ -451,13 +575,20 @@ fun SessionScreen(
     val listState = androidx.compose.foundation.lazy.rememberLazyListState()
     var settled by remember { mutableStateOf(false) }
     LaunchedEffect(historyLoading) { if (historyLoading) settled = false }
-    LaunchedEffect(items.size, historyLoading) {
-        if (items.isEmpty() || historyLoading) return@LaunchedEffect
-        if (settled) {
-            listState.animateScrollToItem(items.size - 1)
-        } else {
-            listState.scrollToItem(items.size - 1)
+    // Der live wachsende Streaming-Text zählt als zusätzliches letztes Item.
+    val totalCount = items.size + if (streaming != null) 1 else 0
+    LaunchedEffect(totalCount, streaming?.text, historyLoading) {
+        if (totalCount == 0 || historyLoading) return@LaunchedEffect
+        val target = totalCount - 1
+        if (!settled) {
+            // Erstes Ansteuern ohne Animation: der Verlauf steht fertig unten.
+            listState.scrollToItem(target)
             settled = true
+        } else if (isNearListBottom(listState)) {
+            // Nur nachziehen, wenn der Leser ohnehin (fast) am Ende steht —
+            // sonst reißt jeder neue Delta/Event ihn aus dem Hochgescrollten
+            // (Fund: Auto-Scroll reißt den Leser ans Ende).
+            listState.animateScrollToItem(target)
         }
     }
 
@@ -587,7 +718,10 @@ fun SessionScreen(
                         // Composer statt in der Timeline, wo er wegscrollen würde.
                         startProgressOf(session?.status, progress)?.let { StartProgressCard(it) }
                         AnimatedVisibility(
-                            visible = busy,
+                            // Der Pulsier-Punkt zeigt nur „arbeitet, noch kein
+                            // Text". Sobald Deltas fließen, trägt der live
+                            // wachsende Text selbst die Aussage und der Punkt weicht.
+                            visible = busy && streaming == null,
                             enter = fadeIn(tween(MotionShort, easing = LinearEasing)),
                             exit = fadeOut(tween(MotionShort, easing = LinearEasing)),
                         ) {
@@ -723,7 +857,7 @@ fun SessionScreen(
             }
         },
     ) { padding ->
-        if (items.isEmpty()) {
+        if (items.isEmpty() && streaming == null) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -778,6 +912,13 @@ fun SessionScreen(
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 items(items) { item -> TimelineItemView(item, vm) }
+                // Der laufende, live wachsende Assistententext. Er ersetzt den
+                // Pulsier-Punkt, sobald wirklich Text fließt; beim finalen
+                // message.completed wird er geleert und derselbe Text erscheint
+                // als reguläre Chat-Karte oben.
+                streaming?.let { s ->
+                    item(key = "streaming") { StreamingBubble(s) }
+                }
             }
         }
     }
@@ -1039,43 +1180,6 @@ fun SettingChip(
                 contentDescription = null,
                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.size(16.dp),
-            )
-        }
-    }
-}
-
-/**
- * Chip ohne Wort: ein Symbol, das ein Sheet öffnet. Für Einstellungen, die
- * selten angefasst werden und deren Name mehr Platz kostet als er einbringt.
- */
-@Composable
-fun SettingIconChip(
-    icon: ImageVector,
-    contentDescription: String,
-    onClick: () -> Unit,
-    enabled: Boolean = true,
-) {
-    Surface(
-        shape = PillShape,
-        color = MaterialTheme.colorScheme.surfaceContainerHighest,
-        onClick = onClick,
-        enabled = enabled,
-        // minimumInteractiveComponentSize() deckt hier auch die Breite ab —
-        // ein reiner Icon-Chip ist von Natur aus schmaler als 48 dp.
-        modifier = Modifier
-            .minimumInteractiveComponentSize()
-            .heightIn(min = ChipHeight)
-            .alpha(if (enabled) 1f else 0.4f),
-    ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
-        ) {
-            Icon(
-                icon,
-                contentDescription = contentDescription,
-                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.size(18.dp),
             )
         }
     }
@@ -1395,7 +1499,13 @@ internal fun TimelineItemView(item: TimelineItem, vm: SessionViewModel) {
         is TimelineItem.Tool -> ToolCard(item)
         is TimelineItem.Approval -> ApprovalCard(item, vm)
         is TimelineItem.TurnEnd -> SystemLine(
-            text = listOfNotNull("Fertig", item.commitSha?.take(7)).joinToString(" · "),
+            // summary wird jetzt mit angezeigt statt still verworfen (Tier 6):
+            // „Fertig · <sha> · <summary>".
+            text = listOfNotNull(
+                "Fertig",
+                item.commitSha?.take(7),
+                item.summary?.takeIf { it.isNotBlank() },
+            ).joinToString(" · "),
             icon = Icons.Outlined.Check,
         )
 
@@ -1442,6 +1552,49 @@ private fun ChatBubble(item: TimelineItem.Chat) {
         }
         if (!isUser) Spacer(modifier = Modifier.width(40.dp))
     }
+}
+
+/**
+ * Die live wachsende Assistenten-Blase (message.delta). Dieselbe Gestalt wie
+ * eine fertige Assistenten-Chat-Karte, nur mit einem kleinen Pulsier-Punkt als
+ * Zeichen, dass der Text noch fließt. Sie verschwindet beim finalen
+ * message.completed und weicht der regulären Chat-Karte.
+ */
+@Composable
+private fun StreamingBubble(message: SessionViewModel.StreamingMessage) {
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Surface(
+            shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp, bottomStart = 6.dp, bottomEnd = 20.dp),
+            color = MaterialTheme.colorScheme.surfaceContainer,
+            modifier = Modifier.weight(1f),
+        ) {
+            Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+                MarkdownText(text = message.text)
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.padding(top = 4.dp),
+                ) {
+                    PulsingDot(color = MaterialTheme.colorScheme.primary, pulse = true, size = 6.dp)
+                }
+            }
+        }
+        Spacer(modifier = Modifier.width(40.dp))
+    }
+}
+
+/**
+ * Steht der Leser (fast) am Ende der Liste? Nur dann darf ein neues Ereignis
+ * automatisch nachziehen. „Fast" heißt: das letzte oder vorletzte Item ist
+ * sichtbar — so folgt der Verlauf beim Mitlesen, reißt aber niemanden aus einer
+ * hochgescrollten Stelle.
+ */
+private fun isNearListBottom(state: androidx.compose.foundation.lazy.LazyListState): Boolean {
+    val layout = state.layoutInfo
+    val last = layout.visibleItemsInfo.lastOrNull() ?: return true
+    return last.index >= layout.totalItemsCount - 2
 }
 
 @Composable

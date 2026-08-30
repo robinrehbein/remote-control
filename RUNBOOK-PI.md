@@ -186,6 +186,9 @@ Android-App  ──wss──►  Orchestrator (Coolify)  ◄──outbound WS─
 ```bash
 # 1. auf dem SERVER: Token erzeugen
 npm run link:token -w server -- --name=heim-pc
+# In PROD läuft der Server im gebauten Image (kein tsx zur Hand); dort stattdessen
+# im laufenden Container ausführen:
+#   docker exec <orchestrator-container> node dist/link-token.js --name=heim-pc
 
 # 2. auf dem PC / im Devcontainer
 git clone https://github.com/robinrehbein/remote-control && cd remote-control

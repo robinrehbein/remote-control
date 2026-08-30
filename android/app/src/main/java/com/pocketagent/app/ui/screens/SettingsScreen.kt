@@ -46,6 +46,8 @@ import androidx.compose.material.icons.outlined.Fingerprint
 import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Key
+import androidx.compose.material.icons.outlined.Link
+import androidx.compose.material.icons.outlined.Smartphone
 import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material.icons.outlined.Visibility
 import androidx.compose.material.icons.outlined.VisibilityOff
@@ -97,6 +99,8 @@ import com.pocketagent.app.PocketAgentApp
 import com.pocketagent.app.connection.ConnectionService
 import com.pocketagent.app.data.AppRepository
 import com.pocketagent.app.data.CrashLog
+import com.pocketagent.app.data.DeviceInfo
+import com.pocketagent.app.data.LinkInfo
 import com.pocketagent.app.data.PI_DEFAULT_PROVIDER
 import com.pocketagent.app.data.PI_PROVIDERS
 import com.pocketagent.app.data.PairingApi
@@ -139,12 +143,45 @@ class SettingsViewModel : ViewModel() {
     private val _error = MutableStateFlow<String?>(null)
     val error: StateFlow<String?> = _error
 
+    private val _devices = MutableStateFlow<List<DeviceInfo>>(emptyList())
+    val devices: StateFlow<List<DeviceInfo>> = _devices
+
+    private val _links = MutableStateFlow<List<LinkInfo>>(emptyList())
+    val links: StateFlow<List<LinkInfo>> = _links
+
     fun refresh() {
         viewModelScope.launch {
             repository.refreshStats()
             repository.loadSecrets()
             repository.refreshSessions()
             repository.refreshRepos()
+        }
+        loadDevices()
+    }
+
+    /** Gekoppelte Geräte und verbundene Link-Agenten holen. */
+    fun loadDevices() {
+        viewModelScope.launch {
+            repository.loadDevices().onSuccess { _devices.value = it }
+            repository.loadLinks().onSuccess { _links.value = it }
+        }
+    }
+
+    fun revokeDevice(id: String) {
+        viewModelScope.launch {
+            repository.revokeDevice(id).fold(
+                onSuccess = { _error.value = null; loadDevices() },
+                onFailure = { _error.value = userMessage("Gerät konnte nicht entkoppelt werden.", it) },
+            )
+        }
+    }
+
+    fun revokeLink(id: String) {
+        viewModelScope.launch {
+            repository.revokeLink(id).fold(
+                onSuccess = { _error.value = null; loadDevices() },
+                onFailure = { _error.value = userMessage("Link-Agent konnte nicht getrennt werden.", it) },
+            )
         }
     }
 
@@ -287,6 +324,14 @@ fun SettingsScreen(onBack: () -> Unit) {
     val connState by repository.connState.collectAsState()
     val error by vm.error.collectAsState()
     val connected = connState is WsClient.ConnState.Connected
+    val devices by vm.devices.collectAsState()
+    val links by vm.links.collectAsState()
+    // Eigene Geräte-Id, um das aktuelle Gerät zu markieren und sein Entkoppeln
+    // dem „Abmelden“-Weg zu überlassen (kein Selbst-Rauswurf über diese Liste).
+    val setup by repository.tokenStore.setup.collectAsState(initial = null)
+    val currentDeviceId = setup?.deviceId
+    var confirmRevokeDevice by remember { mutableStateOf<DeviceInfo?>(null) }
+    var confirmRevokeLink by remember { mutableStateOf<LinkInfo?>(null) }
 
     val existingKinds = secrets.map { it.kind }.toSet()
     val recommended = recommendedKinds(existingKinds)
@@ -560,6 +605,57 @@ fun SettingsScreen(onBack: () -> Unit) {
             /* ---------- App-Update ---------- */
             AppUpdateSection()
 
+            /* ---------- Gekoppelte Geräte ---------- */
+            SectionHeader("Gekoppelte Geräte")
+            GroupCard {
+                Column(Modifier.padding(vertical = 4.dp)) {
+                    if (devices.isEmpty() && links.isEmpty()) {
+                        EmptyRow("Keine weiteren Geräte oder Link-Agenten verbunden")
+                    }
+                    devices.forEachIndexed { index, device ->
+                        if (index > 0) ListDivider()
+                        val self = device.id == currentDeviceId
+                        SettingsTile(
+                            icon = Icons.Outlined.Smartphone,
+                            title = if (self) "${device.name} (dieses Gerät)" else device.name,
+                            // DeviceInfo trägt keine eigene „letzte Aktivität" —
+                            // online-Status plus Kopplungszeitpunkt sind, was der
+                            // Vertrag hergibt.
+                            subtitle = if (device.online) {
+                                "online"
+                            } else {
+                                "gekoppelt ${relativeTime(device.enrolledAt)}"
+                            },
+                            // Das eigene Gerät entkoppelt man über „Abmelden" —
+                            // nicht über diese Liste (kein Selbst-Rauswurf).
+                            trailing = if (self) {
+                                null
+                            } else {
+                                {
+                                    TextButton(onClick = { confirmRevokeDevice = device }) {
+                                        Text("Entkoppeln", color = MaterialTheme.colorScheme.error)
+                                    }
+                                }
+                            },
+                        )
+                    }
+                    links.forEachIndexed { index, link ->
+                        if (index > 0 || devices.isNotEmpty()) ListDivider()
+                        SettingsTile(
+                            icon = Icons.Outlined.Link,
+                            title = link.name,
+                            subtitle = "Link-Agent · verbunden ${relativeTime(link.createdAt)}",
+                            trailing = {
+                                TextButton(onClick = { confirmRevokeLink = link }) {
+                                    Text("Trennen", color = MaterialTheme.colorScheme.error)
+                                }
+                            },
+                        )
+                    }
+                }
+            }
+            SectionNote("Entzogene Geräte müssen neu gekoppelt werden. Das eigene Gerät meldest du unten ab.")
+
             /* ---------- Gerät ---------- */
             SectionHeader("Gerät")
             GroupCard {
@@ -646,6 +742,38 @@ fun SettingsScreen(onBack: () -> Unit) {
         AddRepoDialog(
             onDismiss = { showAddRepo = false },
             onSave = { fullName, branch -> vm.addRepo(fullName, branch) { showAddRepo = false } },
+        )
+    }
+    confirmRevokeDevice?.let { device ->
+        OneUiDialog(
+            onDismissRequest = { confirmRevokeDevice = null },
+            title = "„${device.name}“ entkoppeln?",
+            text = { Text("Das Gerät verliert seinen Zugang und muss neu gekoppelt werden.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    vm.revokeDevice(device.id)
+                    confirmRevokeDevice = null
+                }) { Text("Entkoppeln", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmRevokeDevice = null }) { Text("Abbrechen") }
+            },
+        )
+    }
+    confirmRevokeLink?.let { link ->
+        OneUiDialog(
+            onDismissRequest = { confirmRevokeLink = null },
+            title = "„${link.name}“ trennen?",
+            text = { Text("Der Link-Agent wird getrennt. Auf ihm laufende Sessions gelten danach als offline.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    vm.revokeLink(link.id)
+                    confirmRevokeLink = null
+                }) { Text("Trennen", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmRevokeLink = null }) { Text("Abbrechen") }
+            },
         )
     }
     if (confirmLogout) {
@@ -1089,9 +1217,14 @@ private fun SecretDialog(
     onValidate: (kind: String, value: String, onResult: (Result<SecretValidation>) -> Unit) -> Unit,
 ) {
     var selectedKind by remember(initialKind) { mutableStateOf(initialKind) }
-    // Ein halb eingetippter Zugang muss einen Faltvorgang überleben.
+    // Ein halb eingetippter Zugang (nur die ART, kein Geheimnis) darf einen
+    // Faltvorgang überleben.
     var customKind by rememberSaveable { mutableStateOf("") }
-    var value by rememberSaveable { mutableStateOf("") }
+    // remember, NICHT rememberSaveable: der getippte Klartext-Key darf nicht ins
+    // Instance-State-Bundle wandern (unverschlüsselt, überlebt auf Platte). Ihn
+    // beim Falten zu verlieren ist hier das korrekte Verhalten (Fund, HOCH:
+    // Secret im Klartext im SavedInstanceState).
+    var value by remember { mutableStateOf("") }
     var showValue by rememberSaveable { mutableStateOf(false) }
     var expanded by remember { mutableStateOf(false) }
     var checking by remember { mutableStateOf(false) }

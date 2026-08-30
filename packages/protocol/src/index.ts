@@ -142,8 +142,6 @@ export interface PiModeSemantics {
   bash: GateLevel;
   /** Gating für Datei-Änderungen (edit/write). */
   edits: Extract<GateLevel, 'none' | 'all'>;
-  /** Gating für alle übrigen, nicht lesenden Tools (webfetch, externe Aufrufe …). */
-  otherTools: Extract<GateLevel, 'none' | 'all'>;
   /** Einzeiler für die Modus-Auswahl in der App. */
   hint: string;
 }
@@ -160,7 +158,6 @@ export const PI_MODE_SEMANTICS: Readonly<Record<AgentMode, PiModeSemantics>> = O
     autoPush: true,
     bash: 'none',
     edits: 'none',
-    otherTools: 'none',
     hint: 'Keine Rückfragen; pusht nach jedem Turn und legt einen Draft-PR an.',
   },
   auto: {
@@ -169,7 +166,6 @@ export const PI_MODE_SEMANTICS: Readonly<Record<AgentMode, PiModeSemantics>> = O
     autoPush: false,
     bash: 'risky',
     edits: 'none',
-    otherTools: 'all',
     hint: 'Änderungen laufen durch; nur riskante Shell-Kommandos werden nachgefragt.',
   },
   acceptEdits: {
@@ -178,7 +174,6 @@ export const PI_MODE_SEMANTICS: Readonly<Record<AgentMode, PiModeSemantics>> = O
     autoPush: false,
     bash: 'all',
     edits: 'none',
-    otherTools: 'all',
     hint: 'Datei-Änderungen laufen durch, jedes Shell-Kommando wird nachgefragt.',
   },
   ask: {
@@ -187,7 +182,6 @@ export const PI_MODE_SEMANTICS: Readonly<Record<AgentMode, PiModeSemantics>> = O
     autoPush: false,
     bash: 'all',
     edits: 'all',
-    otherTools: 'all',
     hint: 'Fragt vor jeder Änderung und jedem Kommando nach.',
   },
 } as const satisfies Record<AgentMode, PiModeSemantics>);
@@ -281,7 +275,15 @@ export interface TurnInfo {
 
 export type PermissionDecision = 'once' | 'always' | 'reject';
 
-export type PermissionKind = 'bash' | 'edit' | 'webfetch' | 'external' | 'other';
+/**
+ * Art eines genehmigungspflichtigen Tool-Aufrufs. Nur `bash` und `edit`
+ * (edit/write): das ist die feste Toolliste des Runners
+ * (['read','bash','edit','write','grep','find','ls']), von der read/grep/find/ls
+ * reine Lese-Tools sind (nie gegated) und die restlichen drei genau in diese
+ * zwei Klassen fallen. Frühere Werte 'webfetch'/'external'/'other' hatte nie ein
+ * Tool produziert.
+ */
+export type PermissionKind = 'bash' | 'edit';
 
 /**
  * Secret-Arten, die der Vault des Orchestrators kennt: die pi-Provider-Ids plus
@@ -339,16 +341,6 @@ export interface ModelsResponse {
   models: ModelInfo[];
 }
 
-/** POST /resume — hängt den Runner an eine bestehende pi-Session-Datei. */
-export interface ResumeRequest {
-  sessionRef: string;
-}
-
-/** POST /permissions/:id */
-export interface PermissionReplyBody {
-  response: PermissionDecision;
-}
-
 /** GET /status */
 export interface ShimStatus {
   /** pi-eigene Session-Referenz (Session-Datei), für /resume. */
@@ -372,24 +364,32 @@ export interface ErrorResponse { ok: false; error: string }
 
 export type ShimApiResponse = OkResponse | ErrorResponse;
 
-/** GET /health des Runners — bewusst ohne Auth, für Docker-Healthchecks. */
-export interface HealthResponse { ok: true }
-
 /**
  * Env-Variablen, die der Orchestrator in jeden Session-Container injiziert und
  * die der Runner beim Start liest. Der Link-Agent baut dieselbe Struktur lokal
  * zusammen, auch wenn dort kein Container beteiligt ist.
  */
 export interface ShimEnv {
-  /** Zufälliges Token je Session; der Orchestrator sendet es als `authorization: Bearer <token>`. */
+  /**
+   * Zufälliges API-Token je Session; der Orchestrator sendet es als
+   * `authorization: Bearer <token>` an die Runner-API (u. a. das Permission-Gate).
+   * Es ist NICHT das Egress-Proxy-Credential: der Orchestrator leitet daraus einen
+   * separaten Wert ab (server/src/runner.ts `proxyTokenFor`) und spielt nur den in
+   * die HTTP(S)_PROXY-URL des Containers. Der Runner löscht SHIM_TOKEN direkt nach
+   * dem Start aus process.env, damit vom Agenten gestartete Kindprozesse es nicht
+   * erben und damit ihr eigenes Approval-Gate umgehen können.
+   */
   SHIM_TOKEN: string;
   WORK_DIR: string;              // z. B. /work (Repo-Checkout)
   AGENT_MODE: AgentMode;
   SESSION_ID: string;            // Session-Id des Orchestrators (uuid)
-  REPO_URL: string;              // https-Clone-URL, ohne eingebettetes Token
+  // Optional: der Link-Embed setzt REPO_URL leer bzw. REPO_FULL_NAME gar nicht
+  // (lokaler Checkout, keine PR ohne owner/name). Der Runner behandelt beide
+  // ohnehin als „darf fehlen" (ensureRepo/createDraftPr).
+  REPO_URL?: string;             // https-Clone-URL, ohne eingebettetes Token
   REPO_BRANCH?: string;          // Basis-Branch (Vorgabe: Default-Branch des Repos)
   GITHUB_PAT?: string;           // nur gesetzt, wenn Push erlaubt ist
-  REPO_FULL_NAME: string;        // owner/name für die PR-API
+  REPO_FULL_NAME?: string;       // owner/name für die PR-API
   /**
    * Nur Startwert (yolo => 1): Auto-Push + Draft-PR nach jedem beendeten Turn.
    * Weil der Modus mitten in der Session umschaltbar ist, entscheidet der
@@ -443,20 +443,28 @@ export type NoticePhase = 'container-start' | 'shim-start' | 'ready';
 /**
  * Sequenz-Metadaten, die der `SequencedSseBroadcaster` jedem normalisierten
  * Event aufprägt:
- *  - `seq`: monotone Sequenznummer je Session und je Runner-Prozess,
- *    gespiegelt im SSE-Feld `id:`. Sie ist die Grundlage für den
- *    Last-Event-ID-Replay (der Orchestrator verbindet sich mit der zuletzt
- *    gesehenen seq neu, der Runner spielt ab dort nach) und für die Dedup im
- *    Client zwischen Live-Strom und gespeicherter Historie. Sie heißt `seq` und
- *    nicht `id`, weil `tool.call`/`tool.result` bereits ein string-`id` (die
- *    Tool-Call-Id) tragen, mit dem sie nicht kollidieren darf.
+ *  - `seq`: monotone Sequenznummer, gespiegelt im SSE-Feld `id:`. Sie heißt
+ *    `seq` und nicht `id`, weil `tool.call`/`tool.result` bereits ein
+ *    string-`id` (die Tool-Call-Id) tragen, mit dem sie nicht kollidieren darf.
  *  - `ts`: Sendezeitpunkt in Millisekunden seit Epoch.
  *
  * Beide sind optional: Events aus der gespeicherten Historie oder von einem
  * älteren Sender haben sie nicht, jeder Decoder muss sie als „darf fehlen"
- * behandeln. Die seq beginnt bei jedem Runner-Neustart wieder bei 0 (neuer
- * Container, Resume), ist also nur innerhalb eines Runner-Streams eindeutig,
- * nicht über die gesamte Lebensdauer einer Session.
+ * behandeln.
+ *
+ * WICHTIG - zwei Bedeutungen, je nach Hop:
+ *  - Runner -> Orchestrator (SSE): `seq` ist der TRANSPORT-Cursor. Er beginnt
+ *    bei jedem Runner-Neustart wieder bei 1 (neuer Container, Resume) und ist
+ *    nur innerhalb EINES Runner-Streams eindeutig. Er trägt den
+ *    Last-Event-ID-Replay: der Orchestrator verbindet sich mit der zuletzt
+ *    gesehenen seq neu, der Runner spielt ab dort nach.
+ *  - Orchestrator -> Gerät (`session.event`-Broadcast und `session.events.get`-
+ *    Historie): `seq` ist die SERVER-kanonische Sequenz - die rowid aus
+ *    `session_events`, sessionweit streng monoton, ohne Reset und ohne Kollision
+ *    über Resume-Generationen. NUR auf diesem Wert darf die App sessionweit
+ *    dedupen (`seq:$id`); die Runner-seq würde nach jedem Neustart kollidieren.
+ *    Der Orchestrator ersetzt die Transport-seq beim Broadcast/Read durch diesen
+ *    kanonischen Wert (server/src/sessions.ts, db.ts listSessionEvents).
  */
 export interface AgentEventMeta {
   seq?: number;
@@ -511,12 +519,6 @@ export type AgentEventBody =
  * diskriminierte Union), `seq`/`ts` stehen einfach zur Verfügung, wenn da.
  */
 export type AgentEvent = AgentEventBody & AgentEventMeta;
-
-/** SSE-Wire-Format: `event: agent` + `data: <AgentEvent JSON>` */
-export interface AgentSseEvent {
-  event: 'agent';
-  data: AgentEvent;
-}
 
 /* ------------------------------------------------------------------ */
 /* App <-> Orchestrator (WebSocket)                                    */
@@ -592,41 +594,13 @@ export interface ServerStats {
 /* ------------------------------------------------------------------ */
 
 /**
- * Wire-Version, die ein Link-Agent spricht; getragen von `agent.hello` und
- * `agent.heartbeat`. Nur bei einer brechenden Änderung am Link<->Server-Format
- * erhöhen; additive Erweiterungen (neue optionale Felder, neue
- * `LinkCapabilities`) brauchen keinen Sprung. Fehlt das Feld, gilt Version 1 —
- * ein Link-Agent, der Heartbeats/Capabilities noch gar nicht kennt.
+ * Status je Session, wie ihn ein Link-Agent im Heartbeat meldet. Der
+ * Event-Strom kennt kein Signal für „wartet auf eine Freitext-Antwort", nur
+ * `permission.request`; der Server faltet ohnehin alles Nicht-idle auf
+ * 'running' (statusFromLinkHeartbeat), sodass 'busy' und 'permission'
+ * gleichwertig sind.
  */
-export const LINK_PROTOCOL_VERSION = 2;
-
-/**
- * Feature-Flags, die ein Link-Agent auf `agent.hello`/`agent.heartbeat`
- * ankündigt. Jedes Flag ist optional und MUSS als `false` gelten, wenn es
- * fehlt — so arbeitet ein älterer Link-Agent gegen einen neueren Server
- * unverändert weiter und ein neuerer gegen einen älteren Server degradiert,
- * statt zu brechen. Neue Flags nur additiv: nie eines umdeuten oder entfernen.
- */
-export interface LinkCapabilities {
-  /**
-   * Sendet periodische `agent.heartbeat`-Frames mit der vollständigen
-   * Session-Liste (`LinkSessionState`), statt sich allein auf
-   * `agent.event`/Verbindungsabbruch zu verlassen. Heute rein informativ (der
-   * Server rekonziliert aus jedem empfangenen `agent.heartbeat`, unabhängig
-   * vom Flag — die Nachricht selbst ist das Signal); als explizites Flag
-   * behalten, damit eine künftige, wirklich verhaltensändernde Capability ein
-   * Vorbild hat.
-   */
-  heartbeat?: boolean;
-}
-
-/**
- * Status je Session, wie ihn ein Link-Agent im Heartbeat meldet, nach Kilos
- * `idle|busy|question|permission`. Der Event-Strom kennt heute kein Signal für
- * „wartet auf eine Freitext-Antwort" (nur `permission.request`), also sendet
- * derzeit niemand `'question'` — es existiert für Wire-Parität mit Kilo.
- */
-export type LinkSessionStatus = 'idle' | 'busy' | 'question' | 'permission';
+export type LinkSessionStatus = 'idle' | 'busy' | 'permission';
 
 /** Eine Session, die ein Link-Agent gerade führt (Inhalt von `agent.heartbeat`). */
 export interface LinkSessionState {
@@ -682,10 +656,6 @@ export type ClientMessage =
       mode?: AgentMode;
       branch?: string;
       workDir?: string;
-      sessionRef?: string;
-      /** Fehlt => Version 1 (Link-Agent ohne Heartbeat/Capabilities). */
-      protocolVersion?: number;
-      capabilities?: LinkCapabilities;
     }
   | {
       type: 'session.create';
@@ -789,8 +759,13 @@ export type ServerMessage =
   | { type: 'welcome'; ok: true; serverVersion: string }
   /** Server -> Link-Agent: Registrierung akzeptiert, Session gebunden. */
   | { type: 'agent.ready'; sessionId: string }
-  /** Server -> Link-Agent: einen Runner-HTTP-Aufruf über die ausgehende WS durchreichen. */
-  | { type: 'agent.command'; sessionId: string; callId: string; path: string; method: 'GET' | 'POST'; body?: unknown }
+  /**
+   * Server -> Link-Agent: einen Runner-HTTP-Aufruf über die ausgehende WS
+   * durchreichen. Keine sessionId - ein Link führt genau eine Session, und der
+   * Link-Agent adressiert den Aufruf ohnehin nur über callId/path an seinen
+   * eingebetteten Runner.
+   */
+  | { type: 'agent.command'; callId: string; path: string; method: 'GET' | 'POST'; body?: unknown }
   /** Link-Agent -> Server: Antwort auf ein `agent.command`. */
   | { type: 'agent.response'; callId: string; status: number; body?: unknown }
   /** Link-Agent -> Server: normalisiertes Runner-Event. */
@@ -804,12 +779,11 @@ export type ServerMessage =
    * der Orchestrator braucht keine Event-Buchhaltung, um korrekt zu bleiben,
    * und eine Session-Id, die hier nicht mehr auftaucht, ist aus Sicht des
    * Link-Agenten weg — dieselbe Folgerung wie bei einem Socket-Close, nur ohne
-   * dass einer nötig wäre. `protocolVersion`/`capabilities` fahren mit, damit
-   * der Server künftiges additives Verhalten daran knüpfen kann.
+   * dass einer nötig wäre.
    */
-  | { type: 'agent.heartbeat'; sessions: LinkSessionState[]; protocolVersion?: number; capabilities?: LinkCapabilities }
-  /** Server -> Link-Agent: Session aus der App gestoppt; der Link-Agent fährt herunter. */
-  | { type: 'agent.bye'; sessionId: string }
+  | { type: 'agent.heartbeat'; sessions: LinkSessionState[] }
+  /** Server -> Link-Agent: Session aus der App gestoppt; der Link-Agent fährt herunter. Keine sessionId - der Link führt genau eine Session. */
+  | { type: 'agent.bye' }
   | { type: 'error'; requestId?: string; sessionId?: string; message: string }
   | { type: 'request.ok'; requestId: string; payload?: unknown }
   | { type: 'session.list'; requestId: string; sessions: SessionInfo[] }
@@ -875,24 +849,6 @@ export interface PairingConfirmResponse {
   deviceId: string;
   /** Langlebiges Gerätetoken; landet im Keystore-gestützten Speicher der App. */
   deviceToken: string;
-}
-
-/**
- * POST /api/pairing/create (Admin-Token im Authorization-Header).
- * Liefert den Code, den der Betreiber als QR anzeigt.
- */
-export interface PairingCreateResponse {
-  ok: true;
-  code: string;
-  /** ISO-8601; nach diesem Zeitpunkt lehnt `confirm` den Code ab. */
-  expiresAt: string;
-}
-
-/** GET /api/health — ohne Auth, für Coolify/Docker-Healthchecks. */
-export interface ServerHealthResponse {
-  ok: true;
-  version: string;
-  docker: boolean;
 }
 
 /* ------------------------------------------------------------------ */

@@ -11,6 +11,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -23,7 +24,6 @@ import com.pocketagent.app.ui.PocketAgentNavHost
 import com.pocketagent.app.ui.screens.PairingScreen
 import com.pocketagent.app.ui.screens.RequestNotificationPermission
 import com.pocketagent.app.ui.theme.PocketAgentTheme
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 
 class MainActivity : FragmentActivity() {
@@ -76,27 +76,28 @@ class MainActivity : FragmentActivity() {
 private fun AppRoot(deepLinkSessionId: String?, onConsumeDeepLink: () -> Unit) {
     val context = LocalContext.current
     val app = context.applicationContext as PocketAgentApp
-    // rememberSaveable statt remember: die Activity wird bei Fold/Rotation neu erzeugt
-    // (siehe AndroidManifest configChanges), aber der Compose-State sonst nicht über
-    // solche Recreates hinweg erhalten. Ohne das landet der Nutzer bei jedem Aufklappen
-    // wieder vor dem BiometricPrompt und verliert den Nav-Stack. Übersteht keinen
-    // Prozesstod — dafür bleibt paired/unlocked bewusst ungesichert (kein Secret).
-    var paired by rememberSaveable { mutableStateOf<Boolean?>(null) }
-    var unlocked by rememberSaveable { mutableStateOf(false) }
-
-    LaunchedEffect(Unit) {
-        paired = app.container.tokenStore.setup.first() != null
+    // `setup` als Flow beobachten statt einmalig lesen: Nach dem Abmelden
+    // (SettingsScreen.logout -> tokenStore.clear()) emittiert er null, und der
+    // Nutzer landet sofort wieder im Pairing — vorher blieb paired=true und die
+    // App hing an einer toten Verbindung (Fund: Logout führt nicht zum Pairing
+    // zurück). null = noch nicht geladen (weder Pairing noch Inhalt zeigen).
+    // rememberSaveable für unlocked: die Activity wird bei Fold/Rotation neu
+    // erzeugt (siehe configChanges), sonst stünde der Nutzer bei jedem
+    // Aufklappen wieder vor dem BiometricPrompt.
+    val paired by produceState<Boolean?>(initialValue = null, app) {
+        app.container.tokenStore.setup.collect { value = it != null }
     }
+    var unlocked by rememberSaveable { mutableStateOf(false) }
 
     when (paired) {
         null -> Unit
         false -> PairingScreen(
             onPaired = {
-                paired = true
-                // Frisch gekoppelt und im Vordergrund — der beste Moment, den
-                // Hintergrund-Dienst zu starten (startIfEligible prüft die
-                // Einstellung selbst; der Vordergrund-Übergang allein feuert
-                // erst beim nächsten Verlassen/Wiederkehren der App).
+                // paired wird vom setup-Flow oben getrieben (save() schreibt den
+                // Token -> setup emittiert nicht-null); hier nur der beste Moment,
+                // den Hintergrund-Dienst zu starten (startIfEligible prüft die
+                // Einstellung selbst; der Vordergrund-Übergang allein feuert erst
+                // beim nächsten Verlassen/Wiederkehren der App).
                 ConnectionService.startIfEligible(context)
             },
         )
@@ -170,13 +171,16 @@ private fun BiometricGate(enabled: Boolean?, unlocked: Boolean, onUnlocked: () -
                 }
 
                 override fun onAuthenticationError(code: Int, msg: CharSequence) {
-                    if (code == BiometricPrompt.ERROR_NEGATIVE_BUTTON ||
-                        code == BiometricPrompt.ERROR_USER_CANCELED
-                    ) {
-                        activity.finish()
-                    } else {
-                        onUnlocked()
-                    }
+                    // Entsperrt wird AUSSCHLIESSLICH in onAuthenticationSucceeded.
+                    // Jeder Fehler schließt die App, statt sie zu öffnen — das
+                    // schließt ERROR_LOCKOUT/ERROR_LOCKOUT_PERMANENT ein (zu viele
+                    // Fehlversuche). Früher rief jeder Code außer
+                    // NEGATIVE_BUTTON/USER_CANCELED onUnlocked() und machte die
+                    // Sperre damit umgehbar (5× falscher Finger -> App offen).
+                    // Der DEVICE_CREDENTIAL-Fallback bleibt (setAllowedAuthenticators
+                    // unten): bei biometrischem Lockout bietet der Prompt die PIN
+                    // an, ohne dass es hier zu diesem Fehler-Callback kommt.
+                    activity.finish()
                 }
             },
         )

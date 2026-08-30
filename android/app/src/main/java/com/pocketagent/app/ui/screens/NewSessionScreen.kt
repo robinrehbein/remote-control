@@ -120,6 +120,13 @@ class NewSessionViewModel : ViewModel() {
          * sondern schickt denselben Text noch einmal.
          */
         val pendingSessionId: String? = null,
+        /**
+         * Über den Turn stabile Nachrichten-Id des ersten Auftrags. Ein Retry
+         * (pendingSessionId) benutzt dieselbe Id, damit der Server denselben
+         * Turn nicht zweimal startet (Idempotenz, Tier 1). Wird beim vollen
+         * Erfolg verworfen.
+         */
+        val promptMessageId: String? = null,
     )
 
     private val _state = MutableStateFlow(UiState())
@@ -257,8 +264,12 @@ class NewSessionViewModel : ViewModel() {
         if (text.isNotEmpty()) {
             // `session.prompt` wird inzwischen bestätigt: eine ausbleibende
             // Bestätigung zählt wie ein Fehlschlag, damit kein Auftrag still
-            // verschwindet.
-            val failure = repository.sendPrompt(sessionId, text, null).exceptionOrNull()
+            // verschwindet. Über den Turn stabile Id, damit ein Retry denselben
+            // Turn nicht doppelt startet (Idempotenz, Tier 1).
+            val messageId = s.promptMessageId ?: com.pocketagent.app.data.newMessageId().also { id ->
+                _state.value = _state.value.copy(promptMessageId = id)
+            }
+            val failure = repository.sendPrompt(sessionId, text, null, messageId).exceptionOrNull()
             if (failure != null) {
                 hold(
                     sessionId,
@@ -271,6 +282,7 @@ class NewSessionViewModel : ViewModel() {
         _state.value = _state.value.copy(
             busy = false,
             pendingSessionId = null,
+            promptMessageId = null,
             error = null,
             createdSessionId = sessionId,
         )
@@ -386,7 +398,10 @@ fun NewSessionScreen(
     LaunchedEffect(secretKinds) { vm.syncProviderDefault(secretKinds) }
     LaunchedEffect(state.createdSessionId) { state.createdSessionId?.let { onCreated(it) } }
     LaunchedEffect(repos) {
-        if (repos.isNotEmpty() && state.repoId == null && repos.none { it.id == state.repoId }) {
+        // Ist noch kein Repo gewählt, das erste vorbelegen. Die frühere
+        // Zusatzbedingung `repos.none { it.id == state.repoId }` war bei
+        // repoId == null immer wahr und damit redundant.
+        if (repos.isNotEmpty() && state.repoId == null) {
             vm.update { it.copy(repoId = repos.first().id) }
         }
     }

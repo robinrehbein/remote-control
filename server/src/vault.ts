@@ -7,20 +7,20 @@ export interface Encrypted {
 }
 
 /**
- * Startup hygiene: MASTER_KEY should be 32 raw bytes as 64 hex chars
+ * Startup hygiene (reiner Seiteneffekt, kein Export - niemand liest das
+ * Ergebnis): MASTER_KEY should be 32 raw bytes as 64 hex chars
  * (openssl rand -hex 32) or base64 decoding to 32 bytes. Anything else is
  * hashed from a passphrase and therefore weak. Read from process.env directly
  * (config.ts already normalized the key material by the time we check).
  */
-export const masterKeyWeak: boolean = (() => {
+(() => {
   const raw = process.env.MASTER_KEY?.trim();
-  if (!raw) return false; // unset => ephemeral key; config.ts warns about that case
-  if (/^[0-9a-fA-F]{64}$/.test(raw)) return false;
-  if (Buffer.from(raw, 'base64').length === 32) return false;
+  if (!raw) return; // unset => ephemeral key; config.ts warns about that case
+  if (/^[0-9a-fA-F]{64}$/.test(raw)) return;
+  if (Buffer.from(raw, 'base64').length === 32) return;
   console.warn(
     '[vault] weak MASTER_KEY (hash-derived from passphrase); use openssl rand -hex 32',
   );
-  return true;
 })();
 
 function crypt(value: string, aad: string | undefined): Encrypted {
@@ -48,26 +48,4 @@ export function encrypt(value: string, aad?: string): Encrypted {
 /** AES-256-GCM decrypt that throws when the ciphertext/AAD pair does not verify. */
 export function decryptStrict(enc: Encrypted, aad?: string): string {
   return cryptBack(enc, aad);
-}
-
-/**
- * Decrypt with optional AAD. When `aad` is provided and verification fails,
- * retry once WITHOUT aad: rows written before AAD binding was introduced have
- * no AAD; returning normally lets the caller transparently re-encrypt them.
- *
- * Both writers of secret rows (ws.ts `secret.set` and secrets-api.ts
- * `saveSecretValue`) now always encrypt with AAD, so no *new* AAD-less row
- * can be created any more - this fallback exists only to heal rows that
- * predate that change (or were written directly against the DB). Do not
- * widen it into a general "AAD is optional" path; once every legacy row has
- * been touched once by Store.getSecretValue's transparent re-encrypt, it can
- * be removed.
- */
-export function decrypt(enc: Encrypted, aad?: string): string {
-  if (aad === undefined) return cryptBack(enc, undefined);
-  try {
-    return cryptBack(enc, aad);
-  } catch {
-    return cryptBack(enc, undefined);
-  }
 }

@@ -10,6 +10,7 @@
  * Bewusst frei von `dockerode`: die Ableitungen hier sind pur und deshalb im
  * Smoke ohne Daemon prüfbar; das Bauen selbst liegt in docker.ts.
  */
+import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -38,14 +39,15 @@ export const RUNNER_IMAGE_DIR = '/app/runner';
  * ohne den Agenten zu starten. In v1 kam der Pfad aus dem Adapter-Manifest,
  * jetzt ist es diese eine Konstante.
  *
- * Der Pfad ist bewusst `scripts/…` und nicht `dist/…`: `push.js` ist fertiges
- * JavaScript, kein TypeScript, also emittiert `npm run build` (tsc, `include:
- * ["src"]`) es nie nach `dist/`. `runner/Dockerfile` kopiert `runner/scripts`
- * unverändert nach `/app/runner/scripts` - genau dort liegt die Datei, und
- * weil derselbe relative Pfad auch im Build-Kontext gilt, prüft der Smoke ihn
- * gegen `runnerContextFiles()` statt gegen ein Image.
+ * Der Pfad zeigt nach `dist/`: das Push-Skript ist jetzt TypeScript
+ * (`runner/src/push.ts`) und importiert dieselben gitops-Funktionen wie der
+ * laufende Runner - keine per Hand kopierte Zweitfassung mehr. `npm run build`
+ * (tsc, `include: ["src"]`) emittiert es nach `dist/push.js`; `runner/Dockerfile`
+ * kopiert `dist/` aus der Builder-Stage ins Image. Der Server-Smoke prüft daher,
+ * dass `runner/src/push.ts` im Build-Kontext liegt (die Quelle, aus der gebaut
+ * wird), nicht ein vorgefertigtes JS.
  */
-export const RUNNER_PUSH_SCRIPT_REL = 'scripts/push.js';
+export const RUNNER_PUSH_SCRIPT_REL = 'dist/push.js';
 
 /** Absoluter Pfad desselben Skripts im laufenden Container. */
 export const RUNNER_PUSH_SCRIPT = `${RUNNER_IMAGE_DIR}/${RUNNER_PUSH_SCRIPT_REL}`;
@@ -155,6 +157,28 @@ export function lookupProviderSecret(kind: string, secret: SecretLookup): string
   if (direct !== null) return direct;
   const alias = SECRET_ALIASES[kind];
   return alias === undefined ? null : secret(alias);
+}
+
+/**
+ * Egress-Proxy-Credential einer Session, ABGELEITET vom API-Token (shim_token),
+ * aber ein anderer Wert.
+ *
+ * Warum getrennt: der API-Token (SHIM_TOKEN) authentifiziert Orchestrator->Runner
+ * (u. a. das Permission-Gate unter /permissions/<id>). Läge derselbe Wert auch in
+ * HTTP(S)_PROXY, könnte ein vom Agenten gestarteter Bash-Prozess ihn dort auslesen
+ * und sein eigenes Approval-Gate per curl auf 127.0.0.1:8080 umgehen. Deshalb trägt
+ * die Proxy-URL diesen abgeleiteten Wert statt des shim_token: aus der Ableitung
+ * lässt sich der API-Token nicht zurückrechnen (SHA-256), und der Runner löscht
+ * SHIM_TOKEN nach dem Start aus process.env, sodass Kinder ihn gar nicht erst sehen.
+ * Das Proxy-Token selbst ist harmlos - der Egress ist ohnehin durch die Host-
+ * Allowlist begrenzt.
+ *
+ * Deterministisch aus dem shim_token, damit weder eine DB-Spalte noch ein
+ * zusätzliches Env-Feld nötig ist: docker.ts (Proxy-URL) und sessions.ts
+ * (egressTokens-Tabelle) leiten denselben Wert unabhängig aus derselben Zeile ab.
+ */
+export function proxyTokenFor(shimToken: string): string {
+  return createHash('sha256').update(`pa-egress:${shimToken}`, 'utf8').digest('hex');
 }
 
 export interface RunnerEnvInput {

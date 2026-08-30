@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFile, mkdir, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
@@ -53,6 +53,25 @@ const ASKPASS_SCRIPT = [
 ].join('\n');
 
 /**
+ * Pfad des GIT_ASKPASS-Helfers, EINMAL pro Prozess in einem frisch angelegten,
+ * nur für uns lesbaren Verzeichnis (mkdtempSync -> unvorhersagbarer Name, 0700).
+ * Früher wurde die Datei bei JEDEM Aufruf unter einem festen, vorhersagbaren
+ * Pfad (`/tmp/pocketagent-askpass-<pid>.sh`) neu geschrieben - ein anderer
+ * Nutzer auf demselben Host hätte ihn vorab anlegen/verlinken können. Der Helfer
+ * selbst trägt kein Geheimnis (der PAT kommt zur Laufzeit über PA_GIT_PAT).
+ */
+let askpassHelperPath: string | undefined;
+function askpassHelper(): string {
+  if (askpassHelperPath === undefined) {
+    const dir = mkdtempSync(join(tmpdir(), 'pocketagent-askpass-'));
+    const helper = join(dir, 'askpass.sh');
+    writeFileSync(helper, ASKPASS_SCRIPT, { mode: 0o700 });
+    askpassHelperPath = helper;
+  }
+  return askpassHelperPath;
+}
+
+/**
  * Env for authenticated git child processes: a tiny GIT_ASKPASS helper hands
  * the PAT to git via the PA_GIT_PAT env var, so the PAT never appears in
  * remote URLs, .git/config, argv or logs (the script itself holds no secret).
@@ -60,11 +79,9 @@ const ASKPASS_SCRIPT = [
  */
 export function askpassEnv(pat: string | undefined): NodeJS.ProcessEnv | undefined {
   if (!pat) return undefined;
-  const helper = join(tmpdir(), `pocketagent-askpass-${process.pid}.sh`);
-  writeFileSync(helper, ASKPASS_SCRIPT, { mode: 0o700 });
   return {
     ...process.env,
-    GIT_ASKPASS: helper,
+    GIT_ASKPASS: askpassHelper(),
     GIT_TERMINAL_PROMPT: '0',
     PA_GIT_PAT: pat,
   };
@@ -99,15 +116,22 @@ async function git(cwd: string, args: string[], ctx: GitContext, timeoutMs = 120
   }
 }
 
+/**
+ * Halte das pi-Session-Verzeichnis (.pi-sessions/) aus git heraus - über
+ * `.git/info/exclude`, NICHT über die Repo-.gitignore. Eine Zeile in der
+ * Repo-.gitignore wäre eine echte Änderung am Worktree und landete in jedem
+ * Auto-Commit/PR ("agent: turn ..." mit einem .gitignore-Diff, das der Nutzer
+ * nie wollte). `.git/info/exclude` wirkt genauso, berührt den Worktree aber nie.
+ */
 async function ensureGitIgnore(ctx: GitContext): Promise<void> {
-  const ignorePath = join(ctx.workDir, '.gitignore');
+  const excludePath = join(ctx.workDir, '.git', 'info', 'exclude');
   let current = '';
-  if (existsSync(ignorePath)) {
-    current = await readFile(ignorePath, 'utf8');
+  if (existsSync(excludePath)) {
+    current = await readFile(excludePath, 'utf8');
   }
   if (!current.split('\n').some(line => line.trim() === SESSION_DIR_IGNORE.trim())) {
-    const next = current.length > 0 ? `${current.replace(/\n*$/, '\n')}${SESSION_DIR_IGNORE}` : SESSION_DIR_IGNORE;
-    await writeFile(ignorePath, next, 'utf8');
+    await mkdir(dirname(excludePath), { recursive: true });
+    await appendFile(excludePath, current.length > 0 && !current.endsWith('\n') ? `\n${SESSION_DIR_IGNORE}` : SESSION_DIR_IGNORE);
   }
 }
 
@@ -145,14 +169,23 @@ export async function ensureRepo(ctx: GitContext): Promise<string> {
   return branch;
 }
 
-/** Auto-commit after a completed turn. Always creates a commit (--allow-empty) as turn marker. */
+/** Gibt es im Worktree überhaupt etwas zu committen (tracked oder untracked)? */
+export async function hasUncommittedChanges(ctx: GitContext): Promise<boolean> {
+  return (await git(ctx.workDir, ['status', '--porcelain'], ctx)).trim().length > 0;
+}
+
+/**
+ * Auto-commit nach einem beendeten Turn - aber NUR, wenn der Worktree wirklich
+ * schmutzig ist. Früher lief jeder Turn mit `--allow-empty` und hinterließ pro
+ * Turn einen Leer-Commit ("agent: turn ...") ohne jede Änderung; das blähte die
+ * Historie und den PR-Diff auf. Bei einem sauberen Worktree wird nichts
+ * committet und der aktuelle HEAD zurückgegeben.
+ */
 export async function commitTurn(ctx: GitContext, isoTimestamp: string): Promise<string> {
-  await git(ctx.workDir, ['add', '-A'], ctx);
-  await git(
-    ctx.workDir,
-    ['commit', '-m', `agent: turn ${isoTimestamp}`, '--allow-empty', '--no-verify'],
-    ctx,
-  );
+  if (await hasUncommittedChanges(ctx)) {
+    await git(ctx.workDir, ['add', '-A'], ctx);
+    await git(ctx.workDir, ['commit', '-m', `agent: turn ${isoTimestamp}`, '--no-verify'], ctx);
+  }
   return (await git(ctx.workDir, ['rev-parse', 'HEAD'], ctx)).trim();
 }
 
@@ -172,7 +205,7 @@ interface PullRequestResponse {
   html_url?: unknown;
 }
 
-/** Create a draft PR; returns undefined when one already exists (409/422 swallowed). */
+/** Create a draft PR; returns undefined only when one already exists (409/422 with GitHub's "A pull request already exists" body). Every other 4xx/5xx throws. */
 export async function createDraftPr(ctx: GitContext, branch: string): Promise<string | undefined> {
   if (!ctx.githubPat || !ctx.repoFullName) return undefined;
   const base = ctx.repoBranch || 'main';
@@ -199,8 +232,18 @@ export async function createDraftPr(ctx: GitContext, branch: string): Promise<st
     }
     return undefined;
   }
-  if (response.status === 409 || response.status === 422) return undefined;
   const text = redact(await response.text(), ctx.githubPat);
+  // "PR existiert schon" wird geschluckt (Auto-Push legt pro Turn erneut an) -
+  // aber NUR daran erkennbar, nicht pauschal an 409/422: GitHub liefert 422 auch
+  // für einen ungültigen Base-Branch, einen leeren Diff (no commits between ...)
+  // oder ein nicht existierendes Head-Ref. Die würden sonst still verschluckt und
+  // der Nutzer bekäme nie einen PR, ohne je einen Fehler zu sehen.
+  if (
+    (response.status === 409 || response.status === 422) &&
+    text.includes('A pull request already exists')
+  ) {
+    return undefined;
+  }
   throw new Error(`draft PR failed: HTTP ${response.status} ${text.slice(0, 300)}`);
 }
 
@@ -223,27 +266,86 @@ async function untrackedEntry(workDir: string, path: string): Promise<DiffEntry 
   }
 }
 
-/** Whole-session diff: tracked changes vs HEAD plus untracked files. */
+/** Zerlegt die Ausgabe eines `git diff` in ihre Pro-Datei-Blöcke (je ab `diff --git`). */
+function splitDiffBlocks(out: string): string[] {
+  if (out.trim().length === 0) return [];
+  const blocks: string[] = [];
+  let current: string[] | null = null;
+  for (const line of out.split('\n')) {
+    if (line.startsWith('diff --git ')) {
+      if (current) blocks.push(current.join('\n'));
+      current = [line];
+    } else if (current) {
+      current.push(line);
+    }
+  }
+  if (current) blocks.push(current.join('\n'));
+  return blocks;
+}
+
+/** `--- a/x` / `+++ b/x` -> `x` (die a//b/-Präfixe strippen). */
+function stripDiffPrefix(p: string): string {
+  return p.startsWith('a/') || p.startsWith('b/') ? p.slice(2) : p;
+}
+
+/**
+ * Dateipfad eines Diff-Blocks. Bevorzugt die `+++ b/…`-Zeile (bei Löschung
+ * `/dev/null` -> stattdessen `--- a/…`); als letzter Ausweg der `diff --git`-
+ * Header. `core.quotePath=false` (in getDiff gesetzt) hält Unicode-Pfade
+ * unescaped, sodass diese Zeilen den vollen Pfad tragen.
+ */
+function pathFromBlock(lines: string[]): string | null {
+  let aPath: string | null = null;
+  let bPath: string | null = null;
+  for (const line of lines) {
+    if (line.startsWith('+++ ')) {
+      const p = line.slice(4);
+      if (p !== '/dev/null') bPath = stripDiffPrefix(p);
+    } else if (line.startsWith('--- ')) {
+      const p = line.slice(4);
+      if (p !== '/dev/null') aPath = stripDiffPrefix(p);
+    }
+  }
+  if (bPath) return bPath;
+  if (aPath) return aPath;
+  const m = /^diff --git a\/(.+) b\/(.+)$/.exec(lines[0] ?? '');
+  return m ? m[2]! : null;
+}
+
+/**
+ * Whole-session diff: tracked changes vs HEAD plus untracked files.
+ *
+ * Ein einziges `git diff HEAD` statt eines git-Spawns pro Datei (früher: erst
+ * `status --porcelain`, dann je Pfad ein `diff HEAD -- <path>` - N+1 Prozesse
+ * bei N geänderten Dateien). `--no-renames`, damit eine Umbenennung als
+ * Löschung + Hinzufügung erscheint (stabile, einfach zu parsende Pfade statt
+ * eines `rename from/to`-Headers). Untracked-Dateien zeigt `git diff HEAD` nicht
+ * - die kommen wie bisher separat über `ls-files --others` als reine +-Patches.
+ */
 export async function getDiff(ctx: GitContext): Promise<DiffEntry[]> {
   const { workDir } = ctx;
-  const trackedOut = await git(workDir, ['status', '--porcelain', '-z', '--untracked-files=no'], ctx);
-  const untrackedOut = await git(workDir, ['ls-files', '--others', '--exclude-standard', '-z'], ctx);
+  const diffOut = await git(workDir, ['-c', 'core.quotePath=false', 'diff', 'HEAD', '--no-renames'], ctx);
   const entries: DiffEntry[] = [];
-
-  const trackedRecords = trackedOut.split('\0').filter(record => record.length >= 3);
   const seen = new Set<string>();
-  for (const record of trackedRecords) {
-    const path = record.slice(3).trim();
+
+  for (const block of splitDiffBlocks(diffOut)) {
+    const lines = block.split('\n');
+    const path = pathFromBlock(lines);
     if (!path || seen.has(path)) continue;
     seen.add(path);
-    const patch = await git(workDir, ['diff', 'HEAD', '--', path], ctx);
-    entries.push({ path, patch: patch.slice(0, MAX_PATCH_BYTES) });
+    if (lines.some(line => line.startsWith('Binary files '))) {
+      entries.push({ path, patch: '', binary: true });
+    } else {
+      entries.push({ path, patch: block.slice(0, MAX_PATCH_BYTES) });
+    }
     if (entries.length >= MAX_DIFF_FILES) return entries;
   }
 
+  const untrackedOut = await git(workDir, ['ls-files', '--others', '--exclude-standard', '-z'], ctx);
   const untrackedPaths = untrackedOut.split('\0').filter(path => path.length > 0);
   for (const path of untrackedPaths) {
     if (seen.has(path)) continue;
+    seen.add(path);
     const entry = await untrackedEntry(workDir, path);
     if (entry) entries.push(entry);
     if (entries.length >= MAX_DIFF_FILES) return entries;

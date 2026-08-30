@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import type { AgentEvent } from '@pocketagent/protocol';
 import { config } from './config.js';
-import { decrypt, decryptStrict, encrypt } from './vault.js';
+import { decryptStrict } from './vault.js';
 
 export function sha256(s: string): string {
   return createHash('sha256').update(s).digest('hex');
@@ -59,11 +59,13 @@ CREATE TABLE IF NOT EXISTS devices (
   token_hash TEXT NOT NULL UNIQUE, fcm_token TEXT, enrolled_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS pairing_codes (
-  code TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, expires_at TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0
+  code TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, expires_at TEXT NOT NULL,
+  used INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS secrets (
   id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, kind TEXT NOT NULL,
-  ciphertext TEXT NOT NULL, nonce TEXT NOT NULL, created_at TEXT NOT NULL
+  ciphertext TEXT NOT NULL, nonce TEXT NOT NULL, created_at TEXT NOT NULL,
+  UNIQUE(tenant_id, kind)
 );
 CREATE TABLE IF NOT EXISTS repos (
   id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, full_name TEXT NOT NULL,
@@ -121,50 +123,12 @@ export class Store {
     this.db.exec(
       'CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_message ON turns(session_id, message_id) WHERE message_id IS NOT NULL',
     );
-    this.migrateSecretsUnique();
-    // Die Session-Spalten stehen vollständig in SCHEMA (v2 startet auf einer
-    // frischen Datei, siehe GREENFIELD-PI.md „Risiken"), deshalb bleibt hier nur
-    // die attempts-Migration: pairing_codes wird ohne sie angelegt, wenn eine
-    // Datenbank aus einer sehr frühen Version weiterbenutzt wird, und ohne die
-    // Spalte fällt der 5-Versuche-Lockout in consumePairingCode aus.
-    const pairingCols = this.db.prepare('PRAGMA table_info(pairing_codes)').all() as Array<{ name: string }>;
-    if (!pairingCols.some((c) => c.name === 'attempts')) {
-      this.db.exec('ALTER TABLE pairing_codes ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0');
-    }
-  }
-
-  /**
-   * secrets used to have no uniqueness on (tenant_id, kind): every save
-   * inserted a new row, deleteSecret(id) only ever removed the newest one,
-   * and getSecretValue silently fell back to the next-newest (a leaked,
-   * "rotated away" key) the moment the current row was deleted. Runs once:
-   * the unique index below is the marker that this already happened, so a
-   * restart does not re-scan/re-dedupe an unbounded secrets table on every
-   * boot.
-   */
-  private migrateSecretsUnique(): void {
-    const indexes = this.db.prepare('PRAGMA index_list(secrets)').all() as Array<{
-      name: string;
-      unique: number;
-    }>;
-    if (indexes.some((i) => i.name === 'idx_secrets_tenant_kind')) return;
-    // Keep only the newest row per (tenant_id, kind); rowid (insertion order)
-    // breaks ties within the same created_at millisecond. Everything older
-    // is exactly the class of row the finding describes: an already-rotated
-    // key nobody can reach through the app any more.
-    this.db.exec(`
-      DELETE FROM secrets
-      WHERE rowid NOT IN (
-        SELECT rowid FROM (
-          SELECT rowid, ROW_NUMBER() OVER (
-            PARTITION BY tenant_id, kind ORDER BY created_at DESC, rowid DESC
-          ) AS rn
-          FROM secrets
-        )
-        WHERE rn = 1
-      )
-    `);
-    this.db.exec('CREATE UNIQUE INDEX idx_secrets_tenant_kind ON secrets(tenant_id, kind)');
+    // v2 startet auf einer frischen Datei (siehe GREENFIELD-PI.md „Risiken"):
+    // sämtliche Spalten und die UNIQUE-Constraints (secrets(tenant_id,kind),
+    // pairing_codes.attempts) stehen vollständig in SCHEMA, deshalb sind hier
+    // keine ALTER-/Dedupe-Migrationen aus v1 mehr nötig - nur die Indizes oben,
+    // die reine Performance sind und auf einer frischen wie einer bestehenden
+    // Datei idempotent laufen.
   }
 
   close(): void {
@@ -283,32 +247,19 @@ export class Store {
       .get(tenant, kind) as SecretRow | undefined;
   }
 
-  /** In-place re-encryption of a secret row (used for legacy AAD-less migration). */
-  updateSecret(id: string, ciphertext: string, nonce: string): void {
-    this.db.prepare('UPDATE secrets SET ciphertext = ?, nonce = ? WHERE id = ?').run(ciphertext, nonce, id);
-  }
-
   /**
    * Newest plaintext secret value for tenant+kind (same ordering as getSecretByKind),
-   * decrypted with AAD `secret:<tenant>:<kind>`. Legacy rows written before AAD
-   * binding decrypt via the no-AAD fallback and are transparently re-encrypted
-   * with AAD and persisted. Returns null when no row exists.
+   * decrypted STRICTLY with AAD `secret:<tenant>:<kind>`. Returns null when no row
+   * exists; throws when the ciphertext/AAD pair does not verify. v2 startet frisch
+   * und schreibt jedes Secret AAD-gebunden (ws.ts `secret.set`, secrets-api.ts) -
+   * es gibt keine AAD-losen Alt-Zeilen mehr, daher kein No-AAD-Fallback und keine
+   * transparente Re-Verschlüsselung.
    */
   getSecretValue(kind: string, tenant: string): string | null {
     const row = this.getSecretByKind(kind, tenant);
     if (!row) return null;
     const aad = `secret:${tenant}:${kind}`;
-    const enc = { ciphertext: row.ciphertext, nonce: row.nonce };
-    try {
-      return decryptStrict(enc, aad);
-    } catch {
-      // AAD-strict decrypt failed => legacy row; decrypt via the no-AAD fallback
-      // path (returns normally for legacy rows) and re-encrypt with AAD.
-      const value = decrypt(enc);
-      const re = encrypt(value, aad);
-      this.updateSecret(row.id, re.ciphertext, re.nonce);
-      return value;
-    }
+    return decryptStrict({ ciphertext: row.ciphertext, nonce: row.nonce }, aad);
   }
 
   listSecrets(tenant: string): SecretRow[] {
@@ -438,10 +389,6 @@ export class Store {
     this.db.prepare('UPDATE sessions SET container_id = ? WHERE id = ?').run(containerId, id);
   }
 
-  setShimEndpoint(id: string, endpoint: string | null): void {
-    this.db.prepare('UPDATE sessions SET shim_endpoint = ? WHERE id = ?').run(endpoint, id);
-  }
-
   setLinkId(id: string, linkId: string | null): void {
     this.bumpSessionAuth();
     this.db.prepare('UPDATE sessions SET link_id = ? WHERE id = ?').run(linkId, id);
@@ -469,37 +416,53 @@ export class Store {
     this.db.prepare('UPDATE sessions SET last_active_at = ? WHERE id = ?').run(new Date().toISOString(), id);
   }
 
-  appendEvent(sessionId: string, type: string, payload: string): void {
-    this.db
+  /**
+   * Persist one event and return its `id` (the AUTOINCREMENT rowid). That rowid
+   * is the server's session-wide, strictly monotone event sequence: the
+   * orchestrator stamps it onto the event that reaches devices (live broadcast
+   * and history), so the app dedups on a number that never resets and never
+   * collides - unlike the runner/link `seq` inside the payload, which restarts
+   * at 1 on every runner process and repeats across resume generations.
+   */
+  appendEvent(sessionId: string, type: string, payload: string): number {
+    const info = this.db
       .prepare('INSERT INTO session_events (session_id, type, payload, ts) VALUES (?, ?, ?, ?)')
       .run(sessionId, type, payload, new Date().toISOString());
+    const rowid = Number(info.lastInsertRowid);
     // Keep only the 5000 most recent events per session (unbounded growth = DoS).
-    this.db
-      .prepare(
-        'DELETE FROM session_events WHERE session_id = ? AND id NOT IN (SELECT id FROM session_events WHERE session_id = ? ORDER BY id DESC LIMIT 5000)',
-      )
-      .run(sessionId, sessionId);
+    // Der Trim ist ein Subquery-Scan; ihn nicht bei JEDEM Event fahren, sondern
+    // nur etwa jedes 50. (über die globale rowid gedrosselt). Eine Session
+    // überschreitet die Obergrenze dadurch höchstens kurz um ein paar Dutzend
+    // Zeilen - unkritisch, spart aber den Scan bei 49 von 50 Schreibvorgängen.
+    if (rowid % 50 === 0) {
+      this.db
+        .prepare(
+          'DELETE FROM session_events WHERE session_id = ? AND id NOT IN (SELECT id FROM session_events WHERE session_id = ? ORDER BY id DESC LIMIT 5000)',
+        )
+        .run(sessionId, sessionId);
+    }
+    return rowid;
   }
 
   /**
    * The `limit` youngest stored events of a session, returned oldest first so
    * a client can append them to an empty timeline as they happened.
    *
-   * Two kinds of noise never make it into the answer: 'ping' keepalives and
-   * progress notices (a `phase` field), which describe a start that is long
-   * over by the time anyone reloads. They are already dropped on write
-   * (isHistoryEvent in sessions.ts) - repeating the rule here covers the rows
-   * a database written before that filter still holds.
+   * Noise (pings, progress notices) is already dropped on write (isHistoryEvent
+   * in sessions.ts) and pings are additionally excluded by the query, so the
+   * read path only validates the payload shape - it does not re-apply the
+   * history filter (v2 starts on a fresh DB; there are no pre-filter rows to heal).
    *
-   * A row whose payload is not readable JSON is skipped, never thrown on: one
-   * damaged line must not cost the whole conversation.
+   * A row whose payload is not readable JSON, or is not an object with a string
+   * `type`, is skipped, never thrown on: one damaged line must not cost the whole
+   * conversation.
    */
   listSessionEvents(sessionId: string, limit: number): AgentEvent[] {
     const rows = this.db
       .prepare(
-        "SELECT payload FROM session_events WHERE session_id = ? AND type <> 'ping' ORDER BY id DESC LIMIT ?",
+        "SELECT id, payload FROM session_events WHERE session_id = ? AND type <> 'ping' ORDER BY id DESC LIMIT ?",
       )
-      .all(sessionId, limit) as Array<{ payload: string }>;
+      .all(sessionId, limit) as Array<{ id: number; payload: string }>;
     const events: AgentEvent[] = [];
     for (const row of rows.reverse()) {
       let parsed: unknown;
@@ -509,10 +472,14 @@ export class Store {
         continue;
       }
       if (typeof parsed !== 'object' || parsed === null) continue;
-      const ev = parsed as { type?: unknown; phase?: unknown };
-      if (typeof ev.type !== 'string') continue;
-      if (ev.type === 'ping' || (ev.type === 'notice' && ev.phase !== undefined)) continue;
-      events.push(parsed as AgentEvent);
+      if (typeof (parsed as { type?: unknown }).type !== 'string') continue;
+      // Kanonische Sequenz: die App dedupt zwischen Live-Strom und Historie über
+      // `seq`. Der Live-Broadcast trägt die server-vergebene rowid (onEvent), also
+      // muss die Historie DENSELBEN Wert tragen - nicht die im Payload gespeicherte
+      // Runner-seq (pro Runner-Prozess bei 1 startend, über Resume-Generationen
+      // kollidierend). Der gespeicherte Runner-seq bleibt für den Transport-Cursor
+      // erhalten (lastEventSeq liest ihn separat), wird hier aber überschrieben.
+      events.push({ ...(parsed as AgentEvent), seq: row.id });
     }
     return events;
   }

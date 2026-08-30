@@ -14,7 +14,7 @@
  */
 import WebSocket from 'ws';
 import type { AgentEvent, AgentMode, LinkSessionStatus, ServerMessage } from '@pocketagent/protocol';
-import { LINK_PROTOCOL_VERSION, WS_CLOSE_UNAUTHORIZED, isTerminalLinkCloseCode } from '@pocketagent/protocol';
+import { WS_CLOSE_UNAUTHORIZED, isTerminalLinkCloseCode } from '@pocketagent/protocol';
 import { resolveWsUrl } from './ws-url.js';
 import { INITIAL_LINK_SESSION_STATUS, nextLinkSessionStatus } from './link-status.js';
 
@@ -107,11 +107,18 @@ export function startLinkAgent(opts: LinkAgentOptions): LinkAgentHandle {
     if (ev.type === 'ping') return;
     eventQueue.push(ev);
     if (eventQueue.length > MAX_QUEUED_EVENTS) {
-      eventQueue.shift();
+      // Bei vollem Puffer zuerst ein `message.delta` opfern (Streaming-Token, das
+      // die App durch das folgende `message.completed` ohnehin komplett ersetzt),
+      // statt blind das älteste Event zu verwerfen: sonst fiele u. U. ein
+      // `turn.completed`/`permission.request`/`tool.result` weg, dessen Verlust
+      // die Timeline dauerhaft verfälscht. Nur wenn gar kein Delta im Puffer ist,
+      // fällt das älteste Event (dann ist alles Verbliebene gleich wichtig).
+      const deltaIdx = eventQueue.findIndex((e) => e.type === 'message.delta');
+      eventQueue.splice(deltaIdx >= 0 ? deltaIdx : 0, 1);
       droppedEventCount++;
       if (droppedEventCount === 1 || droppedEventCount % 100 === 0) {
         log(
-          `event queue at cap (${MAX_QUEUED_EVENTS}) - dropped ${droppedEventCount} oldest event(s) so far (no orchestrator connection)`,
+          `event queue at cap (${MAX_QUEUED_EVENTS}) - dropped ${droppedEventCount} event(s) so far, message.delta first (no orchestrator connection)`,
         );
       }
     }
@@ -131,6 +138,20 @@ export function startLinkAgent(opts: LinkAgentOptions): LinkAgentHandle {
       if (ev && sessionId) send({ type: 'agent.event', sessionId, event: ev });
     }
   }
+
+  // TODO(event-loss-window): Bei einem langen Orchestrator-Ausfall kann die
+  // gedeckelte Queue (MAX_QUEUED_EVENTS) überlaufen und Events endgültig
+  // verwerfen - die Timeline drüben hätte dann eine Lücke, die kein Reconnect
+  // schließt. Ein lückenloser Weg wäre: der Orchestrator trägt in `agent.ready`
+  // die zuletzt für diese Session persistierte (server-kanonische) seq, und der
+  // Link-Agent liest seinen eingebetteten Runner-SSE-Strom ab da per
+  // Last-Event-ID nach, statt aus einem flüchtigen In-Memory-Puffer zu liefern.
+  // Das setzt die in Tier 2 gebaute Server-Kanonik voraus (die steht jetzt), ist
+  // aber eine Protokoll-Erweiterung (agent.ready + LinkHello-Resume) mit eigenem
+  // Testbedarf und daher bewusst noch nicht umgesetzt. Bis dahin mildert der
+  // message.delta-zuerst-Drop oben den Verlust ab.
+
+
 
   /** Liefert die laufende Runner-Instanz, wartet auf einen bereits laufenden Start statt einen zweiten anzustoßen. */
   async function ensureRunner(): Promise<EmbeddedRunner> {
@@ -269,6 +290,12 @@ export function startLinkAgent(opts: LinkAgentOptions): LinkAgentHandle {
 
   function dial(): void {
     if (stopped) return;
+    // Die Stille-Uhr für den frischen Socket neu stellen: stünde hier noch der
+    // Zeitpunkt der letzten Nachricht der ALTEN (gerade getrennten) Verbindung,
+    // könnte der pingTimer den eben geöffneten Socket sofort wieder terminieren,
+    // bevor der Server auch nur antworten konnte - eine Reconnect-Schleife, die
+    // nie zur Ruhe kommt.
+    lastServerMsgAt = Date.now();
     const url = resolveWsUrl(opts.server);
     log(`connecting ${url}`);
     const sock = new WebSocket(url);
@@ -281,8 +308,6 @@ export function startLinkAgent(opts: LinkAgentOptions): LinkAgentHandle {
         mode: opts.mode,
         branch: opts.branch || undefined,
         workDir: opts.workDir,
-        protocolVersion: LINK_PROTOCOL_VERSION,
-        capabilities: { heartbeat: true },
       });
     });
     sock.on('message', (raw) => {
@@ -350,15 +375,21 @@ export function startLinkAgent(opts: LinkAgentOptions): LinkAgentHandle {
    * agent.ping oben: jede Session, die dieser Link-Agent führt, mit ihrem
    * aktuellen Status, damit der Orchestrator ohne Abhängigkeit von jedem
    * einzelnen agent.event rekonziliieren kann. Heute immer höchstens die eine
-   * in `agent.ready` gebundene Session - ein leeres Array vor der
-   * Registrierung ist selbst aussagekräftig ("keine Sessions"), keine Lücke.
+   * in `agent.ready` gebundene Session.
+   *
+   * Erst NACH der Registrierung senden (sessionId gesetzt): Der Heartbeat ist ein
+   * VOLL-Zustand - ein leeres `sessions`-Array bedeutet dem Orchestrator "diese
+   * Session ist weg" und setzt sie auf 'stopped'. Zwischen einem Reconnect und
+   * dem nächsten `agent.ready` ist sessionId aber kurz null; ein in diesem Fenster
+   * gesendeter leerer Heartbeat würde die gerade wieder verbundene Session
+   * fälschlich auf 'stopped' flappen lassen. Also in diesem Fenster gar nichts
+   * senden - der Server behält den letzten bekannten Zustand.
    */
   const heartbeatTimer = setInterval(() => {
+    if (!sessionId) return;
     send({
       type: 'agent.heartbeat',
-      sessions: sessionId ? [{ sessionId, status: linkSessionStatus }] : [],
-      protocolVersion: LINK_PROTOCOL_VERSION,
-      capabilities: { heartbeat: true },
+      sessions: [{ sessionId, status: linkSessionStatus }],
     });
   }, intervals.heartbeatMs);
 

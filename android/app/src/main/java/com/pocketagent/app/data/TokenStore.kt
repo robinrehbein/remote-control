@@ -70,8 +70,6 @@ class TokenStore(private val context: Context) {
         )
     }
 
-    val deviceName: Flow<String> = context.dataStore.data.map { it[Keys.DEVICE_NAME] ?: "Android" }
-
     suspend fun credentials(): DeviceCredentials? {
         val s = setup.first() ?: return null
         val token = runCatching { decrypt(s.encryptedToken) }.getOrNull() ?: return null

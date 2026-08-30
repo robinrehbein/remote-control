@@ -617,12 +617,138 @@ class ProtocolDecodeTest {
         assertNull(parseServerMessage("""{"noType":true}"""))
     }
 
+    /* -------------------- Geräte & Links -------------------- */
+
+    @Test
+    fun `decodes device and link list responses`() {
+        val devices = parseServerMessage(
+            """
+            {
+              "type": "device.list",
+              "requestId": "r1",
+              "devices": [
+                {"id":"d1","name":"Pixel","enrolledAt":"2026-01-01T10:00:00Z","online":true},
+                {"id":"d2","name":"Tablet","enrolledAt":"2026-01-02T10:00:00Z"}
+              ]
+            }
+            """.trimIndent(),
+        )
+        assertTrue(devices is ServerMessage.DeviceListMsg)
+        val list = (devices as ServerMessage.DeviceListMsg).devices
+        assertEquals(2, list.size)
+        assertTrue(list[0].online)
+        // Fehlt online (älterer Server), gilt das Gerät als offline.
+        assertFalse(list[1].online)
+
+        val links = parseServerMessage(
+            """{"type":"link.list","requestId":"r3","links":[{"id":"l1","name":"devbox","createdAt":"2026-01-01T10:00:00Z"}]}""",
+        )
+        assertTrue(links is ServerMessage.LinkListMsg)
+        assertEquals("devbox", (links as ServerMessage.LinkListMsg).links.first().name)
+
+        // Die Revoke-Bestätigungen (Vergangenheitsform) tragen die Id zurück.
+        assertEquals(
+            "d1",
+            (parseServerMessage("""{"type":"device.revoked","requestId":"r2","deviceId":"d1"}""") as ServerMessage.DeviceRevokedMsg).deviceId,
+        )
+        assertEquals(
+            "l1",
+            (parseServerMessage("""{"type":"link.revoked","requestId":"r4","linkId":"l1"}""") as ServerMessage.LinkRevokedMsg).linkId,
+        )
+
+        // device.revoke/link.revoke sind Client->Server-Nachrichten: der
+        // Server->App-Decoder kennt sie korrekt nicht (null).
+        assertNull(parseServerMessage("""{"type":"device.revoke","requestId":"r2","deviceId":"d1"}"""))
+        assertNull(parseServerMessage("""{"type":"link.revoke","requestId":"r4","linkId":"l1"}"""))
+    }
+
+    @Test
+    fun `encodes device and link commands`() {
+        assertTrue(com.pocketagent.app.data.encodeDeviceList("r1").contains(""""type":"device.list""""))
+        assertTrue(com.pocketagent.app.data.encodeLinkList("r2").contains(""""type":"link.list""""))
+        val dr = com.pocketagent.app.data.encodeDeviceRevoke("r3", "d1")
+        assertTrue(dr.contains(""""type":"device.revoke""""))
+        assertTrue(dr.contains(""""deviceId":"d1""""))
+        val lr = com.pocketagent.app.data.encodeLinkRevoke("r4", "l1")
+        assertTrue(lr.contains(""""type":"link.revoke""""))
+        assertTrue(lr.contains(""""linkId":"l1""""))
+    }
+
+    /* -------------------- Turns -------------------- */
+
+    @Test
+    fun `decodes a turn status push with the messageId echo`() {
+        val msg = parseServerMessage(
+            """
+            {
+              "type": "turn.status",
+              "sessionId": "s1",
+              "turn": {
+                "turnId": "t1",
+                "sessionId": "s1",
+                "messageId": "msg_abc",
+                "state": "running",
+                "createdAt": "2026-01-01T10:00:00Z",
+                "updatedAt": "2026-01-01T10:00:01Z"
+              }
+            }
+            """.trimIndent(),
+        )
+        assertTrue(msg is ServerMessage.TurnStatusMsg)
+        val turn = (msg as ServerMessage.TurnStatusMsg).turn
+        assertEquals("s1", msg.sessionId)
+        assertEquals("t1", turn.turnId)
+        assertEquals("msg_abc", turn.messageId)
+        assertEquals(com.pocketagent.app.data.TurnState.RUNNING, turn.state)
+        assertTrue(turn.state.active)
+    }
+
+    @Test
+    fun `decodes session turns and tolerates unknown turn states`() {
+        val msg = parseServerMessage(
+            """
+            {
+              "type": "session.turns",
+              "requestId": "r1",
+              "sessionId": "s1",
+              "turns": [
+                {"turnId":"t1","sessionId":"s1","state":"completed"},
+                {"turnId":"t2","sessionId":"s1","state":"failed","reason":{"message":"runner weg","stage":"runner","retryable":true}},
+                {"turnId":"t3","sessionId":"s1","state":"teleported"}
+              ]
+            }
+            """.trimIndent(),
+        )
+        assertTrue(msg is ServerMessage.SessionTurnsMsg)
+        val turns = (msg as ServerMessage.SessionTurnsMsg).turns
+        assertEquals(3, turns.size)
+        assertEquals(com.pocketagent.app.data.TurnState.COMPLETED, turns[0].state)
+        assertEquals("runner weg", turns[1].reason?.message)
+        assertEquals(true, turns[1].reason?.retryable)
+        // Ein neuerer Server-Zustand fällt auf UNKNOWN, statt den Turn zu verwerfen.
+        assertEquals(com.pocketagent.app.data.TurnState.UNKNOWN, turns[2].state)
+        assertFalse(turns[2].state.active)
+    }
+
+    @Test
+    fun `encodes session turns get with and without limit`() {
+        val plain = com.pocketagent.app.data.encodeSessionTurnsGet("r1", "s1")
+        assertTrue(plain.contains(""""type":"session.turns.get""""))
+        assertFalse(plain.contains("\"limit\""))
+        assertTrue(com.pocketagent.app.data.encodeSessionTurnsGet("r2", "s1", 20).contains(""""limit":20"""))
+    }
+
+    @Test
+    fun `newMessageId is stable-prefixed and unique`() {
+        val a = com.pocketagent.app.data.newMessageId()
+        val b = com.pocketagent.app.data.newMessageId()
+        assertTrue(a.startsWith("msg_"))
+        assertTrue(a != b)
+    }
+
     @Test
     fun `returns null for unknown future server message types`() {
-        assertNull(parseServerMessage("""{"type":"device.list","requestId":"r1","devices":[]}"""))
-        assertNull(parseServerMessage("""{"type":"device.revoke","requestId":"r2","deviceId":"d1"}"""))
-        assertNull(parseServerMessage("""{"type":"link.list","requestId":"r3","links":[]}"""))
-        assertNull(parseServerMessage("""{"type":"link.revoke","requestId":"r4","linkId":"l1"}"""))
+        assertNull(parseServerMessage("""{"type":"completely.unknown.future","requestId":"r1"}"""))
     }
 
     /* -------------------- Unbekannte Enum-Werte (mode/status) -------------------- */

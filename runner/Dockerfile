@@ -22,7 +22,6 @@ RUN npm ci --no-audit --no-fund
 
 COPY runner/tsconfig.json runner/tsconfig.build.json ./
 COPY runner/src ./src
-COPY runner/scripts ./scripts
 RUN npm run build
 
 FROM node:22-bookworm-slim AS runtime
@@ -37,15 +36,12 @@ COPY packages/protocol /app/packages/protocol
 COPY runner/package.json runner/package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund
 
+# dist/ enthaelt sowohl den Runner (dist/index.js) als auch das Tap-Push-Skript
+# (dist/push.js, gebaut aus src/push.ts). Der Orchestrator startet fuer den
+# Tap-Push einen Wegwerf-Container mit `node /app/runner/dist/push.js`
+# (server/src/runner.ts: RUNNER_PUSH_SCRIPT); wer diese Zeile aendert, muss dort
+# mit - der Server-Smoke prueft beide Seiten gegeneinander.
 COPY --from=builder /app/runner/dist ./dist
-
-# scripts/ liegt bewusst NEBEN dist/: `npm run build` ist tsc mit include:["src"]
-# und emittiert nur TypeScript - push.js ist fertiges JavaScript und wandert
-# unveraendert mit. Der Orchestrator startet fuer den Tap-Push einen
-# Wegwerf-Container mit `node /app/runner/scripts/push.js`
-# (server/src/runner.ts: RUNNER_PUSH_SCRIPT); wer diese Zeile aendert, muss
-# dort mit - der Server-Smoke prueft beide Seiten gegeneinander.
-COPY runner/scripts ./scripts
 
 # Session containers run as uid 1000 (node) with a read-only root fs:
 # HOME/XDG_CONFIG_HOME point at writable /tmp locations so the pi SDK and its

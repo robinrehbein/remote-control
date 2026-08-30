@@ -9,7 +9,9 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -149,9 +151,12 @@ class WsClient(private val client: OkHttpClient) {
         if (wsUrl == null || credentials == null) return
         if (_state.value is ConnState.Connected || _state.value is ConnState.Connecting) return
         if (!manual && _state.value is ConnState.Unauthorized) return
-        // Mehrere Anstöße kurz hintereinander (zwei Netze werden gleichzeitig
-        // verfügbar, dazu der Vordergrund-Wechsel) sind ein einziger Versuch.
-        if (System.currentTimeMillis() - lastAttemptAt < MIN_ATTEMPT_GAP_MS) return
+        // Mehrere automatische Anstöße kurz hintereinander (zwei Netze werden
+        // gleichzeitig verfügbar, dazu der Vordergrund-Wechsel) sind ein
+        // einziger Versuch. Ein bewusster Nutzer-Tap („Jetzt verbinden“) ist
+        // davon ausgenommen: er will genau jetzt einen Versuch, nicht in 900 ms
+        // (Fund: MIN_ATTEMPT_GAP schluckt den manuellen Tap).
+        if (!manual && System.currentTimeMillis() - lastAttemptAt < MIN_ATTEMPT_GAP_MS) return
         reconnectJob?.cancel()
         reconnectJob = null
         backoff.reset()
@@ -352,13 +357,16 @@ fun isUnauthorizedClose(code: Int, reason: String): Boolean =
 suspend fun awaitConnected(
     state: StateFlow<WsClient.ConnState>,
     timeoutMs: Long,
-    pollMs: Long = 150,
+    @Suppress("UNUSED_PARAMETER") pollMs: Long = 150,
     reconnect: () -> Unit = {},
 ): Boolean {
     if (state.value !is WsClient.ConnState.Connected) reconnect()
-    val deadline = System.currentTimeMillis() + timeoutMs
-    while (state.value !is WsClient.ConnState.Connected && System.currentTimeMillis() < deadline) {
-        delay(pollMs)
-    }
-    return state.value is WsClient.ConnState.Connected
+    // Statt im [pollMs]-Takt zu pollen, direkt auf die nächste Connected-
+    // Emission warten — der StateFlow liefert seinen aktuellen Wert sofort,
+    // steht die Verbindung also schon, kehrt das ohne Verzögerung zurück.
+    // [pollMs] bleibt als Parameter nur für Abwärtskompatibilität bestehen.
+    return withTimeoutOrNull(timeoutMs) {
+        state.first { it is WsClient.ConnState.Connected }
+        true
+    } ?: false
 }

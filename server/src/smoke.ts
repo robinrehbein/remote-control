@@ -33,7 +33,7 @@ const { buildApp } = await import('./index.js');
 const { generatePairingCode, SlidingWindowRateLimiter } = await import('./pairing.js');
 const { validateSecret } = await import('./secret-validate.js');
 const { buildPromptBody, isNoticePhase } = await import('./sessions.js');
-const { buildRunnerEnv, runnerImageName } = await import('./runner.js');
+const { buildRunnerEnv, proxyTokenFor, runnerImageName } = await import('./runner.js');
 type SessionManager = import('./sessions.js').SessionManager;
 type Store = import('./db.js').Store;
 type SessionRow = import('./db.js').SessionRow;
@@ -120,6 +120,10 @@ class Client {
 
   closed(): Promise<boolean> {
     return new Promise((res) => this.ws.once('close', () => res(true)));
+  }
+
+  close(): void {
+    this.ws.close();
   }
 
   closeCode(): Promise<number> {
@@ -429,23 +433,24 @@ async function runnerConfigSmoke(): Promise<void> {
     /* ---- Tap-Push: Server-Pfad und Image-Layout sind dieselbe Wahrheit ---- */
 
     const { RUNNER_PUSH_SCRIPT, RUNNER_PUSH_SCRIPT_REL, RUNNER_IMAGE_DIR } = await import('./runner.js');
+    // Das Push-Skript ist jetzt TypeScript (src/push.ts) und wird nach dist/push.js
+    // gebaut. Im Kontext liegt also die QUELLE, nicht ein vorgefertigtes JS; das
+    // gebaute dist/ kommt im Image aus der Builder-Stage (COPY --from=builder).
     assert(
-      ctxSet.has(`runner/${RUNNER_PUSH_SCRIPT_REL}`),
-      `das Push-Skript liegt als runner/${RUNNER_PUSH_SCRIPT_REL} im Kontext (docker.ts startet genau dieses)`,
+      ctxSet.has('runner/src/push.ts'),
+      'die Push-Skript-Quelle liegt als runner/src/push.ts im Kontext (tsc baut sie nach dist/push.js)',
     );
     assert(
       RUNNER_PUSH_SCRIPT === `${RUNNER_IMAGE_DIR}/${RUNNER_PUSH_SCRIPT_REL}`,
       'der absolute Pfad im Container leitet sich aus WORKDIR + relativem Pfad ab',
     );
-    // `npm run build` (tsc, include: ["src"]) emittiert nur TypeScript nach
-    // dist/ - ein Pfad unter dist/ waere im Image also leer.
     assert(
-      !RUNNER_PUSH_SCRIPT.includes('/dist/'),
-      'der Push-Pfad zeigt nicht nach dist/ (push.js ist fertiges JS und wird nicht kompiliert)',
+      RUNNER_PUSH_SCRIPT_REL.startsWith('dist/'),
+      'der Push-Pfad zeigt nach dist/ (aus src/push.ts kompiliert, wie dist/index.js)',
     );
     assert(
-      copySources.includes('runner/scripts'),
-      'runner/Dockerfile kopiert runner/scripts unveraendert ins Image',
+      copySources.includes('runner/src'),
+      'runner/Dockerfile kopiert runner/src (enthaelt push.ts) in die Builder-Stage',
     );
   }
 
@@ -884,6 +889,17 @@ async function turnSmoke(store: Store, manager: SessionManager, c2: Client, repo
     const history = manager.sessionEvents(idB);
     const assistantLines = history.filter((e) => e.type === 'message.completed' && e.role === 'assistant');
     assert(assistantLines.length === 1, `ein wiedergespieltes Event landet nur einmal in der Historie (waren ${assistantLines.length})`);
+    // Kanonische seq: der Live-Broadcast und die Historie tragen DENSELBEN
+    // server-vergebenen Wert (die rowid), nicht die Runner-seq (1) - so kann die
+    // App zwischen Live-Strom und nachgeladener Historie sessionweit dedupen.
+    assert(
+      liveEvent.type === 'session.event' && typeof liveEvent.event.seq === 'number' && liveEvent.event.seq !== 1,
+      'ein live gepushtes Event traegt die server-kanonische seq, nicht die Runner-seq',
+    );
+    assert(
+      liveEvent.type === 'session.event' && assistantLines[0]!.seq === liveEvent.event.seq,
+      'die Historie traegt fuer dasselbe Event dieselbe kanonische seq wie der Live-Broadcast',
+    );
     assert(
       history.some((e) => e.type === 'message.completed' && e.role === 'user' && e.text === 'lauf los'),
       'der eigene Prompt steht in der Historie, damit ein neu geladener Verlauf nicht bei der Antwort beginnt',
@@ -1016,17 +1032,24 @@ async function egressSmoke(store: Store, manager: SessionManager, repoId: string
   const allowId = randomUUID();
   const isoId = randomUUID();
   const stoppedId = randomUUID();
-  const allowToken = `allow-${allowId}`;
-  const isoToken = `iso-${isoId}`;
-  const stoppedToken = `stopped-${stoppedId}`;
-  store.insertSession(sessionRow(allowId, repoId, { status: 'idle', shim_token: allowToken }));
-  store.insertSession(sessionRow(isoId, repoId, { status: 'idle', shim_token: isoToken, network_policy: 'isolated' }));
-  store.insertSession(sessionRow(stoppedId, repoId, { status: 'stopped', shim_token: stoppedToken }));
+  const allowShim = `allow-${allowId}`;
+  const isoShim = `iso-${isoId}`;
+  const stoppedShim = `stopped-${stoppedId}`;
+  // Auf dem Draht (Proxy-Authorization) trägt der Container NICHT den shim_token,
+  // sondern das davon abgeleitete Egress-Credential (proxyTokenFor) - so wie es
+  // docker.ts in die HTTP(S)_PROXY-URL schreibt. Das Token-Gate validiert exakt diesen.
+  const allowToken = proxyTokenFor(allowShim);
+  const isoToken = proxyTokenFor(isoShim);
+  const stoppedToken = proxyTokenFor(stoppedShim);
+  store.insertSession(sessionRow(allowId, repoId, { status: 'idle', shim_token: allowShim }));
+  store.insertSession(sessionRow(isoId, repoId, { status: 'idle', shim_token: isoShim, network_policy: 'isolated' }));
+  store.insertSession(sessionRow(stoppedId, repoId, { status: 'stopped', shim_token: stoppedShim }));
 
-  assert(manager.egressTokenAllowed(allowToken)?.id === allowId, 'das Token einer lebenden Session benennt ihre Session');
+  assert(manager.egressTokenAllowed(allowToken)?.id === allowId, 'das abgeleitete Token einer lebenden Session benennt ihre Session');
   assert(manager.egressTokenAllowed(allowToken)?.policy === 'allowlist', 'das Token-Gate meldet die Policy der Session');
   assert(manager.egressTokenAllowed(isoToken)?.policy === 'isolated', 'eine isolierte Session wird identifiziert, nicht versteckt');
   assert(manager.egressTokenAllowed(stoppedToken) === null, 'das Token einer gestoppten Session oeffnet den Proxy nicht mehr');
+  assert(manager.egressTokenAllowed(allowShim) === null, 'der rohe shim_token taugt nicht als Egress-Credential (nur der abgeleitete Wert)');
   assert(manager.egressTokenAllowed('nie-vergeben') === null, 'ein unbekanntes Token benennt keine Session');
   store.setSessionArchived(allowId, true);
   assert(manager.egressTokenAllowed(allowToken) === null, 'eine archivierte Session verliert ihren Egress sofort');
@@ -1141,7 +1164,7 @@ async function egressSmoke(store: Store, manager: SessionManager, repoId: string
  * Heartbeat ist ein Voll-Zustand (keine Deltas), und die beiden Close-Codes,
  * die `link/` als terminal behandelt, kommen wirklich vom Server.
  */
-async function linkSmoke(store: Store, wsBase: string, c2: Client): Promise<void> {
+async function linkSmoke(store: Store, manager: SessionManager, wsBase: string, c2: Client): Promise<void> {
   section('link token + heartbeat');
   const { randomBytes } = await import('node:crypto');
 
@@ -1157,11 +1180,10 @@ async function linkSmoke(store: Store, wsBase: string, c2: Client): Promise<void
 
   const linkA = new Client(wsBase);
   await linkA.opened;
-  // Ohne protocolVersion/capabilities - die Form eines aelteren Link-Agenten.
   linkA.send({ type: 'agent.hello', token: tokenA, name: 'link-a', workDir: '/home/robin/code' });
   const readyA = await linkA.wait((m) => m.type === 'agent.ready');
   const sessionAId = readyA.type === 'agent.ready' ? readyA.sessionId : '';
-  assert(sessionAId !== '', 'ein Link registriert sich auch ohne protocolVersion/capabilities');
+  assert(sessionAId !== '', 'ein Link registriert sich mit agent.hello');
   const linkRow = store.getSession(sessionAId);
   assert(linkRow?.status === 'idle', 'eine frisch registrierte Link-Session startet idle');
   assert(linkRow?.repo_full_name.includes('/home/robin/code') === true, 'das Arbeitsverzeichnis steht im Anzeigenamen');
@@ -1171,6 +1193,50 @@ async function linkSmoke(store: Store, wsBase: string, c2: Client): Promise<void
     listed.type === 'session.list' && listed.sessions.find((s) => s.id === sessionAId)?.linked === true,
     'eine Link-Session ist in session.list als linked markiert',
   );
+
+  // Timeline ueber einen Link-Neustart (Tier-2-Fix (a)): der Link-Agent beginnt
+  // seine seq bei jedem Verbinden wieder bei 1. registerLinkSession muss die
+  // lastPersistedSeq-Marke zuruecksetzen, sonst verwirft persistEvent jedes Event
+  // des neuen Laufs als vermeintlichen Replay und die Session verliert ihre
+  // Historie. Ein eigener, isolierter Link (tokenR), damit der Reconnect keine
+  // andere Bindung stoert.
+  const tokenR = randomBytes(24).toString('hex');
+  store.createLink(randomUUID(), 'default', 'smoke-link-r', sha256(tokenR));
+  const linkR1 = new Client(wsBase);
+  await linkR1.opened;
+  linkR1.send({ type: 'agent.hello', token: tokenR, name: 'link-r' });
+  const readyR1 = await linkR1.wait((m) => m.type === 'agent.ready');
+  const sessionRId = readyR1.type === 'agent.ready' ? readyR1.sessionId : '';
+  manager.handleLinkEvent(sessionRId, { type: 'message.completed', role: 'assistant', text: 'lauf-1 a', seq: 1 });
+  manager.handleLinkEvent(sessionRId, { type: 'message.completed', role: 'assistant', text: 'lauf-1 b', seq: 2 });
+  const beforeReconnect = manager
+    .sessionEvents(sessionRId)
+    .filter((e) => e.type === 'message.completed' && e.role === 'assistant').length;
+  assert(beforeReconnect === 2, `vor dem Neustart stehen beide Zeilen des ersten Laufs in der Historie (waren ${beforeReconnect})`);
+  linkR1.close();
+  // Reconnect desselben Links (gleiches Token) -> registerLinkSession(existing) -> Reset.
+  const linkR2 = new Client(wsBase);
+  await linkR2.opened;
+  linkR2.send({ type: 'agent.hello', token: tokenR, name: 'link-r' });
+  const readyR2 = await linkR2.wait((m) => m.type === 'agent.ready');
+  assert(
+    readyR2.type === 'agent.ready' && readyR2.sessionId === sessionRId,
+    'der Reconnect bindet dieselbe Link-Session-Id wieder',
+  );
+  // seq startet wieder bei 1 - dank Reset darf es NICHT als Replay verworfen werden.
+  manager.handleLinkEvent(sessionRId, { type: 'message.completed', role: 'assistant', text: 'lauf-2 a', seq: 1 });
+  const afterReconnect = manager
+    .sessionEvents(sessionRId)
+    .filter((e) => e.type === 'message.completed' && e.role === 'assistant');
+  assert(
+    afterReconnect.length === 3,
+    `nach dem Neustart landet die neue Zeile trotz zurueckgesetzter seq in der Historie (waren ${afterReconnect.length})`,
+  );
+  assert(
+    new Set(afterReconnect.map((e) => e.seq)).size === 3,
+    'jede der drei Zeilen traegt eine eigene kanonische seq - keine Kollision ueber den Neustart',
+  );
+  linkR2.close();
 
   // Ein zweiter, unabhaengiger Link - Beleg, dass ein Link nur seine eigene Bindung bewegt.
   const tokenC = randomBytes(24).toString('hex');
@@ -1185,8 +1251,6 @@ async function linkSmoke(store: Store, wsBase: string, c2: Client): Promise<void
   linkA.send({
     type: 'agent.heartbeat',
     sessions: [{ sessionId: sessionAId, status: 'busy' }],
-    protocolVersion: 2,
-    capabilities: { heartbeat: true },
   });
   await waitUntil(
     () => store.getSession(sessionAId)?.status === 'running',
@@ -1452,12 +1516,11 @@ async function main(): Promise<void> {
   assert(deletedSecret.type === 'secret.deleted', 'secret.delete wird quittiert');
   assert(store.getSecretValue('anthropic', 'default') === null, 'ein geloeschtes Secret ist wirklich weg');
 
-  /* ---- Vault: AAD-Bindung und Legacy-Migration ---- */
+  /* ---- Vault: strikte AAD-Bindung (v2 kennt keinen No-AAD-Fallback mehr) ---- */
 
   const aad = 'secret:default:smoke-aad';
   const encRound = vault.encrypt('roundtrip-value', aad);
   assert(vault.decryptStrict(encRound, aad) === 'roundtrip-value', 'AES-256-GCM-Roundtrip mit AAD');
-  assert(vault.decrypt(encRound, aad) === 'roundtrip-value', 'decrypt mit passender AAD funktioniert');
   let aadMismatch = false;
   try {
     vault.decryptStrict(encRound, 'secret:default:other');
@@ -1466,18 +1529,24 @@ async function main(): Promise<void> {
   }
   assert(aadMismatch, 'eine falsche AAD laesst den strikten decrypt scheitern');
 
-  const legacyKind = 'openai';
-  const legacyEnc = vault.encrypt('legacy-value'); // ohne AAD (Zeile vor der Migration)
-  store.saveSecret(randomUUID(), 'default', legacyKind, legacyEnc.ciphertext, legacyEnc.nonce);
-  assert(store.getSecretValue(legacyKind, 'default') === 'legacy-value', 'eine Legacy-Zeile entschluesselt ueber den Fallback');
-  const reEncrypted = store.getSecretByKind(legacyKind, 'default');
-  assert(!!reEncrypted && reEncrypted.ciphertext !== legacyEnc.ciphertext, 'die Legacy-Zeile wurde neu verschluesselt');
-  assert(
-    !!reEncrypted &&
-      vault.decryptStrict({ ciphertext: reEncrypted.ciphertext, nonce: reEncrypted.nonce }, `secret:default:${legacyKind}`) ===
-        'legacy-value',
-    'der zweite Lauf entschluesselt strikt mit AAD',
-  );
+  // v2 startet frisch und schreibt jedes Secret AAD-gebunden: getSecretValue
+  // entschluesselt strikt und heilt KEINE AAD-lose Zeile mehr (kein Fallback,
+  // keine transparente Re-Verschluesselung). Eine ohne AAD geschriebene Zeile
+  // scheitert daher fail-closed statt still durchzugehen.
+  const noAadKind = 'openai';
+  const noAadEnc = vault.encrypt('no-aad-value'); // ohne AAD - darf es in v2 nicht geben
+  store.saveSecret(randomUUID(), 'default', noAadKind, noAadEnc.ciphertext, noAadEnc.nonce);
+  let noAadThrew = false;
+  try {
+    store.getSecretValue(noAadKind, 'default');
+  } catch {
+    noAadThrew = true;
+  }
+  assert(noAadThrew, 'eine AAD-lose Zeile scheitert strikt (kein stiller No-AAD-Pfad)');
+  // Regulaer geschriebenes (AAD-gebundenes) Secret liest getSecretValue sauber.
+  const okEnc = vault.encrypt('aad-value', `secret:default:${noAadKind}`);
+  store.saveSecret(randomUUID(), 'default', noAadKind, okEnc.ciphertext, okEnc.nonce);
+  assert(store.getSecretValue(noAadKind, 'default') === 'aad-value', 'ein AAD-gebundenes Secret entschluesselt strikt');
 
   /* ---- secret.validate: rein offline mit gestubbtem fetch ---- */
 
@@ -1655,7 +1724,7 @@ async function main(): Promise<void> {
   await turnSmoke(store, manager, c2, repoId);
   await egressSmoke(store, manager, repoId);
   await lifecycleSmoke(store, manager, c2, repoId);
-  await linkSmoke(store, wsBase, c2);
+  await linkSmoke(store, manager, wsBase, c2);
   await heartbeatSmoke();
   await shimClientSmoke();
 
@@ -1768,13 +1837,20 @@ async function main(): Promise<void> {
   /* ---------------- Speicher-Hygiene + Admin-CLI ---------------- */
 
   section('storage + admin cli');
+  // Der Trim (appendEvent) läuft gedrosselt (etwa jedes 50. Event), damit nicht
+  // jeder Schreibvorgang einen Subquery-Scan auslöst. Er kappt auf 5000, kann die
+  // Session danach aber kurz um bis zu ~49 Zeilen überschreiten, bis der nächste
+  // Trim greift. 5100 Inserts stellen sicher, dass mindestens ein Trim feuert
+  // (jedes Fenster von 50 aufeinanderfolgenden rowids enthält ein Vielfaches von
+  // 50); die Obergrenze ist damit 5000 + 49.
   store.db.transaction(() => {
-    for (let i = 0; i < 5005; i++) store.appendEvent('smoke-prune-session', 'tick', '{}');
+    for (let i = 0; i < 5100; i++) store.appendEvent('smoke-prune-session', 'tick', '{}');
   })();
   const cnt = store.db
     .prepare('SELECT COUNT(*) AS c FROM session_events WHERE session_id = ?')
     .get('smoke-prune-session') as { c: number };
-  assert(cnt.c <= 5000, `session_events auf <= 5000 gestutzt (waren ${cnt.c})`);
+  assert(cnt.c <= 5050, `session_events auf ~5000 (gedrosselter Trim) gestutzt (waren ${cnt.c})`);
+  assert(cnt.c < 5100, 'der Trim hat wirklich gefeuert, nicht nur eingefügt');
 
   const logs: string[] = [];
   const origLog = console.log;

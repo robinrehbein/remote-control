@@ -21,10 +21,6 @@ export const INITIAL_LINK_SESSION_STATUS: LinkSessionStatus = 'idle';
  * is paused waiting on the user, and `turn.completed`/`turn.failed` always
  * end it. Events with no bearing on liveness (message deltas, tool
  * calls/results, notices, pings, ...) leave the status unchanged.
- *
- * `'question'` (Kilo's fourth status) is never produced here: no PocketAgent
- * shim event distinguishes "waiting for a free-text answer" from an
- * in-progress turn today - see `LinkSessionStatus` in the protocol package.
  */
 export function nextLinkSessionStatus(current: LinkSessionStatus, ev: AgentEvent): LinkSessionStatus {
   switch (ev.type) {

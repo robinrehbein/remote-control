@@ -79,9 +79,10 @@ fun SessionListDetail(
                 NoSessionSelected()
             } else {
                 SessionScreen(
-                    // Der Schlüssel hängt an der Id, damit der Wechsel der
-                    // Auswahl auch das ViewModel wechselt und nicht der
-                    // Verlauf der vorigen Session stehen bleibt.
+                    // Ein einziges Session-VM, das bei jedem Auswahlwechsel auf
+                    // die neue Id umbindet (SessionScreen.bind) — kein VM pro je
+                    // geöffneter Session mehr (Fund: ViewModel-Leak). Der Verlauf
+                    // der vorigen Session wird beim Umbinden zurückgesetzt.
                     sessionId = selectedId,
                     onBack = { onSelect(null) },
                     onOpenDiff = onOpenDiff,

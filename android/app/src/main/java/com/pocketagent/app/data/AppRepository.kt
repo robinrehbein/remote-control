@@ -18,6 +18,9 @@ import java.util.concurrent.ConcurrentHashMap
 
 data class SessionEventEnvelope(val sessionId: String, val event: AgentEvent)
 
+/** Ein Turn-Zustandswechsel (`turn.status`), gemünzt auf genau eine Session. */
+data class TurnStatusEnvelope(val sessionId: String, val turn: TurnInfo)
+
 /**
  * Ergebnis einer Key-Prüfung. [unverified] heißt: für diese Art gibt es keine
  * Live-Prüfung — [ok] ist dann true, wird aber neutral dargestellt.
@@ -77,6 +80,17 @@ class AppRepository(
     )
     val sessionEvents: SharedFlow<SessionEventEnvelope> = _sessionEvents
 
+    /**
+     * Live-Turn-Zustandswechsel (`turn.status`). Getrennt von [sessionEvents],
+     * weil ein Turn kein Timeline-Eintrag ist, sondern den Busy-Zustand und den
+     * Idempotenz-Abgleich (messageId-Echo) einer Session trägt.
+     */
+    private val _turnStatus = MutableSharedFlow<TurnStatusEnvelope>(
+        extraBufferCapacity = 128,
+        onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST,
+    )
+    val turnStatus: SharedFlow<TurnStatusEnvelope> = _turnStatus
+
     private val _lastError = MutableStateFlow<String?>(null)
     val lastError: StateFlow<String?> = _lastError
 
@@ -92,7 +106,18 @@ class AppRepository(
         scope.launch {
             tokens.setup.collect { setup ->
                 if (setup == null) {
+                    // Abgemeldet: Verbindung kappen UND den Cache leeren. Ohne
+                    // das trüge ein späteres Re-Pairing (evtl. anderer Server)
+                    // noch die Sessions/Secrets/Repos des alten Kontos, bis die
+                    // erste Antwort sie überschreibt — und die MainActivity, die
+                    // `setup` jetzt als Flow beobachtet, zeigt sofort wieder den
+                    // Pairing-Screen (Fund: Logout führt nicht zum Pairing zurück).
                     ws.disconnect()
+                    _sessions.value = emptyList()
+                    _sessionsLoaded.value = false
+                    _secrets.value = emptyList()
+                    _repos.value = emptyList()
+                    _stats.value = null
                 } else {
                     val creds = tokens.credentials()
                     if (creds == null) {
@@ -199,6 +224,29 @@ class AppRepository(
                 }
             }
 
+            is ServerMessage.TurnStatusMsg -> {
+                _turnStatus.tryEmit(TurnStatusEnvelope(msg.sessionId, msg.turn))
+                // Turn konsumieren statt ignorieren: sein Zustand treibt den
+                // Busy-Status der Session — auch nach einem Reconnect, wo kein
+                // eigenes Live-`status`-Event ankam. Nur zwischen RUNNING und
+                // IDLE schalten; CREATING/STOPPED/ERROR bleibt unangetastet.
+                val running = msg.turn.state.active
+                _sessions.value = _sessions.value.map {
+                    if (it.id != msg.sessionId) it
+                    else when {
+                        running -> it.copy(status = SessionStatus.RUNNING)
+                        it.status == SessionStatus.RUNNING -> it.copy(status = SessionStatus.IDLE)
+                        else -> it
+                    }
+                }
+            }
+
+            is ServerMessage.SessionTurnsMsg -> completePending(msg.requestId, msg)
+            is ServerMessage.DeviceListMsg -> completePending(msg.requestId, msg)
+            is ServerMessage.DeviceRevokedMsg -> completePending(msg.requestId, msg)
+            is ServerMessage.LinkListMsg -> completePending(msg.requestId, msg)
+            is ServerMessage.LinkRevokedMsg -> completePending(msg.requestId, msg)
+
             is ServerMessage.ErrorMsg -> {
                 _lastError.value = msg.message
                 msg.requestId?.let { completePending(it, msg) }
@@ -232,6 +280,24 @@ class AppRepository(
         } finally {
             pending.remove(id)
         }
+    }
+
+    /**
+     * Anfrage senden und die Antwort einheitlich auf ein [Result] abbilden:
+     * ein `error` wird zum Misserfolg, eine fehlende Verbindung (null) ebenso,
+     * und jede andere Antwort geht durch [map]. Gibt [map] null zurück, war die
+     * Antwort unerwartet. Ersetzt das zehnfach kopierte
+     * `when(response){ ErrorMsg->…; null->…; is X->…; else->… }`-Muster.
+     */
+    private suspend fun <T> requestAs(
+        timeoutMs: Long = REQUEST_TIMEOUT_MS,
+        jsonFactory: (requestId: String) -> String,
+        map: (ServerMessage) -> T?,
+    ): Result<T> = when (val response = request(timeoutMs, jsonFactory)) {
+        is ServerMessage.ErrorMsg -> Result.failure(IllegalStateException(response.message))
+        null -> Result.failure(IllegalStateException("Keine Verbindung"))
+        else -> map(response)?.let { Result.success(it) }
+            ?: Result.failure(IllegalStateException("Unerwartete Antwort"))
     }
 
     suspend fun refreshSessions() {
@@ -299,39 +365,32 @@ class AppRepository(
      * dem ältesten Ereignis zuerst. Eine leere Liste ist ein gültiges
      * Ergebnis; nur ein Fehler oder eine fehlende Verbindung sind Misserfolg.
      */
-    suspend fun loadEvents(sessionId: String, limit: Int? = null): Result<List<AgentEvent>> {
-        val response = request { id -> encodeSessionEventsGet(id, sessionId, limit) }
-        return when (response) {
-            is ServerMessage.SessionEventsMsg -> Result.success(response.events)
-            is ServerMessage.ErrorMsg -> Result.failure(IllegalStateException(response.message))
-            null -> Result.failure(IllegalStateException("Keine Verbindung"))
-            else -> Result.failure(IllegalStateException("Unerwartete Antwort"))
+    suspend fun loadEvents(sessionId: String, limit: Int? = null): Result<List<AgentEvent>> =
+        requestAs(jsonFactory = { id -> encodeSessionEventsGet(id, sessionId, limit) }) {
+            (it as? ServerMessage.SessionEventsMsg)?.events
         }
-    }
+
+    /**
+     * Turn-Lebenszyklus einer Session (`session.turns.get`). Nach einem
+     * Reconnect die verlässliche Quelle für den Ausgang jedes Turns, statt ihn
+     * aus dem Event-Strom zu raten. Leere Liste ist ein gültiges Ergebnis.
+     */
+    suspend fun loadTurns(sessionId: String, limit: Int? = null): Result<List<TurnInfo>> =
+        requestAs(jsonFactory = { id -> encodeSessionTurnsGet(id, sessionId, limit) }) {
+            (it as? ServerMessage.SessionTurnsMsg)?.turns
+        }
 
     /**
      * Titel der Session setzen; leerer String entfernt ihn. Der Server
      * bestätigt mit request.ok und schickt die geänderte Session als
      * session.status — die Liste aktualisiert sich darüber von selbst.
      */
-    suspend fun renameSession(sessionId: String, title: String): Result<Unit> {
-        val response = request { id -> encodeSessionRename(id, sessionId, title) }
-        return when (response) {
-            is ServerMessage.ErrorMsg -> Result.failure(IllegalStateException(response.message))
-            null -> Result.failure(IllegalStateException("Keine Verbindung"))
-            else -> Result.success(Unit)
-        }
-    }
+    suspend fun renameSession(sessionId: String, title: String): Result<Unit> =
+        requestAs(jsonFactory = { id -> encodeSessionRename(id, sessionId, title) }) { Unit }
 
     /** Session archivieren oder zurückholen; Antwortweg wie bei [renameSession]. */
-    suspend fun setArchived(sessionId: String, archived: Boolean): Result<Unit> {
-        val response = request { id -> encodeSessionArchive(id, sessionId, archived) }
-        return when (response) {
-            is ServerMessage.ErrorMsg -> Result.failure(IllegalStateException(response.message))
-            null -> Result.failure(IllegalStateException("Keine Verbindung"))
-            else -> Result.success(Unit)
-        }
-    }
+    suspend fun setArchived(sessionId: String, archived: Boolean): Result<Unit> =
+        requestAs(jsonFactory = { id -> encodeSessionArchive(id, sessionId, archived) }) { Unit }
 
     suspend fun loadDiff(sessionId: String): Result<List<DiffEntry>> {
         val response = request { id -> encodeSessionDiffGet(id, sessionId) }
@@ -354,14 +413,9 @@ class AppRepository(
         model: String? = null,
         reasoningEffort: ReasoningEffort? = null,
     ): Result<Unit> {
-        val response = request { id ->
+        return requestAs(jsonFactory = { id ->
             encodeSessionUpdate(id, sessionId, mode, model, reasoningEffort)
-        }
-        return when (response) {
-            is ServerMessage.ErrorMsg -> Result.failure(IllegalStateException(response.message))
-            null -> Result.failure(IllegalStateException("Keine Verbindung"))
-            else -> Result.success(Unit)
-        }
+        }) { Unit }
     }
 
     /**
@@ -419,9 +473,6 @@ class AppRepository(
         }
     }
 
-    /** Über den Turn stabile Nachrichten-Id für die Idempotenz-/Ack-Zuordnung. */
-    private fun newMessageId(): String = "msg_" + UUID.randomUUID().toString().replace("-", "")
-
     fun sendPermission(sessionId: String, permissionId: String, decision: PermissionDecision): Boolean =
         ws.send(encodeSessionPermission(sessionId, permissionId, decision))
 
@@ -462,49 +513,55 @@ class AppRepository(
     fun sendResume(sessionId: String): Boolean = ws.send(encodeSessionResume(sessionId))
     fun sendPush(sessionId: String): Boolean = ws.send(encodeSessionPush(sessionId))
 
-    suspend fun addSecret(kind: String, value: String): Result<SecretInfo> {
-        val response = request { id -> encodeSecretSet(id, kind, value) }
-        return when (response) {
-            is ServerMessage.SecretSavedMsg -> Result.success(response.secret)
-            is ServerMessage.ErrorMsg -> Result.failure(IllegalStateException(response.message))
-            null -> Result.failure(IllegalStateException("Keine Verbindung"))
-            else -> Result.failure(IllegalStateException("Unerwartete Antwort"))
+    suspend fun addSecret(kind: String, value: String): Result<SecretInfo> =
+        requestAs(jsonFactory = { id -> encodeSecretSet(id, kind, value) }) {
+            (it as? ServerMessage.SecretSavedMsg)?.secret
         }
-    }
 
     /**
      * Live-Prüfung eines Keys beim Anbieter. Unabhängig vom Speichern; der
      * Wert wird nur für die Prüfung übertragen und nie zurückgeliefert.
      */
-    suspend fun validateSecret(kind: String, value: String): Result<SecretValidation> {
-        val response = request { id -> encodeSecretValidate(id, kind, value) }
-        return when (response) {
-            is ServerMessage.SecretValidatedMsg -> Result.success(
-                SecretValidation(
-                    ok = response.ok,
-                    detail = response.detail,
-                    unverified = response.unverified,
-                ),
-            )
-
-            is ServerMessage.ErrorMsg -> Result.failure(IllegalStateException(response.message))
-            null -> Result.failure(IllegalStateException("Keine Verbindung"))
-            else -> Result.failure(IllegalStateException("Unerwartete Antwort"))
+    suspend fun validateSecret(kind: String, value: String): Result<SecretValidation> =
+        requestAs(jsonFactory = { id -> encodeSecretValidate(id, kind, value) }) {
+            (it as? ServerMessage.SecretValidatedMsg)?.let { m ->
+                SecretValidation(ok = m.ok, detail = m.detail, unverified = m.unverified)
+            }
         }
-    }
 
     suspend fun deleteSecret(id: String): Boolean =
         request { requestId -> encodeSecretDelete(requestId, id) } is ServerMessage.SecretDeletedMsg
 
-    suspend fun addRepo(fullName: String, defaultBranch: String): Result<RepoInfo> {
-        val response = request { id -> encodeRepoAdd(id, fullName, defaultBranch) }
-        return when (response) {
-            is ServerMessage.RepoAddedMsg -> Result.success(response.repo)
-            is ServerMessage.ErrorMsg -> Result.failure(IllegalStateException(response.message))
-            null -> Result.failure(IllegalStateException("Keine Verbindung"))
-            else -> Result.failure(IllegalStateException("Unerwartete Antwort"))
+    suspend fun addRepo(fullName: String, defaultBranch: String): Result<RepoInfo> =
+        requestAs(jsonFactory = { id -> encodeRepoAdd(id, fullName, defaultBranch) }) {
+            (it as? ServerMessage.RepoAddedMsg)?.repo
         }
-    }
+
+    /* ---------------- Geräte & Links ---------------- */
+
+    /** Gekoppelte App-Geräte holen (`device.list`); leere Liste ist gültig. */
+    suspend fun loadDevices(): Result<List<DeviceInfo>> =
+        requestAs(jsonFactory = { id -> encodeDeviceList(id) }) {
+            (it as? ServerMessage.DeviceListMsg)?.devices
+        }
+
+    /** Ein Gerät entkoppeln (`device.revoke`). */
+    suspend fun revokeDevice(deviceId: String): Result<Unit> =
+        requestAs(jsonFactory = { id -> encodeDeviceRevoke(id, deviceId) }) {
+            if (it is ServerMessage.DeviceRevokedMsg) Unit else null
+        }
+
+    /** Verbundene Link-Agenten holen (`link.list`); leere Liste ist gültig. */
+    suspend fun loadLinks(): Result<List<LinkInfo>> =
+        requestAs(jsonFactory = { id -> encodeLinkList(id) }) {
+            (it as? ServerMessage.LinkListMsg)?.links
+        }
+
+    /** Einen Link-Agenten trennen (`link.revoke`). */
+    suspend fun revokeLink(linkId: String): Result<Unit> =
+        requestAs(jsonFactory = { id -> encodeLinkRevoke(id, linkId) }) {
+            if (it is ServerMessage.LinkRevokedMsg) Unit else null
+        }
 
     /** „Jetzt neu verbinden“ — überspringt die laufende Wartezeit. */
     fun reconnectNow() = ws.reconnectNow()
@@ -576,10 +633,6 @@ class AppRepository(
                 .addOnSuccessListener { token -> onFcmToken(token) }
                 .addOnFailureListener { /* kein Firebase / kein Netz — onNewToken holt es notfalls nach */ }
         }
-    }
-
-    suspend fun awaitConnected() {
-        awaitConnected(state = ws.state, timeoutMs = REQUEST_TIMEOUT_MS)
     }
 
     suspend fun isPaired(): Boolean = tokens.setup.first() != null

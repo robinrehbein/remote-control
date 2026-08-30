@@ -37,7 +37,6 @@ class SessionActionsTest {
         id = id,
         repoId = "r1",
         repoFullName = repo,
-        adapter = "pi",
         provider = "anthropic",
         model = "opus",
         mode = mode,

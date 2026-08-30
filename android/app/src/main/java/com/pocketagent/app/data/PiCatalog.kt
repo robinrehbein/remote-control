@@ -1,13 +1,6 @@
 package com.pocketagent.app.data
 
 /**
- * Der eine Agent dieser App. Der Wert steht weiterhin im Wire-Format
- * (`session.create`, `SessionInfo.adapter`, `status`-Event) — die Oberfläche
- * verzweigt aber nirgends mehr danach.
- */
-const val PI_AGENT_ID: String = "pi"
-
-/**
  * Ein Zugang, den pi kennen kann. [id] ist zugleich die Secret-Art im
  * Server-Vault und der `provider`-Wert im Protokoll; [envVar] ist nur
  * dokumentarisch (der Server baut die Umgebung selbst).
